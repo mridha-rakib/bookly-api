@@ -1,0 +1,10 @@
+process.env["NODE_ENV"] = "test";
+process.env["APP_NAME"] = "Bookly API";
+process.env["API_VERSION"] = "v1";
+process.env["LOG_LEVEL"] = "silent";
+process.env["CORS_ORIGINS"] = "http://localhost:3000";
+process.env["RATE_LIMIT_WINDOW_MS"] = "900000";
+process.env["RATE_LIMIT_MAX"] = "1000";
+process.env["API_DOCS_ENABLED"] = "true";
+process.env["TRUST_PROXY"] = "false";
+process.env["SHUTDOWN_TIMEOUT_MS"] = "1000";
