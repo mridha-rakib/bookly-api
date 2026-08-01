@@ -10,6 +10,9 @@ Production-grade backend foundation for Bookly.
 - Docker, optional for container builds
 - PM2, optional for non-Docker production process management
 
+Node version is pinned via `.nvmrc` and `.node-version` (both `24`), matching `package.json#engines`
+and the Dockerfile base image. Use your version manager of choice (nvm, fnm, volta, asdf) to pick it up.
+
 ## Setup
 
 ```bash
@@ -85,6 +88,12 @@ tests/
 Application construction is separated from process startup. Integration tests import the Express app
 without opening a network port or connecting to production resources.
 
+## pnpm Workspace File
+
+`pnpm-workspace.yaml` exists only to declare pnpm's build-script allow policy (`allowBuilds`, required
+so pnpm permits esbuild's postinstall script). It does not declare a `packages` list. This backend is a
+single-package repository, not a monorepo — do not add workspace packages here.
+
 ## Docker
 
 ```bash
@@ -94,6 +103,12 @@ docker run --rm -p 3000:3000 --env-file .env bookly-api
 
 The Docker image uses a multi-stage Debian-based Node.js 24 build, installs production-only runtime
 dependencies, runs compiled TypeScript output, uses the non-root `node` user, and checks `GET /health`.
+
+Husky is a devDependency, so it is intentionally absent from the production-only dependency install.
+The `prepare` script calls `scripts/prepare-husky.mjs` instead of `husky` directly: it exits
+successfully without importing husky when `HUSKY=0` is set or when no `.git` directory is present, and
+otherwise runs husky's real setup and fails loudly if that setup genuinely errors. The Dockerfile sets
+`HUSKY=0` for its dependency-install stages so `pnpm install` never tries to invoke husky.
 
 ## PM2
 

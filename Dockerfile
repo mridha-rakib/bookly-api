@@ -1,11 +1,13 @@
 FROM node:24-bookworm-slim AS base
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+ENV HUSKY=0
 WORKDIR /app
 RUN corepack enable
 
 FROM base AS deps
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile
 
 FROM deps AS build
@@ -16,6 +18,7 @@ RUN pnpm build
 FROM base AS production-deps
 ENV NODE_ENV=production
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY scripts ./scripts
 RUN pnpm install --prod --frozen-lockfile
 
 FROM node:24-bookworm-slim AS runtime

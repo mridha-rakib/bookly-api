@@ -21,7 +21,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "prepare": "husky"
+    "prepare": "node scripts/prepare-husky.mjs"
   },
   "lint-staged": {
     "*.{ts,js,json,md,yml,yaml}": "biome check --write --no-errors-on-unmatched"
