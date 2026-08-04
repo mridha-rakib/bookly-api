@@ -4,6 +4,7 @@ import {
   OpenApiGeneratorV3,
 } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
+import { registerAuthOpenApi } from "../modules/auth/auth.openapi.js";
 import { livenessHealthSchema, readinessHealthSchema } from "../modules/health/health.schema.js";
 import { env } from "./env.js";
 
@@ -96,6 +97,8 @@ registry.registerPath({
     },
   },
 });
+
+registerAuthOpenApi(registry, env.API_VERSION);
 
 export const openApiDocument: Record<string, unknown> = new OpenApiGeneratorV3(
   registry.definitions,

@@ -11,6 +11,11 @@ const booleanString = z
   .default("false")
   .transform((value) => value === "true" || value === "1");
 
+const optionalBooleanString = z
+  .enum(["true", "false", "1", "0"])
+  .optional()
+  .transform((value) => value === "true" || value === "1");
+
 const docsEnabledSchema = z
   .enum(["true", "false", "1", "0"])
   .default(rawNodeEnv === "production" ? "false" : "true")
@@ -55,6 +60,58 @@ const mongodbUriSchema = z.preprocess(
     .regex(/^mongodb(\+srv)?:\/\//, "MONGODB_URI must start with mongodb:// or mongodb+srv://"),
 );
 
+const optionalProductionRequiredString = (name: string) =>
+  z
+    .string()
+    .optional()
+    .superRefine((value, context) => {
+      if (rawNodeEnv === "production" && !value) {
+        context.addIssue({
+          code: "custom",
+          message: `${name} is required in production`,
+        });
+      }
+    });
+
+const jwtSecretSchema = z
+  .string()
+  .default(
+    rawNodeEnv === "production"
+      ? ""
+      : "development-only-change-me-bookly-access-token-secret-minimum-32-chars",
+  )
+  .superRefine((value, context) => {
+    if (value.length < 32) {
+      context.addIssue({
+        code: "custom",
+        message: "JWT_ACCESS_TOKEN_SECRET must be at least 32 characters",
+      });
+    }
+
+    if (rawNodeEnv === "production" && value.includes("development-only")) {
+      context.addIssue({
+        code: "custom",
+        message: "JWT_ACCESS_TOKEN_SECRET must be explicit in production",
+      });
+    }
+  });
+
+const otpHashSecretSchema = z
+  .string()
+  .default(
+    rawNodeEnv === "production"
+      ? ""
+      : "development-only-change-me-bookly-otp-hash-secret-minimum-32-chars",
+  )
+  .superRefine((value, context) => {
+    if (value.length < 32) {
+      context.addIssue({
+        code: "custom",
+        message: "OTP_HASH_SECRET must be at least 32 characters",
+      });
+    }
+  });
+
 export const env = createEnv({
   server: {
     NODE_ENV: nodeEnvSchema,
@@ -78,6 +135,39 @@ export const env = createEnv({
     API_DOCS_ENABLED: docsEnabledSchema,
     TRUST_PROXY: booleanString,
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+    JWT_ACCESS_TOKEN_SECRET: jwtSecretSchema,
+    JWT_ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
+    REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+    AUTH_COOKIE_NAME: z.string().min(1).default("bookly_refresh_token"),
+    AUTH_COOKIE_DOMAIN: z.string().optional(),
+    AUTH_COOKIE_PATH: z.string().min(1).default("/api/v1/auth"),
+    AUTH_COOKIE_SECURE: optionalBooleanString.default(rawNodeEnv === "production"),
+    AUTH_COOKIE_SAME_SITE: z.enum(["lax", "strict", "none"]).default("lax"),
+    OTP_LENGTH: z.coerce.number().int().min(4).max(4).default(4),
+    OTP_EXPIRY_MINUTES: z.coerce.number().int().positive().default(10),
+    OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
+    OTP_MAX_VERIFICATION_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    OTP_MAX_RESENDS_PER_HOUR: z.coerce.number().int().positive().default(5),
+    OTP_HASH_SECRET: otpHashSecretSchema,
+    REGISTRATION_SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
+    RESEND_API_KEY: optionalProductionRequiredString("RESEND_API_KEY"),
+    RESEND_FROM_EMAIL: optionalProductionRequiredString("RESEND_FROM_EMAIL"),
+    RESEND_FROM_NAME: optionalProductionRequiredString("RESEND_FROM_NAME"),
+    TWILIO_ACCOUNT_SID: optionalProductionRequiredString("TWILIO_ACCOUNT_SID"),
+    TWILIO_AUTH_TOKEN: optionalProductionRequiredString("TWILIO_AUTH_TOKEN"),
+    TWILIO_VERIFY_SERVICE_SID: optionalProductionRequiredString("TWILIO_VERIFY_SERVICE_SID"),
+    SUPER_ADMIN_EMAIL: z.string().email().optional(),
+    SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
+    SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),
+    SUPER_ADMIN_LAST_NAME: z.string().min(1).optional(),
+    ARGON2_MEMORY_COST: z.coerce.number().int().positive().default(65_536),
+    ARGON2_TIME_COST: z.coerce.number().int().positive().default(3),
+    ARGON2_PARALLELISM: z.coerce.number().int().positive().default(1),
+    AUTH_ENTRY_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
+    AUTH_LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+    AUTH_OTP_SEND_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+    AUTH_OTP_VERIFY_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+    AUTH_REFRESH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
