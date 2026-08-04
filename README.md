@@ -34,6 +34,7 @@ pnpm test
 pnpm test:coverage
 pnpm build
 pnpm start
+pnpm seed:super-admin
 ```
 
 ## Environment Variables
@@ -52,6 +53,39 @@ pnpm start
 | `API_DOCS_ENABLED` | No | Enables `/docs` and `/openapi.json`. Defaults off in production. |
 | `TRUST_PROXY` | No | Enables Express trust proxy. |
 | `SHUTDOWN_TIMEOUT_MS` | No | Graceful shutdown timeout. |
+| `JWT_ACCESS_TOKEN_SECRET` | Yes in production | HS256 signing secret, minimum 32 characters. Local development has an unsafe default. |
+| `JWT_ACCESS_TOKEN_TTL_MINUTES` | No | Access-token lifetime. Defaults to 15 minutes. |
+| `REFRESH_TOKEN_TTL_DAYS` | No | Refresh-session lifetime and cookie max age. Defaults to 30 days. |
+| `AUTH_COOKIE_NAME` | No | Refresh cookie name. |
+| `AUTH_COOKIE_DOMAIN` | Deployment-specific | Optional cookie domain. Leave blank for host-only local cookies. |
+| `AUTH_COOKIE_PATH` | No | Refresh cookie path. Defaults to `/api/v1/auth`. |
+| `AUTH_COOKIE_SECURE` | Yes in production | Must be true in production deployments. |
+| `AUTH_COOKIE_SAME_SITE` | No | `lax`, `strict`, or `none`. Use `none` only with secure cross-site deployments. |
+| `OTP_LENGTH` | No | Fixed at 4 for the current frontend. |
+| `OTP_EXPIRY_MINUTES` | No | Email OTP expiry. Defaults to 10 minutes. |
+| `OTP_RESEND_COOLDOWN_SECONDS` | No | OTP resend cooldown. Defaults to 60 seconds. |
+| `OTP_MAX_VERIFICATION_ATTEMPTS` | No | Maximum OTP verification attempts. Defaults to 5. |
+| `OTP_MAX_RESENDS_PER_HOUR` | No | Maximum OTP sends per rolling hour. Defaults to 5. |
+| `OTP_HASH_SECRET` | Yes in production | Secret used to hash locally generated email OTPs. |
+| `REGISTRATION_SESSION_TTL_HOURS` | No | TTL for abandoned registration sessions. Defaults to 24 hours. |
+| `RESEND_API_KEY` | Required for email OTP delivery | Resend API key. Not required to boot locally; provider calls fail with `PROVIDER_NOT_CONFIGURED` when missing. |
+| `RESEND_FROM_EMAIL` | Required for email OTP delivery | Verified sender email for Resend. |
+| `RESEND_FROM_NAME` | Required for email OTP delivery | Sender display name for Resend. |
+| `TWILIO_ACCOUNT_SID` | Required for phone OTP delivery | Twilio account SID. |
+| `TWILIO_AUTH_TOKEN` | Required for phone OTP delivery | Twilio auth token. |
+| `TWILIO_VERIFY_SERVICE_SID` | Required for phone OTP delivery | Twilio Verify service SID configured for the 4-digit frontend contract. |
+| `SUPER_ADMIN_EMAIL` | Required for seed command | Email for `pnpm seed:super-admin`. |
+| `SUPER_ADMIN_PASSWORD` | Required for seed command | Initial Super Admin password. Never logged. |
+| `SUPER_ADMIN_FIRST_NAME` | Required for seed command | Super Admin profile first name. |
+| `SUPER_ADMIN_LAST_NAME` | Required for seed command | Super Admin profile last name. |
+| `ARGON2_MEMORY_COST` | No | Argon2id memory cost. Defaults to 65536. |
+| `ARGON2_TIME_COST` | No | Argon2id time cost. Defaults to 3. |
+| `ARGON2_PARALLELISM` | No | Argon2id parallelism. Defaults to 1. |
+| `AUTH_ENTRY_RATE_LIMIT_MAX` | No | Entry/account lookup requests per 15 minutes. |
+| `AUTH_LOGIN_RATE_LIMIT_MAX` | No | Login requests per 15 minutes. |
+| `AUTH_OTP_SEND_RATE_LIMIT_MAX` | No | OTP send requests per hour. |
+| `AUTH_OTP_VERIFY_RATE_LIMIT_MAX` | No | OTP verify requests per 15 minutes. |
+| `AUTH_REFRESH_RATE_LIMIT_MAX` | No | Refresh requests per 15 minutes. |
 
 ## Endpoints
 
@@ -59,6 +93,22 @@ pnpm start
 - `GET /api/v1/health`: readiness check. Reports MongoDB connection state and returns `503` when not ready.
 - `GET /docs`: Swagger UI, when docs are enabled.
 - `GET /openapi.json`: generated OpenAPI document, when docs are enabled.
+
+### Authentication
+
+Core auth is mounted under `/api/v1/auth`.
+
+- Customer portal: `POST /customer/entry`, `POST /customer/login`, and `/customer/register/*`.
+- Professional portal: `POST /professional/entry`, `POST /professional/login`, and `/professional/register/*`.
+- Super Admin portal: `POST /super-admin/login`; public Super Admin signup is intentionally absent.
+- Common session endpoints: `POST /refresh`, `POST /logout`, `GET /me`.
+
+Access tokens are returned in JSON for `Authorization: Bearer` usage. Refresh tokens are opaque,
+stored only as hashes server-side, and sent only in an HttpOnly cookie. Refresh rotates the cookie on
+each successful call.
+
+Email OTP uses Resend and phone OTP uses Twilio Verify. Missing provider credentials do not create a
+development bypass; provider-backed OTP endpoints fail with `PROVIDER_NOT_CONFIGURED`.
 
 ## Architecture
 
@@ -77,6 +127,13 @@ src/
   config/
   database/
   modules/health/
+  modules/auth/
+  modules/registration-session/
+  modules/verification/
+  modules/session/
+  modules/user/
+  modules/business-onboarding/
+  modules/business/
   routes/
 tests/
   helpers/
