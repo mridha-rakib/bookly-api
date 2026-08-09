@@ -30,7 +30,7 @@ export const createAuthenticateAccessTokenMiddleware =
       };
       next();
     } catch (error) {
-      next(error);
+      next(error instanceof AuthError ? error : new AuthError("SESSION_EXPIRED", 401));
     }
   };
 

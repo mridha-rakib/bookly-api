@@ -1,3 +1,4 @@
+import { setServers } from "node:dns";
 import mongoose from "mongoose";
 
 import { env } from "../config/env.js";
@@ -40,6 +41,7 @@ export class DatabaseManager implements DatabaseStateReader {
     }
 
     logger.info("Connecting to MongoDB");
+    this.configureDnsServers();
 
     this.connectPromise = mongoose
       .connect(env.MONGODB_URI, {
@@ -60,6 +62,18 @@ export class DatabaseManager implements DatabaseStateReader {
       });
 
     await this.connectPromise;
+  }
+
+  private configureDnsServers(): void {
+    if (env.MONGODB_DNS_SERVERS.length === 0) {
+      return;
+    }
+
+    setServers(env.MONGODB_DNS_SERVERS);
+    logger.info(
+      { dnsServerCount: env.MONGODB_DNS_SERVERS.length },
+      "Configured MongoDB DNS servers",
+    );
   }
 
   public async disconnect(): Promise<void> {

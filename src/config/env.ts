@@ -1,10 +1,19 @@
 import "dotenv/config";
 
+import { isIP } from "node:net";
 import { createEnv } from "@t3-oss/env-core";
 import { z } from "zod";
 
 const nodeEnvSchema = z.enum(["development", "test", "production"]).default("development");
 const rawNodeEnv = nodeEnvSchema.parse(process.env["NODE_ENV"] ?? "development");
+const emailProviderSchema = z
+  .enum(["smtp", "resend"])
+  .default(rawNodeEnv === "production" ? "resend" : "smtp");
+const rawEmailProvider = emailProviderSchema.parse(process.env["EMAIL_PROVIDER"] || undefined);
+const phoneOtpProviderSchema = z
+  .enum(["dummy", "twilio"])
+  .default(rawNodeEnv === "production" ? "twilio" : "dummy");
+const rawPhoneOtpProvider = phoneOtpProviderSchema.parse(process.env["OTP_PROVIDER"] || undefined);
 
 const booleanString = z
   .enum(["true", "false", "1", "0"])
@@ -60,6 +69,26 @@ const mongodbUriSchema = z.preprocess(
     .regex(/^mongodb(\+srv)?:\/\//, "MONGODB_URI must start with mongodb:// or mongodb+srv://"),
 );
 
+const mongodbDnsServersSchema = z
+  .string()
+  .optional()
+  .transform((value) =>
+    (value ?? "")
+      .split(",")
+      .map((server) => server.trim())
+      .filter(Boolean),
+  )
+  .superRefine((servers, context) => {
+    for (const server of servers) {
+      if (isIP(server) === 0) {
+        context.addIssue({
+          code: "custom",
+          message: "MONGODB_DNS_SERVERS must contain only comma-separated IP addresses",
+        });
+      }
+    }
+  });
+
 const optionalProductionRequiredString = (name: string) =>
   z
     .string()
@@ -69,6 +98,32 @@ const optionalProductionRequiredString = (name: string) =>
         context.addIssue({
           code: "custom",
           message: `${name} is required in production`,
+        });
+      }
+    });
+
+const optionalProviderRequiredString = (provider: "smtp" | "resend", name: string) =>
+  z
+    .string()
+    .optional()
+    .superRefine((value, context) => {
+      if (rawEmailProvider === provider && !value) {
+        context.addIssue({
+          code: "custom",
+          message: `${name} is required when EMAIL_PROVIDER=${provider}`,
+        });
+      }
+    });
+
+const optionalPhoneProviderRequiredString = (provider: "dummy" | "twilio", name: string) =>
+  z
+    .string()
+    .optional()
+    .superRefine((value, context) => {
+      if (rawPhoneOtpProvider === provider && !value) {
+        context.addIssue({
+          code: "custom",
+          message: `${name} is required when OTP_PROVIDER=${provider}`,
         });
       }
     });
@@ -125,6 +180,7 @@ export const env = createEnv({
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default(rawNodeEnv === "development" ? "debug" : "info"),
+    MONGODB_DNS_SERVERS: mongodbDnsServersSchema,
     CORS_ORIGINS: corsOriginsSchema,
     RATE_LIMIT_WINDOW_MS: z.coerce
       .number()
@@ -150,12 +206,67 @@ export const env = createEnv({
     OTP_MAX_RESENDS_PER_HOUR: z.coerce.number().int().positive().default(5),
     OTP_HASH_SECRET: otpHashSecretSchema,
     REGISTRATION_SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
-    RESEND_API_KEY: optionalProductionRequiredString("RESEND_API_KEY"),
-    RESEND_FROM_EMAIL: optionalProductionRequiredString("RESEND_FROM_EMAIL"),
-    RESEND_FROM_NAME: optionalProductionRequiredString("RESEND_FROM_NAME"),
-    TWILIO_ACCOUNT_SID: optionalProductionRequiredString("TWILIO_ACCOUNT_SID"),
-    TWILIO_AUTH_TOKEN: optionalProductionRequiredString("TWILIO_AUTH_TOKEN"),
-    TWILIO_VERIFY_SERVICE_SID: optionalProductionRequiredString("TWILIO_VERIFY_SERVICE_SID"),
+    EMAIL_PROVIDER: emailProviderSchema,
+    EMAIL_FROM: optionalProviderRequiredString("smtp", "EMAIL_FROM"),
+    EMAIL_FROM_NAME: z
+      .string()
+      .min(1)
+      .default(process.env["APP_NAME"] ?? "Bookly"),
+    SMTP_HOST: optionalProviderRequiredString("smtp", "SMTP_HOST"),
+    SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
+    SMTP_SECURE: booleanString,
+    SMTP_USER: optionalProviderRequiredString("smtp", "SMTP_USER"),
+    SMTP_PASS: optionalProviderRequiredString("smtp", "SMTP_PASS"),
+    RESEND_API_KEY:
+      rawEmailProvider === "resend"
+        ? optionalProviderRequiredString("resend", "RESEND_API_KEY")
+        : optionalProductionRequiredString("RESEND_API_KEY"),
+    RESEND_FROM_EMAIL:
+      rawEmailProvider === "resend"
+        ? optionalProviderRequiredString("resend", "RESEND_FROM_EMAIL")
+        : optionalProductionRequiredString("RESEND_FROM_EMAIL"),
+    RESEND_FROM_NAME:
+      rawEmailProvider === "resend"
+        ? optionalProviderRequiredString("resend", "RESEND_FROM_NAME")
+        : optionalProductionRequiredString("RESEND_FROM_NAME"),
+    OTP_PROVIDER: phoneOtpProviderSchema.superRefine((value, context) => {
+      if (rawNodeEnv === "production" && value === "dummy") {
+        context.addIssue({
+          code: "custom",
+          message: "OTP_PROVIDER=dummy is not allowed in production",
+        });
+      }
+    }),
+    DUMMY_PHONE_OTP_CODE: z
+      .string()
+      .optional()
+      .superRefine((value, context) => {
+        if (rawPhoneOtpProvider === "dummy" && !value) {
+          context.addIssue({
+            code: "custom",
+            message: "DUMMY_PHONE_OTP_CODE is required when OTP_PROVIDER=dummy",
+          });
+        }
+
+        if (value && !/^\d{4}$/.test(value)) {
+          context.addIssue({
+            code: "custom",
+            message: "DUMMY_PHONE_OTP_CODE must be exactly 4 digits",
+          });
+        }
+      }),
+    TWILIO_ACCOUNT_SID:
+      rawPhoneOtpProvider === "twilio"
+        ? optionalPhoneProviderRequiredString("twilio", "TWILIO_ACCOUNT_SID")
+        : optionalProductionRequiredString("TWILIO_ACCOUNT_SID"),
+    TWILIO_AUTH_TOKEN:
+      rawPhoneOtpProvider === "twilio"
+        ? optionalPhoneProviderRequiredString("twilio", "TWILIO_AUTH_TOKEN")
+        : optionalProductionRequiredString("TWILIO_AUTH_TOKEN"),
+    TWILIO_VERIFY_SERVICE_SID:
+      rawPhoneOtpProvider === "twilio"
+        ? optionalPhoneProviderRequiredString("twilio", "TWILIO_VERIFY_SERVICE_SID")
+        : optionalProductionRequiredString("TWILIO_VERIFY_SERVICE_SID"),
     SUPER_ADMIN_EMAIL: z.string().email().optional(),
     SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
     SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),

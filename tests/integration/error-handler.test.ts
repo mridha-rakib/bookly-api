@@ -30,6 +30,33 @@ const createValidationApp = () => {
 };
 
 describe("validation and error handling", () => {
+  it("preserves a valid request id and replaces unsafe request ids", async () => {
+    const app = express();
+
+    app.use(requestIdMiddleware);
+    app.get("/request-id", (request, response) => {
+      response.json({ requestId: request.id });
+    });
+
+    const validResponse = await request(app)
+      .get("/request-id")
+      .set("x-request-id", "req_123.test-1")
+      .expect(200);
+
+    expect(validResponse.body.requestId).toBe("req_123.test-1");
+    expect(validResponse.headers["x-request-id"]).toBe("req_123.test-1");
+
+    const unsafeResponse = await request(app)
+      .get("/request-id")
+      .set("x-request-id", "invalid request id")
+      .expect(200);
+
+    expect(unsafeResponse.body.requestId).not.toBe("invalid request id");
+    expect(unsafeResponse.body.requestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+  });
+
   it("stores validated request data for downstream handlers", async () => {
     const app = createValidationApp();
 

@@ -44,7 +44,10 @@ const businessOnboardingDraftSchema = new Schema<BusinessOnboardingDraftDocument
       required: true,
       unique: true,
     },
-    visitType: { type: String, enum: ["location", "travel"] },
+    visitType: {
+      type: String,
+      enum: ["AT_BUSINESS_LOCATION", "TRAVEL_TO_CUSTOMER", "location", "travel"],
+    },
     businessDetails: {
       businessName: { type: String, trim: true },
       ownerName: { type: String, trim: true },
@@ -75,8 +78,6 @@ const businessOnboardingDraftSchema = new Schema<BusinessOnboardingDraftDocument
   },
   { timestamps: true },
 );
-
-businessOnboardingDraftSchema.index({ registrationSessionId: 1 }, { unique: true });
 
 export const BusinessOnboardingDraftModel = model<BusinessOnboardingDraftDocument>(
   "BusinessOnboardingDraft",

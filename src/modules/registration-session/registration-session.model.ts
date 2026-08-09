@@ -1,4 +1,4 @@
-import { model, Schema, type Types } from "mongoose";
+import { type HydratedDocument, model, Schema, type Types } from "mongoose";
 
 import type { BusinessVisitType } from "../business/business.types.js";
 import type { Gender, PhoneNumber } from "../user/user.types.js";
@@ -20,11 +20,12 @@ export const registrationSteps = [
 ] as const;
 export type RegistrationStep = (typeof registrationSteps)[number];
 
-export type RegistrationSessionDocument = {
+export type RegistrationSession = {
   _id: Types.ObjectId;
   portal: RegistrationPortal;
   intendedRole: "CUSTOMER" | "BUSINESS_OWNER";
   normalizedEmail: string;
+  isActive: boolean;
   currentStep: RegistrationStep;
   emailVerification: {
     verifiedAt?: Date | undefined;
@@ -59,11 +60,14 @@ export type RegistrationSessionDocument = {
   updatedAt: Date;
 };
 
-const registrationSessionSchema = new Schema<RegistrationSessionDocument>(
+export type RegistrationSessionDocument = HydratedDocument<RegistrationSession>;
+
+const registrationSessionSchema = new Schema<RegistrationSession>(
   {
     portal: { type: String, enum: registrationPortals, required: true },
     intendedRole: { type: String, enum: ["CUSTOMER", "BUSINESS_OWNER"], required: true },
     normalizedEmail: { type: String, required: true, lowercase: true, trim: true },
+    isActive: { type: Boolean, required: true, default: true },
     currentStep: { type: String, enum: registrationSteps, required: true },
     emailVerification: {
       verifiedAt: { type: Date },
@@ -93,7 +97,10 @@ const registrationSessionSchema = new Schema<RegistrationSessionDocument>(
     passwordHash: { type: String, select: false },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
-    businessVisitType: { type: String, enum: ["location", "travel"] },
+    businessVisitType: {
+      type: String,
+      enum: ["AT_BUSINESS_LOCATION", "TRAVEL_TO_CUSTOMER", "location", "travel"],
+    },
     businessOnboardingDraftId: { type: Schema.Types.ObjectId, ref: "BusinessOnboardingDraft" },
     completedUserId: { type: Schema.Types.ObjectId, ref: "User" },
     completedBusinessId: { type: Schema.Types.ObjectId, ref: "Business" },
@@ -103,9 +110,13 @@ const registrationSessionSchema = new Schema<RegistrationSessionDocument>(
 );
 
 registrationSessionSchema.index({ normalizedEmail: 1, portal: 1 });
+registrationSessionSchema.index(
+  { normalizedEmail: 1, portal: 1, isActive: 1 },
+  { unique: true, partialFilterExpression: { isActive: true } },
+);
 registrationSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-export const RegistrationSessionModel = model<RegistrationSessionDocument>(
+export const RegistrationSessionModel = model<RegistrationSession>(
   "RegistrationSession",
   registrationSessionSchema,
 );

@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { jwtVerify, SignJWT } from "jose";
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import { env } from "../../config/env.js";
 import type { SessionRepository } from "../session/session.repository.js";
-import type { UserRole } from "../user/user.types.js";
+import { type UserRole, userRoles } from "../user/user.types.js";
 import { addDays, addMinutes, createOpaqueToken, sha256 } from "./auth.utils.js";
 
 export type AccessTokenClaims = {
@@ -40,18 +40,21 @@ export class TokenService {
     const subject = result.payload.sub;
     const role = result.payload["role"];
 
-    if (!subject || typeof role !== "string") {
+    if (!subject || typeof role !== "string" || !userRoles.includes(role as UserRole)) {
       throw new Error("Invalid token claims");
     }
 
     return { sub: subject, role: role as UserRole };
   }
 
-  public async createRefreshSession(input: {
-    userId: Types.ObjectId;
-    userAgent?: string;
-    ipAddress?: string;
-  }): Promise<RefreshTokenResult> {
+  public async createRefreshSession(
+    input: {
+      userId: Types.ObjectId;
+      userAgent?: string;
+      ipAddress?: string;
+    },
+    session?: ClientSession,
+  ): Promise<RefreshTokenResult> {
     const refreshToken = createOpaqueToken();
     const expiresAt = addDays(new Date(), env.REFRESH_TOKEN_TTL_DAYS);
 
@@ -64,7 +67,7 @@ export class TokenService {
       ...(input.ipAddress ? { ipAddress: input.ipAddress } : {}),
     };
 
-    await this.sessionRepository.create(createInput);
+    await this.sessionRepository.create(createInput, session);
 
     return { refreshToken, expiresAt };
   }
@@ -81,6 +84,7 @@ export class TokenService {
     }
 
     if (existing.revokedAt) {
+      await this.sessionRepository.revokeFamily(existing.tokenFamilyId);
       throw new Error("REFRESH_TOKEN_REUSED");
     }
 

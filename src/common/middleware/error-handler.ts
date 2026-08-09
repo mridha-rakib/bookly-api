@@ -27,6 +27,9 @@ const mongooseValidationToDetails = (error: mongoose.Error.ValidationError): Err
     code: validatorError.name,
   }));
 
+const isMongoDuplicateKeyError = (error: unknown): error is { code: 11000; keyPattern?: unknown } =>
+  typeof error === "object" && error !== null && "code" in error && error.code === 11000;
+
 const normalizeError = (error: unknown): AppError => {
   if (error instanceof AppError) {
     return error;
@@ -48,6 +51,21 @@ const normalizeError = (error: unknown): AppError => {
         code: "invalid_cast",
       },
     ]);
+  }
+
+  if (isMongoDuplicateKeyError(error)) {
+    const keyPattern =
+      typeof error.keyPattern === "object" && error.keyPattern !== null
+        ? Object.keys(error.keyPattern)
+        : [];
+    const code = keyPattern.includes("normalizedEmail")
+      ? "EMAIL_ALREADY_REGISTERED"
+      : "DUPLICATE_RESOURCE";
+
+    return new AppError("Email is already registered", 409, {
+      details: [{ message: "Email is already registered", code }],
+      expose: true,
+    });
   }
 
   return new AppError("Internal server error", 500, { cause: error, expose: false });

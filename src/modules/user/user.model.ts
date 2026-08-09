@@ -34,7 +34,6 @@ const userSchema = new Schema<UserDocument>(
   { timestamps: true },
 );
 
-userSchema.index({ normalizedEmail: 1 }, { unique: true });
 userSchema.index({ role: 1, status: 1 });
 
 export const UserModel = model<UserDocument>("User", userSchema);
@@ -45,11 +44,13 @@ export type UserProfileDocument = {
   firstName: string;
   lastName: string;
   gender: "male" | "female" | "other";
-  phone: {
-    countryCode: string;
-    nationalNumber: string;
-    e164: string;
-  };
+  phone?:
+    | {
+        countryCode: string;
+        nationalNumber: string;
+        e164: string;
+      }
+    | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   createdAt: Date;
@@ -63,9 +64,9 @@ const userProfileSchema = new Schema<UserProfileDocument>(
     lastName: { type: String, required: true, trim: true },
     gender: { type: String, enum: genders, required: true },
     phone: {
-      countryCode: { type: String, required: true },
-      nationalNumber: { type: String, required: true },
-      e164: { type: String, required: true },
+      countryCode: { type: String },
+      nationalNumber: { type: String },
+      e164: { type: String },
     },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
@@ -73,7 +74,6 @@ const userProfileSchema = new Schema<UserProfileDocument>(
   { timestamps: true },
 );
 
-userProfileSchema.index({ userId: 1 }, { unique: true });
 userProfileSchema.index({ "phone.e164": 1 });
 
 export const UserProfileModel = model<UserProfileDocument>("UserProfile", userProfileSchema);
@@ -95,8 +95,6 @@ const customerProfileSchema = new Schema<CustomerProfileDocument>(
   },
   { timestamps: true },
 );
-
-customerProfileSchema.index({ userId: 1 }, { unique: true });
 
 export const CustomerProfileModel = model<CustomerProfileDocument>(
   "CustomerProfile",

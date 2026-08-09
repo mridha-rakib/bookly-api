@@ -12,6 +12,7 @@ import type {
   CategorySelectionBody,
   EntryBody,
   LoginBody,
+  ProfessionalEntryBody,
   ProfileBody,
   VerifyEmailOtpBody,
   VerifyPhoneOtpBody,
@@ -28,7 +29,9 @@ export class AuthController {
   };
 
   public professionalEntry = async (request: Request, response: Response): Promise<void> => {
-    const result = await this.authService.professionalEntry(request.validated?.body as EntryBody);
+    const result = await this.authService.professionalEntry(
+      request.validated?.body as ProfessionalEntryBody,
+    );
     sendSuccess(response, 200, "Professional entry resolved", result);
   };
 
@@ -147,9 +150,17 @@ export class AuthController {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
-    const result = await this.authService.refresh(refreshToken);
-    setRefreshCookie(response, result.refreshToken);
-    sendSuccess(response, 200, "Session refreshed", this.withoutRefreshToken(result));
+    try {
+      const result = await this.authService.refresh(refreshToken);
+      setRefreshCookie(response, result.refreshToken);
+      sendSuccess(response, 200, "Session refreshed", this.withoutRefreshToken(result));
+    } catch (error) {
+      if (error instanceof AuthError && error.details?.[0]?.code === "USER_SUSPENDED") {
+        clearRefreshCookie(response);
+      }
+
+      throw error;
+    }
   };
 
   public logout = async (request: Request, response: Response): Promise<void> => {

@@ -19,15 +19,80 @@ export class RegistrationSessionRepository {
   public async create(input: CreateSessionInput): Promise<RegistrationSessionDocument> {
     return RegistrationSessionModel.create({
       ...input,
+      isActive: true,
       emailVerification: { attempts: 0, resendTimestamps: [] },
       phoneVerification: { attempts: 0, resendTimestamps: [] },
     });
   }
 
+  public async createOrReuseActive(
+    input: CreateSessionInput,
+  ): Promise<RegistrationSessionDocument> {
+    await RegistrationSessionModel.updateMany(
+      {
+        normalizedEmail: input.normalizedEmail,
+        portal: input.portal,
+        isActive: true,
+        expiresAt: { $lte: new Date() },
+      },
+      { $set: { isActive: false } },
+    );
+
+    try {
+      return await RegistrationSessionModel.findOneAndUpdate(
+        {
+          normalizedEmail: input.normalizedEmail,
+          portal: input.portal,
+          isActive: true,
+          expiresAt: { $gt: new Date() },
+        },
+        {
+          $setOnInsert: {
+            ...input,
+            isActive: true,
+            emailVerification: { attempts: 0, resendTimestamps: [] },
+            phoneVerification: { attempts: 0, resendTimestamps: [] },
+          },
+        },
+        { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+      )
+        .select(
+          "+passwordHash +emailVerification.otpHash +phoneVerification.providerVerificationId",
+        )
+        .orFail()
+        .exec();
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        const existing = await this.findActiveByEmailAndPortal(input.normalizedEmail, input.portal);
+
+        if (existing) {
+          return existing;
+        }
+      }
+
+      throw error;
+    }
+  }
+
   public async findActiveById(
     id: Types.ObjectId | string,
   ): Promise<RegistrationSessionDocument | null> {
-    return RegistrationSessionModel.findOne({ _id: id, expiresAt: { $gt: new Date() } })
+    return RegistrationSessionModel.findOne({
+      _id: id,
+      isActive: true,
+      expiresAt: { $gt: new Date() },
+    })
+      .select("+passwordHash +emailVerification.otpHash +phoneVerification.providerVerificationId")
+      .exec();
+  }
+
+  public async findCompletableById(
+    id: Types.ObjectId | string,
+  ): Promise<RegistrationSessionDocument | null> {
+    return RegistrationSessionModel.findOne({
+      _id: id,
+      $or: [{ currentStep: "COMPLETED" }, { isActive: true, expiresAt: { $gt: new Date() } }],
+    })
       .select("+passwordHash +emailVerification.otpHash +phoneVerification.providerVerificationId")
       .exec();
   }
@@ -39,6 +104,7 @@ export class RegistrationSessionRepository {
     return RegistrationSessionModel.findOne({
       normalizedEmail,
       portal,
+      isActive: true,
       expiresAt: { $gt: new Date() },
       currentStep: { $ne: "COMPLETED" },
     })
@@ -48,7 +114,7 @@ export class RegistrationSessionRepository {
   }
 
   public async save(session: RegistrationSessionDocument): Promise<RegistrationSessionDocument> {
-    return (session as unknown as { save(): Promise<RegistrationSessionDocument> }).save();
+    return session.save();
   }
 
   public async markCompleted(
@@ -62,11 +128,23 @@ export class RegistrationSessionRepository {
       {
         $set: {
           currentStep: "COMPLETED",
+          isActive: false,
           completedUserId,
           ...(completedBusinessId ? { completedBusinessId } : {}),
         },
+        $unset: {
+          passwordHash: "",
+          "emailVerification.otpHash": "",
+          "phoneVerification.providerVerificationId": "",
+        },
       },
-      { session } as never,
+      session ? { session } : undefined,
     );
   }
 }
+
+const isDuplicateKeyError = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === 11000;

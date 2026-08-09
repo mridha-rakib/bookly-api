@@ -11,8 +11,8 @@ import { BusinessOnboardingService } from "../business-onboarding/business-onboa
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { UserRepository } from "../user/user.repository.js";
-import { ResendEmailOtpProvider } from "../verification/email-otp.provider.js";
-import { TwilioVerifyPhoneOtpProvider } from "../verification/phone-otp.provider.js";
+import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
+import { createPhoneOtpProvider } from "../verification/phone-otp.provider.js";
 import { AuthController } from "./auth.controller.js";
 import { createAuthenticateAccessTokenMiddleware, requireActiveUser } from "./auth.middleware.js";
 import {
@@ -57,8 +57,8 @@ export const createAuthRoute = (): Router => {
     businessOnboardingService,
     businessRepository,
     new Argon2PasswordHasher(),
-    new ResendEmailOtpProvider(),
-    new TwilioVerifyPhoneOtpProvider(),
+    createEmailOtpProvider(),
+    createPhoneOtpProvider(),
     tokenService,
   );
   const controller = new AuthController(authService);

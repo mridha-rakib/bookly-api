@@ -1,15 +1,14 @@
 import type { Types } from "mongoose";
+import { AuthError } from "../auth/auth.errors.js";
 import type { BusinessDetailsBody, CategorySelectionBody } from "../auth/auth.schema.js";
 import { normalizePhoneNumber } from "../auth/auth.utils.js";
+import type { BusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "./business-onboarding.repository.js";
 
 export class BusinessOnboardingService {
   public constructor(private readonly repository: BusinessOnboardingRepository) {}
 
-  public async saveVisitType(
-    registrationSessionId: Types.ObjectId,
-    visitType: "location" | "travel",
-  ) {
+  public async saveVisitType(registrationSessionId: Types.ObjectId, visitType: BusinessVisitType) {
     return this.repository.upsertVisitType(registrationSessionId, visitType);
   }
 
@@ -20,7 +19,13 @@ export class BusinessOnboardingService {
     const nationalNumber = input.nationalNumber ?? input.mobileNumber;
 
     if (!nationalNumber) {
-      throw new Error("Business phone number is required");
+      throw new AuthError("INVALID_REGISTRATION_STEP", 400, [
+        {
+          path: "mobileNumber",
+          message: "Business phone number is required",
+          code: "required",
+        },
+      ]);
     }
 
     const address = {

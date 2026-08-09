@@ -1,4 +1,4 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import { type SessionDocument, SessionModel } from "./session.model.js";
 
@@ -12,8 +12,11 @@ type CreateSessionInput = {
 };
 
 export class SessionRepository {
-  public async create(input: CreateSessionInput): Promise<SessionDocument> {
-    return new SessionModel(input).save();
+  public async create(
+    input: CreateSessionInput,
+    session?: ClientSession,
+  ): Promise<SessionDocument> {
+    return new SessionModel(input).save(session ? { session } : undefined);
   }
 
   public async findByRefreshTokenHash(refreshTokenHash: string): Promise<SessionDocument | null> {
@@ -27,11 +30,37 @@ export class SessionRepository {
     );
   }
 
+  public async revokeFamily(tokenFamilyId: string): Promise<void> {
+    await SessionModel.updateMany(
+      { tokenFamilyId, revokedAt: { $exists: false } },
+      { $set: { revokedAt: new Date() } },
+    );
+  }
+
   public async rotate(
     oldSession: SessionDocument,
     refreshTokenHash: string,
     expiresAt: Date,
   ): Promise<SessionDocument> {
+    const consumed = await SessionModel.findOneAndUpdate(
+      {
+        _id: oldSession._id,
+        revokedAt: { $exists: false },
+        expiresAt: { $gt: new Date() },
+      },
+      {
+        $set: {
+          revokedAt: new Date(),
+          lastUsedAt: new Date(),
+        },
+      },
+      { returnDocument: "after" },
+    ).exec();
+
+    if (!consumed) {
+      throw new Error("REFRESH_TOKEN_REUSED");
+    }
+
     const newSession = await SessionModel.create({
       userId: oldSession.userId,
       refreshTokenHash,
@@ -45,9 +74,7 @@ export class SessionRepository {
       { _id: oldSession._id },
       {
         $set: {
-          revokedAt: new Date(),
           replacedBySessionId: newSession._id,
-          lastUsedAt: new Date(),
         },
       },
     );

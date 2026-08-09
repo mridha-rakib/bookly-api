@@ -1,5 +1,6 @@
 import type { Types } from "mongoose";
 
+import type { BusinessVisitType } from "../business/business.types.js";
 import {
   type BusinessOnboardingDraftDocument,
   BusinessOnboardingDraftModel,
@@ -8,12 +9,12 @@ import {
 export class BusinessOnboardingRepository {
   public async upsertVisitType(
     registrationSessionId: Types.ObjectId,
-    visitType: "location" | "travel",
+    visitType: BusinessVisitType,
   ): Promise<BusinessOnboardingDraftDocument> {
     return BusinessOnboardingDraftModel.findOneAndUpdate(
       { registrationSessionId },
       { $set: { visitType } },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
     ).orFail();
   }
 
@@ -24,7 +25,7 @@ export class BusinessOnboardingRepository {
     return BusinessOnboardingDraftModel.findOneAndUpdate(
       { registrationSessionId },
       { $set: { businessDetails } },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
     ).orFail();
   }
 
@@ -35,7 +36,7 @@ export class BusinessOnboardingRepository {
     return BusinessOnboardingDraftModel.findOneAndUpdate(
       { registrationSessionId },
       { $set: { categorySelection } },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
     ).orFail();
   }
 

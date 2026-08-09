@@ -6,6 +6,7 @@ const defaultMessages: Record<string, string> = {
   INVALID_CREDENTIALS: "Invalid email or password",
   INVALID_REGISTRATION_STEP: "Registration step is invalid",
   REGISTRATION_SESSION_EXPIRED: "Registration session has expired",
+  REGISTRATION_ALREADY_COMPLETED: "Registration is already completed",
   OTP_INVALID: "Verification code is invalid",
   OTP_EXPIRED: "Verification code has expired",
   OTP_ATTEMPTS_EXCEEDED: "Verification attempt limit exceeded",
@@ -19,6 +20,11 @@ const defaultMessages: Record<string, string> = {
   SESSION_EXPIRED: "Session has expired",
   REFRESH_TOKEN_REUSED: "Refresh token reuse detected",
   PROVIDER_NOT_CONFIGURED: "Verification provider is not configured",
+  REGISTRATION_COMPLETION_FAILED: "Registration completion failed",
+  DATABASE_TRANSACTION_UNAVAILABLE: "Database transaction support is unavailable",
+  OTP_DELIVERY_FAILED: "Verification code delivery failed",
+  OTP_VERIFICATION_FAILED: "Verification check failed",
+  PROVIDER_RATE_LIMITED: "Verification provider rate limit exceeded",
 };
 
 export class AuthError extends AppError {

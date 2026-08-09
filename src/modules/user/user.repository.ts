@@ -24,11 +24,13 @@ type CreateProfileInput = {
   firstName: string;
   lastName: string;
   gender: "male" | "female" | "other";
-  phone: {
-    countryCode: string;
-    nationalNumber: string;
-    e164: string;
-  };
+  phone?:
+    | {
+        countryCode: string;
+        nationalNumber: string;
+        e164: string;
+      }
+    | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
 };

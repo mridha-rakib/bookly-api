@@ -56,7 +56,11 @@ const businessSchema = new Schema<BusinessDocument>(
       e164: { type: String, required: true },
     },
     status: { type: String, enum: businessStatuses, required: true, default: "PENDING" },
-    visitType: { type: String, enum: businessVisitTypes, required: true },
+    visitType: {
+      type: String,
+      enum: [...businessVisitTypes, "location", "travel"],
+      required: true,
+    },
     address: {
       city: { type: String, required: true },
       area: { type: String, required: true },

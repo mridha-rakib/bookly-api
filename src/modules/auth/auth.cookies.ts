@@ -16,10 +16,8 @@ export const setRefreshCookie = (response: Response, refreshToken: string): void
 };
 
 export const clearRefreshCookie = (response: Response): void => {
-  response.clearCookie(env.AUTH_COOKIE_NAME, {
-    ...getRefreshCookieOptions(),
-    maxAge: undefined,
-  });
+  const { maxAge: _maxAge, ...options } = getRefreshCookieOptions();
+  response.clearCookie(env.AUTH_COOKIE_NAME, options);
 };
 
 export const getRefreshTokenFromRequest = (request: Request): string | undefined => {

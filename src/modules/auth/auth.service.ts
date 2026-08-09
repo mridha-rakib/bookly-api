@@ -1,6 +1,7 @@
-import mongoose, { Types } from "mongoose";
+import mongoose, { type ClientSession, Types } from "mongoose";
 import { env } from "../../config/env.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import type {
@@ -18,6 +19,7 @@ import type {
   CategorySelectionBody,
   EntryBody,
   LoginBody,
+  ProfessionalEntryBody,
   ProfileBody,
   VerifyEmailOtpBody,
   VerifyPhoneOtpBody,
@@ -76,7 +78,7 @@ export class AuthService {
     return this.entry("CUSTOMER", normalizeEmail(input.email));
   }
 
-  public async professionalEntry(input: EntryBody & { visitType?: "location" | "travel" }) {
+  public async professionalEntry(input: ProfessionalEntryBody) {
     const result = await this.entry("PROFESSIONAL", normalizeEmail(input.email));
 
     if (result.nextStep === nextStepValues.EMAIL_VERIFICATION && input.visitType) {
@@ -234,6 +236,12 @@ export class AuthService {
     input: VerifyPhoneOtpBody,
     context: RequestContext,
   ): Promise<AuthResult> {
+    const existingSession = await this.getRegistrationSessionForCompletion(input.sessionId);
+
+    if (existingSession.currentStep === "COMPLETED") {
+      throw new AuthError("REGISTRATION_ALREADY_COMPLETED", 409);
+    }
+
     const session = await this.verifyPhoneOtp(input);
     return this.completeCustomer(session, context);
   }
@@ -291,31 +299,10 @@ export class AuthService {
     input: { sessionId: string },
     context: RequestContext,
   ): Promise<AuthResult & { business: { id: string; status: string } }> {
-    const session = await this.getRegistrationSession(input.sessionId);
+    const session = await this.getRegistrationSessionForCompletion(input.sessionId);
 
     if (session.completedUserId) {
-      const user = await this.userRepository.findById(session.completedUserId);
-      const business = session.completedBusinessId
-        ? await this.businessRepository.findByOwnerUserId(session.completedUserId)
-        : null;
-
-      if (!user) {
-        throw new AuthError("SESSION_EXPIRED", 401);
-      }
-
-      return {
-        ...(await this.issueAuthResult(
-          user._id,
-          user.normalizedEmail,
-          user.role,
-          user.status,
-          context,
-        )),
-        business: {
-          id: String(business?._id ?? session.completedBusinessId ?? ""),
-          status: business?.status ?? "PENDING",
-        },
-      };
+      throw new AuthError("REGISTRATION_ALREADY_COMPLETED", 409);
     }
 
     this.ensureProfessionalSession(session);
@@ -337,8 +324,7 @@ export class AuthService {
     }
 
     const dbSession = await mongoose.startSession();
-    let createdUserId: Types.ObjectId | undefined;
-    let createdBusinessId: Types.ObjectId | undefined;
+    let authResult: (AuthResult & { business: { id: string; status: string } }) | undefined;
 
     try {
       await dbSession.withTransaction(async () => {
@@ -357,7 +343,6 @@ export class AuthService {
           },
           dbSession,
         );
-        createdUserId = user._id;
         await this.userRepository.createProfile(
           {
             userId: user._id,
@@ -396,17 +381,30 @@ export class AuthService {
           },
           dbSession,
         );
-        createdBusinessId = business._id;
         await this.registrationSessionRepository.markCompleted(
           session._id,
           user._id,
           business._id,
           dbSession,
         );
+        authResult = {
+          ...(await this.issueAuthResult(
+            user._id,
+            user.normalizedEmail,
+            user.role,
+            user.status,
+            context,
+            dbSession,
+          )),
+          business: {
+            id: String(business._id),
+            status: "PENDING",
+          },
+        };
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
-        throw new AuthError("INVALID_REGISTRATION_STEP", 500, [
+        throw new AuthError("DATABASE_TRANSACTION_UNAVAILABLE", 503, [
           {
             message:
               "MongoDB transactions are not available; use a replica set or retry with transaction support enabled.",
@@ -414,34 +412,17 @@ export class AuthService {
           },
         ]);
       }
+      await this.throwStableDuplicateCompletionError(error, session._id);
       throw error;
     } finally {
       await dbSession.endSession();
     }
 
-    if (!createdUserId || !createdBusinessId) {
+    if (!authResult) {
       throw new Error("Business owner completion failed");
     }
 
-    const user = await this.userRepository.findById(createdUserId);
-
-    if (!user) {
-      throw new Error("Created user was not found");
-    }
-
-    return {
-      ...(await this.issueAuthResult(
-        user._id,
-        user.normalizedEmail,
-        user.role,
-        user.status,
-        context,
-      )),
-      business: {
-        id: String(createdBusinessId),
-        status: "PENDING",
-      },
-    };
+    return authResult;
   }
 
   public async refresh(refreshToken: string): Promise<AuthResult> {
@@ -450,7 +431,13 @@ export class AuthService {
       const user = await this.userRepository.findById(rotated.userId);
 
       if (!user) {
+        await this.tokenService.revokeRefreshToken(rotated.refreshToken);
         throw new AuthError("SESSION_EXPIRED", 401);
+      }
+
+      if (user.status === "SUSPENDED") {
+        await this.tokenService.revokeRefreshToken(rotated.refreshToken);
+        throw new AuthError("USER_SUSPENDED", 403);
       }
 
       const accessToken = await this.tokenService.createAccessToken({
@@ -524,14 +511,14 @@ export class AuthService {
             id: String(business._id),
             name: business.name,
             status: business.status,
-            visitType: business.visitType,
+            visitType: normalizeBusinessVisitType(business.visitType),
           }
         : null,
     };
   }
 
   public async getProgress(sessionId: string) {
-    const session = await this.getRegistrationSession(sessionId);
+    const session = await this.getRegistrationSessionForCompletion(sessionId);
     return {
       sessionId: String(session._id),
       portal: session.portal,
@@ -557,20 +544,7 @@ export class AuthService {
       return { nextStep: nextStepValues.PASSWORD_LOGIN };
     }
 
-    const existingSession = await this.registrationSessionRepository.findActiveByEmailAndPortal(
-      normalizedEmail,
-      portal,
-    );
-
-    if (existingSession) {
-      return {
-        nextStep: nextStepValues.EMAIL_VERIFICATION,
-        sessionId: String(existingSession._id),
-        currentStep: existingSession.currentStep,
-      };
-    }
-
-    const session = await this.registrationSessionRepository.create({
+    const session = await this.registrationSessionRepository.createOrReuseActive({
       portal,
       intendedRole: portal === "CUSTOMER" ? "CUSTOMER" : "BUSINESS_OWNER",
       normalizedEmail,
@@ -640,13 +614,7 @@ export class AuthService {
     context: RequestContext,
   ): Promise<AuthResult> {
     if (session.completedUserId) {
-      const user = await this.userRepository.findById(session.completedUserId);
-
-      if (!user) {
-        throw new AuthError("SESSION_EXPIRED", 401);
-      }
-
-      return this.issueAuthResult(user._id, user.normalizedEmail, user.role, user.status, context);
+      throw new AuthError("REGISTRATION_ALREADY_COMPLETED", 409);
     }
 
     if (session.intendedRole !== "CUSTOMER") {
@@ -660,7 +628,7 @@ export class AuthService {
     }
 
     const dbSession = await mongoose.startSession();
-    let createdUserId: Types.ObjectId | undefined;
+    let authResult: AuthResult | undefined;
 
     try {
       await dbSession.withTransaction(async () => {
@@ -679,7 +647,6 @@ export class AuthService {
           },
           dbSession,
         );
-        createdUserId = user._id;
         await this.userRepository.createProfile(
           {
             userId: user._id,
@@ -692,17 +659,24 @@ export class AuthService {
           },
           dbSession,
         );
-        await this.userRepository.createCustomerProfile(user._id, {}, dbSession);
         await this.registrationSessionRepository.markCompleted(
           session._id,
           user._id,
           undefined,
           dbSession,
         );
+        authResult = await this.issueAuthResult(
+          user._id,
+          user.normalizedEmail,
+          user.role,
+          user.status,
+          context,
+          dbSession,
+        );
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
-        throw new AuthError("INVALID_REGISTRATION_STEP", 500, [
+        throw new AuthError("DATABASE_TRANSACTION_UNAVAILABLE", 503, [
           {
             message:
               "MongoDB transactions are not available; use a replica set or retry with transaction support enabled.",
@@ -710,22 +684,17 @@ export class AuthService {
           },
         ]);
       }
+      await this.throwStableDuplicateCompletionError(error, session._id);
       throw error;
     } finally {
       await dbSession.endSession();
     }
 
-    if (!createdUserId) {
+    if (!authResult) {
       throw new Error("Customer completion failed");
     }
 
-    const user = await this.userRepository.findById(createdUserId);
-
-    if (!user) {
-      throw new Error("Created user was not found");
-    }
-
-    return this.issueAuthResult(user._id, user.normalizedEmail, user.role, user.status, context);
+    return authResult;
   }
 
   private async issueAuthResult(
@@ -734,6 +703,7 @@ export class AuthService {
     role: UserRole,
     status: string,
     context: RequestContext,
+    session?: ClientSession,
   ): Promise<AuthResult> {
     const accessToken = await this.tokenService.createAccessToken({ userId, role });
     const refreshInput = {
@@ -741,7 +711,7 @@ export class AuthService {
       ...(context.userAgent ? { userAgent: context.userAgent } : {}),
       ...(context.ipAddress ? { ipAddress: context.ipAddress } : {}),
     };
-    const refreshSession = await this.tokenService.createRefreshSession(refreshInput);
+    const refreshSession = await this.tokenService.createRefreshSession(refreshInput, session);
 
     return {
       accessToken,
@@ -762,6 +732,22 @@ export class AuthService {
     }
 
     const session = await this.registrationSessionRepository.findActiveById(sessionId);
+
+    if (!session) {
+      throw new AuthError("REGISTRATION_SESSION_EXPIRED", 410);
+    }
+
+    return session;
+  }
+
+  private async getRegistrationSessionForCompletion(
+    sessionId: string,
+  ): Promise<RegistrationSessionDocument> {
+    if (!Types.ObjectId.isValid(sessionId)) {
+      throw new AuthError("REGISTRATION_SESSION_EXPIRED", 410);
+    }
+
+    const session = await this.registrationSessionRepository.findCompletableById(sessionId);
 
     if (!session) {
       throw new AuthError("REGISTRATION_SESSION_EXPIRED", 410);
@@ -836,6 +822,32 @@ export class AuthService {
     return (
       error instanceof Error &&
       /transaction numbers are only allowed|replica set member/i.test(error.message)
+    );
+  }
+
+  private async throwStableDuplicateCompletionError(
+    error: unknown,
+    sessionId: Types.ObjectId,
+  ): Promise<void> {
+    if (!this.isDuplicateKeyError(error)) {
+      return;
+    }
+
+    const latestSession = await this.registrationSessionRepository.findCompletableById(sessionId);
+
+    if (latestSession?.completedUserId) {
+      throw new AuthError("REGISTRATION_ALREADY_COMPLETED", 409);
+    }
+
+    throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
+  }
+
+  private isDuplicateKeyError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === 11000
     );
   }
 }
