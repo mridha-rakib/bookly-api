@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import {
+  businessCities,
   businessVisitTypeAliases,
   businessVisitTypes,
   normalizeBusinessVisitType,
@@ -11,9 +12,9 @@ const emailSchema = z.email();
 const sessionIdSchema = z.string().min(1);
 const otpCodeSchema = z.string().regex(/^\d{4}$/, "OTP must be 4 digits");
 const passwordSchema = z.string().min(6);
-const countryCodeSchema = z.string().regex(/^\+\d{1,4}$/);
-const nationalNumberSchema = z.string().regex(/^\d{4,20}$/);
-const visitTypeInputSchema = z
+export const countryCodeSchema = z.string().regex(/^\+\d{1,4}$/);
+export const nationalNumberSchema = z.string().regex(/^\d{4,20}$/);
+export const visitTypeInputSchema = z
   .enum([...businessVisitTypes, ...businessVisitTypeAliases])
   .transform(normalizeBusinessVisitType);
 
@@ -70,7 +71,7 @@ export const businessDetailsBodySchema = sessionBodySchema
   .extend({
     businessName: z.string().trim().min(1),
     ownerName: z.string().trim().min(1),
-    city: z.enum(["Larnaca", "Limassol", "Nicosia", "Paphos"]),
+    city: z.enum(businessCities),
     countryCode: countryCodeSchema,
     nationalNumber: nationalNumberSchema.optional(),
     mobileNumber: nationalNumberSchema.optional(),

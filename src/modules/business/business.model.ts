@@ -81,7 +81,7 @@ const businessSchema = new Schema<BusinessDocument>(
   { timestamps: true },
 );
 
-businessSchema.index({ ownerUserId: 1 });
+businessSchema.index({ ownerUserId: 1 }, { unique: true });
 businessSchema.index({ status: 1 });
 
 export const BusinessModel = model<BusinessDocument>("Business", businessSchema);

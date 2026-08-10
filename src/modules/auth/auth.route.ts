@@ -6,6 +6,9 @@ import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { BusinessRepository } from "../business/business.repository.js";
+import { BusinessService } from "../business/business.service.js";
+import { BusinessAccessRepository } from "../business/business-access.repository.js";
+import { BusinessLinkVerificationRepository } from "../business/business-link-verification.repository.js";
 import { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
@@ -46,6 +49,15 @@ export const createAuthRoute = (): Router => {
   const userRepository = new UserRepository();
   const registrationSessionRepository = new RegistrationSessionRepository();
   const businessRepository = new BusinessRepository();
+  const businessAccessRepository = new BusinessAccessRepository();
+  const businessLinkVerificationRepository = new BusinessLinkVerificationRepository();
+  const businessService = new BusinessService(
+    businessRepository,
+    businessAccessRepository,
+    userRepository,
+    businessLinkVerificationRepository,
+    createEmailOtpProvider(),
+  );
   const businessOnboardingRepository = new BusinessOnboardingRepository();
   const businessOnboardingService = new BusinessOnboardingService(businessOnboardingRepository);
   const sessionRepository = new SessionRepository();
@@ -60,6 +72,7 @@ export const createAuthRoute = (): Router => {
     createEmailOtpProvider(),
     createPhoneOtpProvider(),
     tokenService,
+    businessService,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);

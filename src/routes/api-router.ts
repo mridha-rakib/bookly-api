@@ -2,6 +2,7 @@ import { Router } from "express";
 
 import type { DatabaseStateReader } from "../database/database-manager.js";
 import { createAuthRoute } from "../modules/auth/auth.route.js";
+import { createBusinessRoute } from "../modules/business/business.route.js";
 import { HealthController } from "../modules/health/health.controller.js";
 import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
@@ -15,6 +16,7 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
 
   router.use("/health", createReadinessHealthRoute(healthController));
   router.use("/auth", createAuthRoute());
+  router.use("/businesses", createBusinessRoute());
 
   return router;
 };

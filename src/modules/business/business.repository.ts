@@ -47,4 +47,30 @@ export class BusinessRepository {
   ): Promise<BusinessDocument | null> {
     return BusinessModel.findOne({ ownerUserId }).exec();
   }
+
+  public async findById(businessId: Types.ObjectId | string): Promise<BusinessDocument | null> {
+    return BusinessModel.findById(businessId).exec();
+  }
+
+  public async findManyByIds(
+    businessIds: Array<Types.ObjectId | string>,
+  ): Promise<BusinessDocument[]> {
+    if (businessIds.length === 0) {
+      return [];
+    }
+
+    return BusinessModel.find({ _id: { $in: businessIds } }).exec();
+  }
+
+  public async updateOwnedById(
+    ownerUserId: Types.ObjectId | string,
+    businessId: Types.ObjectId | string,
+    update: Record<string, unknown>,
+  ): Promise<BusinessDocument | null> {
+    return BusinessModel.findOneAndUpdate(
+      { _id: businessId, ownerUserId },
+      { $set: update },
+      { returnDocument: "after", runValidators: true },
+    ).exec();
+  }
 }

@@ -1,6 +1,7 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
 import { env } from "../../config/env.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { BusinessService } from "../business/business.service.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
@@ -27,9 +28,11 @@ import type {
 } from "./auth.schema.js";
 import {
   addMinutes,
+  assertOtpResendAllowed,
   generateNumericOtp,
   normalizeEmail,
   normalizePhoneNumber,
+  pruneRecentTimestamps,
   safeCompare,
   sha256,
 } from "./auth.utils.js";
@@ -72,6 +75,7 @@ export class AuthService {
     private readonly emailOtpProvider: EmailOtpProvider,
     private readonly phoneOtpProvider: PhoneOtpProvider,
     private readonly tokenService: TokenService,
+    private readonly businessService: BusinessService,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -211,7 +215,7 @@ export class AuthService {
       throw new AuthError("INVALID_REGISTRATION_STEP", 400);
     }
 
-    this.assertResendAllowed(
+    assertOtpResendAllowed(
       session.phoneVerification.resendTimestamps,
       session.phoneVerification.sentAt,
     );
@@ -221,10 +225,10 @@ export class AuthService {
     if (result.providerVerificationId) {
       session.phoneVerification.providerVerificationId = result.providerVerificationId;
     }
-    session.phoneVerification.resendTimestamps = this.pruneRecentResends([
-      ...session.phoneVerification.resendTimestamps,
-      now,
-    ]);
+    session.phoneVerification.resendTimestamps = pruneRecentTimestamps(
+      [...session.phoneVerification.resendTimestamps, now],
+      oneHourMs,
+    );
     session.phoneVerification.attempts = 0;
     session.currentStep = "PHONE_OTP_SENT";
     await this.registrationSessionRepository.save(session);
@@ -365,7 +369,7 @@ export class AuthService {
             : {}),
           ...(businessDetails.address.aptRoom ? { aptRoom: businessDetails.address.aptRoom } : {}),
         };
-        const business = await this.businessRepository.create(
+        const business = await this.businessService.createOwnedBusiness(
           {
             ownerUserId: user._id,
             name: businessDetails.businessName,
@@ -560,7 +564,7 @@ export class AuthService {
   }
 
   private async issueEmailOtp(session: RegistrationSessionDocument): Promise<void> {
-    this.assertResendAllowed(
+    assertOtpResendAllowed(
       session.emailVerification.resendTimestamps,
       session.emailVerification.sentAt,
     );
@@ -572,10 +576,10 @@ export class AuthService {
     session.emailVerification.otpHash = this.hashOtp(session, code);
     session.emailVerification.otpExpiresAt = addMinutes(now, env.OTP_EXPIRY_MINUTES);
     session.emailVerification.sentAt = now;
-    session.emailVerification.resendTimestamps = this.pruneRecentResends([
-      ...session.emailVerification.resendTimestamps,
-      now,
-    ]);
+    session.emailVerification.resendTimestamps = pruneRecentTimestamps(
+      [...session.emailVerification.resendTimestamps, now],
+      oneHourMs,
+    );
     session.emailVerification.attempts = 0;
     session.currentStep = "EMAIL_OTP_SENT";
     await this.registrationSessionRepository.save(session);
@@ -795,23 +799,6 @@ export class AuthService {
     }
 
     return role === "SUPER_ADMIN";
-  }
-
-  private assertResendAllowed(timestamps: Date[], sentAt?: Date): void {
-    const now = new Date();
-
-    if (sentAt && now.getTime() - sentAt.getTime() < env.OTP_RESEND_COOLDOWN_SECONDS * 1000) {
-      throw new AuthError("OTP_RESEND_COOLDOWN", 429);
-    }
-
-    if (this.pruneRecentResends(timestamps).length >= env.OTP_MAX_RESENDS_PER_HOUR) {
-      throw new AuthError("OTP_RESEND_LIMIT_EXCEEDED", 429);
-    }
-  }
-
-  private pruneRecentResends(timestamps: Date[]): Date[] {
-    const cutoff = Date.now() - oneHourMs;
-    return timestamps.filter((timestamp) => timestamp.getTime() >= cutoff);
   }
 
   private hashOtp(session: RegistrationSessionDocument, code: string): string {
