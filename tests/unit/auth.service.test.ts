@@ -5,6 +5,7 @@ import { AuthService } from "../../src/modules/auth/auth.service.js";
 import type { PasswordHasher } from "../../src/modules/auth/password-hasher.js";
 import type { TokenService } from "../../src/modules/auth/token.service.js";
 import type { BusinessRepository } from "../../src/modules/business/business.repository.js";
+import type { BusinessService } from "../../src/modules/business/business.service.js";
 import type { BusinessOnboardingRepository } from "../../src/modules/business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../../src/modules/business-onboarding/business-onboarding.service.js";
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
@@ -70,6 +71,10 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     findByOwnerUserId: vi.fn(),
     ...(overrides["businessRepository"] as object | undefined),
   };
+  const businessService = {
+    createOwnedBusiness: vi.fn((input: unknown) => businessRepository.create(input)),
+    ...(overrides["businessService"] as object | undefined),
+  };
   const tokenService = {
     createAccessToken: vi.fn().mockResolvedValue("access-token"),
     createRefreshSession: vi.fn().mockResolvedValue({
@@ -96,9 +101,10 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     { sendOtp: vi.fn() } as unknown as EmailOtpProvider,
     { sendOtp: vi.fn(), verifyOtp: vi.fn().mockResolvedValue(true) } as unknown as PhoneOtpProvider,
     tokenService as unknown as TokenService,
+    businessService as unknown as BusinessService,
   );
 
-  return { service, userRepository, registrationSessionRepository, tokenService };
+  return { service, userRepository, registrationSessionRepository, tokenService, businessService };
 };
 
 describe("AuthService repairs", () => {

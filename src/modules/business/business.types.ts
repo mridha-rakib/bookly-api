@@ -6,6 +6,10 @@ export const businessVisitTypes = ["AT_BUSINESS_LOCATION", "TRAVEL_TO_CUSTOMER"]
 
 export type BusinessVisitType = (typeof businessVisitTypes)[number];
 
+export const businessCities = ["Larnaca", "Limassol", "Nicosia", "Paphos"] as const;
+
+export type BusinessCity = (typeof businessCities)[number];
+
 export const businessVisitTypeAliases = ["location", "travel"] as const;
 
 export type BusinessVisitTypeAlias = (typeof businessVisitTypeAliases)[number];

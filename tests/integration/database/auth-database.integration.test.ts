@@ -19,6 +19,9 @@ import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { BusinessService } from "../../../src/modules/business/business.service.js";
+import { BusinessAccessRepository } from "../../../src/modules/business/business-access.repository.js";
+import { BusinessLinkVerificationRepository } from "../../../src/modules/business/business-link-verification.repository.js";
 import { BusinessOnboardingRepository } from "../../../src/modules/business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
 import {
@@ -116,9 +119,18 @@ const createAuthService = (
   const businessOnboardingRepository = new BusinessOnboardingRepository();
   const businessOnboardingService = new BusinessOnboardingService(businessOnboardingRepository);
   const businessRepository = overrides.businessRepository ?? new BusinessRepository();
+  const businessAccessRepository = new BusinessAccessRepository();
+  const businessLinkVerificationRepository = new BusinessLinkVerificationRepository();
   const sessionRepository = overrides.sessionRepository ?? new SessionRepository();
   const emailProvider = new CapturingEmailOtpProvider();
   const phoneProvider = new TestPhoneOtpProvider();
+  const businessService = new BusinessService(
+    businessRepository,
+    businessAccessRepository,
+    userRepository,
+    businessLinkVerificationRepository,
+    emailProvider,
+  );
 
   return {
     authService: new AuthService(
@@ -131,6 +143,7 @@ const createAuthService = (
       emailProvider,
       phoneProvider,
       new TokenService(sessionRepository),
+      businessService,
     ),
     emailProvider,
     phoneProvider,
