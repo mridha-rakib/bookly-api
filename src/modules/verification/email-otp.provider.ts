@@ -5,9 +5,15 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { AuthError } from "../auth/auth.errors.js";
 
-export type EmailOtpPurpose = "REGISTRATION" | "BUSINESS_LINK";
+export type EmailOtpPurpose = "REGISTRATION" | "BUSINESS_LINK" | "STAFF_TEMP_PASSWORD";
 
 export interface EmailOtpProvider {
+  /**
+   * Despite the name, this sends any short-lived-credential transactional email built
+   * from a purpose + single secret string — OTP codes and staff temporary passwords both
+   * fit that shape, so STAFF_TEMP_PASSWORD reuses this instead of a parallel SMTP/Resend
+   * client. The `code` field carries the temporary password for that purpose.
+   */
   sendOtp(input: { to: string; code: string; purpose?: EmailOtpPurpose }): Promise<void>;
 }
 
@@ -19,6 +25,13 @@ const buildOtpEmailContent = (
     return {
       subject: "Verify your Bookly business connection request",
       text: `Someone requested to connect their Bookly business profile with your business account. This does not transfer ownership of your business. Enter this verification code in Bookly to approve the connection: ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes. If you did not expect this, you can safely ignore this email.`,
+    };
+  }
+
+  if (purpose === "STAFF_TEMP_PASSWORD") {
+    return {
+      subject: "Your Bookly staff account is ready",
+      text: `A Bookly staff account was created for you. Log in at the Bookly professional login using this email address and the temporary password below, then change your password once you're in:\n\nTemporary password: ${code}\n\nIf you were not expecting this, please contact the business that added you.`,
     };
   }
 

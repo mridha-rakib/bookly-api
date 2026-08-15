@@ -8,7 +8,13 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
+import { createBusinessMediaRoute } from "../business-media/business-media.route.js";
+import { createBusinessTravelSettingsRoute } from "../business-travel-settings/business-travel-settings.route.js";
 import { SessionRepository } from "../session/session.repository.js";
+import { createStaffRoute } from "../staff/staff.route.js";
+import { createStaffAvatarRoute } from "../staff-avatar/staff-avatar.route.js";
+import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import { BusinessController } from "./business.controller.js";
@@ -30,12 +36,16 @@ export const createBusinessRoute = (): Router => {
   const businessRepository = new BusinessRepository();
   const businessAccessRepository = new BusinessAccessRepository();
   const businessLinkVerificationRepository = new BusinessLinkVerificationRepository();
+  const businessMediaRepository = new BusinessMediaRepository();
+  const storageService = createDeferredStorageServiceFromEnv();
   const businessService = new BusinessService(
     businessRepository,
     businessAccessRepository,
     userRepository,
     businessLinkVerificationRepository,
     createEmailOtpProvider(),
+    businessMediaRepository,
+    storageService,
   );
   const controller = new BusinessController(businessService);
   const sessionRepository = new SessionRepository();
@@ -47,6 +57,10 @@ export const createBusinessRoute = (): Router => {
   router.use(authenticate, requireActiveUser(), requireRoles(["BUSINESS_OWNER"]));
 
   router.get("/my-profile", asyncHandler(controller.getMyProfile));
+  router.use(createBusinessMediaRoute());
+  router.use(createBusinessTravelSettingsRoute());
+  router.use(createStaffRoute());
+  router.use(createStaffAvatarRoute());
 
   router.post(
     "/links/verification",

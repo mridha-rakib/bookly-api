@@ -7,9 +7,14 @@ import { DatabaseManager } from "../database/database-manager.js";
 import "../modules/business/business-access.model.js";
 import "../modules/business/business-link-verification.model.js";
 import "../modules/business/business.model.js";
+import "../modules/business-media/business-media.model.js";
+import "../modules/business-travel-settings/business-travel-settings.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
 import "../modules/registration-session/registration-session.model.js";
 import "../modules/session/session.model.js";
+import "../modules/staff/staff.model.js";
+import "../modules/staff/staff-schedule.model.js";
+import "../modules/staff/staff-time-off.model.js";
 import "../modules/user/user.model.js";
 
 type SyncIndexesLogger = Pick<typeof logger, "info" | "error">;
@@ -26,7 +31,8 @@ export type SyncIndexesResult = {
  * creation/removal must be applied out-of-band via this script rather than
  * implicitly on server boot. Run it as an explicit deploy step, after reviewing
  * for duplicate-key conflicts on any newly-unique index (e.g. Business.ownerUserId,
- * BusinessAccess.{userId,businessId}) against the target database.
+ * BusinessAccess.{userId,businessId}, StaffMembership.userId (partial, active-only),
+ * StaffSchedule.membershipId) against the target database.
  */
 export const syncDatabaseIndexes = async (
   dependencies: { logger: SyncIndexesLogger } = { logger },

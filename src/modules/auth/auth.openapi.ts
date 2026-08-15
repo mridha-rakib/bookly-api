@@ -1,7 +1,11 @@
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 
-import { businessVisitTypeAliases, businessVisitTypes } from "../business/business.types.js";
+import {
+  businessCities,
+  businessVisitTypeAliases,
+  businessVisitTypes,
+} from "../business/business.types.js";
 
 const emailSchema = z.string().email();
 const sessionIdSchema = z.string().min(1);
@@ -37,7 +41,7 @@ const businessDetailsOpenApiSchema = sessionOpenApiSchema
   .extend({
     businessName: z.string().min(1),
     ownerName: z.string().min(1),
-    city: z.enum(["Larnaca", "Limassol", "Nicosia", "Paphos"]),
+    city: z.enum(businessCities),
     countryCode: countryCodeSchema,
     nationalNumber: nationalNumberSchema.optional(),
     mobileNumber: nationalNumberSchema.optional(),

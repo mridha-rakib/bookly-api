@@ -75,6 +75,14 @@ const redactPaths = [
   "*.mongodbUri",
   "MONGODB_URI",
   "*.MONGODB_URI",
+  "S3_ACCESS_KEY_ID",
+  "*.S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "*.S3_SECRET_ACCESS_KEY",
+  "MINIO_ROOT_USER",
+  "*.MINIO_ROOT_USER",
+  "MINIO_ROOT_PASSWORD",
+  "*.MINIO_ROOT_PASSWORD",
 ];
 
 const loggerOptions: LoggerOptions = {

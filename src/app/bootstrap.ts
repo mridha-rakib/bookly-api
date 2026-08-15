@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
+import { bootstrapStorage } from "../modules/storage/storage.bootstrap.js";
 import { ExpressApplication } from "./app.js";
 
 export class ApplicationBootstrap {
@@ -14,6 +15,7 @@ export class ApplicationBootstrap {
   public async start(): Promise<void> {
     try {
       await this.databaseManager.connect();
+      await bootstrapStorage();
 
       const expressApplication = new ExpressApplication(this.databaseManager);
       this.server = expressApplication.app.listen(env.PORT, () => {
