@@ -86,6 +86,16 @@ pnpm seed:super-admin
 | `AUTH_OTP_SEND_RATE_LIMIT_MAX` | No | OTP send requests per hour. |
 | `AUTH_OTP_VERIFY_RATE_LIMIT_MAX` | No | OTP verify requests per 15 minutes. |
 | `AUTH_REFRESH_RATE_LIMIT_MAX` | No | Refresh requests per 15 minutes. |
+| `STORAGE_PROVIDER` | No | Storage backend selector. Currently `s3`. |
+| `S3_ENDPOINT` | Required for business media | S3-compatible endpoint, for example local MinIO or a future object-storage provider endpoint. |
+| `S3_REGION` | No | S3-compatible region. Defaults to `us-east-1` for local MinIO. |
+| `S3_BUCKET` | Required for business media | Bucket for business media object data. |
+| `S3_ACCESS_KEY_ID` | Required for business media | S3-compatible access key. Never expose to browser code. |
+| `S3_SECRET_ACCESS_KEY` | Required for business media | S3-compatible secret key. Never expose to browser code. |
+| `S3_FORCE_PATH_STYLE` | No | Use path-style addressing. Defaults to `true` for local MinIO. |
+| `S3_PUBLIC_BASE_URL` | No | Optional public object base URL. Leave blank to return signed read URLs. |
+| `BUSINESS_MEDIA_MAX_UPLOAD_BYTES` | No | Maximum image upload size. Defaults to `5242880` bytes. |
+| `BUSINESS_MEDIA_SIGNED_URL_TTL_SECONDS` | No | Signed read URL lifetime. Defaults to `900` seconds. |
 
 ## Endpoints
 
@@ -166,6 +176,35 @@ The `prepare` script calls `scripts/prepare-husky.mjs` instead of `husky` direct
 successfully without importing husky when `HUSKY=0` is set or when no `.git` directory is present, and
 otherwise runs husky's real setup and fails loudly if that setup genuinely errors. The Dockerfile sets
 `HUSKY=0` for its dependency-install stages so `pnpm install` never tries to invoke husky.
+
+### Local MinIO for Business Media
+
+From the repository root:
+
+```bash
+cp .env.example .env
+docker compose up -d minio
+```
+
+Set the API `.env` storage variables to point at MinIO:
+
+```bash
+STORAGE_PROVIDER=s3
+S3_ENDPOINT=http://127.0.0.1:9000
+S3_REGION=us-east-1
+S3_BUCKET=bookly-business-media
+S3_ACCESS_KEY_ID=<same value as MINIO_ROOT_USER locally, or a dedicated MinIO access key>
+S3_SECRET_ACCESS_KEY=<same value as MINIO_ROOT_PASSWORD locally, or a dedicated MinIO secret key>
+S3_FORCE_PATH_STYLE=true
+S3_PUBLIC_BASE_URL=
+```
+
+The API bootstraps the configured bucket idempotently at startup when storage configuration is present.
+Object data is stored in the `bookly-minio-data` Docker volume and survives container restarts.
+
+For a future S3-compatible provider such as Hetzner Object Storage, keep `STORAGE_PROVIDER=s3` and
+change only the endpoint, region, bucket, credentials, and path-style/public URL settings required by
+that provider.
 
 ## PM2
 

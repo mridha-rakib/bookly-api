@@ -575,6 +575,121 @@ describe("database-backed authentication integration", () => {
     expect(travelBusiness.visitType).toBe("TRAVEL_TO_CUSTOMER");
   });
 
+  it("ignores client-supplied ownerName/phone in business details and persists the registration session's verified identity instead", async () => {
+    const parts = createAuthService();
+    const professionalEntry = await parts.authService.professionalEntry(
+      professionalEntryBodySchema.parse({
+        email: "tamper-test@example.com",
+        visitType: "location",
+      }),
+    );
+    const sessionId = professionalEntry.sessionId ?? "";
+
+    await parts.authService.sendEmailOtp({ sessionId });
+    await parts.authService.verifyEmailOtp(
+      verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+    );
+    await parts.authService.submitProfile(
+      profileBodySchema.parse({
+        sessionId,
+        firstName: "Real",
+        lastName: "Owner",
+        gender: "other",
+        countryCode: "+357",
+        nationalNumber: "99770011",
+        password: testPassword,
+      }),
+    );
+    await parts.authService.sendPhoneOtp({ sessionId });
+    await parts.authService.verifyProfessionalPhone(
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+    );
+
+    // Simulates a tampered client request (e.g. via DevTools) sending a different owner
+    // name and phone than what was verified during signup.
+    await parts.authService.saveBusinessDetails(
+      businessDetailsBodySchema.parse({
+        sessionId,
+        businessName: "Tamper Test Studio",
+        ownerName: "Fake Owner Name",
+        city: "Larnaca",
+        countryCode: "+1",
+        nationalNumber: "00000000",
+        area: "Center",
+        streetName: "Tamper",
+        streetNumber: "1",
+        briefDesc: "Business used to verify identity tampering is ignored",
+      }),
+    );
+    await parts.authService.saveCategories(
+      categorySelectionBodySchema.parse({
+        sessionId,
+        selectedCategory: "Wellness",
+        selectedSubcategories: ["Spa"],
+      }),
+    );
+    const result = await parts.authService.completeBusinessOwner({ sessionId }, context);
+
+    const business = await BusinessModel.findOne({ ownerUserId: result.user.id }).orFail();
+    expect(business.ownerName).toBe("Real Owner");
+    expect(business.ownerName).not.toBe("Fake Owner Name");
+    expect(business.phone.countryCode).toBe("+357");
+    expect(business.phone.nationalNumber).toBe("99770011");
+    expect(business.phone.countryCode).not.toBe("+1");
+    expect(business.phone.nationalNumber).not.toBe("00000000");
+    expect(business.email).toBe("tamper-test@example.com");
+  });
+
+  it("exposes authoritative identity/contact data through registration progress for Business Form hydration", async () => {
+    const parts = createAuthService();
+    const professionalEntry = await parts.authService.professionalEntry(
+      professionalEntryBodySchema.parse({
+        email: "progress-test@example.com",
+        visitType: "location",
+      }),
+    );
+    const sessionId = professionalEntry.sessionId ?? "";
+
+    await parts.authService.sendEmailOtp({ sessionId });
+    await parts.authService.verifyEmailOtp(
+      verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+    );
+
+    const beforeProfile = await parts.authService.getProgress(sessionId);
+    expect(beforeProfile.email).toBe("progress-test@example.com");
+    expect(beforeProfile.firstName).toBeUndefined();
+    expect(beforeProfile.phoneVerified).toBe(false);
+
+    await parts.authService.submitProfile(
+      profileBodySchema.parse({
+        sessionId,
+        firstName: "Progress",
+        lastName: "Tester",
+        gender: "other",
+        countryCode: "+357",
+        nationalNumber: "99330022",
+        password: testPassword,
+      }),
+    );
+
+    const afterProfile = await parts.authService.getProgress(sessionId);
+    expect(afterProfile.firstName).toBe("Progress");
+    expect(afterProfile.lastName).toBe("Tester");
+    // Phone exists on the session already (captured with the profile) but is not yet
+    // OTP-verified, so the frontend must not treat it as authoritative yet.
+    expect(afterProfile.phoneVerified).toBe(false);
+
+    await parts.authService.sendPhoneOtp({ sessionId });
+    await parts.authService.verifyProfessionalPhone(
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+    );
+
+    const afterPhoneVerified = await parts.authService.getProgress(sessionId);
+    expect(afterPhoneVerified.phoneVerified).toBe(true);
+    expect(afterPhoneVerified.phone).toEqual({ countryCode: "+357", nationalNumber: "99330022" });
+    expect(afterPhoneVerified.email).toBe("progress-test@example.com");
+  });
+
   it("rolls back Business Owner completion failures and rejects repeated/concurrent completion", async () => {
     const businessFailure = await completeBusinessOwner(
       "owner-rollback-business@example.com",
@@ -789,6 +904,56 @@ describe("database-backed authentication integration", () => {
         revokedAt: { $exists: false },
       }),
     ).toBe(0);
+  });
+
+  it("revokes only the current session on logout, leaving other sessions/users untouched, and is idempotent", async () => {
+    const parts = await completeCustomer("logout-current-db@example.com");
+    const currentToken = parts.result.refreshToken;
+    const user = await UserModel.findOne({
+      normalizedEmail: "logout-current-db@example.com",
+    }).orFail();
+
+    // A second session for the same user, simulating another logged-in device.
+    const tokenService = new TokenService(new SessionRepository());
+    const otherDeviceSession = await tokenService.createRefreshSession({ userId: user._id });
+
+    // An unrelated user's session, which logout must never touch.
+    const other = await completeCustomer("logout-other-user-db@example.com", parts);
+    const otherUserToken = other.result.refreshToken;
+
+    await parts.authService.logout(currentToken);
+
+    expect(
+      await SessionModel.findOne({ refreshTokenHash: sha256(currentToken) })
+        .select("+refreshTokenHash")
+        .orFail(),
+    ).toMatchObject({ revokedAt: expect.any(Date) });
+    expect(
+      await SessionModel.findOne({
+        refreshTokenHash: sha256(otherDeviceSession.refreshToken),
+      })
+        .select("+refreshTokenHash")
+        .orFail(),
+    ).toMatchObject({ revokedAt: undefined });
+    expect(
+      await SessionModel.findOne({ refreshTokenHash: sha256(otherUserToken) })
+        .select("+refreshTokenHash")
+        .orFail(),
+    ).toMatchObject({ revokedAt: undefined });
+
+    // The logged-out session cannot be revived through refresh...
+    await expect(parts.authService.refresh(currentToken)).rejects.toMatchObject({
+      statusCode: 401,
+    });
+    // ...while the user's other device session remains a valid, independent session.
+    await expect(parts.authService.refresh(otherDeviceSession.refreshToken)).resolves.toMatchObject(
+      { user: { id: String(user._id) } },
+    );
+
+    // Repeated/racing logout calls, and logout without a token, never throw.
+    await expect(parts.authService.logout(currentToken)).resolves.toBeUndefined();
+    await expect(parts.authService.logout(undefined)).resolves.toBeUndefined();
+    await expect(parts.authService.logout("not-a-real-refresh-token")).resolves.toBeUndefined();
   });
 
   it("database-tests Super Admin seed core behavior without CLI execution or fake phone", async () => {

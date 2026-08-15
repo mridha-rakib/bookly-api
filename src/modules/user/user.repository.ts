@@ -48,6 +48,60 @@ export class UserRepository {
     return UserModel.findById(id).exec();
   }
 
+  public async findManyByIds(ids: Array<Types.ObjectId | string>): Promise<UserDocument[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    return UserModel.find({ _id: { $in: ids } }).exec();
+  }
+
+  public async findProfilesByUserIds(
+    userIds: Array<Types.ObjectId | string>,
+  ): Promise<UserProfileDocument[]> {
+    if (userIds.length === 0) {
+      return [];
+    }
+
+    return UserProfileModel.find({ userId: { $in: userIds } }).exec();
+  }
+
+  public async updateRole(userId: Types.ObjectId, role: UserRole): Promise<void> {
+    await UserModel.updateOne({ _id: userId }, { $set: { role } });
+  }
+
+  public async updateEmail(userId: Types.ObjectId, normalizedEmail: string): Promise<void> {
+    await UserModel.updateOne({ _id: userId }, { $set: { normalizedEmail } });
+  }
+
+  public async updateProfile(
+    profileId: Types.ObjectId,
+    update: Partial<Pick<CreateProfileInput, "firstName" | "lastName">> & {
+      /** `undefined` clears the phone (via $unset); omit the key entirely to leave it untouched. */
+      phone?: CreateProfileInput["phone"];
+    },
+  ): Promise<void> {
+    const { phone, ...rest } = update;
+    const setFields: Record<string, unknown> = { ...rest };
+    const unsetFields: Record<string, unknown> = {};
+
+    if ("phone" in update) {
+      if (phone) {
+        setFields["phone"] = phone;
+      } else {
+        unsetFields["phone"] = "";
+      }
+    }
+
+    await UserProfileModel.updateOne(
+      { _id: profileId },
+      {
+        ...(Object.keys(setFields).length > 0 ? { $set: setFields } : {}),
+        ...(Object.keys(unsetFields).length > 0 ? { $unset: unsetFields } : {}),
+      },
+    );
+  }
+
   public async create(input: CreateUserInput, session?: ClientSession): Promise<UserDocument> {
     return new UserModel({
       ...input,

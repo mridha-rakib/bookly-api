@@ -13,6 +13,9 @@ import {
   safeCompare,
   sha256,
 } from "../auth/auth.utils.js";
+import type { BusinessMediaDocument } from "../business-media/business-media.model.js";
+import type { BusinessMediaRepository } from "../business-media/business-media.repository.js";
+import type { StorageService } from "../storage/storage.service.js";
 import type { UserDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { EmailOtpProvider } from "../verification/email-otp.provider.js";
@@ -39,7 +42,17 @@ export type BusinessCardDto = {
   category: string;
   subcategories: string[];
   address: { city: string; area: string };
+  profileMedia?: BusinessProfileMediaDto | undefined;
   createdAt: string;
+};
+
+export type BusinessProfileMediaDto = {
+  id: string;
+  url: string;
+  mimeType: string;
+  size: number;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type BusinessDetailDto = {
@@ -77,6 +90,11 @@ export class BusinessService {
     private readonly userRepository: UserRepository,
     private readonly businessLinkVerificationRepository: BusinessLinkVerificationRepository,
     private readonly emailOtpProvider: EmailOtpProvider,
+    private readonly businessMediaRepository?: Pick<
+      BusinessMediaRepository,
+      "listProfileByBusinessIds"
+    >,
+    private readonly storageService?: Pick<StorageService, "getObjectUrl">,
   ) {}
 
   public async createOwnedBusiness(
@@ -98,10 +116,18 @@ export class BusinessService {
 
     const secondaryBusinesses =
       secondaryIds.length > 0 ? await this.businessRepository.findManyByIds(secondaryIds) : [];
+    const visibleBusinesses = [primary, ...secondaryBusinesses].filter(
+      (business): business is BusinessDocument => Boolean(business),
+    );
+    const profileMediaByBusinessId = await this.getProfileMediaByBusinessId(visibleBusinesses);
 
     return {
-      primary: primary ? this.toCardDto(primary) : null,
-      secondary: secondaryBusinesses.map((business) => this.toCardDto(business)),
+      primary: primary
+        ? this.toCardDto(primary, profileMediaByBusinessId.get(String(primary._id)))
+        : null,
+      secondary: secondaryBusinesses.map((business) =>
+        this.toCardDto(business, profileMediaByBusinessId.get(String(business._id))),
+      ),
     };
   }
 
@@ -405,7 +431,40 @@ export class BusinessService {
     );
   }
 
-  private toCardDto(business: BusinessDocument): BusinessCardDto {
+  private async getProfileMediaByBusinessId(
+    businesses: BusinessDocument[],
+  ): Promise<Map<string, BusinessProfileMediaDto>> {
+    if (!this.businessMediaRepository || !this.storageService || businesses.length === 0) {
+      return new Map();
+    }
+
+    const media = await this.businessMediaRepository.listProfileByBusinessIds(
+      businesses.map((business) => business._id),
+    );
+    const entries = await Promise.all(
+      media.map(
+        async (item) => [String(item.businessId), await this.toProfileMediaDto(item)] as const,
+      ),
+    );
+
+    return new Map(entries);
+  }
+
+  private async toProfileMediaDto(media: BusinessMediaDocument): Promise<BusinessProfileMediaDto> {
+    return {
+      id: String(media._id),
+      url: (await this.storageService?.getObjectUrl({ key: media.storageKey })) ?? "",
+      mimeType: media.mimeType,
+      size: media.size,
+      createdAt: media.createdAt.toISOString(),
+      updatedAt: media.updatedAt.toISOString(),
+    };
+  }
+
+  private toCardDto(
+    business: BusinessDocument,
+    profileMedia?: BusinessProfileMediaDto,
+  ): BusinessCardDto {
     return {
       id: String(business._id),
       name: business.name,
@@ -414,6 +473,7 @@ export class BusinessService {
       category: business.category,
       subcategories: business.subcategories,
       address: { city: business.address.city, area: business.address.area },
+      profileMedia,
       createdAt: business.createdAt.toISOString(),
     };
   }

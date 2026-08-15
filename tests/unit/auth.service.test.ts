@@ -41,7 +41,12 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     findByEmail: vi.fn().mockResolvedValue(null),
     findByEmailWithPassword: vi.fn(),
     findById: vi.fn(),
+    findManyByIds: vi.fn().mockResolvedValue([]),
+    findProfilesByUserIds: vi.fn().mockResolvedValue([]),
     updateLastLogin: vi.fn(),
+    updateRole: vi.fn(),
+    updateEmail: vi.fn(),
+    updateProfile: vi.fn(),
     create: vi.fn().mockResolvedValue({
       _id: new Types.ObjectId(),
       normalizedEmail: "customer@example.com",
@@ -184,5 +189,22 @@ describe("AuthService repairs", () => {
     expect(userRepository.create).not.toHaveBeenCalled();
     expect(registrationSessionRepository.markCompleted).not.toHaveBeenCalled();
     expect(tokenService.createRefreshSession).not.toHaveBeenCalled();
+  });
+
+  it("revokes the refresh token backing the current session on logout", async () => {
+    const { service, tokenService } = createAuthService();
+
+    await service.logout("a-refresh-token");
+
+    expect(tokenService.revokeRefreshToken).toHaveBeenCalledTimes(1);
+    expect(tokenService.revokeRefreshToken).toHaveBeenCalledWith("a-refresh-token");
+  });
+
+  it("treats logout without a refresh token as a safe no-op", async () => {
+    const { service, tokenService } = createAuthService();
+
+    await expect(service.logout(undefined)).resolves.toBeUndefined();
+
+    expect(tokenService.revokeRefreshToken).not.toHaveBeenCalled();
   });
 });

@@ -14,6 +14,10 @@ const phoneOtpProviderSchema = z
   .enum(["dummy", "twilio"])
   .default(rawNodeEnv === "production" ? "twilio" : "dummy");
 const rawPhoneOtpProvider = phoneOtpProviderSchema.parse(process.env["OTP_PROVIDER"] || undefined);
+const storageProviderSchema = z.enum(["s3"]).default("s3");
+const rawStorageProvider = storageProviderSchema.parse(
+  process.env["STORAGE_PROVIDER"] || undefined,
+);
 
 const booleanString = z
   .enum(["true", "false", "1", "0"])
@@ -124,6 +128,19 @@ const optionalPhoneProviderRequiredString = (provider: "dummy" | "twilio", name:
         context.addIssue({
           code: "custom",
           message: `${name} is required when OTP_PROVIDER=${provider}`,
+        });
+      }
+    });
+
+const optionalStorageRequiredString = (name: string) =>
+  z
+    .string()
+    .optional()
+    .superRefine((value, context) => {
+      if (rawNodeEnv === "production" && rawStorageProvider === "s3" && !value) {
+        context.addIssue({
+          code: "custom",
+          message: `${name} is required when STORAGE_PROVIDER=s3 in production`,
         });
       }
     });
@@ -267,6 +284,31 @@ export const env = createEnv({
       rawPhoneOtpProvider === "twilio"
         ? optionalPhoneProviderRequiredString("twilio", "TWILIO_VERIFY_SERVICE_SID")
         : optionalProductionRequiredString("TWILIO_VERIFY_SERVICE_SID"),
+    STORAGE_PROVIDER: storageProviderSchema,
+    S3_ENDPOINT: optionalStorageRequiredString("S3_ENDPOINT"),
+    S3_REGION: z.string().min(1).default("us-east-1"),
+    S3_BUCKET: optionalStorageRequiredString("S3_BUCKET"),
+    S3_ACCESS_KEY_ID: optionalStorageRequiredString("S3_ACCESS_KEY_ID"),
+    S3_SECRET_ACCESS_KEY: optionalStorageRequiredString("S3_SECRET_ACCESS_KEY"),
+    S3_FORCE_PATH_STYLE: optionalBooleanString.default(true),
+    S3_PUBLIC_BASE_URL: z.string().url().optional(),
+    BUSINESS_MEDIA_MAX_UPLOAD_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5 * 1024 * 1024),
+    BUSINESS_MEDIA_SIGNED_URL_TTL_SECONDS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(15 * 60),
+    // Governs the Staff avatar upload endpoint only; reuses BUSINESS_MEDIA_SIGNED_URL_TTL_SECONDS
+    // for read URLs since the TTL is baked into the shared S3 client at construction time.
+    STAFF_AVATAR_MAX_UPLOAD_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5 * 1024 * 1024),
     SUPER_ADMIN_EMAIL: z.string().email().optional(),
     SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
     SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),

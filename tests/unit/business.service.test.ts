@@ -10,6 +10,9 @@ import { BusinessService } from "../../src/modules/business/business.service.js"
 import type { BusinessAccessRepository } from "../../src/modules/business/business-access.repository.js";
 import type { BusinessLinkVerificationDocument } from "../../src/modules/business/business-link-verification.model.js";
 import type { BusinessLinkVerificationRepository } from "../../src/modules/business/business-link-verification.repository.js";
+import type { BusinessMediaDocument } from "../../src/modules/business-media/business-media.model.js";
+import type { BusinessMediaRepository } from "../../src/modules/business-media/business-media.repository.js";
+import type { StorageService } from "../../src/modules/storage/storage.service.js";
 import type { UserRepository } from "../../src/modules/user/user.repository.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
 
@@ -54,6 +57,24 @@ const buildVerification = (
     ...overrides,
   }) as unknown as BusinessLinkVerificationDocument;
 
+const buildBusinessMedia = (
+  overrides: Partial<BusinessMediaDocument> = {},
+): BusinessMediaDocument =>
+  ({
+    _id: new Types.ObjectId(),
+    businessId: new Types.ObjectId(),
+    storageKey: "businesses/test/media/profile.png",
+    bucket: "test-media",
+    role: "PROFILE",
+    mimeType: "image/png",
+    size: 9,
+    sortOrder: 0,
+    createdBy: new Types.ObjectId(),
+    createdAt: new Date("2026-01-03T00:00:00.000Z"),
+    updatedAt: new Date("2026-01-04T00:00:00.000Z"),
+    ...overrides,
+  }) as BusinessMediaDocument;
+
 const createService = (
   overrides: {
     businessRepository?: Partial<BusinessRepository>;
@@ -61,6 +82,8 @@ const createService = (
     userRepository?: Partial<UserRepository>;
     businessLinkVerificationRepository?: Partial<BusinessLinkVerificationRepository>;
     emailOtpProvider?: Partial<EmailOtpProvider>;
+    businessMediaRepository?: Partial<BusinessMediaRepository>;
+    storageService?: Partial<StorageService>;
   } = {},
 ) => {
   const businessRepository = {
@@ -93,6 +116,14 @@ const createService = (
     sendOtp: vi.fn(),
     ...overrides.emailOtpProvider,
   };
+  const businessMediaRepository = {
+    listProfileByBusinessIds: vi.fn().mockResolvedValue([]),
+    ...overrides.businessMediaRepository,
+  };
+  const storageService = {
+    getObjectUrl: vi.fn(async ({ key }: { key: string }) => `https://media.example/${key}`),
+    ...overrides.storageService,
+  };
 
   const service = new BusinessService(
     businessRepository as unknown as BusinessRepository,
@@ -100,6 +131,8 @@ const createService = (
     userRepository as unknown as UserRepository,
     businessLinkVerificationRepository as unknown as BusinessLinkVerificationRepository,
     emailOtpProvider as unknown as EmailOtpProvider,
+    businessMediaRepository as unknown as BusinessMediaRepository,
+    storageService as unknown as StorageService,
   );
 
   return {
@@ -109,6 +142,8 @@ const createService = (
     userRepository,
     businessLinkVerificationRepository,
     emailOtpProvider,
+    businessMediaRepository,
+    storageService,
   };
 };
 
@@ -135,6 +170,48 @@ describe("BusinessService.getBusinessProfile", () => {
     expect(result.secondary[0]?.id).toBe(String(secondaryBusiness._id));
     expect(businessRepository.findByOwnerUserId).toHaveBeenCalledTimes(1);
     expect(businessAccessRepository.listByUserId).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds PROFILE media to visible cards with one bounded media lookup", async () => {
+    const primary = buildBusiness();
+    const secondaryBusiness = buildBusiness({ _id: new Types.ObjectId() });
+    const primaryMedia = buildBusinessMedia({
+      businessId: primary._id,
+      storageKey: "businesses/primary/media/profile.png",
+    });
+    const secondaryMedia = buildBusinessMedia({
+      businessId: secondaryBusiness._id,
+      storageKey: "businesses/secondary/media/profile.png",
+    });
+    const { service, businessMediaRepository, storageService } = createService({
+      businessRepository: {
+        findByOwnerUserId: vi.fn().mockResolvedValue(primary),
+        findManyByIds: vi.fn().mockResolvedValue([secondaryBusiness]),
+      },
+      businessAccessRepository: {
+        listByUserId: vi
+          .fn()
+          .mockResolvedValue([{ businessId: secondaryBusiness._id } as unknown as never]),
+      },
+      businessMediaRepository: {
+        listProfileByBusinessIds: vi.fn().mockResolvedValue([primaryMedia, secondaryMedia]),
+      },
+    });
+
+    const result = await service.getBusinessProfile(String(primary.ownerUserId));
+
+    expect(result.primary?.profileMedia?.url).toBe(
+      "https://media.example/businesses/primary/media/profile.png",
+    );
+    expect(result.secondary[0]?.profileMedia?.url).toBe(
+      "https://media.example/businesses/secondary/media/profile.png",
+    );
+    expect(businessMediaRepository.listProfileByBusinessIds).toHaveBeenCalledTimes(1);
+    expect(businessMediaRepository.listProfileByBusinessIds).toHaveBeenCalledWith([
+      primary._id,
+      secondaryBusiness._id,
+    ]);
+    expect(storageService.getObjectUrl).toHaveBeenCalledTimes(2);
   });
 
   it("excludes the primary business id from secondary even if a stray link exists", async () => {

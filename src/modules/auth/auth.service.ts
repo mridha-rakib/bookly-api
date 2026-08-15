@@ -369,13 +369,22 @@ export class AuthService {
             : {}),
           ...(businessDetails.address.aptRoom ? { aptRoom: businessDetails.address.aptRoom } : {}),
         };
+        // Owner identity/contact fields must come from the registration session (profile
+        // submission + phone-OTP verification), never from the client-supplied business
+        // details payload — those fields are still accepted there for backward
+        // compatibility (older clients, the persisted draft), but are no longer trusted
+        // for the actual Business record. `ensureFinalCommonData` above already
+        // guarantees `personalProfile`/`phone` are present at this point.
+        const ownerName = [session.personalProfile?.firstName, session.personalProfile?.lastName]
+          .filter(Boolean)
+          .join(" ");
         const business = await this.businessService.createOwnedBusiness(
           {
             ownerUserId: user._id,
             name: businessDetails.businessName,
-            ownerName: businessDetails.ownerName,
+            ownerName,
             email: session.normalizedEmail,
-            phone: businessDetails.phone,
+            phone: session.phone ?? businessDetails.phone,
             visitType: businessVisitType,
             address,
             ...(businessDetails.location ? { location: businessDetails.location } : {}),
@@ -531,6 +540,25 @@ export class AuthService {
       emailVerified: Boolean(session.emailVerification.verifiedAt),
       phoneVerified: Boolean(session.phoneVerification.verifiedAt),
       expiresAt: session.expiresAt.toISOString(),
+      // Authoritative identity/contact data already captured earlier in registration
+      // (profile submission + phone OTP verification), so later steps — e.g. the
+      // Business Form — can hydrate read-only fields from the session instead of
+      // asking the user to re-enter (or trusting a client-editable) name/phone/email.
+      email: session.normalizedEmail,
+      ...(session.personalProfile
+        ? {
+            firstName: session.personalProfile.firstName,
+            lastName: session.personalProfile.lastName,
+          }
+        : {}),
+      ...(session.phone
+        ? {
+            phone: {
+              countryCode: session.phone.countryCode,
+              nationalNumber: session.phone.nationalNumber,
+            },
+          }
+        : {}),
     };
   }
 
