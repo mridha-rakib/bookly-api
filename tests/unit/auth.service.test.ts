@@ -8,7 +8,9 @@ import type { BusinessRepository } from "../../src/modules/business/business.rep
 import type { BusinessService } from "../../src/modules/business/business.service.js";
 import type { BusinessOnboardingRepository } from "../../src/modules/business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../../src/modules/business-onboarding/business-onboarding.service.js";
+import type { ClientIdentityService } from "../../src/modules/client/client-identity.service.js";
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
+import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../src/modules/verification/phone-otp.provider.js";
 
@@ -56,6 +58,8 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     createProfile: vi.fn(),
     createCustomerProfile: vi.fn(),
     findProfileByUserId: vi.fn(),
+    findVerifiedCustomerByEmail: vi.fn().mockResolvedValue(null),
+    findVerifiedCustomerByPhoneE164: vi.fn().mockResolvedValue(null),
     ...(overrides["userRepository"] as object | undefined),
   };
   const registrationSessionRepository = {
@@ -91,6 +95,15 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     revokeRefreshToken: vi.fn(),
     ...(overrides["tokenService"] as object | undefined),
   };
+  const staffRepository = {
+    findActiveByUserId: vi.fn().mockResolvedValue(null),
+    ...(overrides["staffRepository"] as object | undefined),
+  };
+  const clientIdentityService = {
+    resolveContactLinkState: vi.fn().mockResolvedValue({ linkState: "UNLINKED" }),
+    linkEligibleClientsForNewCustomer: vi.fn().mockResolvedValue(undefined),
+    ...(overrides["clientIdentityService"] as object | undefined),
+  };
 
   const service = new AuthService(
     userRepository,
@@ -107,9 +120,19 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     { sendOtp: vi.fn(), verifyOtp: vi.fn().mockResolvedValue(true) } as unknown as PhoneOtpProvider,
     tokenService as unknown as TokenService,
     businessService as unknown as BusinessService,
+    staffRepository as unknown as StaffRepository,
+    clientIdentityService as unknown as ClientIdentityService,
   );
 
-  return { service, userRepository, registrationSessionRepository, tokenService, businessService };
+  return {
+    service,
+    userRepository,
+    registrationSessionRepository,
+    tokenService,
+    businessService,
+    staffRepository,
+    clientIdentityService,
+  };
 };
 
 describe("AuthService repairs", () => {
@@ -156,6 +179,47 @@ describe("AuthService repairs", () => {
       expect.objectContaining({ userId: expect.any(Types.ObjectId) }),
       dbSession,
     );
+  });
+
+  it("triggers best-effort Client identity linking, post-commit, with the new Customer's verified email/phone", async () => {
+    const dbSession = createDbSession();
+    vi.spyOn(mongoose, "startSession").mockResolvedValue(dbSession as unknown as never);
+    const { service, clientIdentityService } = createAuthService();
+
+    await service.verifyCustomerPhoneAndComplete(
+      { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+      {},
+    );
+    // The linking call is fire-and-forget (never awaited by the caller) — flush microtasks so
+    // it has actually run before asserting on it.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(clientIdentityService.linkEligibleClientsForNewCustomer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        normalizedEmail: "customer@example.com",
+        phoneE164: "+35712345678",
+      }),
+    );
+  });
+
+  it("still returns a successful registration result even if Client identity linking fails", async () => {
+    const dbSession = createDbSession();
+    vi.spyOn(mongoose, "startSession").mockResolvedValue(dbSession as unknown as never);
+    const { service } = createAuthService({
+      clientIdentityService: {
+        linkEligibleClientsForNewCustomer: vi.fn().mockRejectedValue(new Error("boom")),
+      },
+    });
+
+    // Must not reject and must not block — an ambiguous/failed Client match is never allowed
+    // to fail the Customer's own registration.
+    await expect(
+      service.verifyCustomerPhoneAndComplete(
+        { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+        {},
+      ),
+    ).resolves.toMatchObject({ accessToken: "access-token" });
   });
 
   it("rejects a completed customer retry without creating duplicate permanent records", async () => {

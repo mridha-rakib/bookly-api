@@ -1,15 +1,18 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
 import { env } from "../../config/env.js";
+import { logger } from "../../config/logger.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessService } from "../business/business.service.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
+import type { ClientIdentityService } from "../client/client-identity.service.js";
 import type {
   RegistrationPortal,
   RegistrationSessionDocument,
 } from "../registration-session/registration-session.model.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
+import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import { professionalRoles, type UserRole } from "../user/user.types.js";
 import type { EmailOtpProvider } from "../verification/email-otp.provider.js";
@@ -76,6 +79,8 @@ export class AuthService {
     private readonly phoneOtpProvider: PhoneOtpProvider,
     private readonly tokenService: TokenService,
     private readonly businessService: BusinessService,
+    private readonly staffRepository: StaffRepository,
+    private readonly clientIdentityService: ClientIdentityService,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -247,7 +252,27 @@ export class AuthService {
     }
 
     const session = await this.verifyPhoneOtp(input);
-    return this.completeCustomer(session, context);
+    const authResult = await this.completeCustomer(session, context);
+
+    // Best-effort, post-commit — see client-identity.service.ts. Never blocks registration:
+    // an ambiguous/failed match just leaves existing Business Client rows exactly as they
+    // were (still UNLINKED), nothing here is allowed to fail the response the user is waiting on.
+    if (session.phone?.e164) {
+      this.clientIdentityService
+        .linkEligibleClientsForNewCustomer({
+          userId: new Types.ObjectId(authResult.user.id),
+          normalizedEmail: authResult.user.email,
+          phoneE164: session.phone.e164,
+        })
+        .catch((error: unknown) => {
+          logger.error(
+            { err: error, userId: authResult.user.id },
+            "Client identity linking failed",
+          );
+        });
+    }
+
+    return authResult;
   }
 
   public async verifyProfessionalPhone(
@@ -496,10 +521,7 @@ export class AuthService {
     }
 
     const profile = await this.userRepository.findProfileByUserId(user._id);
-    const business =
-      user.role === "BUSINESS_OWNER"
-        ? await this.businessRepository.findByOwnerUserId(user._id)
-        : null;
+    const business = await this.resolveMeBusiness(user._id, user.role);
 
     return {
       user: {
@@ -528,6 +550,29 @@ export class AuthService {
           }
         : null,
     };
+  }
+
+  /**
+   * BUSINESS_OWNER resolves via Business.ownerUserId directly. SUPERVISOR/STAFF resolve via
+   * their active StaffMembership — the same relationship the Client Management domain uses for
+   * authorization (see client.service.ts requireBusinessAccess) — so the frontend can finally
+   * learn a Supervisor's businessId from this endpoint (previously always null for every
+   * non-owner role). CUSTOMER/SUPER_ADMIN have no business context.
+   */
+  private async resolveMeBusiness(userId: Types.ObjectId, role: UserRole) {
+    if (role === "BUSINESS_OWNER") {
+      return this.businessRepository.findByOwnerUserId(userId);
+    }
+
+    if (role === "SUPERVISOR" || role === "STAFF") {
+      const membership = await this.staffRepository.findActiveByUserId(userId);
+      if (!membership) {
+        return null;
+      }
+      return this.businessRepository.findById(membership.businessId);
+    }
+
+    return null;
   }
 
   public async getProgress(sessionId: string) {

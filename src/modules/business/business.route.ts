@@ -2,15 +2,18 @@ import { Router } from "express";
 
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
+import { createAddonsRoute } from "../addons/addon.route.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import { createBusinessBookingSettingsRoute } from "../business-booking-settings/business-booking-settings.route.js";
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { createBusinessMediaRoute } from "../business-media/business-media.route.js";
 import { createBusinessTravelSettingsRoute } from "../business-travel-settings/business-travel-settings.route.js";
+import { createServicesRoute } from "../services/service.route.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { createStaffRoute } from "../staff/staff.route.js";
 import { createStaffAvatarRoute } from "../staff-avatar/staff-avatar.route.js";
@@ -59,6 +62,9 @@ export const createBusinessRoute = (): Router => {
   router.get("/my-profile", asyncHandler(controller.getMyProfile));
   router.use(createBusinessMediaRoute());
   router.use(createBusinessTravelSettingsRoute());
+  router.use(createBusinessBookingSettingsRoute());
+  router.use(createServicesRoute());
+  router.use(createAddonsRoute());
   router.use(createStaffRoute());
   router.use(createStaffAvatarRoute());
 

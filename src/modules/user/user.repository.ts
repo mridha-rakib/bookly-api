@@ -135,4 +135,33 @@ export class UserRepository {
   ): Promise<UserProfileDocument | null> {
     return UserProfileModel.findOne({ userId }).exec();
   }
+
+  /**
+   * Client identity-linking building blocks (see client-identity.service.ts). "Verified" here
+   * means the User row itself has emailVerifiedAt/phoneVerifiedAt set — Bookly's customer
+   * signup flow requires both OTP steps before a CUSTOMER account exists, so every CUSTOMER is
+   * verified on both signals by construction; these queries simply make that check explicit
+   * rather than assuming it.
+   */
+  public async findVerifiedCustomerByEmail(normalizedEmail: string): Promise<UserDocument | null> {
+    return UserModel.findOne({
+      normalizedEmail,
+      role: "CUSTOMER",
+      emailVerifiedAt: { $exists: true },
+    }).exec();
+  }
+
+  public async findVerifiedCustomerByPhoneE164(phoneE164: string): Promise<UserDocument | null> {
+    const profile = await UserProfileModel.findOne({ "phone.e164": phoneE164 }).exec();
+
+    if (!profile) {
+      return null;
+    }
+
+    return UserModel.findOne({
+      _id: profile.userId,
+      role: "CUSTOMER",
+      phoneVerifiedAt: { $exists: true },
+    }).exec();
+  }
 }

@@ -10,6 +10,7 @@ import "../modules/business/business.model.js";
 import "../modules/business-media/business-media.model.js";
 import "../modules/business-travel-settings/business-travel-settings.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
+import "../modules/client/client.model.js";
 import "../modules/registration-session/registration-session.model.js";
 import "../modules/session/session.model.js";
 import "../modules/staff/staff.model.js";
