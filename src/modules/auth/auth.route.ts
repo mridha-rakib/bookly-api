@@ -11,8 +11,11 @@ import { BusinessAccessRepository } from "../business/business-access.repository
 import { BusinessLinkVerificationRepository } from "../business/business-link-verification.repository.js";
 import { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
+import { ClientRepository } from "../client/client.repository.js";
+import { ClientIdentityService } from "../client/client-identity.service.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
+import { StaffRepository } from "../staff/staff.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import { createPhoneOtpProvider } from "../verification/phone-otp.provider.js";
@@ -62,6 +65,8 @@ export const createAuthRoute = (): Router => {
   const businessOnboardingService = new BusinessOnboardingService(businessOnboardingRepository);
   const sessionRepository = new SessionRepository();
   const tokenService = new TokenService(sessionRepository);
+  const staffRepository = new StaffRepository();
+  const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
@@ -73,6 +78,8 @@ export const createAuthRoute = (): Router => {
     createPhoneOtpProvider(),
     tokenService,
     businessService,
+    staffRepository,
+    clientIdentityService,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);

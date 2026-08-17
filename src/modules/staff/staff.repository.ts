@@ -46,6 +46,23 @@ export class StaffRepository {
     return StaffMembershipModel.findOne({ userId, removedAt: { $exists: false } }).exec();
   }
 
+  /**
+   * Batched membership lookup scoped to one business — used by Services to resolve
+   * assignedStaffMembershipIds for display without a query per Service. Does not filter by
+   * removedAt: a Service may still reference a since-removed membership (display can show it
+   * as inactive rather than silently vanishing).
+   */
+  public async findManyByIdsForBusiness(
+    businessId: Types.ObjectId | string,
+    staffIds: Array<Types.ObjectId | string>,
+  ): Promise<StaffMembershipDocument[]> {
+    if (staffIds.length === 0) {
+      return [];
+    }
+
+    return StaffMembershipModel.find({ _id: { $in: staffIds }, businessId }).exec();
+  }
+
   public async updateActiveById(
     businessId: Types.ObjectId | string,
     staffId: Types.ObjectId | string,

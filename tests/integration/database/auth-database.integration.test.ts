@@ -24,6 +24,8 @@ import { BusinessAccessRepository } from "../../../src/modules/business/business
 import { BusinessLinkVerificationRepository } from "../../../src/modules/business/business-link-verification.repository.js";
 import { BusinessOnboardingRepository } from "../../../src/modules/business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
+import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
 import {
   type RegistrationPortal,
   RegistrationSessionModel,
@@ -31,6 +33,7 @@ import {
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
+import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import {
   CustomerProfileModel,
   UserModel,
@@ -131,6 +134,8 @@ const createAuthService = (
     businessLinkVerificationRepository,
     emailProvider,
   );
+  const staffRepository = new StaffRepository();
+  const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
 
   return {
     authService: new AuthService(
@@ -144,6 +149,8 @@ const createAuthService = (
       phoneProvider,
       new TokenService(sessionRepository),
       businessService,
+      staffRepository,
+      clientIdentityService,
     ),
     emailProvider,
     phoneProvider,

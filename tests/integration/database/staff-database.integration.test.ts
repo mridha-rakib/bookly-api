@@ -20,6 +20,8 @@ import { BusinessMediaRepository } from "../../../src/modules/business-media/bus
 import { BusinessMediaService } from "../../../src/modules/business-media/business-media.service.js";
 import { BusinessOnboardingRepository } from "../../../src/modules/business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
+import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
@@ -663,6 +665,8 @@ describe("database-backed StaffMembership integration", () => {
       { sendOtp: async () => ({}), verifyOtp: async () => false },
       new TokenService(new SessionRepository()),
       businessService,
+      new StaffRepository(),
+      new ClientIdentityService(userRepository, new ClientRepository()),
     );
 
     const result = await authService.login(
