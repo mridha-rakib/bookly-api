@@ -14,6 +14,9 @@ export type CreateBusinessInput = {
     e164: string;
   };
   visitType: BusinessVisitType;
+  /** Omitted by every current caller — the schema default (Europe/Nicosia) applies. Typed here
+   * so a future onboarding step can supply it explicitly without a repository signature change. */
+  timezone?: string;
   address: {
     city: string;
     area: string;

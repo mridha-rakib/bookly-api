@@ -1,5 +1,6 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
 
+import { resolveBusinessTimezone } from "../../common/time/timezone.js";
 import { env } from "../../config/env.js";
 import { AuthError } from "../auth/auth.errors.js";
 import {
@@ -61,6 +62,7 @@ export type BusinessDetailDto = {
   ownerName: string;
   status: BusinessStatus;
   visitType: BusinessVisitType;
+  timezone: string;
   phone: { countryCode: string; nationalNumber: string; e164: string };
   address: BusinessAddress;
   location?: { lat: number; lng: number; searchQuery?: string | undefined } | undefined;
@@ -395,6 +397,7 @@ export class BusinessService {
     if (input.name !== undefined) update["name"] = input.name;
     if (input.ownerName !== undefined) update["ownerName"] = input.ownerName;
     if (input.visitType !== undefined) update["visitType"] = input.visitType;
+    if (input.timezone !== undefined) update["timezone"] = input.timezone;
     if (input.briefDescription !== undefined) update["briefDescription"] = input.briefDescription;
     if (input.category !== undefined) update["category"] = input.category;
     if (input.subcategories !== undefined) update["subcategories"] = input.subcategories;
@@ -488,6 +491,7 @@ export class BusinessService {
       ownerName: business.ownerName,
       status: business.status,
       visitType: normalizeBusinessVisitType(business.visitType),
+      timezone: resolveBusinessTimezone(business.timezone),
       phone: business.phone,
       address: business.address,
       location: business.location,

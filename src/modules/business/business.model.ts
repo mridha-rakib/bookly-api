@@ -1,5 +1,6 @@
 import { model, Schema, type Types } from "mongoose";
 
+import { DEFAULT_BUSINESS_TIMEZONE, isValidIanaTimeZone } from "../../common/time/timezone.js";
 import {
   type BusinessStatus,
   type BusinessVisitType,
@@ -29,6 +30,17 @@ export type BusinessDocument = {
   };
   status: BusinessStatus;
   visitType: BusinessVisitType;
+  /**
+   * IANA time zone identifier (e.g. "Europe/Nicosia") — the source of truth for interpreting
+   * every business-local date/time this Business will ever produce (opening hours, Booking
+   * schedule snapshots, etc). `required: true` describes the model going forward; Business
+   * documents persisted before this field existed simply lack it in the raw database record. No
+   * destructive backfill migration was run for those rows — a plain find/findById self-heals via
+   * this schema's own `default`, but `.lean()` queries and aggregation results do not (they skip
+   * Document hydration), so any such read path must go through `resolveBusinessTimezone()` (see
+   * common/time/timezone.ts) instead of assuming the field is always populated.
+   */
+  timezone: string;
   address: BusinessAddress;
   location?:
     | {
@@ -60,6 +72,15 @@ const businessSchema = new Schema<BusinessDocument>(
       type: String,
       enum: [...businessVisitTypes, "location", "travel"],
       required: true,
+    },
+    timezone: {
+      type: String,
+      required: true,
+      default: DEFAULT_BUSINESS_TIMEZONE,
+      validate: {
+        validator: isValidIanaTimeZone,
+        message: "timezone must be a valid IANA time zone identifier",
+      },
     },
     address: {
       city: { type: String, required: true },
