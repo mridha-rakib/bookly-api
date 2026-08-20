@@ -4,18 +4,26 @@ import mongoose from "mongoose";
 
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
+import "../modules/addons/addon-service-assignment.model.js";
+import "../modules/addons/addon.model.js";
+import "../modules/booking/booking.model.js";
 import "../modules/business/business-access.model.js";
 import "../modules/business/business-link-verification.model.js";
 import "../modules/business/business.model.js";
+import "../modules/business-booking-settings/business-booking-settings.model.js";
+import "../modules/business-hours/business-hours.model.js";
 import "../modules/business-media/business-media.model.js";
 import "../modules/business-travel-settings/business-travel-settings.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
 import "../modules/client/client.model.js";
 import "../modules/registration-session/registration-session.model.js";
+import "../modules/services/service-category.model.js";
+import "../modules/services/service.model.js";
 import "../modules/session/session.model.js";
 import "../modules/staff/staff.model.js";
 import "../modules/staff/staff-schedule.model.js";
 import "../modules/staff/staff-time-off.model.js";
+import "../modules/staff-avatar/staff-avatar.model.js";
 import "../modules/user/user.model.js";
 
 type SyncIndexesLogger = Pick<typeof logger, "info" | "error">;
@@ -33,7 +41,16 @@ export type SyncIndexesResult = {
  * implicitly on server boot. Run it as an explicit deploy step, after reviewing
  * for duplicate-key conflicts on any newly-unique index (e.g. Business.ownerUserId,
  * BusinessAccess.{userId,businessId}, StaffMembership.userId (partial, active-only),
- * StaffSchedule.membershipId) against the target database.
+ * StaffSchedule.membershipId, BusinessOpeningHours.businessId, Booking.reference)
+ * against the target database.
+ *
+ * The side-effect imports above previously omitted Addon, AddonServiceAssignment, Service,
+ * ServiceCategory, StaffAvatar, and BusinessBookingSettings — those models existed and were
+ * registered at runtime (so the app itself worked fine), but this script never synced their
+ * indexes because `mongoose.modelNames()` only sees whatever has been imported into the
+ * running process. Fixed alongside adding Booking/BusinessOpeningHours; if this script is ever
+ * split out of the main process again, re-check this import list against
+ * `src/modules/*.model.ts` rather than assuming it is complete.
  */
 export const syncDatabaseIndexes = async (
   dependencies: { logger: SyncIndexesLogger } = { logger },

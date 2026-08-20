@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { isValidIanaTimeZone } from "../../common/time/timezone.js";
 import {
   countryCodeSchema,
   nationalNumberSchema,
@@ -32,6 +33,12 @@ export const updateBusinessBodySchema = z
     countryCode: countryCodeSchema.optional(),
     nationalNumber: nationalNumberSchema.optional(),
     visitType: visitTypeInputSchema.optional(),
+    timezone: z
+      .string()
+      .trim()
+      .min(1)
+      .refine(isValidIanaTimeZone, "timezone must be a valid IANA time zone identifier")
+      .optional(),
     city: z.enum(businessCities).optional(),
     area: z.string().trim().min(1).optional(),
     streetName: z.string().trim().min(1).optional(),

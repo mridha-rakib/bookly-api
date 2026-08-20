@@ -471,4 +471,69 @@ describe("database-backed Business and BusinessAccess integration", () => {
       businessService.unlinkBusiness(String(userA._id), String(businessB._id)),
     ).rejects.toMatchObject({ statusCode: 404 });
   });
+
+  describe("Business.timezone (Phase 0)", () => {
+    it("defaults a newly-created Business to Europe/Nicosia", async () => {
+      const { business } = await createBusinessOwner("owner-a@example.com", "Business A");
+      expect(business.timezone).toBe("Europe/Nicosia");
+
+      const reloaded = await BusinessModel.findById(business._id).orFail();
+      expect(reloaded.timezone).toBe("Europe/Nicosia");
+    });
+
+    it("a Business Owner can change their Business's timezone via the existing update path", async () => {
+      const { user, business } = await createBusinessOwner("owner-a@example.com", "Business A");
+
+      const updated = await businessService.updateOwnedBusiness(
+        String(user._id),
+        String(business._id),
+        {
+          timezone: "Europe/London",
+        },
+      );
+
+      expect(updated.timezone).toBe("Europe/London");
+      const reloaded = await BusinessModel.findById(business._id).orFail();
+      expect(reloaded.timezone).toBe("Europe/London");
+    });
+
+    it("rejects an invalid IANA timezone at the model layer (defense in depth beyond Zod)", async () => {
+      const { business } = await createBusinessOwner("owner-a@example.com", "Business A");
+
+      await expect(
+        BusinessModel.findByIdAndUpdate(
+          business._id,
+          { $set: { timezone: "Not/AZone" } },
+          { runValidators: true },
+        ).orFail(),
+      ).rejects.toThrow();
+    });
+
+    it("legacy Business documents that predate the timezone field remain safe to read (no destructive migration required)", async () => {
+      const { business } = await createBusinessOwner("owner-a@example.com", "Business A");
+
+      // Simulate a pre-existing document from before this field existed: unset it directly at
+      // the driver level, bypassing Mongoose entirely.
+      await BusinessModel.collection.updateOne({ _id: business._id }, { $unset: { timezone: "" } });
+
+      // Confirmed genuinely absent in storage (not just "falsy") via the raw driver, bypassing
+      // Mongoose's own query hydration.
+      const rawDocument = await BusinessModel.collection.findOne({ _id: business._id });
+      expect(rawDocument).not.toHaveProperty("timezone");
+
+      // No destructive backfill migration was run, yet every read path still resolves safely
+      // to the platform default rather than surfacing `undefined` or throwing — whether via
+      // Mongoose's own schema-default-on-hydrate behavior (observed in this Mongoose version)
+      // or, for any path that bypasses hydration (e.g. .lean()/aggregation), the explicit
+      // resolveBusinessTimezone() fallback in common/time/timezone.ts.
+      const reloaded = await BusinessModel.findById(business._id).orFail();
+      expect(reloaded.timezone).toBe("Europe/Nicosia");
+
+      const detail = await businessService.getBusinessDetail(
+        String(business.ownerUserId),
+        String(business._id),
+      );
+      expect(detail.timezone).toBe("Europe/Nicosia");
+    });
+  });
 });

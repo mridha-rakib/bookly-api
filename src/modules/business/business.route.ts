@@ -10,6 +10,7 @@ import {
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
 import { createBusinessBookingSettingsRoute } from "../business-booking-settings/business-booking-settings.route.js";
+import { createBusinessHoursRoute } from "../business-hours/business-hours.route.js";
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { createBusinessMediaRoute } from "../business-media/business-media.route.js";
 import { createBusinessTravelSettingsRoute } from "../business-travel-settings/business-travel-settings.route.js";
@@ -63,6 +64,7 @@ export const createBusinessRoute = (): Router => {
   router.use(createBusinessMediaRoute());
   router.use(createBusinessTravelSettingsRoute());
   router.use(createBusinessBookingSettingsRoute());
+  router.use(createBusinessHoursRoute());
   router.use(createServicesRoute());
   router.use(createAddonsRoute());
   router.use(createStaffRoute());
