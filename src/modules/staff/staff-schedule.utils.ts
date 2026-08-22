@@ -22,6 +22,24 @@ export const minutesSinceMidnight = (hhmm: string): number => {
 };
 
 /**
+ * The inverse of {@link minutesSinceMidnight}: minutes since midnight (0–1439) → canonical
+ * "HH:mm". Added for the Availability Engine's AUTO-mode slot generation (booking.interval
+ * stepping produces minute offsets that need to become canonical times for
+ * {@link "../../common/time/business-clock.js".businessLocalToUtc}) — kept here rather than in
+ * that module so all canonical-time <-> minutes conversion stays in one place, matching this
+ * project's "no duplicate time math" convention.
+ */
+export const minutesToCanonicalTime = (minutes: number): string => {
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 1439) {
+    throw new Error(`Invalid minutes since midnight: ${minutes}`);
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+};
+
+/**
  * Canonical "HH:mm" (24-hour) → 12-hour display label, e.g. "09:00" -> "9:00 AM",
  * "13:30" -> "1:30 PM", "00:00" -> "12:00 AM", "12:00" -> "12:00 PM".
  */

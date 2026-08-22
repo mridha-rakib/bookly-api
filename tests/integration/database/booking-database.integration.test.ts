@@ -6,6 +6,7 @@ import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import type { CreateBookingInput } from "../../../src/modules/booking/booking.repository.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
+import { NO_SHOW_RESOLUTION_WINDOW_MINUTES } from "../../../src/modules/booking/booking.types.js";
 import { generateBookingReference } from "../../../src/modules/booking/booking.utils.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
@@ -18,7 +19,12 @@ import {
   stopIsolatedReplicaSet,
 } from "./mongo-replset-helper.js";
 
-type DbIndex = { name?: string; key: Record<string, unknown>; unique?: boolean };
+type DbIndex = {
+  name?: string;
+  key: Record<string, unknown>;
+  unique?: boolean;
+  partialFilterExpression?: unknown;
+};
 
 describe("database-backed Booking integration", () => {
   let userRepository: UserRepository;
@@ -52,6 +58,7 @@ describe("database-backed Booking integration", () => {
       addonRepository,
       addonServiceAssignmentRepository,
       clientRepository,
+      bookingRepository,
     );
   });
 
@@ -185,6 +192,10 @@ describe("database-backed Booking integration", () => {
         responsibleStaffMembershipId: input.staffMembershipId,
         addons: [],
         amountCents: 2000,
+        // Batch 3 made this required (see BookingServiceLine's own comment) — a fresh, unused
+        // ObjectId is fine here since these tests exercise the Booking schema/model in
+        // isolation, never a real BookingSlotReservation write.
+        reservationId: new Types.ObjectId(),
       },
     ],
     financials: {
@@ -308,6 +319,7 @@ describe("database-backed Booking integration", () => {
         responsibleStaffMembershipId: membership._id,
         addons: [],
         amountCents: 2000,
+        reservationId: new Types.ObjectId(),
       },
     ];
 
@@ -330,6 +342,146 @@ describe("database-backed Booking integration", () => {
     input.customerRescheduleCount = 3;
 
     await expect(bookingRepository.create(input)).rejects.toThrow();
+  });
+
+  // --- Financial invariants (item 6) -----------------------------------------------------
+
+  describe("Booking.financials invariants", () => {
+    const setup = async () => {
+      const { business, owner } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const client = await createClient(business._id);
+      const input = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      return { business, owner, membership, service, client, input };
+    };
+
+    it("rejects serviceDiscountCents greater than servicesSubtotalCents", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, serviceDiscountCents: 2001 };
+
+      await expect(bookingRepository.create(input)).rejects.toThrow();
+    });
+
+    it("rejects an eligiblePlatformFeeBasisCents that does not equal services + addons - discount", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, eligiblePlatformFeeBasisCents: 1999 };
+
+      await expect(bookingRepository.create(input)).rejects.toThrow();
+    });
+
+    it("accepts eligiblePlatformFeeBasisCents that correctly excludes travelFeeCents", async () => {
+      const { input } = await setup();
+      // servicesSubtotal 2000 + addons 0 - discount 0 = basis 2000, regardless of a nonzero
+      // travel fee sitting alongside it (travel is never part of the basis, confirmed rule M).
+      input.financials = {
+        ...input.financials,
+        travelFeeCents: 1000,
+        eligiblePlatformFeeBasisCents: 2000,
+        totalCents: 3000,
+        balanceDueCents: 2500,
+      };
+
+      await expect(bookingRepository.create(input)).resolves.toBeDefined();
+    });
+
+    it("rejects a nonzero platformFeeCents outside the confirmed [€5, €35] range", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, platformFeeCents: 499 };
+      await expect(bookingRepository.create(input)).rejects.toThrow();
+
+      const tooHigh = { ...input, financials: { ...input.financials, platformFeeCents: 3501 } };
+      await expect(bookingRepository.create(tooHigh)).rejects.toThrow();
+    });
+
+    it("accepts platformFeeCents === 0 — an unwired/not-yet-charged Booking remains valid", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, platformFeeCents: 0 };
+
+      await expect(bookingRepository.create(input)).resolves.toBeDefined();
+    });
+
+    it("rejects depositCents greater than totalCents", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, depositCents: 2001, balanceDueCents: -1 };
+
+      await expect(bookingRepository.create(input)).rejects.toThrow();
+    });
+
+    it("rejects balanceDueCents that does not equal totalCents - depositCents", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, balanceDueCents: 1400 };
+
+      await expect(bookingRepository.create(input)).rejects.toThrow();
+    });
+
+    it("accepts depositCents === 0 (no deposit, full balance at venue) — an explicitly legitimate future state", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, depositCents: 0, balanceDueCents: 2000 };
+
+      await expect(bookingRepository.create(input)).resolves.toBeDefined();
+    });
+
+    it("accepts depositCents === totalCents (full payment upfront, zero balance due) — an explicitly legitimate future state", async () => {
+      const { input } = await setup();
+      input.financials = { ...input.financials, depositCents: 2000, balanceDueCents: 0 };
+
+      await expect(bookingRepository.create(input)).resolves.toBeDefined();
+    });
+
+    it("rejects a MANUAL Booking with a nonzero platformFeeCents or depositCents (confirmed rule E, enforced at the model layer too)", async () => {
+      const { input } = await setup();
+      const withFee = {
+        ...input,
+        source: "MANUAL" as const,
+        financials: { ...input.financials, platformFeeCents: 500 },
+      };
+      await expect(bookingRepository.create(withFee)).rejects.toThrow();
+
+      const withDeposit = {
+        ...input,
+        source: "MANUAL" as const,
+        financials: { ...input.financials, depositCents: 500, balanceDueCents: 1500 },
+      };
+      await expect(bookingRepository.create(withDeposit)).rejects.toThrow();
+    });
+
+    it("accepts a MANUAL Booking with platformFeeCents === 0 and depositCents === 0", async () => {
+      const { input } = await setup();
+      const manual = {
+        ...input,
+        source: "MANUAL" as const,
+        financials: {
+          ...input.financials,
+          platformFeeCents: 0,
+          depositCents: 0,
+          balanceDueCents: 2000,
+        },
+      };
+
+      await expect(bookingRepository.create(manual)).resolves.toBeDefined();
+    });
+
+    it("BookingService.validateManualBookingHasNoBooklyFee agrees with the model-layer invariant (same rule, two layers)", () => {
+      expect(() =>
+        bookingService.validateManualBookingHasNoBooklyFee("MANUAL", {
+          platformFeeCents: 0,
+          depositCents: 0,
+        }),
+      ).not.toThrow();
+      expect(() =>
+        bookingService.validateManualBookingHasNoBooklyFee("MANUAL", {
+          platformFeeCents: 500,
+          depositCents: 0,
+        }),
+      ).toThrow();
+    });
   });
 
   it("finds bookings within a Business date range, sorted ascending", async () => {
@@ -390,6 +542,76 @@ describe("database-backed Booking integration", () => {
     expect(results[1]?.schedule.startAt.toISOString()).toBe("2026-08-25T12:00:00.000Z");
   });
 
+  describe("BookingService.findBookingsInRange / range safety (item 11)", () => {
+    it("rejects a range wider than the confirmed maximum through the real service, before touching the database", async () => {
+      const { business } = await createBusiness();
+      const startAt = new Date("2026-01-01T00:00:00.000Z");
+      const endAt = new Date("2028-01-01T00:00:00.000Z");
+
+      await expect(
+        bookingService.findBookingsInRange(business, startAt, endAt),
+      ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it("excludeHistory: true strips populated eventHistory/rescheduleHistory; excludeHistory: false preserves them", async () => {
+      const { business, owner } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const client = await createClient(business._id);
+
+      const input = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      input.eventHistory = [
+        {
+          type: "CREATED",
+          nextStatus: "UPCOMING",
+          actorUserId: owner._id,
+          actorRole: "BUSINESS_OWNER",
+          createdAt: new Date(),
+        },
+      ];
+      input.rescheduleHistory = [
+        {
+          actorUserId: owner._id,
+          actorRole: "BUSINESS_OWNER",
+          previousStart: new Date("2026-08-25T08:00:00.000Z"),
+          previousEnd: new Date("2026-08-25T08:30:00.000Z"),
+          newStart: new Date("2026-08-25T09:00:00.000Z"),
+          newEnd: new Date("2026-08-25T09:30:00.000Z"),
+          countedTowardCustomerQuota: true,
+          createdAt: new Date(),
+        },
+      ];
+      await bookingRepository.create(input);
+
+      const startAt = new Date("2026-08-25T00:00:00.000Z");
+      const endAt = new Date("2026-08-26T00:00:00.000Z");
+
+      const listView = await bookingService.findBookingsInRange(business, startAt, endAt, {
+        excludeHistory: true,
+      });
+      expect(listView).toHaveLength(1);
+      // A deliberately-excluded projection path comes back `undefined`, not schema-defaulted
+      // to `[]` — unlike a path genuinely absent from a legacy document (see business.service's
+      // resolveBusinessTimezone comment for that other case), Mongoose tracks projection
+      // exclusion separately and does not backfill defaults for it. This is itself the proof
+      // the field was never transferred from MongoDB, i.e. that the projection is working.
+      expect(listView[0]?.eventHistory).toBeUndefined();
+      expect(listView[0]?.rescheduleHistory).toBeUndefined();
+
+      const detailView = await bookingService.findBookingsInRange(business, startAt, endAt, {
+        excludeHistory: false,
+      });
+      expect(detailView[0]?.eventHistory).toHaveLength(1);
+      expect(detailView[0]?.rescheduleHistory).toHaveLength(1);
+    });
+  });
+
   it("provisions the expected index set", async () => {
     const indexes = (await BookingModel.collection.indexes()) as DbIndex[];
 
@@ -421,6 +643,122 @@ describe("database-backed Booking integration", () => {
           index.key["customer.customerUserId"] === 1 && index.key["schedule.startAt"] === -1,
       ),
     ).toBe(true);
+    const noShowWorkerIndex = indexes.find(
+      (index) => index.key["status"] === 1 && index.key["noShowDeadlineAt"] === 1,
+    );
+    expect(noShowWorkerIndex).toBeDefined();
+    expect(noShowWorkerIndex?.partialFilterExpression).toBeDefined();
+  });
+
+  // --- No-show domain fields (item 7) --------------------------------------------------------
+
+  describe("Booking no-show fields", () => {
+    const setup = async () => {
+      const { business, owner } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const client = await createClient(business._id);
+      const input = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      return { business, owner, membership, service, client, input };
+    };
+
+    it("a fresh Booking has neither noShowStartedAt nor noShowDeadlineAt — no-show never starts automatically", async () => {
+      const { input } = await setup();
+      const created = await bookingRepository.create(input);
+
+      expect(created.noShowStartedAt).toBeUndefined();
+      expect(created.noShowDeadlineAt).toBeUndefined();
+    });
+
+    it("accepts both fields set together, 90 minutes apart", async () => {
+      const { input } = await setup();
+      const startedAt = new Date("2026-08-25T09:00:00.000Z");
+      input.noShowStartedAt = startedAt;
+      input.noShowDeadlineAt = new Date(
+        startedAt.getTime() + NO_SHOW_RESOLUTION_WINDOW_MINUTES * 60_000,
+      );
+      input.status = "PENDING";
+
+      const created = await bookingRepository.create(input);
+      expect(created.noShowStartedAt?.toISOString()).toBe(startedAt.toISOString());
+      expect(created.noShowDeadlineAt?.toISOString()).toBe("2026-08-25T10:30:00.000Z");
+    });
+
+    it("rejects noShowStartedAt set without a matching noShowDeadlineAt, and vice versa", async () => {
+      const { input } = await setup();
+      const startedOnly = { ...input, noShowStartedAt: new Date("2026-08-25T09:00:00.000Z") };
+      await expect(bookingRepository.create(startedOnly)).rejects.toThrow();
+
+      const { input: input2 } = await setup();
+      const deadlineOnly = { ...input2, noShowDeadlineAt: new Date("2026-08-25T10:30:00.000Z") };
+      await expect(bookingRepository.create(deadlineOnly)).rejects.toThrow();
+    });
+
+    it("rejects noShowDeadlineAt at or before noShowStartedAt", async () => {
+      const { input } = await setup();
+      const at = new Date("2026-08-25T09:00:00.000Z");
+      const same = { ...input, noShowStartedAt: at, noShowDeadlineAt: at };
+      await expect(bookingRepository.create(same)).rejects.toThrow();
+
+      const before = {
+        ...input,
+        noShowStartedAt: at,
+        noShowDeadlineAt: new Date(at.getTime() - 1000),
+      };
+      await expect(bookingRepository.create(before)).rejects.toThrow();
+    });
+
+    it("the no-show worker's query shape finds only PENDING bookings past their deadline", async () => {
+      const { business, owner, membership, service, client } = await setup();
+      const now = new Date("2026-08-25T12:00:00.000Z");
+
+      const expired = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      expired.status = "PENDING";
+      expired.noShowStartedAt = new Date("2026-08-25T10:00:00.000Z");
+      expired.noShowDeadlineAt = new Date("2026-08-25T11:30:00.000Z");
+      await bookingRepository.create(expired);
+
+      const notYetExpired = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      notYetExpired.status = "PENDING";
+      notYetExpired.noShowStartedAt = new Date("2026-08-25T11:45:00.000Z");
+      notYetExpired.noShowDeadlineAt = new Date("2026-08-25T13:15:00.000Z");
+      await bookingRepository.create(notYetExpired);
+
+      const neverMarked = buildValidBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        serviceId: service._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+      });
+      await bookingRepository.create(neverMarked);
+
+      const dueForResolution = await BookingModel.find({
+        status: "PENDING",
+        noShowDeadlineAt: { $lte: now },
+      }).exec();
+
+      expect(dueForResolution).toHaveLength(1);
+      expect(dueForResolution[0]?.noShowDeadlineAt?.toISOString()).toBe("2026-08-25T11:30:00.000Z");
+    });
   });
 
   // --- Domain validation, exercised against real repositories -------------------------------

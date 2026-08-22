@@ -6,6 +6,14 @@ import {
   businessCities,
   businessVisitTypes,
 } from "../business/business.types.js";
+import {
+  CANCELLATION_PERCENTAGE_MAX,
+  CANCELLATION_PERCENTAGE_MIN,
+  type CancellationFeeMode,
+  type CancellationTier,
+  cancellationFeeModes,
+  cancellationTiers,
+} from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import { type ClientPropertyType, clientPropertyTypes } from "../client/client.types.js";
 import {
   type BookingActorRole,
@@ -20,6 +28,8 @@ import {
   bookingServiceLinePricingModes,
   bookingSources,
   bookingStatuses,
+  DEPOSIT_MAX_CENTS,
+  DEPOSIT_MIN_CENTS,
   MAX_CUSTOMER_RESCHEDULE_COUNT,
 } from "./booking.types.js";
 
@@ -145,16 +155,44 @@ export type BookingServiceLine = {
   addons: BookingServiceLineAddon[];
   /** Integer cents — this line's own amount, before Booking-level fees/discounts/travel. */
   amountCents: number;
+  /**
+   * The BookingSlotReservation interval this line's occupancy claim lives in (Batch 3) — one
+   * per distinct responsible Staff member across the Booking's service lines, all sharing the
+   * Booking's single root `schedule` window (see BookingSchedule's own comment: this schema has
+   * no per-line timing, so a multi-line Booking's lines are modeled as happening in parallel
+   * during the same [startAt, endAt), each with its own Staff member and hence its own
+   * reservation — never a second, invented per-line timing model). Required from Batch 3
+   * onward: every real creation path reserves before it persists.
+   */
+  reservationId: Types.ObjectId;
 };
 
 // --- Financial snapshot ------------------------------------------------------------------
 //
-// Every amount is integer cents (matches the rest of the codebase's money convention). Bookly's
-// first-booking platform fee (confirmed rule M) is `clamp(eligiblePlatformFeeBasisCents * 20%,
-// €5, €35)`, where the basis excludes travelFeeCents by design — travelFeeCents is tracked
-// separately and belongs to the Business/provider, never Bookly. A MANUAL Booking must always
-// have platformFeeCents === 0 and depositCents === 0 (confirmed rule E) — enforced in
-// booking.service.ts.
+// Every amount is integer cents (matches the rest of the codebase's money convention).
+//
+// BATCH 6.5 — DEPOSIT vs PLATFORM FEE (critical correction; do not conflate these again):
+//
+//   depositCents      = calculateBookingDepositCents(eligiblePlatformFeeBasisCents)
+//                      = clamp(eligiblePlatformFeeBasisCents * 20%, €5, €35)
+//                      — charged online for EVERY BOOKLY_MANAGED booking, first OR returning.
+//   platformFeeCents  = isFirstBooking ? depositCents : 0
+//                      — Bookly's own share of that SAME deposit. Nonzero ONLY on the
+//                        customer's first eligible booking at this specific Business (see
+//                        BusinessClient.activatedAt) — a first booking's deposit IS the
+//                        platform fee (they happen to be numerically equal), never a second,
+//                        independently-invented figure.
+//
+// So: depositCents is ALWAYS the amount the customer actually pays online (subject to real
+// booking economics; 0 only for MANUAL). platformFeeCents is Bookly's economic CLAIM on that
+// deposit, which is 0 for a returning customer's booking — in that case the customer still
+// pays depositCents online, but it belongs to the Business (an already-collected service
+// prepayment), never to Bookly. NEVER use platformFeeCents as a proxy for "how much did the
+// customer pay" (that is always depositCents) or use "returning" to mean "no deposit required"
+// (a returning customer still pays a deposit — only WHO economically keeps it changes). The
+// basis excludes travelFeeCents by design — travelFeeCents is tracked separately and belongs to
+// the Business/provider, never Bookly. A MANUAL Booking must always have platformFeeCents === 0
+// and depositCents === 0 (confirmed rule E) — enforced in booking.service.ts.
 
 export type BookingFinancials = {
   currency: BookingCurrency;
@@ -225,6 +263,93 @@ export type BookingEventHistoryEntry = {
   createdAt: Date;
 };
 
+// --- Cancellation policy snapshot / outcome (Batch 3) -----------------------------------------
+//
+// Historical-integrity requirement: a Booking's cancellation classification must never depend on
+// the LIVE BusinessCancellationPolicy, since a Business may edit that policy after this Booking
+// was created — doing so must never retroactively change what an already-placed Booking owes on
+// cancellation. `cancellationPolicySnapshot` copies exactly the two fact fields the policy
+// document holds (tiers + noShowPercentage — see business-cancellation-policy.model.ts) at
+// Booking-creation time; it is absent only when the Business had no policy configured at all at
+// that moment (matches this codebase's "missing configuration" convention elsewhere — see
+// BusinessOpeningHours — where a missing document means "not configured", not a fabricated
+// default). `cancellationOutcome` is populated once, only by an actual cancellation action, and
+// records the classification actually applied — never recomputed from a later policy edit.
+
+export type BookingCancellationPolicySnapshot = {
+  tiers: Array<{ tier: CancellationTier; mode: CancellationFeeMode; percentage?: number }>;
+  noShowPercentage: number;
+};
+
+/**
+ * `cancellationFeeCents`/`refundOwedCents` are the CLASSIFIED amounts (what the policy says is
+ * owed/refundable) — never proof that money actually moved. `settlementStatus` is the honest,
+ * separately-tracked record of whether the associated Stripe charge/refund actually succeeded
+ * (Batch 4: "Do not conflate booking lifecycle status with payment settlement status" — the
+ * Booking's own `status` transitions to CANCELLED_BY_CUSTOMER/LATE_CANCELLATION/
+ * CANCELLED_BY_BUSINESS regardless of settlement outcome, since the appointment IS cancelled
+ * and the slot IS released either way; only this field says whether the money side is done,
+ * still pending, or failed). `settlementProviderReference` is the Stripe PaymentIntent/Refund id
+ * once known, for audit/reconciliation — cross-referenced against the immutable
+ * BookingFinancialTransaction ledger entry, which remains the authoritative money record; this
+ * field is a fast-read convenience, never a second source of truth.
+ *
+ * Batch 5 correction: `depositAppliedCents`/`additionalChargeCents` net the classified
+ * `cancellationFeeCents` against the deposit ALREADY collected at booking time
+ * (`Booking.financials.depositCents` — see BookingFinancials's own doc comment). Evidence: the
+ * approved customer-facing reference screenshots (docs/figma-booking-reference) and this same
+ * repo's own pre-existing customer/bookings mock data both consistently show a
+ * late-cancellation/no-show fee being paid FROM the already-collected deposit first, with only
+ * the shortfall ever newly charged — e.g. a €80 booking with a €16 deposit and a 50%-tier €40
+ * fee shows "€16 retained, €24 additionally charged, €40 total", never a fresh €40 charge on top
+ * of the already-held €16. The deposit itself is never refunded back to the customer on a
+ * customer-initiated cancellation/no-show, REGARDLESS of whether it is Bookly's own activation
+ * revenue (first booking) or the Business's already-collected service prepayment (returning
+ * booking, Batch 6.5) — same non-refundable-to-customer rule Batch 4 already established for a
+ * >72h free cancellation — `refundOwedCents` therefore stays 0 for every CUSTOMER-initiated
+ * path; it is populated only by the BUSINESS-cancellation caller
+ * (BookingLifecycleService.cancelByBusiness), which refunds the FULL deposit (whichever party
+ * economically owned it) since a business-caused cancellation is never the customer's fault
+ * (unchanged from Batch 4).
+ *   depositAppliedCents = min(cancellationFeeCents, depositAlreadyPaidCents)  — informational
+ *   additionalChargeCents = max(0, cancellationFeeCents - depositAlreadyPaidCents) — the actual
+ *     amount a NEW Stripe charge collects; this, not the gross `cancellationFeeCents`, is what
+ *     executeCancellationFeeCharge/NoShowResolutionService/waiveFee all charge or waive.
+ */
+export type BookingCancellationOutcome = {
+  classifiedAt: Date;
+  tier: CancellationTier;
+  feeMode: CancellationFeeMode;
+  feePercentage?: number | undefined;
+  cancellationFeeCents: number;
+  depositAppliedCents: number;
+  additionalChargeCents: number;
+  refundOwedCents: number;
+  settlementStatus: "NOT_APPLICABLE" | "PENDING" | "SUCCEEDED" | "FAILED" | "WAIVED";
+  settlementProviderReference?: string | undefined;
+};
+
+/**
+ * Written ONCE, only by `BookingLifecycleService.completeBooking`, when the Business explicitly
+ * attests whether the customer paid the remaining `financials.balanceDueCents` at the venue
+ * (confirmed via the business-owner "Complete Booking" reference screenshot — see
+ * docs/figma-booking-reference/business-owner/complete.png, not previously implemented). This is
+ * a Business self-attestation about money collected OFF-platform (cash/card-in-person, exactly
+ * like a MANUAL Booking's financials are already entirely business-attested) — Bookly has no way
+ * to independently verify it, so `amountCents` is the one legitimate exception to "never trust
+ * client-supplied financial values": it is never used to compute Bookly's own fee/deposit/ledger
+ * PLATFORM_FEE entries, only to record a `PAYMENT` ledger entry (see completeBooking) for
+ * reporting/reconciliation. Absent entirely when the Business's completion action didn't record
+ * a venue-payment answer (e.g. no balance was ever due, or an older/manual completion path).
+ */
+export type BookingCompletionPayment = {
+  paid: boolean;
+  amountCents?: number | undefined;
+  note?: string | undefined;
+  recordedAt: Date;
+  recordedBy: Types.ObjectId;
+};
+
 // --- Root ---------------------------------------------------------------------------------
 
 export type BookingDocument = {
@@ -251,6 +376,24 @@ export type BookingDocument = {
   customerRescheduleCount: number;
   rescheduleHistory: BookingRescheduleEntry[];
   eventHistory: BookingEventHistoryEntry[];
+  /**
+   * No-show never starts automatically — both fields are set together, only by an explicit
+   * business-side "mark as no-show" action (not implemented in this phase), never by a
+   * timer/cron reacting to a missed appointment on its own. noShowDeadlineAt is always
+   * noShowStartedAt + NO_SHOW_RESOLUTION_WINDOW_MINUTES (booking.types.ts), computed by that
+   * future action, not derived implicitly here. A future background worker resolves any
+   * Booking still `status: "PENDING"` past its noShowDeadlineAt (charge/waive/cancel);
+   * resolving moves `status` away from "PENDING" to one of NO_SHOW_CHARGED/NO_SHOW_WAIVED/
+   * NO_SHOW_CANCELLED, which is itself the resolution record — no separate
+   * noShowResolvedAt/noShowResolution field is modeled, since `status` (with eventHistory for
+   * the audit trail of who/when) already captures that unambiguously. See the
+   * `{status, noShowDeadlineAt}` index below, sized for exactly that worker's query. Neither
+   * the worker nor the "mark as no-show" action itself is implemented in this phase. */
+  noShowStartedAt?: Date | undefined;
+  noShowDeadlineAt?: Date | undefined;
+  cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
+  cancellationOutcome?: BookingCancellationOutcome | undefined;
+  completionPayment?: BookingCompletionPayment | undefined;
   notes?: string | undefined;
   // No hard-delete/archive path is modeled: a Booking is never removed once created — its
   // status changes, but the record (and every snapshot on it) persists indefinitely as the
@@ -425,6 +568,11 @@ const bookingServiceLineSchema = new Schema<BookingServiceLine>(
     staffSnapshot: { type: bookingServiceLineStaffSnapshotSchema },
     addons: { type: [bookingServiceLineAddonSchema], required: true, default: [] },
     amountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    reservationId: {
+      type: Schema.Types.ObjectId,
+      ref: "BookingSlotReservation",
+      required: true,
+    },
   },
   { _id: false },
 );
@@ -449,6 +597,58 @@ const bookingFinancialsSchema = new Schema<BookingFinancials>(
   },
   { _id: false },
 );
+
+/**
+ * Structural money invariants that can never legitimately be violated regardless of pricing
+ * policy, deposit strategy, or payment state — deliberately NOT a deposit formula (no rule
+ * constrains depositCents itself beyond "not more than the total"; see
+ * BookingService.calculateBookingDepositCents for where the actual [€5, €35] deposit clamp is
+ * computed, at write time, for every BOOKLY_MANAGED booking) and deliberately NOT an exact
+ * platformFeeCents formula (0 is valid both for a MANUAL Booking and for a RETURNING customer's
+ * BOOKLY_MANAGED booking — see the Batch 6.5 correction: platformFeeCents === 0 no longer
+ * implies "no deposit was collected", only "this deposit is Business-owned, not Bookly's own
+ * activation revenue"; only a *nonzero* platformFeeCents is bounded to the confirmed [€5, €35]
+ * range, since a nonzero platform fee is always exactly the first-booking deposit amount).
+ * Every one of these must hold for every legitimate future state named in the audit — no
+ * deposit (depositCents 0, e.g. MANUAL), full balance collected upfront (depositCents ===
+ * totalCents), a later refund/cancellation/no-show (those rewrite this whole snapshot
+ * consistently, which is exactly what these checks require of any writer, present or future).
+ */
+bookingFinancialsSchema.pre("validate", function () {
+  const financials = this as unknown as BookingFinancials;
+
+  if (financials.serviceDiscountCents > financials.servicesSubtotalCents) {
+    throw new Error("serviceDiscountCents cannot exceed servicesSubtotalCents");
+  }
+
+  const expectedBasis =
+    financials.servicesSubtotalCents +
+    financials.addonsSubtotalCents -
+    financials.serviceDiscountCents;
+  if (financials.eligiblePlatformFeeBasisCents !== expectedBasis) {
+    throw new Error(
+      "eligiblePlatformFeeBasisCents must equal servicesSubtotalCents + addonsSubtotalCents - serviceDiscountCents (travel fee excluded by design)",
+    );
+  }
+
+  if (
+    financials.platformFeeCents !== 0 &&
+    (financials.platformFeeCents < DEPOSIT_MIN_CENTS ||
+      financials.platformFeeCents > DEPOSIT_MAX_CENTS)
+  ) {
+    throw new Error(
+      `A nonzero platformFeeCents must be within [${DEPOSIT_MIN_CENTS}, ${DEPOSIT_MAX_CENTS}]`,
+    );
+  }
+
+  if (financials.depositCents > financials.totalCents) {
+    throw new Error("depositCents cannot exceed totalCents");
+  }
+
+  if (financials.balanceDueCents !== financials.totalCents - financials.depositCents) {
+    throw new Error("balanceDueCents must equal totalCents - depositCents");
+  }
+});
 
 const bookingScheduleSchema = new Schema<BookingSchedule>(
   {
@@ -487,6 +687,70 @@ const bookingEventHistoryEntrySchema = new Schema<BookingEventHistoryEntry>(
   { _id: false },
 );
 
+const bookingCancellationTierRuleSnapshotSchema = new Schema<
+  BookingCancellationPolicySnapshot["tiers"][number]
+>(
+  {
+    tier: { type: String, enum: cancellationTiers, required: true },
+    mode: { type: String, enum: cancellationFeeModes, required: true },
+    percentage: {
+      type: Number,
+      min: CANCELLATION_PERCENTAGE_MIN,
+      max: CANCELLATION_PERCENTAGE_MAX,
+    },
+  },
+  { _id: false },
+);
+
+const bookingCancellationPolicySnapshotSchema = new Schema<BookingCancellationPolicySnapshot>(
+  {
+    tiers: { type: [bookingCancellationTierRuleSnapshotSchema], required: true },
+    noShowPercentage: {
+      type: Number,
+      required: true,
+      min: CANCELLATION_PERCENTAGE_MIN,
+      max: CANCELLATION_PERCENTAGE_MAX,
+    },
+  },
+  { _id: false },
+);
+
+const bookingCancellationOutcomeSchema = new Schema<BookingCancellationOutcome>(
+  {
+    classifiedAt: { type: Date, required: true },
+    tier: { type: String, enum: cancellationTiers, required: true },
+    feeMode: { type: String, enum: cancellationFeeModes, required: true },
+    feePercentage: {
+      type: Number,
+      min: CANCELLATION_PERCENTAGE_MIN,
+      max: CANCELLATION_PERCENTAGE_MAX,
+    },
+    cancellationFeeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    depositAppliedCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    additionalChargeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    refundOwedCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    settlementStatus: {
+      type: String,
+      enum: ["NOT_APPLICABLE", "PENDING", "SUCCEEDED", "FAILED", "WAIVED"],
+      required: true,
+      default: "NOT_APPLICABLE",
+    },
+    settlementProviderReference: { type: String, trim: true },
+  },
+  { _id: false },
+);
+
+const bookingCompletionPaymentSchema = new Schema<BookingCompletionPayment>(
+  {
+    paid: { type: Boolean, required: true },
+    amountCents: { type: Number, min: 0, validate: Number.isInteger },
+    note: { type: String, trim: true, maxlength: 2000 },
+    recordedAt: { type: Date, required: true },
+    recordedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { _id: false },
+);
+
 const bookingSchema = new Schema<BookingDocument>(
   {
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
@@ -518,10 +782,53 @@ const bookingSchema = new Schema<BookingDocument>(
     },
     rescheduleHistory: { type: [bookingRescheduleEntrySchema], required: true, default: [] },
     eventHistory: { type: [bookingEventHistoryEntrySchema], required: true, default: [] },
+    noShowStartedAt: { type: Date },
+    noShowDeadlineAt: { type: Date },
+    cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
+    cancellationOutcome: { type: bookingCancellationOutcomeSchema },
+    completionPayment: { type: bookingCompletionPaymentSchema },
     notes: { type: String, trim: true, maxlength: 2000 },
   },
   { timestamps: true },
 );
+
+// Both-or-neither, and the deadline must genuinely be after the start — defense in depth for
+// the future "mark as no-show" action, which is the only intended writer of these two fields.
+bookingSchema.pre("validate", function () {
+  const booking = this as unknown as BookingDocument;
+  const hasStarted = booking.noShowStartedAt !== undefined;
+  const hasDeadline = booking.noShowDeadlineAt !== undefined;
+
+  if (hasStarted !== hasDeadline) {
+    throw new Error("noShowStartedAt and noShowDeadlineAt must be set together");
+  }
+
+  if (
+    hasStarted &&
+    hasDeadline &&
+    booking.noShowDeadlineAt !== undefined &&
+    booking.noShowStartedAt !== undefined &&
+    booking.noShowDeadlineAt <= booking.noShowStartedAt
+  ) {
+    throw new Error("noShowDeadlineAt must be after noShowStartedAt");
+  }
+});
+
+// Defense in depth for confirmed rule E, duplicating BookingService.validateManualBookingHasNoBooklyFee
+// at the persistence layer — a MANUAL Booking is financially outside Bookly entirely, so no
+// direct model write (bypassing the service) can ever persist a nonzero Bookly fee/deposit on
+// one. BOOKLY_MANAGED Bookings are unconstrained here; their actual fee/deposit values are
+// Phase 2/3 payment work.
+bookingSchema.pre("validate", function () {
+  const booking = this as unknown as BookingDocument;
+
+  if (
+    booking.source === "MANUAL" &&
+    (booking.financials.platformFeeCents !== 0 || booking.financials.depositCents !== 0)
+  ) {
+    throw new Error("A MANUAL Booking must have platformFeeCents === 0 and depositCents === 0");
+  }
+});
 
 // Booking reference is the human-facing identifier and must never collide across the whole
 // platform (a Customer's cross-Business "My Bookings" view could otherwise show two different
@@ -542,5 +849,14 @@ bookingSchema.index({ "customer.businessClientId": 1, "schedule.startAt": -1 });
 // A linked Customer's own bookings across every Business ("My Bookings") — sparse because
 // customerUserId is only ever set when the BusinessClient is linked to a real Customer account.
 bookingSchema.index({ "customer.customerUserId": 1, "schedule.startAt": -1 }, { sparse: true });
+// The future no-show background worker's exact query shape: efficiently find every Booking
+// still `status: "PENDING"` whose noShowDeadlineAt has passed. Partial (not sparse) — scoped
+// to documents that actually have a noShowDeadlineAt at all, which is the large majority-never
+// case (no-show is a deliberate action on a specific Booking, not every Booking's default
+// path), so this index stays small relative to the whole collection.
+bookingSchema.index(
+  { status: 1, noShowDeadlineAt: 1 },
+  { partialFilterExpression: { noShowDeadlineAt: { $exists: true } } },
+);
 
 export const BookingModel = model<BookingDocument>("Booking", bookingSchema);

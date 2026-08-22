@@ -288,18 +288,7 @@ export class StaffService {
     }
 
     if (input.role) {
-      const updatedMembership = await this.staffRepository.updateActiveById(business._id, staffId, {
-        role: input.role,
-      });
-
-      if (updatedMembership) {
-        membership.role = updatedMembership.role;
-      }
-
-      if (user.role !== input.role) {
-        await this.userRepository.updateRole(user._id, input.role);
-        user.role = input.role;
-      }
+      await this.updateRoleTransactionally(business._id, staffId, membership, user, input.role);
     }
 
     if (input.employmentActive !== undefined) {
@@ -369,6 +358,56 @@ export class StaffService {
       timeOff,
       avatarUrlByUserId.get(String(membership.userId)),
     ) as StaffMemberDto;
+  }
+
+  /**
+   * StaffMembership.role and User.role are two independent documents in two different
+   * collections that must never disagree — the Booking module's authorization check reads
+   * both. Wrapped in a transaction so a mid-write failure (e.g. a dropped connection between
+   * the two updates) can never leave one collection updated and the other stale — either both
+   * roles move together or neither does.
+   */
+  private async updateRoleTransactionally(
+    businessId: BusinessDocument["_id"],
+    staffId: string,
+    membership: StaffMembershipDocument,
+    user: UserDocument,
+    role: StaffCreatableRole,
+  ): Promise<void> {
+    const dbSession = await mongoose.startSession();
+
+    try {
+      await dbSession.withTransaction(async () => {
+        const updatedMembership = await this.staffRepository.updateActiveById(
+          businessId,
+          staffId,
+          { role },
+          dbSession,
+        );
+
+        if (!updatedMembership) {
+          // Membership was removed by a concurrent request between the initial fetch above
+          // and this write — abort rather than proceeding to update User.role alone, which
+          // is exactly the split-brain this transaction exists to prevent.
+          throw new StaffError("STAFF_NOT_FOUND", 404);
+        }
+
+        membership.role = updatedMembership.role;
+
+        if (user.role !== role) {
+          await this.userRepository.updateRole(user._id, role, dbSession);
+          user.role = role;
+        }
+      });
+    } catch (error) {
+      if (this.isTransactionUnsupported(error)) {
+        throw new StaffError("STAFF_TRANSACTION_UNAVAILABLE", 503);
+      }
+
+      throw error;
+    } finally {
+      await dbSession.endSession();
+    }
   }
 
   public async removeStaff(
@@ -531,6 +570,12 @@ export class StaffService {
    * Business) is deliberately never consulted here — a Secondary/linked Business grants no
    * Staff-management rights, even though it remains valid for other Bookly features. Forged
    * or unrelated businessId values are denied.
+   *
+   * 404 (never a bare 403) on every mismatch — nonexistent business and existing-business-
+   * owned-by-someone-else are intentionally indistinguishable, matching the anti-enumeration
+   * convention every other management surface (Client, Service, Addon, Booking) already
+   * follows. A forged businessId must never let a caller learn whether it belongs to someone
+   * else versus not existing at all.
    */
   private async requireOwnedStaffBusiness(
     actorUserId: string,
@@ -544,7 +589,7 @@ export class StaffService {
     }
 
     if (!business.ownerUserId.equals(actorUserId)) {
-      throw new StaffError("STAFF_BUSINESS_ACCESS_DENIED", 403);
+      throw new StaffError("STAFF_BUSINESS_NOT_FOUND", 404);
     }
 
     return business;

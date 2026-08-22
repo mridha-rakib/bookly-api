@@ -206,8 +206,15 @@ const serviceSchema = new Schema<ServiceDocument>(
 );
 
 // Catalogue list + ACTIVE/INACTIVE/ARCHIVED counts for one Business — the primary Services
-// page query.
-serviceSchema.index({ businessId: 1, status: 1 });
+// page query. Trailing createdAt matches listByBusinessId's actual sort (service.repository.ts
+// `.sort({ createdAt: -1 })`). For an explicit status equality (e.g. status: "ACTIVE") this
+// fully avoids both a collection scan and an in-memory sort. For the default "exclude
+// ARCHIVED" query (status: {$ne: "ARCHIVED"}) — confirmed via .explain() — only the
+// collection-scan elimination holds: a $ne on this index's middle field still requires an
+// in-memory sort stage, since MongoDB cannot deliver one sorted pass across the multiple
+// disjoint index sub-ranges a $ne spans. Still a real improvement (bounded to this Business's
+// own rows instead of the whole collection) even in that case.
+serviceSchema.index({ businessId: 1, status: 1, createdAt: -1 });
 // "Which Services reference this category" — used before allowing a category rename check
 // and by the picker's reverse lookup.
 serviceSchema.index({ businessId: 1, serviceCategoryId: 1 });

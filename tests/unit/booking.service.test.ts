@@ -5,6 +5,7 @@ import type { AddonRepository } from "../../src/modules/addons/addon.repository.
 import type { AddonServiceAssignmentDocument } from "../../src/modules/addons/addon-service-assignment.model.js";
 import type { AddonServiceAssignmentRepository } from "../../src/modules/addons/addon-service-assignment.repository.js";
 import type { BookingFulfilment } from "../../src/modules/booking/booking.model.js";
+import type { BookingRepository } from "../../src/modules/booking/booking.repository.js";
 import { BookingService } from "../../src/modules/booking/booking.service.js";
 import type { BusinessDocument } from "../../src/modules/business/business.model.js";
 import type { BusinessRepository } from "../../src/modules/business/business.repository.js";
@@ -128,6 +129,7 @@ const buildHarness = () => {
   const addonServiceAssignmentRepository = { findByServiceIds: vi.fn() };
   const clientRepository = { findById: vi.fn() };
   const businessRepository = { findById: vi.fn().mockResolvedValue(business) };
+  const bookingRepository = { findManyByBusinessIdInRange: vi.fn().mockResolvedValue([]) };
 
   const service = new BookingService(
     businessRepository as unknown as BusinessRepository,
@@ -136,6 +138,7 @@ const buildHarness = () => {
     addonRepository as unknown as AddonRepository,
     addonServiceAssignmentRepository as unknown as AddonServiceAssignmentRepository,
     clientRepository as unknown as ClientRepository,
+    bookingRepository as unknown as BookingRepository,
   );
 
   return {
@@ -148,6 +151,7 @@ const buildHarness = () => {
     addonServiceAssignmentRepository,
     clientRepository,
     businessRepository,
+    bookingRepository,
   };
 };
 
@@ -610,45 +614,111 @@ describe("BookingService.validateManualBookingHasNoBooklyFee", () => {
   });
 });
 
-describe("BookingService.calculatePlatformFeeCents", () => {
+describe("BookingService.calculateBookingDepositCents (Batch 6.5 — renamed from calculatePlatformFeeCents; same formula, corrected name)", () => {
   it("clamps small amounts to the €5 floor (rule M example: €10 -> €5)", () => {
     const { service } = buildHarness();
-    expect(service.calculatePlatformFeeCents(1000)).toBe(500);
+    expect(service.calculateBookingDepositCents(1000)).toBe(500);
   });
 
   it("applies the flat 20% in the middle of the range (rule M example: €100 -> €20)", () => {
     const { service } = buildHarness();
-    expect(service.calculatePlatformFeeCents(10_000)).toBe(2000);
+    expect(service.calculateBookingDepositCents(10_000)).toBe(2000);
   });
 
   it("clamps large amounts to the €35 ceiling (rule M example: €2,000 -> €35)", () => {
     const { service } = buildHarness();
-    expect(service.calculatePlatformFeeCents(200_000)).toBe(3500);
+    expect(service.calculateBookingDepositCents(200_000)).toBe(3500);
   });
 
   it("floors at exactly €5 for a zero-eligible basis", () => {
     const { service } = buildHarness();
-    expect(service.calculatePlatformFeeCents(0)).toBe(500);
+    expect(service.calculateBookingDepositCents(0)).toBe(500);
   });
 
   it("is exclusive of any travel fee by contract — callers must exclude it from the basis", () => {
     // This is a documentation-style test: the function has no travel-fee parameter at all, so
     // there is no way to accidentally include it — the exclusion is structural.
     const { service } = buildHarness();
-    expect(service.calculatePlatformFeeCents.length).toBe(1);
+    expect(service.calculateBookingDepositCents.length).toBe(1);
   });
 
   it("rejects a negative basis", () => {
     const { service } = buildHarness();
-    expect(() => service.calculatePlatformFeeCents(-1)).toThrow(
+    expect(() => service.calculateBookingDepositCents(-1)).toThrow(
       expect.objectContaining({ statusCode: 400 }),
     );
   });
 
   it("rejects a non-integer basis", () => {
     const { service } = buildHarness();
-    expect(() => service.calculatePlatformFeeCents(10.5)).toThrow(
+    expect(() => service.calculateBookingDepositCents(10.5)).toThrow(
       expect.objectContaining({ statusCode: 400 }),
+    );
+  });
+});
+
+describe("BookingService.requireBoundedRange (item 11)", () => {
+  it("accepts a same-day range", () => {
+    const { service } = buildHarness();
+    expect(() =>
+      service.requireBoundedRange(
+        new Date("2026-08-25T00:00:00.000Z"),
+        new Date("2026-08-25T23:59:59.000Z"),
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts a range at exactly the maximum width", () => {
+    const { service } = buildHarness();
+    const startAt = new Date("2026-01-01T00:00:00.000Z");
+    const endAt = new Date(startAt.getTime() + 366 * 24 * 60 * 60 * 1000);
+    expect(() => service.requireBoundedRange(startAt, endAt)).not.toThrow();
+  });
+
+  it("rejects a range wider than the maximum", () => {
+    const { service } = buildHarness();
+    const startAt = new Date("2026-01-01T00:00:00.000Z");
+    const endAt = new Date(startAt.getTime() + 367 * 24 * 60 * 60 * 1000);
+    expect(() => service.requireBoundedRange(startAt, endAt)).toThrow(
+      expect.objectContaining({ statusCode: 400 }),
+    );
+  });
+
+  it("rejects an inverted range (start at or after end)", () => {
+    const { service } = buildHarness();
+    const at = new Date("2026-08-25T00:00:00.000Z");
+    expect(() => service.requireBoundedRange(at, at)).toThrow(
+      expect.objectContaining({ statusCode: 400 }),
+    );
+    expect(() => service.requireBoundedRange(new Date(at.getTime() + 1000), at)).toThrow(
+      expect.objectContaining({ statusCode: 400 }),
+    );
+  });
+});
+
+describe("BookingService.findBookingsInRange (item 11)", () => {
+  it("validates the range before ever calling the repository", async () => {
+    const { service, business, bookingRepository } = buildHarness();
+    const at = new Date("2026-08-25T00:00:00.000Z");
+
+    await expect(service.findBookingsInRange(business, at, at)).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    expect(bookingRepository.findManyByBusinessIdInRange).not.toHaveBeenCalled();
+  });
+
+  it("defaults to excludeHistory: true for list reads, and delegates to the repository", async () => {
+    const { service, business, bookingRepository } = buildHarness();
+    const startAt = new Date("2026-08-25T00:00:00.000Z");
+    const endAt = new Date("2026-08-26T00:00:00.000Z");
+
+    await service.findBookingsInRange(business, startAt, endAt);
+
+    expect(bookingRepository.findManyByBusinessIdInRange).toHaveBeenCalledWith(
+      business._id,
+      startAt,
+      endAt,
+      { excludeHistory: true },
     );
   });
 });

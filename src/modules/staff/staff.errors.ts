@@ -2,7 +2,6 @@ import { AppError, type ErrorDetail } from "../../common/errors/app-error.js";
 
 const defaultMessages: Record<string, string> = {
   STAFF_BUSINESS_NOT_FOUND: "Business not found",
-  STAFF_BUSINESS_ACCESS_DENIED: "You do not have access to manage staff for this business",
   STAFF_NOT_FOUND: "Staff member not found",
   STAFF_EMAIL_ALREADY_EXISTS: "An account with this email already exists",
   STAFF_ROLE_NOT_ALLOWED: "That role cannot be assigned to a staff member",

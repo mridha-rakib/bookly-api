@@ -518,9 +518,7 @@ export class ServiceService {
     ];
 
     const [categories, memberships] = await Promise.all([
-      Promise.all(
-        categoryIds.map((id) => this.serviceCategoryRepository.findById(business._id, id)),
-      ),
+      this.serviceCategoryRepository.findManyByIdsForBusiness(business._id, categoryIds),
       this.staffRepository.findManyByIdsForBusiness(business._id, staffMembershipIds),
     ]);
 

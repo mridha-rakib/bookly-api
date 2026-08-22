@@ -33,6 +33,20 @@ export class ServiceCategoryRepository {
     return ServiceCategoryModel.findOne({ _id: categoryId, businessId }).exec();
   }
 
+  /** Batched category lookup for list-rendering call sites (Service/Addon toDtos) — one $in
+   * query regardless of how many distinct category ids are referenced, matching the
+   * findManyByIdsForBusiness convention already used by Service/Addon/StaffMembership. */
+  public async findManyByIdsForBusiness(
+    businessId: Types.ObjectId | string,
+    categoryIds: Array<Types.ObjectId | string>,
+  ): Promise<ServiceCategoryDocument[]> {
+    if (categoryIds.length === 0) {
+      return [];
+    }
+
+    return ServiceCategoryModel.find({ _id: { $in: categoryIds }, businessId }).exec();
+  }
+
   public async findActiveById(
     businessId: Types.ObjectId | string,
     categoryId: Types.ObjectId | string,

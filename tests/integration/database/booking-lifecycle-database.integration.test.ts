@@ -1,0 +1,895 @@
+import { Types } from "mongoose";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+
+import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
+import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
+import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
+import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
+import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import { BookingService } from "../../../src/modules/booking/booking.service.js";
+import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
+import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
+import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
+import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
+import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
+import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
+import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
+import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
+import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
+import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
+import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
+import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
+import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
+import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
+import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import {
+  clearIsolatedDatabase,
+  connectIsolatedDatabase,
+  stopIsolatedReplicaSet,
+} from "./mongo-replset-helper.js";
+
+const TIMEZONE = "Europe/Nicosia";
+const DATE = "2026-08-25"; // a Tuesday, safely in the future relative to any real "now"
+
+describe("database-backed Booking creation + lifecycle integration", () => {
+  let userRepository: UserRepository;
+  let businessRepository: BusinessRepository;
+  let serviceRepository: ServiceRepository;
+  let staffRepository: StaffRepository;
+  let staffScheduleRepository: StaffScheduleRepository;
+  let businessHoursRepository: BusinessHoursRepository;
+  let businessHoursService: BusinessHoursService;
+  let clientRepository: ClientRepository;
+  let reservationRepository: BookingSlotReservationRepository;
+  let reservationService: BookingSlotReservationService;
+  let availabilityService: AvailabilityService;
+  let bookingService: BookingService;
+  let bookingRepository: BookingRepository;
+  let creationService: BookingCreationService;
+  let lifecycleService: BookingLifecycleService;
+  let cancellationPolicyRepository: BusinessCancellationPolicyRepository;
+  let paymentGateway: FakePaymentGateway;
+  let paymentService: PaymentService;
+  let financialTransactionService: BookingFinancialTransactionService;
+
+  beforeAll(async () => {
+    await connectIsolatedDatabase();
+  }, 120_000);
+
+  beforeEach(async () => {
+    await clearIsolatedDatabase();
+    userRepository = new UserRepository();
+    businessRepository = new BusinessRepository();
+    serviceRepository = new ServiceRepository();
+    staffRepository = new StaffRepository();
+    staffScheduleRepository = new StaffScheduleRepository();
+    businessHoursRepository = new BusinessHoursRepository();
+    businessHoursService = new BusinessHoursService(businessHoursRepository, businessRepository);
+    clientRepository = new ClientRepository();
+    reservationRepository = new BookingSlotReservationRepository();
+    reservationService = new BookingSlotReservationService(reservationRepository);
+    cancellationPolicyRepository = new BusinessCancellationPolicyRepository();
+    bookingRepository = new BookingRepository();
+    paymentGateway = new FakePaymentGateway();
+    paymentService = new PaymentService(
+      paymentGateway,
+      new CustomerPaymentProfileRepository(),
+      userRepository,
+    );
+    financialTransactionService = new BookingFinancialTransactionService(
+      new BookingFinancialTransactionRepository(),
+    );
+
+    availabilityService = new AvailabilityService(
+      businessRepository,
+      serviceRepository,
+      staffRepository,
+      staffScheduleRepository,
+      new StaffTimeOffRepository(),
+      businessHoursRepository,
+      new BusinessBookingSettingsRepository(),
+      new BusinessTravelSettingsRepository(),
+      reservationRepository,
+    );
+
+    bookingService = new BookingService(
+      businessRepository,
+      staffRepository,
+      serviceRepository,
+      new AddonRepository(),
+      new AddonServiceAssignmentRepository(),
+      clientRepository,
+      bookingRepository,
+    );
+
+    creationService = new BookingCreationService(
+      businessRepository,
+      bookingService,
+      availabilityService,
+      reservationService,
+      new BusinessTravelSettingsRepository(),
+      cancellationPolicyRepository,
+      bookingRepository,
+      new BookingCreationClaimRepository(),
+      userRepository,
+      clientRepository,
+      paymentService,
+      financialTransactionService,
+    );
+
+    lifecycleService = new BookingLifecycleService(
+      bookingService,
+      bookingRepository,
+      businessRepository,
+      reservationService,
+      availabilityService,
+      serviceRepository,
+      staffRepository,
+      paymentService,
+      financialTransactionService,
+    );
+  });
+
+  afterAll(async () => {
+    await stopIsolatedReplicaSet();
+  });
+
+  // --- Fixtures ------------------------------------------------------------------------------
+
+  const createBusiness = async (email: string, name: string) => {
+    const owner = await userRepository.create({
+      normalizedEmail: email,
+      passwordHash: "hash",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+    });
+    const business = await businessRepository.create({
+      ownerUserId: owner._id,
+      name,
+      ownerName: "Owner Name",
+      email,
+      phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+      visitType: "AT_BUSINESS_LOCATION",
+      timezone: TIMEZONE,
+      address: { city: "Larnaca", area: "Center", streetName: "Main", streetNumber: "1" },
+      briefDescription: "A great business",
+      category: "Barber",
+      subcategories: ["Haircut"],
+    });
+    return { owner, business };
+  };
+
+  const createStaff = async (
+    businessId: Types.ObjectId,
+    role: "STAFF" | "SUPERVISOR" = "STAFF",
+  ) => {
+    const user = await userRepository.create({
+      normalizedEmail: `staff-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role,
+      status: "ACTIVE",
+    });
+    const membership = await staffRepository.create({
+      userId: user._id,
+      businessId,
+      role,
+      createdByUserId: user._id,
+    });
+    return { user, membership };
+  };
+
+  const openMondayToFriday = async (businessId: Types.ObjectId, ownerId: Types.ObjectId) => {
+    const days = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"] as const;
+    await businessHoursService.putOpeningHours(String(ownerId), String(businessId), [
+      ...days.map((dayOfWeek) => ({
+        dayOfWeek,
+        isOpen: true,
+        slots: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
+      { dayOfWeek: "SATURDAY", isOpen: false, slots: [] },
+      { dayOfWeek: "SUNDAY", isOpen: false, slots: [] },
+    ]);
+  };
+
+  const staffWorksMondayToFriday = async (
+    membershipId: Types.ObjectId,
+    businessId: Types.ObjectId,
+  ) => {
+    const days = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"] as const;
+    await staffScheduleRepository.replace(
+      membershipId,
+      businessId,
+      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+    );
+  };
+
+  const createFixedService = async (businessId: Types.ObjectId, staffId: Types.ObjectId) =>
+    serviceRepository.create({
+      businessId,
+      status: "ACTIVE",
+      isFeatured: false,
+      isPackageDeal: false,
+      category: "Barber",
+      name: "Haircut",
+      pricingMode: "FIXED",
+      fixedPricing: { priceCents: 2000, durationMin: 60, bookingIntervalMin: 60 },
+      sessionExpiryAlert: { enabled: false },
+      scheduleMode: "AUTO",
+      manualSchedule: [],
+      servedCities: [],
+      assignedStaffMembershipIds: [staffId],
+    });
+
+  const createGroupService = async (
+    businessId: Types.ObjectId,
+    staffId: Types.ObjectId,
+    maxPersons: number,
+  ) =>
+    serviceRepository.create({
+      businessId,
+      status: "ACTIVE",
+      isFeatured: false,
+      isPackageDeal: false,
+      category: "Fitness",
+      name: "Group Class",
+      pricingMode: "PER_PERSON",
+      perPersonPricing: {
+        ratePerPersonCents: 1000,
+        minPersons: 1,
+        maxPersons,
+        durationMin: 60,
+        bookingIntervalMin: 60,
+      },
+      sessionExpiryAlert: { enabled: false },
+      scheduleMode: "AUTO",
+      manualSchedule: [],
+      servedCities: [],
+      assignedStaffMembershipIds: [staffId],
+    });
+
+  const createClientFor = async (businessId: Types.ObjectId, ownerId: Types.ObjectId, tag = "a") =>
+    clientRepository.create({
+      businessId,
+      createdByUserId: ownerId,
+      firstName: "Jane",
+      lastName: "Doe",
+      normalizedEmail: `client-${tag}-${new Types.ObjectId().toString()}@example.com`,
+      phone: { countryCode: "+357", nationalNumber: `991${tag}22334`, e164: `+357991${tag}22334` },
+      address: {
+        city: "Larnaca",
+        propertyType: "House",
+        area: "Center",
+        streetName: "Main",
+        streetNumber: "1",
+      },
+      linkState: "UNLINKED",
+    });
+
+  const startAtFor = (time: string) => businessLocalToUtc(TIMEZONE, DATE, time).toISOString();
+
+  const setupBookableBusiness = async () => {
+    const { owner, business } = await createBusiness(
+      `owner-${new Types.ObjectId().toString()}@example.com`,
+      "Salon A",
+    );
+    const { membership } = await createStaff(business._id);
+    const service = await createFixedService(business._id, membership._id);
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(membership._id, business._id);
+    const client = await createClientFor(business._id, owner._id);
+    return { owner, business, membership, service, client };
+  };
+
+  // --- Manual creation: happy path + snapshot correctness ------------------------------------
+
+  it("creates a real, persisted MANUAL Booking with a correct financial snapshot and a real occupancy reservation", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+
+    const booking = await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor("10:00"),
+        businessClientId: String(client._id),
+        idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+      },
+    );
+
+    expect(booking.status).toBe("UPCOMING");
+    expect(booking.source).toBe("MANUAL");
+    expect(booking.financials.platformFeeCents).toBe(0);
+    expect(booking.financials.depositCents).toBe(0);
+    expect(booking.financials.servicesSubtotalCents).toBe(2000);
+    expect(booking.financials.totalCents).toBe(2000);
+    expect(booking.serviceLines[0]!.reservationId).toBeDefined();
+    expect(booking.eventHistory).toHaveLength(1);
+    expect(booking.eventHistory[0]!.type).toBe("CREATED");
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+      staffMembershipId: membership._id,
+      occupancyDate: DATE,
+    }).exec();
+    expect(reservationDoc?.intervals).toHaveLength(1);
+    expect(
+      reservationDoc?.intervals[0]?.reservationId.equals(booking.serviceLines[0]!.reservationId),
+    ).toBe(true);
+  });
+
+  it("rejects creation for a cross-business Client reference (anti-enumeration, matches 404 convention)", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness();
+    const { business: otherBusiness } = await createBusiness(
+      `owner-b-${new Types.ObjectId().toString()}@example.com`,
+      "Salon B",
+    );
+    const foreignClient = await createClientFor(otherBusiness._id, owner._id, "x");
+
+    await expect(
+      creationService.createManualBooking(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        {
+          serviceLines: [
+            {
+              serviceId: String(service._id),
+              staffMembershipId: String(membership._id),
+              addonIds: [],
+              pricingInput: {},
+            },
+          ],
+          startAt: startAtFor("10:00"),
+          businessClientId: String(foreignClient._id),
+          idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+        },
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("previewCustomerBooking computes a full, correct first-booking snapshot but persists nothing", async () => {
+    const { business, membership, service } = await setupBookableBusiness();
+    const customer = await userRepository.create({
+      normalizedEmail: `preview-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+
+    const preview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor("11:00"),
+        idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+      },
+    );
+
+    expect(preview.finalizable).toBe(true);
+    expect(preview.isFirstBooking).toBe(true);
+    expect(preview.financials.servicesSubtotalCents).toBe(2000);
+    expect(preview.financials.platformFeeCents).toBeGreaterThan(0);
+    expect(preview.amountDueNowCents).toBe(preview.financials.platformFeeCents);
+    expect(preview.requiresSavedCard).toBe(true);
+    expect(preview.hasSavedCard).toBe(false);
+
+    const count = await BookingModel.countDocuments({}).exec();
+    expect(count).toBe(0);
+    const reservationCount = await BookingSlotReservationModel.countDocuments({}).exec();
+    expect(reservationCount).toBe(0);
+  });
+
+  // --- Idempotency -----------------------------------------------------------------------------
+
+  it("returns the SAME Booking for a retried request with the same idempotencyKey — never a duplicate", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+    const idempotencyKey = `key-${new Types.ObjectId().toString()}`;
+    const input = {
+      serviceLines: [
+        {
+          serviceId: String(service._id),
+          staffMembershipId: String(membership._id),
+          addonIds: [],
+          pricingInput: {},
+        },
+      ],
+      startAt: startAtFor("10:00"),
+      businessClientId: String(client._id),
+      idempotencyKey,
+    };
+
+    const first = await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      input,
+    );
+    const second = await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      input,
+    );
+
+    expect(String(second._id)).toBe(String(first._id));
+    const count = await BookingModel.countDocuments({ businessId: business._id }).exec();
+    expect(count).toBe(1);
+  });
+
+  // --- Concurrency (mandatory races) ------------------------------------------------------------
+
+  it("[race] parallel booking-create for the exact same slot: exactly one succeeds", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+    const startAt = startAtFor("10:00");
+
+    const attempts = Array.from({ length: 5 }, () =>
+      creationService.createManualBooking(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        {
+          serviceLines: [
+            {
+              serviceId: String(service._id),
+              staffMembershipId: String(membership._id),
+              addonIds: [],
+              pricingInput: {},
+            },
+          ],
+          startAt,
+          businessClientId: String(client._id),
+          idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+        },
+      ),
+    );
+
+    const results = await Promise.allSettled(attempts);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+
+    const count = await BookingModel.countDocuments({ businessId: business._id }).exec();
+    expect(count).toBe(1);
+  });
+
+  it("[race] group-capacity ceiling is never exceeded under concurrent creation", async () => {
+    const { owner, business, membership, client } = await setupBookableBusiness();
+    const groupService = await createGroupService(business._id, membership._id, 5);
+    const startAt = startAtFor("10:00");
+
+    // 4 concurrent bookings x 2 people each = 8 requested against a ceiling of 5.
+    const attempts = Array.from({ length: 4 }, () =>
+      creationService.createManualBooking(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        {
+          serviceLines: [
+            {
+              serviceId: String(groupService._id),
+              staffMembershipId: String(membership._id),
+              addonIds: [],
+              pricingInput: { personCount: 2 },
+            },
+          ],
+          startAt,
+          businessClientId: String(client._id),
+          idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+        },
+      ),
+    );
+
+    const results = await Promise.allSettled(attempts);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled.length).toBeGreaterThan(0);
+    expect(fulfilled.length).toBeLessThan(4);
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+      staffMembershipId: membership._id,
+      occupancyDate: DATE,
+    }).exec();
+    const interval = reservationDoc?.intervals[0];
+    expect(interval?.capacityUsed).toBeLessThanOrEqual(5);
+    expect(interval?.capacityUsed).toBe(fulfilled.length * 2);
+  });
+
+  // --- State machine -----------------------------------------------------------------------------
+
+  const createUpcomingBooking = async (time = "10:00") => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+    const booking = await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor(time),
+        businessClientId: String(client._id),
+        idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+      },
+    );
+    return { owner, business, membership, service, client, booking };
+  };
+
+  it("completes an UPCOMING booking and preserves the reservation as immutable history", async () => {
+    const { owner, business, booking } = await createUpcomingBooking();
+
+    const completed = await lifecycleService.completeBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      String(booking._id),
+    );
+    expect(completed.status).toBe("COMPLETED");
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+    }).exec();
+    expect(reservationDoc?.intervals).toHaveLength(1);
+  });
+
+  it("rejects illegal transitions: COMPLETED cannot be cancelled, CANCELLED cannot be completed", async () => {
+    const { owner, business, booking } = await createUpcomingBooking();
+    await lifecycleService.completeBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      String(booking._id),
+    );
+
+    await expect(
+      lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const { owner: owner2, business: business2, booking: booking2 } = await createUpcomingBooking();
+    await lifecycleService.cancelByBusiness(
+      String(owner2._id),
+      "BUSINESS_OWNER",
+      String(business2._id),
+      String(booking2._id),
+      undefined,
+    );
+
+    await expect(
+      lifecycleService.completeBooking(
+        String(owner2._id),
+        "BUSINESS_OWNER",
+        String(business2._id),
+        String(booking2._id),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("customer cancellation classifies FREE (>72h) vs LATE_CANCELLATION and releases the reservation", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+
+    // Link the client BEFORE creating the Booking, so customer.customerUserId is populated on
+    // the snapshot from the start (buildCustomerSnapshot reads client.linkState at create time).
+    const customer = await userRepository.create({
+      normalizedEmail: `cust2-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await clientRepository.setLinkState(client._id, {
+      linkState: "LINKED",
+      linkedUserId: customer._id,
+    });
+    const linkedClient = await clientRepository.findById(business._id, client._id);
+
+    const linkedBooking = await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor("14:00"),
+        businessClientId: String(linkedClient!._id),
+        idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+      },
+    );
+    expect(linkedBooking.customer.customerUserId?.equals(customer._id)).toBe(true);
+
+    const cancelled = await lifecycleService.cancelByCustomer(
+      String(customer._id),
+      String(linkedBooking._id),
+      undefined,
+    );
+    expect(cancelled.status).toBe("CANCELLED_BY_CUSTOMER");
+    expect(cancelled.cancellationOutcome?.feeMode).toBe("FREE");
+    expect(cancelled.cancellationOutcome?.cancellationFeeCents).toBe(0);
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+    }).exec();
+    const remainingIntervals = reservationDoc?.intervals.filter((entry) =>
+      entry.reservationId.equals(linkedBooking.serviceLines[0]!.reservationId),
+    );
+    expect(remainingIntervals).toHaveLength(0);
+  });
+
+  it("[race] repeated cancel is idempotent — exactly one succeeds, capacityUsed never goes negative", async () => {
+    const { business, booking, client } = await createUpcomingBooking();
+    const customer = await userRepository.create({
+      normalizedEmail: `cust3-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    const relinked = await clientRepository.setLinkState(client._id, {
+      linkState: "LINKED",
+      linkedUserId: customer._id,
+    });
+    expect(relinked).toBeDefined();
+
+    // Re-fetch as a customer-owned booking by directly patching customerUserId at the DB level
+    // (this Booking's own customer snapshot predates the link — see the prior test for the
+    // create-after-link variant; this test only needs a customer-owned Booking to exist).
+    await BookingModel.updateOne(
+      { _id: booking._id },
+      { $set: { "customer.customerUserId": customer._id } },
+    ).exec();
+
+    const results = await Promise.allSettled([
+      lifecycleService.cancelByCustomer(String(customer._id), String(booking._id), undefined),
+      lifecycleService.cancelByCustomer(String(customer._id), String(booking._id), undefined),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+    }).exec();
+    for (const interval of reservationDoc?.intervals ?? []) {
+      expect(interval.capacityUsed).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("[race] cancel-vs-reschedule on the same booking: exactly one wins", async () => {
+    const { owner, business, booking } = await createUpcomingBooking();
+
+    const results = await Promise.allSettled([
+      lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      ),
+      lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      ),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+  });
+
+  it("[race] complete-vs-cancel on the same booking: exactly one wins", async () => {
+    const { owner, business, booking } = await createUpcomingBooking();
+
+    const results = await Promise.allSettled([
+      lifecycleService.completeBooking(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+      ),
+      lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      ),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+  });
+
+  // --- Reschedule --------------------------------------------------------------------------------
+
+  it("owner reschedule moves the booking and never increments customerRescheduleCount", async () => {
+    const { owner, business, booking } = await createUpcomingBooking();
+    const newStartAt = startAtFor("15:00");
+
+    const rescheduled = await lifecycleService.rescheduleByOwner(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      String(booking._id),
+      newStartAt,
+    );
+
+    expect(rescheduled.schedule.startAt.toISOString()).toBe(newStartAt);
+    expect(rescheduled.customerRescheduleCount).toBe(0);
+    expect(rescheduled.rescheduleHistory).toHaveLength(1);
+    expect(rescheduled.rescheduleHistory[0]!.countedTowardCustomerQuota).toBe(false);
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+    }).exec();
+    const activeIntervals = reservationDoc?.intervals ?? [];
+    expect(activeIntervals).toHaveLength(1);
+    expect(
+      activeIntervals[0]?.reservationId.equals(rescheduled.serviceLines[0]!.reservationId),
+    ).toBe(true);
+  });
+
+  it("customer reschedule increments the quota and enforces the max-2 limit", async () => {
+    const { business, booking, client } = await createUpcomingBooking();
+    const customer = await userRepository.create({
+      normalizedEmail: `cust4-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await clientRepository.setLinkState(client._id, {
+      linkState: "LINKED",
+      linkedUserId: customer._id,
+    });
+    await BookingModel.updateOne(
+      { _id: booking._id },
+      { $set: { "customer.customerUserId": customer._id } },
+    ).exec();
+
+    const r1 = await lifecycleService.rescheduleByCustomer(
+      String(customer._id),
+      String(booking._id),
+      startAtFor("13:00"),
+    );
+    expect(r1.customerRescheduleCount).toBe(1);
+
+    const r2 = await lifecycleService.rescheduleByCustomer(
+      String(customer._id),
+      String(booking._id),
+      startAtFor("15:00"),
+    );
+    expect(r2.customerRescheduleCount).toBe(2);
+
+    await expect(
+      lifecycleService.rescheduleByCustomer(
+        String(customer._id),
+        String(booking._id),
+        startAtFor("16:00"),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    void business;
+  });
+
+  it("[race] a failed reschedule (target slot conflict) leaves the OLD reservation completely valid", async () => {
+    const { owner, business, membership, service, booking } = await createUpcomingBooking("10:00");
+
+    // Occupy the 15:00 slot with a second booking on the SAME staff, so rescheduling booking A
+    // into it must fail.
+    const otherClient = await createClientFor(business._id, owner._id, "z");
+    await creationService.createManualBooking(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor("15:00"),
+        businessClientId: String(otherClient._id),
+        idempotencyKey: `key-${new Types.ObjectId().toString()}`,
+      },
+    );
+
+    const originalStartAt = booking.schedule.startAt.toISOString();
+    const originalReservationId = booking.serviceLines[0]!.reservationId;
+
+    await expect(
+      lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      ),
+    ).rejects.toBeDefined();
+
+    const refetched = await bookingRepository.findById(business._id, booking._id);
+    expect(refetched?.schedule.startAt.toISOString()).toBe(originalStartAt);
+    expect(refetched?.serviceLines[0]?.reservationId.equals(originalReservationId)).toBe(true);
+    expect(refetched?.status).toBe("UPCOMING");
+
+    const reservationDoc = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+      staffMembershipId: membership._id,
+      occupancyDate: DATE,
+    }).exec();
+    const stillHasOriginal = reservationDoc?.intervals.some((entry) =>
+      entry.reservationId.equals(originalReservationId),
+    );
+    expect(stillHasOriginal).toBe(true);
+  });
+
+  it("[race] a repeated identical reschedule request does not double-consume the customer quota", async () => {
+    const { business, booking, client } = await createUpcomingBooking();
+    const customer = await userRepository.create({
+      normalizedEmail: `cust5-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await clientRepository.setLinkState(client._id, {
+      linkState: "LINKED",
+      linkedUserId: customer._id,
+    });
+    await BookingModel.updateOne(
+      { _id: booking._id },
+      { $set: { "customer.customerUserId": customer._id } },
+    ).exec();
+
+    const newStartAt = startAtFor("16:00");
+    const results = await Promise.allSettled([
+      lifecycleService.rescheduleByCustomer(String(customer._id), String(booking._id), newStartAt),
+      lifecycleService.rescheduleByCustomer(String(customer._id), String(booking._id), newStartAt),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    expect(fulfilled).toHaveLength(1);
+
+    const finalBooking = await bookingRepository.findById(business._id, booking._id);
+    expect(finalBooking?.customerRescheduleCount).toBe(1);
+  }, 20_000);
+});

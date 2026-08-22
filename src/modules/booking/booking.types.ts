@@ -47,8 +47,19 @@ export type BookingStatus = (typeof bookingStatuses)[number];
 export const bookingServiceLinePricingModes = ["FIXED", "HOURLY", "PER_PERSON", "PACKAGE"] as const;
 export type BookingServiceLinePricingMode = (typeof bookingServiceLinePricingModes)[number];
 
-/** Booking-level audit-history entry types (confirmed rule P). */
-export const bookingEventTypes = ["CREATED", "STATUS_CHANGED", "RESCHEDULED"] as const;
+/** Booking-level audit-history entry types (confirmed rule P). FEE_WAIVED added Batch 5 for the
+ * explicit business-owner "Waive Fee" action (see BookingLifecycleService.waiveFee) — distinct
+ * from STATUS_CHANGED because waiving a LATE_CANCELLATION's fee never changes `status` (only
+ * `cancellationOutcome.settlementStatus`), so a previousStatus/nextStatus pair would be
+ * misleading; the no-show waive branch (which DOES change status, PENDING -> NO_SHOW_WAIVED)
+ * also uses this type for consistency — one event type for "a fee obligation was explicitly
+ * waived", regardless of whether it happened to co-occur with a status change. */
+export const bookingEventTypes = [
+  "CREATED",
+  "STATUS_CHANGED",
+  "RESCHEDULED",
+  "FEE_WAIVED",
+] as const;
 export type BookingEventType = (typeof bookingEventTypes)[number];
 
 /**
@@ -62,8 +73,36 @@ export type BookingCurrency = (typeof bookingCurrencies)[number];
 /** Maximum successful CUSTOMER-initiated reschedules per Booking (confirmed rule O). */
 export const MAX_CUSTOMER_RESCHEDULE_COUNT = 2;
 
-/** Bookly's first-booking platform fee formula inputs (confirmed rule M). Percentage of the
- * eligible basis, clamped between a floor and a ceiling — not a Business-configurable value. */
-export const PLATFORM_FEE_PERCENT = 0.2;
-export const PLATFORM_FEE_MIN_CENTS = 500;
-export const PLATFORM_FEE_MAX_CENTS = 3500;
+/**
+ * The authoritative no-show resolution window (confirmed rule): once an authorized
+ * business-side user explicitly marks a customer as no-show, this many minutes elapse before
+ * a later background worker must resolve it (charge/waive/cancel) if no one has already done
+ * so manually. No-show never starts automatically for a Booking — see BookingDocument's
+ * noShowStartedAt/noShowDeadlineAt doc comment. This constant is the single source of truth
+ * for that duration; a future worker/service must read it from here, never re-hardcode 90.
+ */
+export const NO_SHOW_RESOLUTION_WINDOW_MINUTES = 90;
+
+/**
+ * The maximum width a Business date-range query (the future Calendar/All Bookings read path)
+ * may span in one call — a domain-level guard, not a UX preference, so an unbounded query can
+ * never silently reach production regardless of what any particular UI happens to request.
+ * ~1 year: wide enough for any legitimate calendar view (day/week/month/quarter/year), never
+ * "all of history."
+ */
+export const MAX_BOOKING_RANGE_DAYS = 366;
+
+/**
+ * Batch 6.5 correction: this is the BOOKING DEPOSIT formula (confirmed rule M), NOT a
+ * "platform fee" formula — clamp(20% of the eligible basis, €5, €35). It is charged online for
+ * EVERY BOOKLY_MANAGED booking (first or returning). Whether Bookly economically keeps that
+ * deposit as platform/activation revenue (first booking) or the Business keeps it as an
+ * already-collected service prepayment (returning booking) is a SEPARATE decision — see
+ * booking-creation.service.ts's assembleFinancials, which derives `platformFeeCents` from this
+ * same deposit amount rather than computing a second, independent figure. Previously named
+ * PLATFORM_FEE_*, back when deposit and platform fee were (incorrectly) assumed to always be the
+ * same field — see BookingService.calculateBookingDepositCents's own doc comment for the full
+ * correction. Not a Business-configurable value either way. */
+export const DEPOSIT_PERCENT = 0.2;
+export const DEPOSIT_MIN_CENTS = 500;
+export const DEPOSIT_MAX_CENTS = 3500;

@@ -16,6 +16,7 @@ import { HealthController } from "../modules/health/health.controller.js";
 import { HealthRepository } from "../modules/health/health.repository.js";
 import { createLivenessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
+import { createStripeWebhookRoute } from "../modules/stripe-webhook/stripe-webhook.route.js";
 import { createApiRouter } from "../routes/api-router.js";
 
 export class ExpressApplication {
@@ -34,6 +35,14 @@ export class ExpressApplication {
     this.app.use(helmet());
     this.app.use(this.createCorsMiddleware());
     this.app.use(compression());
+
+    // MUST be mounted before express.json() below — Stripe webhook signature verification
+    // needs the exact raw request bytes (see stripe-webhook.route.ts's own comment). This is
+    // the one deliberate exception to "every route goes through createApiRouter" in this
+    // codebase; every other route is completely unaffected.
+    const apiPrefix = `/api/${env.API_VERSION}`;
+    this.app.use(`${apiPrefix}/payments/webhooks`, createStripeWebhookRoute());
+
     this.app.use(express.json({ limit: "1mb" }));
     this.app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
@@ -41,8 +50,6 @@ export class ExpressApplication {
     this.app.use("/health", createLivenessHealthRoute(healthController));
 
     this.registerDocumentationRoutes();
-
-    const apiPrefix = `/api/${env.API_VERSION}`;
     this.app.use(apiPrefix, this.createRateLimiter(), createApiRouter(this.databaseStateReader));
 
     this.app.use(notFoundMiddleware);

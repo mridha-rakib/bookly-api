@@ -32,8 +32,10 @@ const serviceCategorySchema = new Schema<ServiceCategoryDocument>(
 // A Business may not have two categories with the same name (case-insensitive), including
 // against an archived one — reactivating/renaming is the intended path, not a duplicate.
 serviceCategorySchema.index({ businessId: 1, nameKey: 1 }, { unique: true });
-// Service-creation picker: active categories for one Business, newest first.
-serviceCategorySchema.index({ businessId: 1, active: 1 });
+// Service-creation picker: active categories for one Business, newest first. Trailing
+// createdAt matches listByBusinessId's actual sort (service-category.repository.ts
+// `.sort({ createdAt: -1 })`) so the list never falls back to an in-memory sort.
+serviceCategorySchema.index({ businessId: 1, active: 1, createdAt: -1 });
 
 export const ServiceCategoryModel = model<ServiceCategoryDocument>(
   "ServiceCategory",

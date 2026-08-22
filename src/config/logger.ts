@@ -83,6 +83,21 @@ const redactPaths = [
   "*.MINIO_ROOT_USER",
   "MINIO_ROOT_PASSWORD",
   "*.MINIO_ROOT_PASSWORD",
+  "STRIPE_SECRET_KEY",
+  "*.STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "*.STRIPE_WEBHOOK_SECRET",
+  // Raw card data must never reach this codebase at all (Stripe Elements tokenizes in the
+  // browser — see the payment module's own doc comment), but these paths are redacted
+  // defensively in case a future caller ever logs a Stripe SDK request/response object whole.
+  "cardNumber",
+  "*.cardNumber",
+  "cvc",
+  "*.cvc",
+  "cvv",
+  "*.cvv",
+  "number",
+  "*.number",
 ];
 
 const loggerOptions: LoggerOptions = {

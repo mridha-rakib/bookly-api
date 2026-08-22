@@ -1,7 +1,7 @@
 import express from "express";
 import mongoose, { type Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import {
@@ -194,6 +194,44 @@ describe("database-backed StaffMembership integration", () => {
     expect(userIdIndex?.partialFilterExpression).toEqual({ removedAt: { $eq: null } });
   });
 
+  it("findActiveByUserId uses the partial {userId} index (query shape matches the partial filter), not a collection scan", async () => {
+    const { user: owner, business } = await createBusinessOwner(
+      "owner-a@example.com",
+      "Business A",
+    );
+    const created = await staffService.createStaff(String(owner._id), String(business._id), {
+      name: "Vivi M",
+      email: "vivi@example.com",
+      role: "SUPERVISOR",
+    });
+
+    const explanation = (await StaffMembershipModel.findOne({
+      userId: created.userId,
+      removedAt: null,
+    })
+      .explain("executionStats")
+      .then((result) => result)) as {
+      executionStats?: { executionStages?: { stage?: string; inputStage?: { stage?: string } } };
+    };
+
+    const stages = [
+      explanation.executionStats?.executionStages?.stage,
+      explanation.executionStats?.executionStages?.inputStage?.stage,
+    ];
+    expect(stages).not.toContain("COLLSCAN");
+    expect(stages.some((stage) => stage === "IXSCAN" || stage === "FETCH")).toBe(true);
+
+    // The repository's fixed query and the old `{$exists: false}` shape return the identical
+    // row — proving this was purely a query-plan improvement, never a behavior change.
+    const viaRepository = await staffRepository.findActiveByUserId(created.userId);
+    const viaOldExistsShape = await StaffMembershipModel.findOne({
+      userId: created.userId,
+      removedAt: { $exists: false },
+    }).exec();
+    expect(String(viaRepository?._id)).toBe(String(created.membershipId));
+    expect(String(viaOldExistsShape?._id)).toBe(String(created.membershipId));
+  });
+
   // --- Creation: owned-Business-only authorization ------------------------
 
   it("allows the owner to create SUPERVISOR and STAFF for their own Business", async () => {
@@ -241,7 +279,7 @@ describe("database-backed StaffMembership integration", () => {
         email: "nikos@example.com",
         role: "STAFF",
       }),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
     expect(await StaffMembershipModel.countDocuments({ businessId: businessB._id })).toBe(0);
 
     // Business B's real owner is unaffected and can still create/manage its Staff normally.
@@ -265,7 +303,7 @@ describe("database-backed StaffMembership integration", () => {
         email: "nobody@example.com",
         role: "STAFF",
       }),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
 
     await businessAccessRepository.create({ userId: ownerA._id, businessId: businessB._id });
     await businessAccessRepository.deleteByUserAndBusiness(ownerA._id, businessB._id);
@@ -276,7 +314,7 @@ describe("database-backed StaffMembership integration", () => {
         email: "still-nobody@example.com",
         role: "STAFF",
       }),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
     expect(await StaffMembershipModel.countDocuments()).toBe(0);
   });
 
@@ -434,6 +472,38 @@ describe("database-backed StaffMembership integration", () => {
     expect((await UserModel.findById(created.userId).orFail()).role).toBe("SUPERVISOR");
   });
 
+  it("rolls back StaffMembership.role if the paired User.role write fails mid-transaction — no split-brain", async () => {
+    const { user: owner, business } = await createBusinessOwner(
+      "owner-a@example.com",
+      "Business A",
+    );
+    const created = await staffService.createStaff(String(owner._id), String(business._id), {
+      name: "Rollback Test",
+      email: "rollback@example.com",
+      role: "STAFF",
+    });
+
+    const updateRoleSpy = vi
+      .spyOn(userRepository, "updateRole")
+      .mockRejectedValueOnce(new Error("simulated mid-transaction failure"));
+
+    await expect(
+      staffService.updateStaff(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(created),
+        { role: "SUPERVISOR" },
+      ),
+    ).rejects.toThrow("simulated mid-transaction failure");
+
+    // Neither write took effect — StaffMembership.role must not have moved without User.role
+    // moving with it (the exact split-brain this transaction exists to prevent).
+    expect((await StaffMembershipModel.findById(created.membershipId).orFail()).role).toBe("STAFF");
+    expect((await UserModel.findById(created.userId).orFail()).role).toBe("STAFF");
+
+    updateRoleSpy.mockRestore();
+  });
+
   // --- One-Business-per-Staff invariant ----------------------------------------------
 
   it("cannot attach the same Staff identity to a second Business", async () => {
@@ -571,7 +641,7 @@ describe("database-backed StaffMembership integration", () => {
         email: "linked-staff@example.com",
         role: "STAFF",
       }),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
 
     // ...exactly as BusinessMedia (a different domain, untouched by this phase) already did —
     // both now recognize ownership only, never BusinessAccess, for mutating operations.
@@ -728,21 +798,21 @@ describe("database-backed StaffMembership integration", () => {
       // listing and creating are both denied, identically to a wholly unrelated Business.
       await expect(
         staffService.listStaff(String(owner._id), String(linkedA._id)),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
       await expect(
         staffService.createStaff(String(owner._id), String(linkedA._id), {
           name: "Linked Staff",
           email: "linked-staff@example.com",
           role: "STAFF",
         }),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
 
       await expect(
         staffService.listStaff(String(owner._id), String(unrelated._id)),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
     });
 
-    it("rejects a forged unrelated businessId at the real HTTP boundary", async () => {
+    it("rejects a forged unrelated businessId at the real HTTP boundary — 404, indistinguishable from a nonexistent business", async () => {
       const { user: owner } = await createBusinessOwner("owner-a@example.com", "Primary Business");
       const { business: unrelated } = await createBusinessOwner("owner-c@example.com", "Unrelated");
       const app = buildStaffApp();
@@ -751,7 +821,13 @@ describe("database-backed StaffMembership integration", () => {
       const response = await request(app)
         .get(`/businesses/${unrelated._id}/staff`)
         .set("Authorization", token);
-      expect(response.status).toBe(403);
+      expect(response.status).toBe(404);
+
+      const nonexistentResponse = await request(app)
+        .get(`/businesses/000000000000000000000000/staff`)
+        .set("Authorization", token);
+      expect(nonexistentResponse.status).toBe(404);
+      expect(nonexistentResponse.body).toEqual(response.body);
     });
   });
 
@@ -989,7 +1065,7 @@ describe("database-backed StaffMembership integration", () => {
           requireMembershipId(linkedStaff),
           { days: [{ dayOfWeek: "FRIDAY", startTime: "12:00", endTime: "20:00" }] },
         ),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
 
       const schedule = await staffService.putSchedule(
         String(ownerB._id),
@@ -1024,7 +1100,7 @@ describe("database-backed StaffMembership integration", () => {
             days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
           },
         ),
-      ).rejects.toMatchObject({ statusCode: 403 }); // ownerA does not manage businessB at all
+      ).rejects.toMatchObject({ statusCode: 404 }); // ownerA does not manage businessB at all
     });
 
     it("includes real schedule data (not fake) in the Staff list, and the Owner row has none", async () => {
@@ -1197,7 +1273,7 @@ describe("database-backed StaffMembership integration", () => {
           email: "timeoff-linked@example.com",
           role: "STAFF",
         }),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
 
       await staffService.createTimeOff(
         String(owner._id),
@@ -1231,7 +1307,7 @@ describe("database-backed StaffMembership integration", () => {
           String(businessB._id),
           requireMembershipId(staffA),
         ),
-      ).rejects.toMatchObject({ statusCode: 403 });
+      ).rejects.toMatchObject({ statusCode: 404 });
     });
 
     it("Remove wires to a real delete: disappears after removal and does not survive reload", async () => {

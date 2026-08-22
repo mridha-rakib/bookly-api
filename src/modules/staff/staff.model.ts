@@ -51,7 +51,9 @@ staffMembershipSchema.index(
 );
 
 // Staff list screen: fetch all active memberships for a business in one bounded query.
-staffMembershipSchema.index({ businessId: 1, removedAt: 1 });
+// Trailing createdAt matches listActiveByBusinessId's actual sort (staff.repository.ts
+// `.sort({ createdAt: -1 })`) so the list never falls back to an in-memory sort.
+staffMembershipSchema.index({ businessId: 1, removedAt: 1, createdAt: -1 });
 
 export const StaffMembershipModel = model<StaffMembershipDocument>(
   "StaffMembership",
