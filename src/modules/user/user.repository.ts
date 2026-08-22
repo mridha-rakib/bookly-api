@@ -66,8 +66,16 @@ export class UserRepository {
     return UserProfileModel.find({ userId: { $in: userIds } }).exec();
   }
 
-  public async updateRole(userId: Types.ObjectId, role: UserRole): Promise<void> {
-    await UserModel.updateOne({ _id: userId }, { $set: { role } });
+  public async updateRole(
+    userId: Types.ObjectId,
+    role: UserRole,
+    session?: ClientSession,
+  ): Promise<void> {
+    await UserModel.updateOne(
+      { _id: userId },
+      { $set: { role } },
+      session ? { session } : undefined,
+    );
   }
 
   public async updateEmail(userId: Types.ObjectId, normalizedEmail: string): Promise<void> {

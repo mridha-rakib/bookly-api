@@ -1,7 +1,7 @@
 import express from "express";
 import mongoose, { type Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import {
@@ -1058,6 +1058,103 @@ describe("database-backed Service integration", () => {
           }),
         );
       expect(response.status).toBe(400);
+    });
+  });
+
+  // --- Category lookup batching (item 10 — no N+1) --------------------------------------------
+
+  describe("listServices category lookups are batched, not N+1", () => {
+    it("issues exactly one batched category query regardless of how many distinct categories are referenced", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const categoryOne = await createCategory(String(user._id), String(business._id), "Hair");
+      const categoryTwo = await createCategory(String(user._id), String(business._id), "Nails");
+      const categoryThree = await createCategory(String(user._id), String(business._id), "Spa");
+
+      await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({ serviceCategoryId: categoryOne.id, name: "Haircut" }),
+      );
+      await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({ serviceCategoryId: categoryTwo.id, name: "Manicure" }),
+      );
+      await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({ serviceCategoryId: categoryThree.id, name: "Facial" }),
+      );
+
+      const findManyByIdsForBusinessSpy = vi.spyOn(
+        serviceCategoryRepository,
+        "findManyByIdsForBusiness",
+      );
+      const findByIdSpy = vi.spyOn(serviceCategoryRepository, "findById");
+
+      const { services } = await serviceService.listServices(
+        String(user._id),
+        String(business._id),
+        {},
+      );
+
+      expect(services).toHaveLength(3);
+      expect(findManyByIdsForBusinessSpy).toHaveBeenCalledTimes(1);
+      // The batched call receives all three distinct category ids in one query — never one
+      // findById call per Service, regardless of how many distinct categories are involved.
+      expect(findByIdSpy).not.toHaveBeenCalled();
+
+      findManyByIdsForBusinessSpy.mockRestore();
+      findByIdSpy.mockRestore();
+    });
+  });
+
+  // --- Index quality (item 14) ---------------------------------------------------------------
+
+  describe("listByBusinessId query plan", () => {
+    const createThreeServices = async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+      for (let index = 0; index < 3; index += 1) {
+        await serviceService.createService(
+          String(user._id),
+          String(business._id),
+          fixedServiceBody({ serviceCategoryId: category.id, name: `Service ${index}` }),
+        );
+      }
+      return { user, business };
+    };
+
+    const explainStages = async (query: Record<string, unknown>) => {
+      const explanation = (await ServiceModel.find(query)
+        .sort({ createdAt: -1 })
+        .explain("executionStats")) as {
+        executionStats?: { executionStages?: { stage?: string; inputStage?: { stage?: string } } };
+      };
+      return [
+        explanation.executionStats?.executionStages?.stage,
+        explanation.executionStats?.executionStages?.inputStage?.stage,
+      ];
+    };
+
+    it("an explicit status equality query (e.g. status: 'ACTIVE') fully avoids both a collection scan and an in-memory sort", async () => {
+      const { business } = await createThreeServices();
+
+      const stages = await explainStages({ businessId: business._id, status: "ACTIVE" });
+      expect(stages).not.toContain("COLLSCAN");
+      expect(stages).not.toContain("SORT");
+    });
+
+    it("the default (exclude-ARCHIVED, $ne) list query avoids a collection scan — the index still bounds the scan to this Business's own Services, never the whole collection", async () => {
+      const { business } = await createThreeServices();
+
+      // NOTE: $ne on the index's middle field (status) means MongoDB cannot use the trailing
+      // createdAt key to avoid an in-memory sort here (a $ne predicate spans multiple
+      // disjoint index sub-ranges, which a single compound-index scan cannot deliver in one
+      // sorted pass) — only the collection-scan elimination is guaranteed for this specific
+      // query shape. See the index's own comment in service.model.ts for this same caveat.
+      const stages = await explainStages({ businessId: business._id, status: { $ne: "ARCHIVED" } });
+      expect(stages).not.toContain("COLLSCAN");
     });
   });
 });

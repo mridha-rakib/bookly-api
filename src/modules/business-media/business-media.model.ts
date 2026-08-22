@@ -34,7 +34,10 @@ const businessMediaSchema = new Schema<BusinessMediaDocument>(
   { timestamps: true },
 );
 
-businessMediaSchema.index({ businessId: 1, sortOrder: 1 });
+// Media gallery list — trailing createdAt matches listByBusinessId's actual compound sort
+// (business-media.repository.ts `.sort({ sortOrder: 1, createdAt: 1 })`, the tie-break for
+// rows sharing a sortOrder) so the list never falls back to an in-memory sort.
+businessMediaSchema.index({ businessId: 1, sortOrder: 1, createdAt: 1 });
 businessMediaSchema.index(
   { businessId: 1, role: 1 },
   { partialFilterExpression: { role: "PROFILE" }, unique: true },

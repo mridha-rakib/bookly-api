@@ -24,6 +24,8 @@
     "test:integration": "vitest run tests/integration/database --pool=forks --fileParallelism=false",
     "seed:super-admin": "tsx src/scripts/seed-super-admin.ts",
     "sync:indexes": "tsx src/scripts/sync-indexes.ts",
+    "worker:no-show": "tsx src/scripts/run-no-show-worker.ts",
+    "worker:no-show:once": "tsx src/scripts/run-no-show-worker.ts --once",
     "prepare": "node scripts/prepare-husky.mjs"
   },
   "lint-staged": {
@@ -42,12 +44,14 @@
     "express-rate-limit": "^8.6.1",
     "helmet": "^8.3.0",
     "jose": "^6.2.8",
+    "luxon": "^3.7.2",
     "mongoose": "^9.8.1",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",
     "resend": "^6.18.1",
+    "stripe": "^22.5.0",
     "twilio": "^6.0.2",
     "zod": "^4.4.3"
   },
@@ -56,6 +60,7 @@
     "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/luxon": "^3.7.4",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.1.2",
     "@types/nodemailer": "^8.0.1",

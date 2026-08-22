@@ -36,6 +36,30 @@ export class StaffTimeOffRepository {
       .exec();
   }
 
+  /**
+   * The Availability Engine's own read: only time-off entries that could possibly overlap the
+   * requested (already-bounded) date range — never a staff member's entire leave history,
+   * which could span years for a long-tenured member. `startDate <= toDateStr AND endDate >=
+   * fromDateStr` is the standard inclusive-range-overlap predicate for the "YYYY-MM-DD" string
+   * dates this collection already uses (see staff-time-off.model.ts — they sort/compare
+   * correctly as plain strings).
+   */
+  public async findManyByMembershipIdsOverlappingRange(
+    membershipIds: Array<Types.ObjectId | string>,
+    fromDateStr: string,
+    toDateStr: string,
+  ): Promise<StaffTimeOffDocument[]> {
+    if (membershipIds.length === 0) {
+      return [];
+    }
+
+    return StaffTimeOffModel.find({
+      membershipId: { $in: membershipIds },
+      startDate: { $lte: toDateStr },
+      endDate: { $gte: fromDateStr },
+    }).exec();
+  }
+
   public async findByIdForMembership(
     membershipId: Types.ObjectId | string,
     timeOffId: Types.ObjectId | string,

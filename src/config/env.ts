@@ -182,6 +182,13 @@ const otpHashSecretSchema = z
         message: "OTP_HASH_SECRET must be at least 32 characters",
       });
     }
+
+    if (rawNodeEnv === "production" && value.includes("development-only")) {
+      context.addIssue({
+        code: "custom",
+        message: "OTP_HASH_SECRET must be explicit in production",
+      });
+    }
   });
 
 export const env = createEnv({
@@ -309,6 +316,19 @@ export const env = createEnv({
       .int()
       .positive()
       .default(5 * 1024 * 1024),
+    // Stripe: required in production (real payment flows), optional in development/test — no
+    // real Stripe TEST credentials exist in this environment as of Batch 4 (confirmed by
+    // inspecting every .env/.env.example file in the repo; none define STRIPE_*). The payment
+    // gateway abstraction (see payment/stripe-payment-gateway.ts) throws a clear
+    // PAYMENT_PROVIDER_NOT_CONFIGURED domain error at the moment a real charge is attempted
+    // without a key, rather than crashing app boot — matching this codebase's existing
+    // provider-optionality convention (OTP_PROVIDER=dummy, RESEND_API_KEY unset outside
+    // EMAIL_PROVIDER=resend, etc.).
+    STRIPE_SECRET_KEY: optionalProductionRequiredString("STRIPE_SECRET_KEY"),
+    STRIPE_PUBLISHABLE_KEY: optionalProductionRequiredString("STRIPE_PUBLISHABLE_KEY"),
+    STRIPE_WEBHOOK_SECRET: optionalProductionRequiredString("STRIPE_WEBHOOK_SECRET"),
+    NO_SHOW_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+    NO_SHOW_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(50),
     SUPER_ADMIN_EMAIL: z.string().email().optional(),
     SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
     SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),
@@ -321,6 +341,8 @@ export const env = createEnv({
     AUTH_OTP_SEND_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
     AUTH_OTP_VERIFY_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
     AUTH_REFRESH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
+    BUSINESS_LINK_OTP_SEND_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+    BUSINESS_LINK_OTP_SEND_PER_EMAIL_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

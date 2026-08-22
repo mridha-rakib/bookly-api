@@ -6,7 +6,6 @@ const defaultMessages: Record<string, string> = {
   STAFF_AVATAR_TOO_LARGE: "Image file is too large",
   STAFF_AVATAR_STAFF_NOT_FOUND: "Staff member not found",
   STAFF_AVATAR_BUSINESS_NOT_FOUND: "Business not found",
-  STAFF_AVATAR_BUSINESS_ACCESS_DENIED: "You do not have access to manage staff for this business",
 };
 
 export class StaffAvatarError extends AppError {

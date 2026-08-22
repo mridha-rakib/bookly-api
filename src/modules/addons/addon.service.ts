@@ -407,9 +407,7 @@ export class AddonService {
     const addonIds = addons.map((addon) => addon._id);
 
     const [categories, assignments] = await Promise.all([
-      Promise.all(
-        categoryIds.map((id) => this.serviceCategoryRepository.findById(business._id, id)),
-      ),
+      this.serviceCategoryRepository.findManyByIdsForBusiness(business._id, categoryIds),
       this.addonServiceAssignmentRepository.findByAddonIds(addonIds),
     ]);
 

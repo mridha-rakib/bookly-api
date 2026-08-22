@@ -866,6 +866,39 @@ describe("database-backed authentication integration", () => {
     expect(await SessionModel.countDocuments({ revokedAt: { $exists: false } })).toBe(1);
   });
 
+  it("the token-reuse-detection breach response (revokeFamily) uses the {tokenFamilyId, revokedAt} index, not a collection scan", async () => {
+    const indexes = await SessionModel.collection.indexes();
+    expect(
+      indexes.some((index) => index.key["tokenFamilyId"] === 1 && index.key["revokedAt"] === 1),
+    ).toBe(true);
+
+    const parts = await completeCustomer("reuse-index-plan@example.com");
+    const sessionRepository = new SessionRepository();
+    const session = await SessionModel.findOne({
+      refreshTokenHash: sha256(parts.result.refreshToken),
+    }).orFail();
+
+    const explanation = await SessionModel.find({
+      tokenFamilyId: session.tokenFamilyId,
+      revokedAt: { $exists: false },
+    })
+      .explain("executionStats")
+      .then((result) => result as { executionStats?: { executionStages?: { stage?: string } } });
+
+    const stage = explanation.executionStats?.executionStages?.stage;
+    // The real revokeFamily() call below must observe the same behavior (all family sessions
+    // revoked) — the explain() above just confirms *how* it gets there.
+    expect(stage).not.toBe("COLLSCAN");
+
+    await sessionRepository.revokeFamily(session.tokenFamilyId);
+    expect(
+      await SessionModel.countDocuments({
+        tokenFamilyId: session.tokenFamilyId,
+        revokedAt: { $exists: false },
+      }),
+    ).toBe(0);
+  });
+
   it("rejects expired, revoked, suspended, and missing-user refresh with persisted sessions", async () => {
     const parts = await completeCustomer("refresh-states@example.com");
     const user = await UserModel.findOne({

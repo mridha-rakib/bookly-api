@@ -1,7 +1,7 @@
 import express from "express";
 import mongoose, { type Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { AddonModel } from "../../../src/modules/addons/addon.model.js";
@@ -783,6 +783,51 @@ describe("database-backed Add-on integration", () => {
           .collection("addonserviceassignments")
           .countDocuments({ addonId: new mongoose.Types.ObjectId(addon.id) }),
       ).toBe(1);
+    });
+  });
+
+  // --- Category lookup batching (item 10 — no N+1) --------------------------------------------
+
+  describe("listAddons category lookups are batched, not N+1", () => {
+    it("issues exactly one batched category query regardless of how many distinct categories are referenced", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const categoryOne = await createCategory(business._id, "Lashes");
+      const categoryTwo = await createCategory(business._id, "Brows");
+      const categoryThree = await createCategory(business._id, "Nails");
+
+      await addonService.createAddon(
+        String(user._id),
+        String(business._id),
+        flatAddonBody({ name: "Classic Lashes", customServiceCategoryId: String(categoryOne._id) }),
+      );
+      await addonService.createAddon(
+        String(user._id),
+        String(business._id),
+        flatAddonBody({
+          name: "Brow Lamination",
+          customServiceCategoryId: String(categoryTwo._id),
+        }),
+      );
+      await addonService.createAddon(
+        String(user._id),
+        String(business._id),
+        flatAddonBody({ name: "Gel Polish", customServiceCategoryId: String(categoryThree._id) }),
+      );
+
+      const findManyByIdsForBusinessSpy = vi.spyOn(
+        serviceCategoryRepository,
+        "findManyByIdsForBusiness",
+      );
+      const findByIdSpy = vi.spyOn(serviceCategoryRepository, "findById");
+
+      const { addons } = await addonService.listAddons(String(user._id), String(business._id), {});
+
+      expect(addons).toHaveLength(3);
+      expect(findManyByIdsForBusinessSpy).toHaveBeenCalledTimes(1);
+      expect(findByIdSpy).not.toHaveBeenCalled();
+
+      findManyByIdsForBusinessSpy.mockRestore();
+      findByIdSpy.mockRestore();
     });
   });
 });

@@ -40,10 +40,21 @@ export class StaffRepository {
     }).exec();
   }
 
+  /**
+   * Written as `removedAt: null` (MongoDB equality, matching both an absent field and an
+   * explicit null) rather than `{$exists: false}` — the partial-unique index on `{userId: 1}`
+   * (staff.model.ts) has filter expression `{removedAt: {$eq: null}}`, and MongoDB's query
+   * planner only considers a partial index when the query predicate is provably a superset of
+   * its filter expression. `{$exists: false}` does not satisfy that even though it happens to
+   * return the same rows today (removedAt is never explicitly set to null — see the model's
+   * own comment) — so this exact query shape is what lets this hot lookup actually use the
+   * index instead of a full collection scan. Verified via `.explain()` in the integration
+   * test (staff-database.integration.test.ts).
+   */
   public async findActiveByUserId(
     userId: Types.ObjectId | string,
   ): Promise<StaffMembershipDocument | null> {
-    return StaffMembershipModel.findOne({ userId, removedAt: { $exists: false } }).exec();
+    return StaffMembershipModel.findOne({ userId, removedAt: null }).exec();
   }
 
   /**
@@ -67,11 +78,12 @@ export class StaffRepository {
     businessId: Types.ObjectId | string,
     staffId: Types.ObjectId | string,
     update: Partial<Pick<StaffMembershipDocument, "role" | "employmentActive">>,
+    session?: ClientSession,
   ): Promise<StaffMembershipDocument | null> {
     return StaffMembershipModel.findOneAndUpdate(
       { _id: staffId, businessId, removedAt: { $exists: false } },
       { $set: update },
-      { returnDocument: "after", runValidators: true },
+      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
     ).exec();
   }
 

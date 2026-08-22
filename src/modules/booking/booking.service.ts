@@ -13,16 +13,26 @@ import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRole } from "../user/user.types.js";
 import { BookingError } from "./booking.errors.js";
 import type {
+  BookingDocument,
   BookingFinancials,
   BookingFulfilment,
   BookingServiceLineAddon,
 } from "./booking.model.js";
+import type {
+  BookingListFilter,
+  BookingListPagination,
+  BookingListResult,
+  BookingRepository,
+} from "./booking.repository.js";
 import {
   type BookingSource,
-  PLATFORM_FEE_MAX_CENTS,
-  PLATFORM_FEE_MIN_CENTS,
-  PLATFORM_FEE_PERCENT,
+  DEPOSIT_MAX_CENTS,
+  DEPOSIT_MIN_CENTS,
+  DEPOSIT_PERCENT,
+  MAX_BOOKING_RANGE_DAYS,
 } from "./booking.types.js";
+
+const oneDayMs = 24 * 60 * 60 * 1000;
 
 /**
  * Booking domain — Phase 1 scope only.
@@ -52,6 +62,7 @@ export class BookingService {
     private readonly addonRepository: AddonRepository,
     private readonly addonServiceAssignmentRepository: AddonServiceAssignmentRepository,
     private readonly clientRepository: ClientRepository,
+    private readonly bookingRepository: BookingRepository,
   ) {}
 
   // --- Authorization foundation -----------------------------------------------------------
@@ -286,21 +297,147 @@ export class BookingService {
     }
   }
 
+  // --- Range-safety foundation (item 11) ---------------------------------------------------
+
+  /**
+   * Domain-level guard on any Business date-range Booking read (the future Calendar/All
+   * Bookings query) — never a UX-layer concern. Rejects an inverted or missing range and
+   * anything wider than MAX_BOOKING_RANGE_DAYS, so an unbounded query (accidental or
+   * malicious) can never reach BookingRepository.findManyByBusinessIdInRange, which does not
+   * itself enforce this (a repository is data access only — see that method's own comment).
+   */
+  public requireBoundedRange(startAt: Date, endAt: Date): void {
+    if (startAt >= endAt) {
+      throw new BookingError("BOOKING_RANGE_INVALID", 400);
+    }
+
+    const rangeMs = endAt.getTime() - startAt.getTime();
+    if (rangeMs > MAX_BOOKING_RANGE_DAYS * oneDayMs) {
+      throw new BookingError("BOOKING_RANGE_TOO_WIDE", 400, [
+        {
+          message: `The date range must not exceed ${MAX_BOOKING_RANGE_DAYS} days`,
+          code: "BOOKING_RANGE_TOO_WIDE",
+        },
+      ]);
+    }
+  }
+
+  /**
+   * The validated entry point for the future Calendar/All Bookings read — always range-
+   * checked first. `excludeHistory` is on by default here because this is a *list* read (see
+   * BookingRepository.findManyByBusinessIdInRange's own comment on why eventHistory/
+   * rescheduleHistory are dropped for list views); a single Booking's detail read is a
+   * separate, not-yet-built code path that would want the full document.
+   */
+  public async findBookingsInRange(
+    business: BusinessDocument,
+    startAt: Date,
+    endAt: Date,
+    options: { excludeHistory?: boolean } = { excludeHistory: true },
+  ): Promise<BookingDocument[]> {
+    this.requireBoundedRange(startAt, endAt);
+    return this.bookingRepository.findManyByBusinessIdInRange(
+      business._id,
+      startAt,
+      endAt,
+      options,
+    );
+  }
+
+  // --- Batch 3: detail / list / calendar reads --------------------------------------------
+
+  public async getBookingDetailForBusiness(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    bookingId: string,
+  ): Promise<BookingDocument> {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+
+    if (!Types.ObjectId.isValid(bookingId)) {
+      throw new BookingError("BOOKING_NOT_FOUND", 404);
+    }
+    const booking = await this.bookingRepository.findById(business._id, bookingId);
+    if (!booking) {
+      throw new BookingError("BOOKING_NOT_FOUND", 404);
+    }
+    return booking;
+  }
+
+  /** Ownership is enforced entirely at the query level (both `_id` and `customer.customerUserId`
+   * in the same filter) — matches this codebase's anti-enumeration convention: a foreign
+   * Customer's bookingId is indistinguishable from an unknown one. */
+  public async getBookingDetailForCustomer(
+    customerUserId: string,
+    bookingId: string,
+  ): Promise<BookingDocument> {
+    if (!Types.ObjectId.isValid(bookingId)) {
+      throw new BookingError("BOOKING_NOT_FOUND", 404);
+    }
+    const booking = await this.bookingRepository.findByIdForCustomer(bookingId, customerUserId);
+    if (!booking) {
+      throw new BookingError("BOOKING_NOT_FOUND", 404);
+    }
+    return booking;
+  }
+
+  public async listBookingsForBusiness(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    filter: BookingListFilter,
+    pagination: BookingListPagination,
+  ): Promise<BookingListResult> {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+    return this.bookingRepository.listForBusiness(business._id, filter, pagination);
+  }
+
+  public async listBookingsForCustomer(
+    customerUserId: string,
+    filter: Omit<BookingListFilter, "businessClientId">,
+    pagination: BookingListPagination,
+  ): Promise<BookingListResult> {
+    return this.bookingRepository.listForCustomer(customerUserId, filter, pagination);
+  }
+
+  public async getCalendarForBusiness(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    startAt: Date,
+    endAt: Date,
+  ): Promise<BookingDocument[]> {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+    this.requireBoundedRange(startAt, endAt);
+    return this.bookingRepository.findManyForCalendar(business._id, startAt, endAt);
+  }
+
   // --- Pure calculators ---------------------------------------------------------------------
 
   /**
-   * Bookly's first-booking platform-fee formula (confirmed rule M):
-   * clamp(eligibleAmountCents * 20%, €5, €35). `eligibleAmountCents` must already exclude
-   * travel fee — that separation happens where the basis is assembled (Phase 2/3), never here.
-   * This is a pure function with no payment side effect: it is not wired to any charge,
-   * booking-creation, or frontend flow in this phase.
+   * Batch 6.5 correction — THE single canonical booking-deposit calculator: clamp(20% of
+   * `eligibleAmountCents`, €5, €35). `eligibleAmountCents` must already exclude travel fee —
+   * that separation happens where the basis is assembled, never here.
+   *
+   * Previously named `calculatePlatformFeeCents`, back when this codebase (incorrectly)
+   * assumed the upfront deposit and Bookly's platform fee were always the same concept. They
+   * are related but distinct: this function computes ONLY the deposit — the amount charged
+   * online for EVERY BOOKLY_MANAGED booking, first or returning. Whether Bookly keeps that
+   * deposit as platform/activation revenue or the Business keeps it as an already-collected
+   * service prepayment is decided entirely by the caller
+   * (booking-creation.service.ts's assembleFinancials: `platformFeeCents = isFirstBooking ?
+   * depositCents : 0`) — never re-derived here. Renamed rather than duplicated so there is
+   * still exactly ONE place this formula is computed (see the module's own callers — small
+   * blast radius, confirmed by inspection before renaming).
+   *
+   * A pure function with no payment side effect.
    */
-  public calculatePlatformFeeCents(eligibleAmountCents: number): number {
+  public calculateBookingDepositCents(eligibleAmountCents: number): number {
     if (!Number.isInteger(eligibleAmountCents) || eligibleAmountCents < 0) {
-      throw new BookingError("BOOKING_INVALID_PLATFORM_FEE_BASIS", 400);
+      throw new BookingError("BOOKING_INVALID_DEPOSIT_BASIS", 400);
     }
 
-    const rawFeeCents = Math.round(eligibleAmountCents * PLATFORM_FEE_PERCENT);
-    return Math.min(Math.max(rawFeeCents, PLATFORM_FEE_MIN_CENTS), PLATFORM_FEE_MAX_CENTS);
+    const rawDepositCents = Math.round(eligibleAmountCents * DEPOSIT_PERCENT);
+    return Math.min(Math.max(rawDepositCents, DEPOSIT_MIN_CENTS), DEPOSIT_MAX_CENTS);
   }
 }

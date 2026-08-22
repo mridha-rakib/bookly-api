@@ -212,11 +212,11 @@ describe("StaffAvatarService", () => {
         String(membership._id),
         buildUpload(),
       ),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
     expect(storageService.putObject).not.toHaveBeenCalled();
   });
 
-  it("denies an unrelated user — business exists but no owner/access relationship (403)", async () => {
+  it("denies an unrelated user — business exists but no owner/access relationship (404, indistinguishable from nonexistent)", async () => {
     const business = buildBusiness();
     const membership = buildMembership({ businessId: business._id });
     const { service, storageService } = createService({ business, membership });
@@ -228,8 +228,40 @@ describe("StaffAvatarService", () => {
         String(membership._id),
         buildUpload(),
       ),
-    ).rejects.toMatchObject({ statusCode: 403 });
+    ).rejects.toMatchObject({ statusCode: 404 });
     expect(storageService.putObject).not.toHaveBeenCalled();
+  });
+
+  it("produces an identical status/body for a nonexistent business and an existing business owned by someone else", async () => {
+    const business = buildBusiness();
+    const { service: serviceForUnrelated } = createService({ business });
+    const { service: serviceForNonexistent } = createService({ business: null });
+
+    const unrelatedError = await serviceForUnrelated
+      .uploadOrReplaceAvatar(
+        String(new Types.ObjectId()),
+        String(business._id),
+        String(new Types.ObjectId()),
+        buildUpload(),
+      )
+      .catch((error: unknown) => error);
+    const nonexistentError = await serviceForNonexistent
+      .uploadOrReplaceAvatar(
+        String(new Types.ObjectId()),
+        String(new Types.ObjectId()),
+        String(new Types.ObjectId()),
+        buildUpload(),
+      )
+      .catch((error: unknown) => error);
+
+    expect(unrelatedError).toMatchObject({ statusCode: 404 });
+    expect(nonexistentError).toMatchObject({ statusCode: 404 });
+    expect((unrelatedError as { message: string }).message).toBe(
+      (nonexistentError as { message: string }).message,
+    );
+    expect((unrelatedError as { details: unknown }).details).toEqual(
+      (nonexistentError as { details: unknown }).details,
+    );
   });
 
   it("denies a staffId that does not belong to this business (404)", async () => {

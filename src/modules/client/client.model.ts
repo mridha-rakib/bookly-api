@@ -54,6 +54,26 @@ export type BusinessClientDocument = {
   linkState: ClientLinkState;
   linkedUserId?: Types.ObjectId | undefined;
 
+  /**
+   * Batch 4 — canonical Business-Customer activation state (confirmed product rule: the
+   * platform/activation fee applies only to "the FIRST ELIGIBLE BOOKLY BOOKING for that
+   * customer with that business"; every later booking for the SAME Business+Customer pair is
+   * "returning", regardless of how many other Businesses this same Customer has separately
+   * activated at). Set exactly once, the moment the first BOOKLY_MANAGED Booking's activation
+   * charge actually succeeds (never merely attempted) — see BookingCreationService's
+   * finalizeCustomerBooking. `activatedByBookingId` is the audit trail: which Booking triggered
+   * activation, so a later investigation never has to guess.
+   *
+   * Deliberately NOT derived from "does this Client have any past Booking" — a MANUAL Booking
+   * (rule E, no Bookly payment) or a Booking that was created but never actually paid must never
+   * count as activation; only a genuinely succeeded activation charge does. Archiving/soft-
+   * deleting a Client never touches this field — activation history is permanent (confirmed:
+   * "Historical booking deletion/soft deletion must not accidentally reset legitimate
+   * activation history").
+   */
+  activatedAt?: Date | undefined;
+  activatedByBookingId?: Types.ObjectId | undefined;
+
   archivedAt?: Date | undefined;
   createdAt: Date;
   updatedAt: Date;
@@ -96,6 +116,9 @@ const businessClientSchema = new Schema<BusinessClientDocument>(
     linkState: { type: String, enum: clientLinkStates, required: true, default: "UNLINKED" },
     linkedUserId: { type: Schema.Types.ObjectId, ref: "User" },
 
+    activatedAt: { type: Date },
+    activatedByBookingId: { type: Schema.Types.ObjectId, ref: "Booking" },
+
     archivedAt: { type: Date },
   },
   { timestamps: true },
@@ -116,8 +139,12 @@ businessClientSchema.index(
 // to one business, so these are separate from the compound indexes above.
 businessClientSchema.index({ normalizedEmail: 1 });
 businessClientSchema.index({ "phone.e164": 1 });
-// Clients list / Archived Clients list.
-businessClientSchema.index({ businessId: 1, archivedAt: 1 });
+// Clients list / Archived Clients list — the one paginated list query in the whole API.
+// Trailing createdAt matches listByBusinessId's actual sort (client.repository.ts
+// `.sort({ createdAt: -1 })`) so the base (no tag/search) case never falls back to an
+// in-memory sort; the businessId+archivedAt prefix still narrows the tag/search-filtered
+// cases even though those two extra filters are not themselves part of this index.
+businessClientSchema.index({ businessId: 1, archivedAt: 1, createdAt: -1 });
 
 export const BusinessClientModel = model<BusinessClientDocument>(
   "BusinessClient",

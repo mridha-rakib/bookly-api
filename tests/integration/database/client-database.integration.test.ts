@@ -180,6 +180,57 @@ describe("database-backed BusinessClient integration", () => {
     expect(linkedIndex?.partialFilterExpression).toEqual({ linkedUserId: { $exists: true } });
   });
 
+  it("listByBusinessId's default (non-archived, unfiltered) query uses the {businessId,archivedAt,createdAt} index, not a collection scan (item 14)", async () => {
+    const { business, user } = await createBusinessOwner("owner-a@example.com", "Salon A");
+
+    for (let index = 0; index < 3; index += 1) {
+      await clientRepository.create({
+        businessId: business._id,
+        createdByUserId: user._id,
+        firstName: `Client${index}`,
+        normalizedEmail: `client${index}@example.com`,
+        phone: {
+          countryCode: "+357",
+          nationalNumber: `9911223${index}`,
+          e164: `+3579911223${index}`,
+        },
+        address: {
+          city: "Larnaca",
+          propertyType: "Apartment",
+          area: "Center",
+          streetName: "Main",
+          streetNumber: "1",
+        },
+        linkState: "UNLINKED",
+      });
+    }
+
+    const explanation = (await BusinessClientModel.find({
+      businessId: business._id,
+      archivedAt: { $exists: false },
+    })
+      .sort({ createdAt: -1 })
+      .explain("executionStats")) as {
+      executionStats?: { executionStages?: { stage?: string; inputStage?: { stage?: string } } };
+    };
+    const stages = [
+      explanation.executionStats?.executionStages?.stage,
+      explanation.executionStats?.executionStages?.inputStage?.stage,
+    ];
+    expect(stages).not.toContain("COLLSCAN");
+    // No separate in-memory SORT stage — the index itself already returns rows in the
+    // required order (proving the trailing createdAt key is actually doing its job).
+    expect(stages).not.toContain("SORT");
+
+    const { clients, total } = await clientRepository.listByBusinessId(business._id, {
+      archivedOnly: false,
+      page: 1,
+      limit: 20,
+    });
+    expect(total).toBe(3);
+    expect(clients).toHaveLength(3);
+  });
+
   // --- Creation & authorization ------------------------------------------------------
 
   it("allows the owner to create an unlinked Client", async () => {

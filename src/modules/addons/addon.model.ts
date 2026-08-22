@@ -41,8 +41,11 @@ const addonSchema = new Schema<AddonDocument>(
 );
 
 // Catalogue list + DRAFT/ACTIVE/INACTIVE/ARCHIVED counts for one Business — the primary
-// Add-ons page query.
-addonSchema.index({ businessId: 1, status: 1 });
+// Add-ons page query. Trailing createdAt matches listAddons' actual sort (addon.repository.ts
+// `.sort({ createdAt: -1 })`). Same $ne caveat as Service's equivalent index (see
+// service.model.ts): an explicit status equality avoids the in-memory sort entirely; the
+// default "exclude ARCHIVED" ($ne) query still avoids a collection scan but not the sort.
+addonSchema.index({ businessId: 1, status: 1, createdAt: -1 });
 // Category picker's reverse lookup / filter-by-category.
 addonSchema.index({ businessId: 1, customServiceCategoryId: 1 });
 // Archived-add-ons screen.

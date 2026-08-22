@@ -161,6 +161,9 @@ export class StaffAvatarService {
    * check rather than shared, matching this codebase's existing convention of each domain
    * service owning its full authorization surface. Owner-only — BusinessAccess (linked
    * Business) is never consulted, even though it remains valid for other Bookly features.
+   *
+   * 404 (never a bare 403) on every mismatch — see the identical rationale on
+   * StaffService.requireOwnedStaffBusiness.
    */
   private async requireOwnedStaffBusiness(
     actorUserId: string,
@@ -174,7 +177,7 @@ export class StaffAvatarService {
     }
 
     if (!business.ownerUserId.equals(actorUserId)) {
-      throw new StaffAvatarError("STAFF_AVATAR_BUSINESS_ACCESS_DENIED", 403);
+      throw new StaffAvatarError("STAFF_AVATAR_BUSINESS_NOT_FOUND", 404);
     }
 
     return business;

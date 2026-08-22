@@ -69,6 +69,36 @@ export class ClientRepository {
     return BusinessClientModel.findOne({ _id: clientId, businessId }).exec();
   }
 
+  /** A Customer's own Client row within one Business (Batch 3 self-booking) — relies on the
+   * existing `{businessId, linkedUserId}` unique partial index (client.model.ts), so at most
+   * one row can ever match. */
+  public async findByBusinessIdAndLinkedUserId(
+    businessId: Types.ObjectId | string,
+    linkedUserId: Types.ObjectId | string,
+  ): Promise<BusinessClientDocument | null> {
+    return BusinessClientModel.findOne({ businessId, linkedUserId }).exec();
+  }
+
+  /**
+   * Batch 4 — the ONLY writer of activation state. Atomically gated on `activatedAt` not
+   * already being set (`$exists: false`), so a concurrent double-activation attempt (e.g. two
+   * near-simultaneous finalize retries) can only ever win once — the loser's update matches
+   * zero documents and returns null, which the caller (BookingCreationService) treats as
+   * "already activated, nothing to do," never as an error. Never called from anywhere except
+   * the moment an activation charge has genuinely succeeded.
+   */
+  public async markActivated(
+    clientId: Types.ObjectId | string,
+    bookingId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<BusinessClientDocument | null> {
+    return BusinessClientModel.findOneAndUpdate(
+      { _id: clientId, activatedAt: { $exists: false } },
+      { $set: { activatedAt: new Date(), activatedByBookingId: bookingId } },
+      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
+    ).exec();
+  }
+
   public async listByBusinessId(
     businessId: Types.ObjectId | string,
     filter: ClientListFilter,
