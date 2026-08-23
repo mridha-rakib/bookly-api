@@ -47,7 +47,14 @@ export type BusinessClientDocument = {
   gender?: "male" | "female" | "other" | undefined;
 
   // Business-specific metadata — always locally authoritative, editable regardless of link state.
-  address: BusinessClientAddress;
+  /** Required when a Business Owner manually creates a Client (enforced at the schema/body-
+   * validation layer, not here). Batch 9 — optional at the MODEL level only so
+   * BookingCreationService.resolveOrCreateCustomerClient can auto-create a Client for a
+   * Customer's first AT_BUSINESS_LOCATION booking without a structured address to source it
+   * from (no travel address exists for that fulfilment mode, and CustomerProfile.address is
+   * free-text — see that method's own doc comment). Confirmed product decision: an at-location
+   * Client's address may be filled in later by the Business if they choose to manage it. */
+  address?: BusinessClientAddress | undefined;
   notes?: string | undefined;
   tag?: ClientTag | undefined;
 
@@ -109,7 +116,7 @@ const businessClientSchema = new Schema<BusinessClientDocument>(
     dateOfBirth: { type: String },
     gender: { type: String, enum: genders },
 
-    address: { type: addressSchema, required: true },
+    address: { type: addressSchema },
     notes: { type: String, trim: true, maxlength: 2000 },
     tag: { type: String, enum: clientTags },
 

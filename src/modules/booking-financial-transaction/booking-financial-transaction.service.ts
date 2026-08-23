@@ -7,6 +7,7 @@ import type {
   CreateBookingFinancialTransactionInput,
   FinancialTransactionAggregateBucket,
   ListByBusinessIdInput,
+  OwnershipAggregateBucket,
 } from "./booking-financial-transaction.repository.js";
 import { MAX_BUSINESS_LEDGER_RANGE_DAYS } from "./booking-financial-transaction.repository.js";
 import type {
@@ -197,6 +198,77 @@ export class BookingFinancialTransactionService {
   }): Promise<{ rows: BookingFinancialTransactionDocument[]; total: number }> {
     this.requireBoundedRange(input.from, input.to);
     return this.transactionRepository.listFeeTransactionsPage(input);
+  }
+
+  /** Batch 8 (Business Payout) — re-reads the exact set a payout is about to claim, INSIDE the
+   * caller's transaction (session required, not optional, on purpose — see
+   * BusinessPayoutService.executePayout, the only intended caller). */
+  public async findUnclaimedForPayout(
+    businessId: Types.ObjectId | string,
+    types: BookingFinancialTransactionType[],
+    session?: ClientSession,
+  ): Promise<BookingFinancialTransactionDocument[]> {
+    return this.transactionRepository.findUnclaimedForPayout(businessId, types, session);
+  }
+
+  /** Batch 8 (Business Payout) — see the repository method's own comment on the concurrency
+   * guarantee this provides. */
+  public async claimForPayout(
+    ids: Array<Types.ObjectId | string>,
+    payoutId: Types.ObjectId,
+    session: ClientSession,
+  ): Promise<number> {
+    return this.transactionRepository.claimForPayout(ids, payoutId, session);
+  }
+
+  /** Batch 8 — the shared ownership-aware aggregation primitive (rule #17/#19). See
+   * BookingFinancialTransactionRepository.aggregateBusinessOwnedBySource's own comment for the
+   * exact contract; this is a thin pass-through kept on the service so every read stays behind
+   * it, matching this module's own "never Mongoose directly" convention. */
+  public async aggregateOwnedBySource(input: {
+    businessId?: Types.ObjectId | string;
+    types: BookingFinancialTransactionType[];
+    unclaimedOnly: boolean;
+    from?: Date;
+    to?: Date;
+    groupByBusiness?: boolean;
+  }): Promise<OwnershipAggregateBucket[]> {
+    if (!input.unclaimedOnly) {
+      if (!input.from || !input.to) {
+        throw new BookingFinancialTransactionError(
+          "BOOKING_FINANCIAL_TRANSACTION_RANGE_REQUIRED",
+          400,
+        );
+      }
+      this.requireBoundedRange(input.from, input.to);
+    }
+    return this.transactionRepository.aggregateBusinessOwnedBySource(input);
+  }
+
+  /** Batch 8 (Super Admin Finance) — the deliberately unbounded, all-time counterpart to
+   * `aggregateOwnedBySource` (matches SuperAdminFinanceBanner's own "All time · platform-wide"
+   * framing, same precedent as `sumAllTimeByTypeAndStatus`). Never period-bounded — safe for
+   * the same reason every other all-time aggregate here is: one reduced `$group`, never a raw
+   * dump. */
+  public async aggregateAllTimeOwnedBySource(input: {
+    types: BookingFinancialTransactionType[];
+  }): Promise<OwnershipAggregateBucket[]> {
+    return this.transactionRepository.aggregateBusinessOwnedBySource({
+      types: input.types,
+      unclaimedOnly: false,
+    });
+  }
+
+  /** Batch 8 (Super Admin Finance) — the platform-wide paginated transaction read. */
+  public async listGlobalPage(input: {
+    types?: BookingFinancialTransactionType[];
+    from: Date;
+    to: Date;
+    page: number;
+    limit: number;
+  }): Promise<{ rows: BookingFinancialTransactionDocument[]; total: number }> {
+    this.requireBoundedRange(input.from, input.to);
+    return this.transactionRepository.listGlobalPage(input);
   }
 
   private requireBoundedRange(from: Date, to: Date): void {

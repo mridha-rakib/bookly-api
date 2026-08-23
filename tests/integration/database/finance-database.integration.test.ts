@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
@@ -737,18 +737,31 @@ describe("database-backed Business Finance (Batch 7)", () => {
   });
 
   it("BusinessPayoutRepository can create and list a real payout record once one exists", async () => {
-    const { business } = await setupBookableBusiness(10_000);
-    await businessPayoutRepository.create({
-      businessId: business._id,
-      periodStart: new Date("2026-04-01T00:00:00.000Z"),
-      periodEnd: new Date("2026-05-01T00:00:00.000Z"),
-      grossBusinessOwnedCents: 10_000,
-      processingFeesCents: 300,
-      netPayoutCents: 9700,
-      currency: "EUR",
-      status: "PAID",
-      paidAt: new Date("2026-05-01T00:00:00.000Z"),
-    });
+    const { owner, business } = await setupBookableBusiness(10_000);
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await businessPayoutRepository.create(
+          {
+            businessId: business._id,
+            periodStart: new Date("2026-04-01T00:00:00.000Z"),
+            periodEnd: new Date("2026-05-01T00:00:00.000Z"),
+            grossBusinessOwnedCents: 10_000,
+            processingFeesCents: 300,
+            refundsCents: 0,
+            netPayoutCents: 9700,
+            currency: "EUR",
+            status: "PAID",
+            settledTransactionIds: [new Types.ObjectId()],
+            initiatedByUserId: owner._id,
+            paidAt: new Date("2026-05-01T00:00:00.000Z"),
+          },
+          session,
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
 
     const { items, total } = await businessPayoutRepository.listByBusinessId({
       businessId: business._id,

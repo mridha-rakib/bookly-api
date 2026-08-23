@@ -79,6 +79,20 @@ export class BookingRepository {
     return BookingModel.find({ _id: { $in: bookingIds }, businessId }).exec();
   }
 
+  /** Batch 8 (Super Admin Finance) — cross-business batched lookup, the same "no actor scoping,
+   * never an HTTP caller directly" contract as `findByIdOnly` above extended to a batch: a
+   * platform-wide transaction log legitimately spans many Businesses, so a single-Business-
+   * scoped `findManyByIds` cannot serve it. Only ever called from FinanceService, itself gated
+   * SUPER_ADMIN-only at the route level (see super-admin.route.ts). */
+  public async findManyByIdsCrossBusiness(
+    bookingIds: Array<Types.ObjectId | string>,
+  ): Promise<BookingDocument[]> {
+    if (bookingIds.length === 0) {
+      return [];
+    }
+    return BookingModel.find({ _id: { $in: bookingIds } }).exec();
+  }
+
   /** Cross-business, no actor scoping — used ONLY by the no-show worker (never a controller: an
    * HTTP caller must always go through `findById`/`findByIdForCustomer`'s ownership scoping).
    * The worker itself finds candidate ids via `findManyOverdueNoShows` below; this is the

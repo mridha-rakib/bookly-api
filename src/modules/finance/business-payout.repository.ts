@@ -1,4 +1,4 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import { type BusinessPayoutDocument, BusinessPayoutModel } from "./business-payout.model.js";
 
@@ -7,15 +7,20 @@ export type CreateBusinessPayoutInput = Omit<
   "_id" | "createdAt" | "updatedAt"
 >;
 
-/**
- * See business-payout.model.ts's own doc comment: `create` has no caller in production code yet
- * (no real payout-execution process exists in this codebase) — it exists so the schema is
- * exercised by tests and ready for a future payout-execution batch, matching this codebase's
- * existing "storage shape before the write path" precedent.
- */
 export class BusinessPayoutRepository {
-  public async create(input: CreateBusinessPayoutInput): Promise<BusinessPayoutDocument> {
-    return new BusinessPayoutModel(input).save();
+  /** Batch 8 — the real write path: BusinessPayoutService.executePayout inserts a payout INSIDE
+   * the same Mongo transaction that claims its settled ledger rows (session required, not
+   * optional — see that service's own comment on why the insert and the claim must be atomic
+   * together). */
+  public async create(
+    input: CreateBusinessPayoutInput,
+    session: ClientSession,
+  ): Promise<BusinessPayoutDocument> {
+    const [document] = await BusinessPayoutModel.create([input], { session });
+    if (!document) {
+      throw new Error("BusinessPayout insert returned no document");
+    }
+    return document;
   }
 
   public async listByBusinessId(input: {
@@ -34,5 +39,28 @@ export class BusinessPayoutRepository {
       BusinessPayoutModel.countDocuments(filter).exec(),
     ]);
     return { items, total };
+  }
+
+  /** Batch 8 (Super Admin Finance) — the platform-wide payout history, newest first. */
+  public async listAll(input: {
+    page: number;
+    limit: number;
+  }): Promise<{ items: BusinessPayoutDocument[]; total: number }> {
+    const skip = (input.page - 1) * input.limit;
+    const [items, total] = await Promise.all([
+      BusinessPayoutModel.find({}).sort({ createdAt: -1 }).skip(skip).limit(input.limit).exec(),
+      BusinessPayoutModel.countDocuments({}).exec(),
+    ]);
+    return { items, total };
+  }
+
+  /** Batch 8 (Super Admin Finance Stats — "Sent to businesses") — a single reduced sum, never a
+   * raw dump; backed by the `{status, createdAt}` index. */
+  public async sumPaidTotal(): Promise<{ totalCents: number; count: number }> {
+    const result = await BusinessPayoutModel.aggregate<{ totalCents: number; count: number }>([
+      { $match: { status: "PAID" } },
+      { $group: { _id: null, totalCents: { $sum: "$netPayoutCents" }, count: { $sum: 1 } } },
+    ]).exec();
+    return { totalCents: result[0]?.totalCents ?? 0, count: result[0]?.count ?? 0 };
   }
 }

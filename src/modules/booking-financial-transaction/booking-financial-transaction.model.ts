@@ -48,9 +48,27 @@ export type BookingFinancialTransactionDocument = {
    * auto-charge worker) — enforced unique below whenever present. Absent for entries that are
    * inherently one-shot and never retried (e.g. a manually-recorded ADJUSTMENT). */
   idempotencyKey?: string | undefined;
-  /** Free-form contextual reference (e.g. which cancellation-policy tier produced this fee) —
-   * primitives only, deliberately not an arbitrary nested/Mixed bag. */
+  /** Free-form contextual reference — primitives only, deliberately not an arbitrary nested/
+   * Mixed bag. Batch 8 convention (see BookingFinancialTransactionService's own doc comment):
+   * `sourceType` and `sourceTransactionId` are written on PROCESSING_FEE and REFUND entries to
+   * record which underlying payment/transaction they belong to — the sole mechanism this ledger
+   * uses to answer "who bears this cost/reversal," since ownership cannot be inferred from
+   * `type` alone for these two types the way it can for DEPOSIT/PLATFORM_FEE/CANCELLATION_FEE/
+   * NO_SHOW_FEE. */
   metadata?: Record<string, string | number | boolean> | undefined;
+  /**
+   * Batch 8 — the SECOND, narrower allowed post-creation mutation (alongside `status`; see
+   * updateStatus/settleFailedAsWaived's own comments and the model's collection-level doc
+   * comment on immutability). Set EXACTLY ONCE, only by BusinessPayoutService's payout-execution
+   * transaction, marking "this entry's value was included in payout X, and must never be
+   * included in a second one." Never set at creation time. A row with `payoutId` unset is
+   * "still pending payable"; a row with it set is "already settled" — this is the sole
+   * mechanism preventing a Business-owned transaction from being paid out twice (see rule #13),
+   * deliberately NOT inferred from dates or from a payout's own settledTransactionIds array
+   * alone (both directions are recorded — see BusinessPayout.settledTransactionIds — purely for
+   * cheap bidirectional auditability, never as the sole source of truth on either side).
+   */
+  payoutId?: Types.ObjectId | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -94,6 +112,7 @@ const bookingFinancialTransactionSchema = new Schema<BookingFinancialTransaction
         message: "metadata must be a flat object of primitives",
       },
     },
+    payoutId: { type: Schema.Types.ObjectId, ref: "BusinessPayout" },
   },
   { timestamps: true },
 );
@@ -111,6 +130,16 @@ bookingFinancialTransactionSchema.index(
   { idempotencyKey: 1 },
   { unique: true, partialFilterExpression: { idempotencyKey: { $exists: true } } },
 );
+// Batch 8 — the pending-Business-payable read path: "this Business's SUCCEEDED entries of a
+// given type not yet swept into a payout" (businessId+type equality, status/payoutId filtered
+// from the same compound key so the scan never touches already-settled or non-SUCCEEDED rows).
+// Used by both BusinessPayoutService's own claim query and BusinessFinanceService's read-only
+// "what do I currently owe this Business" computation — see those services' own comments.
+bookingFinancialTransactionSchema.index({ businessId: 1, type: 1, status: 1, payoutId: 1 });
+// Batch 8 — Super Admin's platform-wide (cross-business) period aggregation: no businessId in
+// this query at all, so the businessId-prefixed index above cannot serve it — this is the
+// dedicated index for that shape (type+status equality, createdAt range).
+bookingFinancialTransactionSchema.index({ type: 1, status: 1, createdAt: 1 });
 
 export const BookingFinancialTransactionModel = model<BookingFinancialTransactionDocument>(
   "BookingFinancialTransaction",

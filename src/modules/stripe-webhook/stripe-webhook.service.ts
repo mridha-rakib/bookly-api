@@ -90,20 +90,27 @@ export class StripeWebhookService {
     }
 
     const entries = await this.financialTransactionService.listForBooking(bookingId);
-    const settled = entries.find(
-      (entry) => entry.providerReference === paymentIntent.id && entry.status === "PENDING",
-    );
-    if (settled) {
-      await this.financialTransactionService.settleStatus(settled._id, "SUCCEEDED");
+    const matched = entries.find((entry) => entry.providerReference === paymentIntent.id);
+    if (!matched) {
+      return;
     }
 
-    // Batch 7 (Finance) — best-effort real PROCESSING_FEE capture. Only meaningful for an entry
-    // this webhook actually settled just now (a fee is recorded once per real charge, not once
-    // per webhook redelivery) — `settled` being present is exactly that signal, and the ledger's
-    // unique idempotencyKey below is the actual duplicate guard against Stripe's own retries.
-    if (settled) {
-      await this.recordProcessingFee(settled, paymentIntent.id);
+    if (matched.status === "PENDING") {
+      await this.financialTransactionService.settleStatus(matched._id, "SUCCEEDED");
     }
+
+    // Batch 8 correction: MOST real charges in this codebase settle synchronously at the
+    // moment the charge is made (`PaymentIntentResult.status === "succeeded"` in the SAME API
+    // response — see PaymentIntentResult's own comment) — the ledger entry is therefore
+    // usually ALREADY "SUCCEEDED" by the time this webhook arrives, not "PENDING". Gating
+    // PROCESSING_FEE capture on "this webhook call is the one that performed PENDING ->
+    // SUCCEEDED" (Batch 7's original condition) meant it almost never fired for the common
+    // case. Stripe sends `payment_intent.succeeded` for EVERY successful PaymentIntent
+    // regardless of whether our own synchronous call already observed success, so this now
+    // always attempts capture once a matching entry is found (by `providerReference`,
+    // any status) — `recordProcessingFee`'s own unique `idempotencyKey` is what actually
+    // guards against duplicate recording on webhook redelivery, not this branch.
+    await this.recordProcessingFee(matched, paymentIntent.id);
   }
 
   private async recordProcessingFee(
@@ -135,6 +142,12 @@ export class StripeWebhookService {
         status: "SUCCEEDED",
         providerReference: paymentIntentId,
         idempotencyKey: `processing-fee:${paymentIntentId}`,
+        // Batch 8 — records WHICH underlying payment this processing fee belongs to, the sole
+        // mechanism FinanceOwnership uses to decide who bears it ("the owner of the underlying
+        // payment bears its Stripe processing fee" — see finance-ownership.ts). Without this,
+        // Batch 7's assumption that every PROCESSING_FEE is Business-borne was wrong for a
+        // first-booking PLATFORM_FEE charge.
+        metadata: { sourceType: settledEntry.type, sourceTransactionId: String(settledEntry._id) },
       });
     } catch {
       // Duplicate key on retry (already recorded) — safe to ignore, matches the idempotent

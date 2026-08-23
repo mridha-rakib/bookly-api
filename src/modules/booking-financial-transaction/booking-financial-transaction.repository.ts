@@ -20,6 +20,21 @@ export type FinancialTransactionAggregateBucket = {
   count: number;
 };
 
+/** Batch 8 — one (businessId?, type, sourceType) bucket. `sourceType` is
+ * `metadata.sourceType` (see the model's own doc comment) — `null` when absent (an entry with
+ * no recorded source, e.g. a pre-Batch-8 PROCESSING_FEE/REFUND row, or a COMPENSATION refund
+ * that was never economically owned by either party — see BookingLifecycleService/
+ * BookingCreationService's own comments on where each is written). `businessId` is present only
+ * when the aggregation was NOT scoped to one Business (a platform-wide/per-business breakdown);
+ * omit it entirely for a single-Business call. */
+export type OwnershipAggregateBucket = {
+  businessId?: string;
+  type: BookingFinancialTransactionType;
+  sourceType: string | null;
+  totalCents: number;
+  count: number;
+};
+
 export type CreateBookingFinancialTransactionInput = Omit<
   BookingFinancialTransactionDocument,
   "_id" | "createdAt" | "updatedAt"
@@ -211,6 +226,157 @@ export class BookingFinancialTransactionRepository {
     ]);
     return { rows, total };
   }
+
+  /**
+   * Batch 8 (Business Payout) — the exact set a payout is about to claim, re-read FRESH inside
+   * the caller's own Mongo transaction (never a pre-transaction snapshot — see
+   * BusinessPayoutService.executePayout's own comment on why the read and the claim must share
+   * one transaction). Bounded by `MAX_PAYOUT_CLAIM_BATCH_SIZE`: a real business is not expected
+   * to accumulate more unclaimed fee/deposit rows than this between payouts (Super Admin can
+   * always run payouts more often); if this bound is ever hit in practice, that is itself a
+   * signal payouts are running too infrequently, not a reason to raise it silently.
+   */
+  public async findUnclaimedForPayout(
+    businessId: Types.ObjectId | string,
+    types: BookingFinancialTransactionType[],
+    session?: ClientSession,
+  ): Promise<BookingFinancialTransactionDocument[]> {
+    return BookingFinancialTransactionModel.find(
+      { businessId, type: { $in: types }, status: "SUCCEEDED", payoutId: { $exists: false } },
+      undefined,
+      session ? { session } : undefined,
+    )
+      .limit(MAX_PAYOUT_CLAIM_BATCH_SIZE)
+      .exec();
+  }
+
+  /**
+   * Batch 8 (Business Payout) — the atomic double-spend guard (rule #13). The `payoutId:
+   * {$exists:false}` filter means a row already claimed by a concurrent/earlier payout is
+   * silently excluded from this update rather than overwritten — combined with running this
+   * inside the SAME Mongo transaction as the read above and the BusinessPayout document's own
+   * insert, two concurrent payout attempts for the same Business can never both claim the same
+   * row (MongoDB's transaction write-conflict + `withTransaction`'s automatic retry-on-
+   * TransientTransactionError together guarantee this — see BusinessPayoutService's own
+   * comment).
+   */
+  public async claimForPayout(
+    ids: Array<Types.ObjectId | string>,
+    payoutId: Types.ObjectId,
+    session: ClientSession,
+  ): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+    const result = await BookingFinancialTransactionModel.updateMany(
+      { _id: { $in: ids }, payoutId: { $exists: false } },
+      { $set: { payoutId } },
+      { session },
+    ).exec();
+    return result.modifiedCount;
+  }
+
+  /**
+   * Batch 8 — the shared ownership-aware aggregation primitive (rule #17: "must derive from
+   * shared backend financial primitives... same transaction must produce the same
+   * ownership/net result everywhere"). Groups by (businessId?, type, metadata.sourceType) so
+   * the SERVICE layer can classify PROCESSING_FEE/REFUND ownership from `sourceType` (see
+   * finance-ownership.ts) without ever re-deriving it per call site.
+   *
+   * Two distinct call shapes, both safe for the reasons noted:
+   *  - `unclaimedOnly: true`, no `from`/`to` — the pending-payable read (rule #12: "do not rely
+   *    on dates to decide whether a transaction was previously paid" — this filters on
+   *    `payoutId` existence, never on a date cutoff). Safe unbounded-by-date because it is a
+   *    single reduced `$group`, never a raw dump (same reasoning as
+   *    `sumAllTimeByTypeAndStatus`).
+   *  - `unclaimedOnly: false` with a bounded `[from, to)` — a period-bounded revenue/collected
+   *    figure (e.g. Bookly's own net platform revenue for a reporting period), unrelated to
+   *    payout status.
+   * `businessId` omitted entirely means "every Business" (Super Admin platform-wide reads);
+   * `groupByBusiness` additionally splits the result per Business (needed for the per-Business
+   * pending-payout list) rather than collapsing to one platform-wide total per (type, source).
+   */
+  public async aggregateBusinessOwnedBySource(input: {
+    businessId?: Types.ObjectId | string;
+    types: BookingFinancialTransactionType[];
+    unclaimedOnly: boolean;
+    from?: Date;
+    to?: Date;
+    groupByBusiness?: boolean;
+  }): Promise<OwnershipAggregateBucket[]> {
+    const match: Record<string, unknown> = {
+      type: { $in: input.types },
+      status: "SUCCEEDED",
+      ...(input.businessId ? { businessId: input.businessId } : {}),
+      ...(input.unclaimedOnly ? { payoutId: { $exists: false } } : {}),
+      ...(input.from && input.to ? { createdAt: { $gte: input.from, $lt: input.to } } : {}),
+    };
+
+    const groupId: Record<string, unknown> = {
+      type: "$type",
+      sourceType: { $ifNull: ["$metadata.sourceType", null] },
+    };
+    if (input.groupByBusiness) {
+      groupId["businessId"] = "$businessId";
+    }
+
+    const rows = await BookingFinancialTransactionModel.aggregate<{
+      _id: {
+        type: BookingFinancialTransactionType;
+        sourceType: string | null;
+        businessId?: Types.ObjectId;
+      };
+      totalCents: number;
+      count: number;
+    }>([
+      { $match: match },
+      { $group: { _id: groupId, totalCents: { $sum: "$amountCents" }, count: { $sum: 1 } } },
+    ]).exec();
+
+    return rows.map((row) => ({
+      ...(row._id.businessId ? { businessId: String(row._id.businessId) } : {}),
+      type: row._id.type,
+      sourceType: row._id.sourceType,
+      totalCents: row.totalCents,
+      count: row.count,
+    }));
+  }
+
+  /** Batch 8 (Super Admin Finance Log) — the platform-wide paginated transaction read, the
+   * global counterpart to `listFeeTransactionsPage`. Always bounded by `[from, to)` (validated
+   * by the service against `MAX_BUSINESS_LEDGER_RANGE_DAYS`, same convention as every other
+   * bounded read here) and real page/limit pagination. Backed by the `{type, status, createdAt}`
+   * index — `businessId` is deliberately NOT part of the match here (this is the cross-business
+   * view); a single-Business equivalent already exists in `listFeeTransactionsPage`/
+   * `listByBusinessId`. */
+  public async listGlobalPage(input: {
+    types?: BookingFinancialTransactionType[];
+    from: Date;
+    to: Date;
+    page: number;
+    limit: number;
+  }): Promise<{ rows: BookingFinancialTransactionDocument[]; total: number }> {
+    const filter = {
+      ...(input.types ? { type: { $in: input.types } } : {}),
+      createdAt: { $gte: input.from, $lt: input.to },
+    };
+    const skip = (input.page - 1) * input.limit;
+    const [rows, total] = await Promise.all([
+      BookingFinancialTransactionModel.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(input.limit)
+        .exec(),
+      BookingFinancialTransactionModel.countDocuments(filter).exec(),
+    ]);
+    return { rows, total };
+  }
 }
 
-export { MAX_BUSINESS_LEDGER_PAGE_SIZE, MAX_BUSINESS_LEDGER_RANGE_DAYS };
+const MAX_PAYOUT_CLAIM_BATCH_SIZE = 2000;
+
+export {
+  MAX_BUSINESS_LEDGER_PAGE_SIZE,
+  MAX_BUSINESS_LEDGER_RANGE_DAYS,
+  MAX_PAYOUT_CLAIM_BATCH_SIZE,
+};

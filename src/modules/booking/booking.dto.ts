@@ -59,6 +59,10 @@ export type BookingDetailDto = {
 
 export type BookingListItemDto = {
   id: string;
+  /** Batch 9 — added so the CUSTOMER-scoped `/me/bookings` list (which spans many Businesses)
+   * can identify and link to each row's Business; `listForBusiness` callers already know their
+   * own businessId and can ignore this field. Matches toBookingDetailDto's own businessId. */
+  businessId: string;
   reference: string;
   status: string;
   source: string;
@@ -176,6 +180,7 @@ export const toBookingDetailDto = (booking: BookingDocument): BookingDetailDto =
 
 export const toBookingListItemDto = (booking: BookingDocument): BookingListItemDto => ({
   id: String(booking._id),
+  businessId: String(booking.businessId),
   reference: booking.reference,
   status: booking.status,
   source: booking.source,
