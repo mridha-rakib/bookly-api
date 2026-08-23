@@ -809,6 +809,71 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     void business;
   });
 
+  it("[IDOR, Batch 9 completion pass] a customer cannot read, cancel, reschedule, or list another customer's booking", async () => {
+    const { business, booking, client } = await createUpcomingBooking();
+    const owner1 = await userRepository.create({
+      normalizedEmail: `owner-cust-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await clientRepository.setLinkState(client._id, {
+      linkState: "LINKED",
+      linkedUserId: owner1._id,
+    });
+    await BookingModel.updateOne(
+      { _id: booking._id },
+      { $set: { "customer.customerUserId": owner1._id } },
+    ).exec();
+
+    const intruder = await userRepository.create({
+      normalizedEmail: `intruder-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+
+    // Read: anti-enumeration 404, never a 403 that would confirm the booking exists.
+    await expect(
+      bookingService.getBookingDetailForCustomer(String(intruder._id), String(booking._id)),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    // List: the intruder's own "/me/bookings" must never surface someone else's booking.
+    const intruderList = await bookingService.listBookingsForCustomer(
+      String(intruder._id),
+      {},
+      { page: 1, limit: 50 },
+    );
+    expect(intruderList.bookings.some((b) => String(b._id) === String(booking._id))).toBe(false);
+
+    // Cancel: must not be able to cancel a booking that isn't theirs.
+    await expect(
+      lifecycleService.cancelByCustomer(String(intruder._id), String(booking._id), undefined),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    // Reschedule: must not be able to move someone else's booking.
+    await expect(
+      lifecycleService.rescheduleByCustomer(
+        String(intruder._id),
+        String(booking._id),
+        startAtFor("13:00"),
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    // The booking itself is completely untouched by all four attempts.
+    const refetched = await bookingRepository.findById(business._id, booking._id);
+    expect(refetched?.status).toBe("UPCOMING");
+    expect(refetched?.customerRescheduleCount).toBe(0);
+    expect(refetched?.schedule.startAt.toISOString()).toBe(booking.schedule.startAt.toISOString());
+
+    // The RIGHTFUL owner can still do all of the above normally — this isn't a broken lockout.
+    const ownDetail = await bookingService.getBookingDetailForCustomer(
+      String(owner1._id),
+      String(booking._id),
+    );
+    expect(String(ownDetail._id)).toBe(String(booking._id));
+  });
+
   it("[race] a failed reschedule (target slot conflict) leaves the OLD reservation completely valid", async () => {
     const { owner, business, membership, service, booking } = await createUpcomingBooking("10:00");
 

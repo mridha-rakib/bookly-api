@@ -260,19 +260,26 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
    * comment — a real, still-unresolved product gap flagged since Batch 3); these payment-focused
    * tests intentionally sidestep that unrelated gap rather than conflating two different concerns.
    */
+  let linkedClientPhoneCounter = 0;
+
   const linkCustomerToBusiness = async (
     businessId: Types.ObjectId,
     ownerId: Types.ObjectId,
     customerId: Types.ObjectId,
   ) => {
     const user = await userRepository.findById(customerId);
+    // A real unique-per-Business constraint on (businessId, phone.e164) means every Client
+    // linked to the SAME Business within one test must get a distinct phone — a single fixed
+    // number silently only worked while no test linked two different Customers to one Business.
+    linkedClientPhoneCounter += 1;
+    const nationalNumber = String(99_000_000 + linkedClientPhoneCounter);
     await clientRepository.create({
       businessId,
       createdByUserId: ownerId,
       firstName: "Test",
       lastName: "Customer",
       normalizedEmail: user?.normalizedEmail ?? `linked-${customerId.toString()}@example.com`,
-      phone: { countryCode: "+357", nationalNumber: "99000000", e164: "+35799000000" },
+      phone: { countryCode: "+357", nationalNumber, e164: `+357${nationalNumber}` },
       address: {
         city: "Larnaca",
         propertyType: "House",
@@ -466,6 +473,109 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     // Both are "first bookings" for their own business — both charge an activation fee.
     expect(atA.booking.financials.platformFeeCents).toBeGreaterThan(0);
     expect(atB.booking.financials.platformFeeCents).toBeGreaterThan(0);
+  });
+
+  it("[race] two different customers finalizing the SAME slot: both charges succeed, the loser is refunded, and no orphan/misattributed ledger entry remains (Batch 9 completion pass)", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+    const customerA = await createCustomer("race-slot-1");
+    const customerB = await createCustomer("race-slot-2");
+    await saveCard(customerA._id);
+    await saveCard(customerB._id);
+    await linkCustomerToBusiness(business._id, owner._id, customerA._id);
+    await linkCustomerToBusiness(business._id, owner._id, customerB._id);
+
+    // Same exact staff + slot for both — a genuine exclusive-slot conflict, not two
+    // independently-bookable times. Promise.allSettled preserves input order in its results
+    // array regardless of which settles first, so results[0]/[1] map to customerA/customerB —
+    // but WHICH of the two actually wins the underlying race is nondeterministic, so it must be
+    // determined from the outcome, never assumed from call order.
+    const results = await Promise.allSettled([
+      creationService.finalizeCustomerBooking(
+        String(customerA._id),
+        String(business._id),
+        finalizeInput(service._id, membership._id, "10:00"),
+      ),
+      creationService.finalizeCustomerBooking(
+        String(customerB._id),
+        String(business._id),
+        finalizeInput(service._id, membership._id, "10:00"),
+      ),
+    ]);
+    const customerIds = [customerA._id, customerB._id];
+
+    const fulfilled = results.filter(
+      (
+        r,
+      ): r is PromiseFulfilledResult<
+        Awaited<ReturnType<typeof creationService.finalizeCustomerBooking>>
+      > => r.status === "fulfilled",
+    );
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    const loserCustomerId = customerIds[results.findIndex((r) => r.status === "rejected")];
+
+    // Exactly one customer actually gets the slot — the other's finalize call must surface a
+    // real, catchable error (never a silent no-op, never a second Booking for the same slot).
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    // Either conflict code is a correct outcome of this exact race depending on which branch of
+    // reserveOrJoin's atomic retry loop the loser lands on — both mean "no double-booking, a
+    // real recoverable 409" (see booking-slot-reservation.service.ts), never a 5xx/silent drop.
+    const rejection = rejected[0]?.reason as {
+      statusCode?: number;
+      details?: Array<{ code?: string }>;
+    };
+    expect(rejection.statusCode).toBe(409);
+    expect(rejection.details?.[0]?.code).toMatch(
+      /^BOOKING_SLOT_RESERVATION_(CONFLICT|CAPACITY_UNAVAILABLE)$/,
+    );
+
+    // Exactly one Booking exists for this business — no orphan/partial Booking for the loser.
+    const bookingCount = await BookingModel.countDocuments({ businessId: business._id }).exec();
+    expect(bookingCount).toBe(1);
+
+    // The loser's charge genuinely succeeded (FakePaymentGateway defaults to "succeeded") but
+    // must have been refunded as a compensating action — never left as an uncollected,
+    // unattributed charge, and never recorded as PLATFORM_FEE/DEPOSIT revenue for anyone since
+    // the transaction that would have written that entry rolled back before it could.
+    const allLedgerEntries = await financialTransactionService.listForBusiness({
+      businessId: business._id,
+      from: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      to: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
+
+    const winningBooking = fulfilled[0]?.value;
+    if (winningBooking?.status !== "confirmed") {
+      throw new Error("expected the winning call to be confirmed");
+    }
+
+    // Only ONE PLATFORM_FEE/DEPOSIT-type entry exists across the whole business for this race —
+    // belonging to the winner's own Booking, never a second one for the loser's non-existent
+    // Booking.
+    const activationLikeEntries = allLedgerEntries.filter(
+      (entry) => entry.type === "PLATFORM_FEE" || entry.type === "DEPOSIT",
+    );
+    expect(activationLikeEntries).toHaveLength(1);
+    expect(String(activationLikeEntries[0]?.bookingId)).toBe(String(winningBooking.booking._id));
+
+    // The loser's compensating refund is real, SUCCEEDED, and deliberately unattributed to
+    // either Bookly or the Business (see compensateFailedBookingAfterPayment's own comment —
+    // `sourceType: "COMPENSATION"`, never counted as anyone's revenue since nothing was ever
+    // durably ledgered as revenue in the first place).
+    const compensationRefunds = allLedgerEntries.filter(
+      (entry) => entry.type === "REFUND" && entry.metadata?.["sourceType"] === "COMPENSATION",
+    );
+    expect(compensationRefunds).toHaveLength(1);
+    expect(compensationRefunds[0]?.status).toBe("SUCCEEDED");
+    expect(compensationRefunds[0]?.amountCents).toBe(
+      winningBooking.booking.financials.depositCents,
+    );
+
+    // The loser's own BusinessClient row was never activated by this failed attempt.
+    const loserClient = await BusinessClientModel.findOne({
+      businessId: business._id,
+      linkedUserId: loserCustomerId,
+    }).exec();
+    expect(loserClient?.activatedAt).toBeUndefined();
   });
 
   it("[race] duplicate finalize with the same idempotencyKey results in exactly one charge and one booking", async () => {

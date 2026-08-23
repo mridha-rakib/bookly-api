@@ -1,6 +1,7 @@
 import mongoose, { Types } from "mongoose";
 
 import type { AvailabilityService } from "../availability/availability.service.js";
+import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -371,10 +372,18 @@ export class BookingLifecycleService {
   /** Symmetric to executeCancellationFeeCharge, for the refund leg of a Business cancellation.
    * `upfrontPayment` is whichever of PLATFORM_FEE/DEPOSIT actually settled for this booking —
    * the full amount is refunded regardless of which type it was (see cancelByBusiness's own
-   * doc comment). */
+   * doc comment). `_id`/`type` (Batch 8) are recorded on the REFUND entry's own metadata so
+   * FinanceOwnership can attribute the reversal to the correct party (a Bookly-owned
+   * PLATFORM_FEE refund reduces Bookly's revenue; a Business-owned DEPOSIT refund reduces the
+   * Business's payable) — never inferred from date/amount alone. */
   private async executeBusinessCancellationRefund(
     booking: BookingDocument,
-    upfrontPayment: { providerReference?: string | undefined; amountCents: number },
+    upfrontPayment: {
+      _id: Types.ObjectId;
+      type: BookingFinancialTransactionDocument["type"];
+      providerReference?: string | undefined;
+      amountCents: number;
+    },
   ): Promise<BookingDocument> {
     const idempotencyKey = `business-cancel-refund:${String(booking._id)}`;
     let settlementStatus: "SUCCEEDED" | "FAILED" = "FAILED";
@@ -408,6 +417,10 @@ export class BookingLifecycleService {
       status: settlementStatus === "SUCCEEDED" ? "SUCCEEDED" : "FAILED",
       ...(refundId ? { providerReference: refundId } : {}),
       idempotencyKey: `${idempotencyKey}:ledger`,
+      metadata: {
+        sourceType: upfrontPayment.type,
+        sourceTransactionId: String(upfrontPayment._id),
+      },
     });
 
     const updated = await this.bookingRepository.updateCancellationSettlement(

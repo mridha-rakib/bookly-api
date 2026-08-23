@@ -8,12 +8,14 @@ import {
   createCustomerBookingRoute,
 } from "../modules/booking/booking.route.js";
 import { createBusinessRoute } from "../modules/business/business.route.js";
+import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
 import { HealthController } from "../modules/health/health.controller.js";
 import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
+import { createSuperAdminRoute } from "../modules/super-admin/super-admin.route.js";
 
 export const createApiRouter = (databaseStateReader: DatabaseStateReader): Router => {
   const router = Router();
@@ -43,6 +45,14 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   router.use("/me", createCustomerBookingRoute());
   // Customer saved-card management — cross-business, same rationale as "My Bookings" above.
   router.use("/payments", createPaymentRoute());
+  // Super Admin's own top-level prefix — SUPER_ADMIN-only end to end (see its own comment); no
+  // ordering dependency with the routers above (distinct path prefix).
+  router.use("/super-admin", createSuperAdminRoute());
+  // Customer-facing catalog browse/availability — its own top-level prefix specifically to
+  // avoid colliding with the Owner-only `/businesses/:businessId` and `/businesses/:businessId/
+  // services/:serviceId/availability` paths above (see createCatalogRoute's own comment). No
+  // ordering dependency (distinct path prefix).
+  router.use("/catalog", createCatalogRoute());
 
   return router;
 };

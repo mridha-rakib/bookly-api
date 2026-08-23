@@ -29,6 +29,8 @@ const defaultMessages: Record<string, string> = {
   BOOKING_CLIENT_CROSS_BUSINESS: "This client does not belong to the selected business",
   BOOKING_CUSTOMER_CLIENT_PROFILE_REQUIRED:
     "This business does not yet have a client record for you, and self-service sign-up is only available when a delivery address is provided as part of the booking (travel bookings). Please contact the business directly for your first booking, or provide a travel address.",
+  BOOKING_CUSTOMER_CLIENT_CONTACT_CONFLICT:
+    "A client record with matching contact details already exists at this business but is not linked to your account. Please contact the business directly to complete your first booking.",
   BOOKING_IDEMPOTENCY_KEY_REQUIRED: "An idempotency key is required to create a booking",
   BOOKING_TRANSACTION_UNAVAILABLE:
     "The database does not support the transactions this operation requires",

@@ -26,7 +26,10 @@ export type BusinessClientDto = {
   phone: { countryCode: string; nationalNumber: string; e164: string };
   dateOfBirth?: string | undefined;
   gender?: "male" | "female" | "other" | undefined;
-  address: BusinessClientAddress;
+  /** Batch 9 — optional: a Client auto-created for a Customer's first AT_BUSINESS_LOCATION
+   * booking has no address on file (see BusinessClientDocument's own doc comment). The
+   * Business-owner Clients UI should treat this as "not yet provided," never fabricate one. */
+  address?: BusinessClientAddress | undefined;
   notes?: string | undefined;
   tag?: ClientTag | undefined;
   linkState: ClientLinkState;

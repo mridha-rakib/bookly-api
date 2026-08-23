@@ -465,14 +465,37 @@ export class BookingCreationService {
   /**
    * Resolves the Customer's BusinessClient row for this Business — reuses an existing linked
    * row if one already exists (created earlier by the Business, or by a prior travel booking).
-   * For a genuinely first-time Customer at this Business: if the booking is TRAVEL_TO_CUSTOMER,
-   * the travel address the Customer is already supplying is a reasonable, evidence-based source
-   * for the Client's required `address` field, so a new Client row is created from it. For
-   * AT_BUSINESS_LOCATION, there is NO structured address source anywhere in this codebase for a
-   * self-service Customer (CustomerProfile.address is free-text, not the structured
-   * city/area/street shape BusinessClient.address requires — confirmed by inspection, not
-   * assumed) — this remains a genuine, unresolved product gap flagged since Batch 3 and still
-   * flagged here, not silently invented around.
+   * For a genuinely first-time Customer at this Business:
+   *  - TRAVEL_TO_CUSTOMER: the travel address the Customer is already supplying is a
+   *    reasonable, evidence-based source for the Client's `address` field, so a new Client row
+   *    is created from it.
+   *  - AT_BUSINESS_LOCATION (Batch 9 — confirmed product decision, corrects the Batch 3 gap
+   *    this method previously threw BOOKING_CUSTOMER_CLIENT_PROFILE_REQUIRED for): there is NO
+   *    structured address source anywhere in this codebase for a self-service Customer
+   *    (CustomerProfile.address is free-text, not the structured city/area/street shape
+   *    BusinessClientAddress requires) — asking the Customer for one purely to satisfy the
+   *    schema would be irrelevant friction for a service that happens AT the venue. The Client
+   *    row is created with `address` omitted (see BusinessClientDocument's own doc comment on
+   *    why the field is optional) rather than blocking the booking; the Business can fill in a
+   *    real address later if they choose to manage this Client manually.
+   *
+   * CONCURRENCY (Batch 9 completion pass — a real bug found and fixed here): two genuinely
+   * concurrent first-booking attempts for the SAME Customer+Business (e.g. a double-click that
+   * outraces the idempotency claim, or two browser tabs) both read "no existing Client" and both
+   * attempt `create()`. Exactly one write wins — `client.model.ts`'s own unique indexes on
+   * `(businessId, normalizedEmail)`, `(businessId, phone.e164)`, and the partial
+   * `(businessId, linkedUserId)` index all guarantee that — but the LOSING call previously let a
+   * raw, uncaught `MongoServerError` (code 11000) propagate all the way to the customer as an
+   * opaque 500, even though its own money-safe ordering (this method runs BEFORE any Stripe
+   * charge — see finalizeCustomerBooking) meant nothing was actually lost. This now mirrors the
+   * exact self-healing idiom BookingCreationClaimRepository.claim() already established
+   * elsewhere in this file's own module: catch the duplicate-key error and re-fetch. Re-fetching
+   * by `linkedUserId` only (never by email/phone) is deliberate — a collision on email/phone
+   * against a row NOT linked to this Customer is a genuinely different situation (e.g. the
+   * Business separately holds an unrelated/unlinked walk-in Client with the same contact info)
+   * that must never be silently auto-linked, since that would silently decide this Customer's
+   * first-vs-returning relationship at this Business without any real evidence it's the same
+   * person — a clear, distinct error is thrown instead.
    */
   private async resolveOrCreateCustomerClient(
     business: BusinessDocument,
@@ -487,10 +510,6 @@ export class BookingCreationService {
       return existing;
     }
 
-    if (fulfilment.mode !== "TRAVEL_TO_CUSTOMER" || !fulfilment.travelAddress) {
-      throw new BookingError("BOOKING_CUSTOMER_CLIENT_PROFILE_REQUIRED", 409);
-    }
-
     const [user, profile] = await Promise.all([
       this.userRepository.findById(customerUserId),
       this.userRepository.findProfileByUserId(customerUserId),
@@ -499,25 +518,57 @@ export class BookingCreationService {
       throw new BookingError("BOOKING_CUSTOMER_CLIENT_PROFILE_REQUIRED", 409);
     }
 
-    return this.clientRepository.create({
-      businessId: business._id,
-      createdByUserId: new Types.ObjectId(customerUserId),
-      firstName: profile.firstName,
-      lastName: profile.lastName,
-      normalizedEmail: user.normalizedEmail,
-      phone: profile.phone,
-      address: {
-        city: fulfilment.travelAddress.city,
-        propertyType: fulfilment.travelAddress.propertyType,
-        area: fulfilment.travelAddress.area,
-        streetName: fulfilment.travelAddress.streetName,
-        streetNumber: fulfilment.travelAddress.streetNumber,
-        floorUnit: fulfilment.travelAddress.floorUnit,
-        aptRoom: fulfilment.travelAddress.aptRoom,
-      },
-      linkState: "LINKED",
-      linkedUserId: new Types.ObjectId(customerUserId),
-    });
+    const travelAddress =
+      fulfilment.mode === "TRAVEL_TO_CUSTOMER" ? fulfilment.travelAddress : undefined;
+
+    try {
+      return await this.clientRepository.create({
+        businessId: business._id,
+        createdByUserId: new Types.ObjectId(customerUserId),
+        firstName: profile.firstName,
+        lastName: profile.lastName,
+        normalizedEmail: user.normalizedEmail,
+        phone: profile.phone,
+        ...(travelAddress
+          ? {
+              address: {
+                city: travelAddress.city,
+                propertyType: travelAddress.propertyType,
+                area: travelAddress.area,
+                streetName: travelAddress.streetName,
+                streetNumber: travelAddress.streetNumber,
+                floorUnit: travelAddress.floorUnit,
+                aptRoom: travelAddress.aptRoom,
+              },
+            }
+          : {}),
+        linkState: "LINKED",
+        linkedUserId: new Types.ObjectId(customerUserId),
+      });
+    } catch (error) {
+      if (!this.isDuplicateKeyError(error)) {
+        throw error;
+      }
+
+      const winner = await this.clientRepository.findByBusinessIdAndLinkedUserId(
+        business._id,
+        customerUserId,
+      );
+      if (winner) {
+        return winner;
+      }
+
+      throw new BookingError("BOOKING_CUSTOMER_CLIENT_CONTACT_CONFLICT", 409);
+    }
+  }
+
+  private isDuplicateKeyError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === 11000
+    );
   }
 
   /**
@@ -726,6 +777,13 @@ export class BookingCreationService {
         status: refund.status === "succeeded" ? "SUCCEEDED" : "PENDING",
         providerReference: refund.refundId,
         idempotencyKey: `refund:${paymentResult.paymentIntentId}:compensation`,
+        // Batch 8 — this refund unwinds a charge whose own ledger entry never durably
+        // persisted (persistCustomerBooking's transaction rolled back before writing it), so
+        // there is no sourceTransactionId to link to. Deliberately NOT attributed to either
+        // Bookly or the Business (see finance-ownership.ts's own comment): the corresponding
+        // charge was never counted as anyone's revenue in the first place, so nothing needs
+        // reversing against either party's total.
+        metadata: { sourceType: "COMPENSATION" },
       });
     } catch {
       // Best-effort — a failed compensation is a real operational issue (an uncollectable/

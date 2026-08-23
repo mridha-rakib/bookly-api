@@ -126,9 +126,7 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     expect(processingFeeEntry?.["businessId"]).toBe(pending.businessId);
   });
 
-  it("never records a PROCESSING_FEE entry on webhook redelivery (nothing was newly settled this time)", async () => {
-    // Already-SUCCEEDED — this simulates the SECOND delivery of the same event, after the first
-    // delivery already settled it.
+  it("still attempts PROCESSING_FEE capture when the entry was ALREADY SUCCEEDED (Batch 8 correction — most real charges settle synchronously, so the ledger entry is usually already SUCCEEDED by the time this webhook arrives, not PENDING)", async () => {
     const bookingId = new Types.ObjectId();
     const alreadySettled = makeEntry({
       bookingId,
@@ -139,8 +137,46 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
 
     await service.process(paymentIntentSucceededEvent("pi_test_1", String(bookingId)));
 
+    // No PENDING -> SUCCEEDED transition happened (it was already SUCCEEDED)...
     expect(settleStatusCalls).toEqual([]);
-    expect(recordedEntries.find((entry) => entry["type"] === "PROCESSING_FEE")).toBeUndefined();
+    // ...but the processing fee is still captured, since Stripe's own webhook delivery is a
+    // separate real-world event from our synchronous charge confirmation.
+    const processingFeeEntry = recordedEntries.find((entry) => entry["type"] === "PROCESSING_FEE");
+    expect(processingFeeEntry).toBeDefined();
+    expect(processingFeeEntry?.["idempotencyKey"]).toBe("processing-fee:pi_test_1");
+  });
+
+  it("never records a duplicate PROCESSING_FEE entry on true webhook redelivery (the ledger's real unique idempotencyKey index rejects the second insert)", async () => {
+    const bookingId = new Types.ObjectId();
+    const alreadySettled = makeEntry({
+      bookingId,
+      providerReference: "pi_test_1",
+      status: "SUCCEEDED",
+    });
+    const service = buildService(alreadySettled);
+    // Simulate the real Mongo unique index: a second `record()` call with the same
+    // idempotencyKey throws, exactly like BookingFinancialTransactionService.record does on a
+    // duplicate-key error.
+    let processingFeeAttempts = 0;
+    financialTransactionService.record = vi.fn(async (input: Record<string, unknown>) => {
+      if (input["type"] === "PROCESSING_FEE") {
+        processingFeeAttempts += 1;
+        if (processingFeeAttempts > 1) {
+          throw new Error("duplicate key");
+        }
+      }
+      recordedEntries.push(input);
+      return {
+        _id: new Types.ObjectId(),
+        ...input,
+      } as unknown as BookingFinancialTransactionDocument;
+    });
+
+    const event = paymentIntentSucceededEvent("pi_test_1", String(bookingId));
+    await service.process(event);
+    await service.process(event);
+
+    expect(recordedEntries.filter((entry) => entry["type"] === "PROCESSING_FEE")).toHaveLength(1);
   });
 
   it("never throws when the balance transaction is not yet available (returns null) — the primary settlement still succeeds", async () => {

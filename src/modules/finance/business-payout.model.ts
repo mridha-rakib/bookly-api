@@ -3,23 +3,34 @@ import { model, Schema, type Types } from "mongoose";
 import { type BookingCurrency, bookingCurrencies } from "../booking/booking.types.js";
 
 /**
- * Batch 7 (Finance/Payouts) — a real bank-transfer batch to a Business, e.g. one monthly SEPA
- * transfer. Deliberately a SEPARATE entity from BookingFinancialTransaction rather than reusing
- * its `BUSINESS_PAYOUT` type: that ledger type is scoped to one `bookingId` (required on the
- * schema), which cannot represent "one payout covering many bookings/transactions over a
- * period" without either faking a bookingId or loosening the ledger's own required field —
- * neither acceptable (see booking-financial-transaction.model.ts's own "never Mongoose
- * directly"/immutability doc comments). This collection is the period-level aggregate; the
- * ledger remains the line-item source of truth those totals are computed from.
+ * A real bank-transfer batch to a Business (Batch 7 introduced this model with no write path;
+ * Batch 8 activates it). Deliberately a SEPARATE entity from BookingFinancialTransaction rather
+ * than reusing its `BUSINESS_PAYOUT` type: that ledger type is scoped to one `bookingId`
+ * (required on the schema), which cannot represent "one payout covering many bookings/
+ * transactions accumulated over time" without either faking a bookingId or loosening the
+ * ledger's own required field — neither acceptable (see booking-financial-transaction.model.ts's
+ * own "never Mongoose directly"/immutability doc comments). This collection is the payout-level
+ * aggregate; the ledger remains the line-item source of truth those totals are computed from.
  *
- * No write path exists yet in this phase — no real SEPA/Stripe Connect payout EXECUTION
- * infrastructure exists in this codebase (confirmed during Batch 7 investigation), so nothing
- * ever inserts a row here today. This is deliberately honest: FinanceService.listPayoutHistory
- * reads whatever rows genuinely exist (none, for every Business, until a real payout-execution
- * process is built) rather than fabricating "Paid" history from collected transactions. The
- * schema/repository exist now so that future payout-execution work has a stable, already-tested
- * target, matching this codebase's existing "storage shape before the write path" convention
- * (see BookingSchedule/BookingRescheduleEntry's own doc comments in booking.model.ts).
+ * BATCH 8 — MANUAL, SELF-ATTESTED PAYOUT (confirmed product decision, not inferred): no real
+ * SEPA/Stripe Connect transfer-EXECUTION infrastructure exists in this codebase. A payout row is
+ * created ONLY by BusinessPayoutService.executePayout, when a Super Admin clicks "Send SEPA" /
+ * "Confirm Transfer" in the Super Admin Finance UI — this is the Super Admin ATTESTING they have
+ * already sent (or are about to send) this exact net amount to the Business via their own bank/
+ * Stripe dashboard OUTSIDE Bookly, mirroring the already-established `BookingCompletionPayment`
+ * self-attestation pattern (Batch 5 — "a Business self-attestation about money collected
+ * OFF-platform... Bookly has no way to independently verify it"). A row is therefore written
+ * DIRECTLY as `status: "PAID"`, `paidAt: <now>` in one step — never as an intermediate "sent but
+ * unconfirmed" state, since there is no external system to later confirm it against. `PENDING`
+ * remains in the status enum only for schema forward-compatibility with a genuine future
+ * transfer-execution integration; nothing in this batch ever writes it.
+ *
+ * `settledTransactionIds` is the explicit, auditable linkage this payout settles (rule #12) —
+ * every one of those ledger rows also carries this payout's own `_id` back on its own
+ * `payoutId` field (see booking-financial-transaction.model.ts) — bidirectional, purely for
+ * cheap lookups either direction; the ledger's `payoutId` field (set exactly once, inside the
+ * same transaction as this document's insert) is the actual source of truth preventing a
+ * transaction from ever being paid out twice, not this array alone.
  */
 export type BusinessPayoutStatus = "PENDING" | "PAID";
 export const businessPayoutStatuses = ["PENDING", "PAID"] as const;
@@ -27,18 +38,37 @@ export const businessPayoutStatuses = ["PENDING", "PAID"] as const;
 export type BusinessPayoutDocument = {
   _id: Types.ObjectId;
   businessId: Types.ObjectId;
-  /** [periodStart, periodEnd) — the settlement window this payout covers. */
+  /** [periodStart, periodEnd] — the min/max `createdAt` of the settled transactions, NOT an
+   * artificial calendar-month boundary (a payout can be triggered at any time, covering
+   * whatever accumulated since the last one — rule #9: "no automatic daily/weekly/monthly
+   * payout"). Purely descriptive/display; never used to decide payout eligibility. */
   periodStart: Date;
   periodEnd: Date;
-  /** The Business-owned amount collected in this period, before processing-fee deduction. */
+  /** The Business-owned amount this payout settles, before processing-fee/refund deduction. */
   grossBusinessOwnedCents: number;
+  /** Business-borne Stripe processing fees deducted from `grossBusinessOwnedCents` — the real,
+   * actual-Stripe-data amount (never an estimate; see finance-ownership.ts). */
   processingFeesCents: number;
-  /** grossBusinessOwnedCents - processingFeesCents — the amount actually transferred. */
+  /** Business-owned refund reversals (e.g. a returning customer's DEPOSIT refunded on a
+   * Business-initiated cancellation) deducted from `grossBusinessOwnedCents` — kept as its own
+   * field rather than folded into `processingFeesCents` so a refund is never misrepresented as
+   * a processing cost (rule #23 auditability). */
+  refundsCents: number;
+  /** grossBusinessOwnedCents - processingFeesCents - refundsCents — the amount the Super Admin
+   * is attesting they transferred. */
   netPayoutCents: number;
   currency: BookingCurrency;
   status: BusinessPayoutStatus;
-  /** External transfer reference (e.g. a SEPA/Stripe Connect payout id) — unset until a real
-   * payout provider is integrated. */
+  /** The exact BookingFinancialTransaction rows this payout settles — see this type's own doc
+   * comment on the bidirectional linkage. */
+  settledTransactionIds: Types.ObjectId[];
+  /** Which Super Admin attested/triggered this payout — required (this batch's flow always sets
+   * it; there is no automated payout path). */
+  initiatedByUserId: Types.ObjectId;
+  /** An optional REAL bank/transfer reference the Super Admin may type in as their own evidence
+   * (e.g. their bank's confirmation code) — never auto-generated by Bookly, since Bookly has no
+   * real transfer integration to generate one from (rule #11: never fabricate a transfer
+   * reference). */
   providerReference?: string | undefined;
   paidAt?: Date | undefined;
   createdAt: Date;
@@ -52,9 +82,19 @@ const businessPayoutSchema = new Schema<BusinessPayoutDocument>(
     periodEnd: { type: Date, required: true },
     grossBusinessOwnedCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     processingFeesCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    refundsCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     netPayoutCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     currency: { type: String, enum: bookingCurrencies, required: true, default: "EUR" },
     status: { type: String, enum: businessPayoutStatuses, required: true, default: "PENDING" },
+    settledTransactionIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: "BookingFinancialTransaction" }],
+      required: true,
+      validate: {
+        validator: (value: unknown[]) => value.length > 0,
+        message: "A payout must settle at least one transaction",
+      },
+    },
+    initiatedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     providerReference: { type: String, trim: true },
     paidAt: { type: Date },
   },
@@ -62,8 +102,11 @@ const businessPayoutSchema = new Schema<BusinessPayoutDocument>(
 );
 
 // Payout history for a Business, most recent period first — the one read pattern this
-// collection serves.
+// collection serves for a single Business.
 businessPayoutSchema.index({ businessId: 1, periodStart: -1 });
+// Super Admin's platform-wide payout history / "sent to businesses" totals — no businessId
+// filter, ordered by recency.
+businessPayoutSchema.index({ status: 1, createdAt: -1 });
 
 export const BusinessPayoutModel = model<BusinessPayoutDocument>(
   "BusinessPayout",
