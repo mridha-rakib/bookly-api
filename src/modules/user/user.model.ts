@@ -35,6 +35,9 @@ const userSchema = new Schema<UserDocument>(
 );
 
 userSchema.index({ role: 1, status: 1 });
+// Batch 12 — Super Admin Customer Analytics "customers registered over time": filters by role
+// then buckets/sorts by createdAt; the index above doesn't have createdAt trailing.
+userSchema.index({ role: 1, createdAt: -1 });
 
 export const UserModel = model<UserDocument>("User", userSchema);
 

@@ -9,6 +9,9 @@ const defaultMessages: Record<string, string> = {
   BUSINESS_LINK_NOT_FOUND: "Business link not found",
   BUSINESS_LINK_VERIFICATION_NOT_FOUND: "Verification request not found or expired",
   BUSINESS_LINK_VERIFICATION_CONSUMED: "This verification code has already been used",
+  // Batch 11 — Business lifecycle (approve/reject/suspend).
+  BUSINESS_INVALID_STATUS_TRANSITION:
+    "This business cannot move to the requested status from its current status",
 };
 
 export class BusinessError extends AppError {

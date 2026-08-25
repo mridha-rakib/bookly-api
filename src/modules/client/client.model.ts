@@ -152,6 +152,10 @@ businessClientSchema.index({ "phone.e164": 1 });
 // in-memory sort; the businessId+archivedAt prefix still narrows the tag/search-filtered
 // cases even though those two extra filters are not themselves part of this index.
 businessClientSchema.index({ businessId: 1, archivedAt: 1, createdAt: -1 });
+// Batch 12 — Super Admin Business Analytics "new customers per business": a period-bounded range
+// scan on activatedAt, platform-wide (not scoped to one business ahead of the $group). Sparse
+// since most Clients never activate.
+businessClientSchema.index({ activatedAt: -1 }, { sparse: true });
 
 export const BusinessClientModel = model<BusinessClientDocument>(
   "BusinessClient",

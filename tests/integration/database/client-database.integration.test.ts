@@ -97,8 +97,21 @@ describe("database-backed BusinessClient integration", () => {
       role: "BUSINESS_OWNER",
       status: "ACTIVE",
     });
-    const business = await businessRepository.create(businessInput(user._id, businessName));
-    return { user, business };
+    const pending = await businessRepository.create(businessInput(user._id, businessName));
+    // Batch 11 — Client management writes are now gated on Business approval status; every
+    // fixture business in this file needs to be in good standing for these (pre-existing,
+    // unrelated) Client tests to still exercise what they actually test.
+    const business = await businessRepository.casUpdateStatus(
+      pending._id,
+      ["PENDING"],
+      "APPROVED",
+      {
+        fromStatus: "PENDING",
+        actorUserId: new Types.ObjectId(),
+        changedAt: new Date(),
+      },
+    );
+    return { user, business: business ?? pending };
   };
 
   const createSupervisor = async (businessId: Types.ObjectId, email: string) => {
