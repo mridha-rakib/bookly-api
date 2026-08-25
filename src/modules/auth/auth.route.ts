@@ -20,16 +20,22 @@ import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import { createPhoneOtpProvider } from "../verification/phone-otp.provider.js";
 import { AuthController } from "./auth.controller.js";
-import { createAuthenticateAccessTokenMiddleware, requireActiveUser } from "./auth.middleware.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+  requireRoles,
+} from "./auth.middleware.js";
 import {
   businessDetailsBodySchema,
   categorySelectionBodySchema,
+  changeMyPasswordBodySchema,
   entryBodySchema,
   loginBodySchema,
   professionalEntryBodySchema,
   profileBodySchema,
   progressQuerySchema,
   sessionBodySchema,
+  updateMyProfileBodySchema,
   verifyEmailOtpBodySchema,
   verifyPhoneOtpBodySchema,
   visitTypeBodySchema,
@@ -238,6 +244,23 @@ export const createAuthRoute = (): Router => {
   router.post("/refresh", refreshLimiter, asyncHandler(controller.refresh));
   router.post("/logout", asyncHandler(controller.logout));
   router.get("/me", authenticate, requireActiveUser(), asyncHandler(controller.me));
+  router.patch(
+    "/me",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ body: updateMyProfileBodySchema }),
+    asyncHandler(controller.updateMe),
+  );
+  router.patch(
+    "/me/password",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    loginLimiter,
+    validateRequest({ body: changeMyPasswordBodySchema }),
+    asyncHandler(controller.changeMyPassword),
+  );
 
   return router;
 };

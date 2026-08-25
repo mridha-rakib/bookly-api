@@ -21,10 +21,12 @@ import { AuthError } from "./auth.errors.js";
 import type {
   BusinessDetailsBody,
   CategorySelectionBody,
+  ChangeMyPasswordBody,
   EntryBody,
   LoginBody,
   ProfessionalEntryBody,
   ProfileBody,
+  UpdateMyProfileBody,
   VerifyEmailOtpBody,
   VerifyPhoneOtpBody,
   VisitTypeBody,
@@ -522,6 +524,10 @@ export class AuthService {
 
     const profile = await this.userRepository.findProfileByUserId(user._id);
     const business = await this.resolveMeBusiness(user._id, user.role);
+    const customerProfile =
+      user.role === "CUSTOMER"
+        ? await this.userRepository.findCustomerProfileByUserId(user._id)
+        : null;
 
     return {
       user: {
@@ -539,6 +545,8 @@ export class AuthService {
             fullName: `${profile.firstName} ${profile.lastName}`.trim(),
             gender: profile.gender,
             phone: profile.phone,
+            address: customerProfile?.address,
+            dateOfBirth: customerProfile?.dateOfBirth,
           }
         : null,
       business: business
@@ -550,6 +558,65 @@ export class AuthService {
           }
         : null,
     };
+  }
+
+  /**
+   * Batch 17 — Customer Profile self-edit. Allow-lists exactly firstName/lastName/gender
+   * (UserProfile) and address/dateOfBirth (CustomerProfile — upserted since no signup path ever
+   * creates that row). Deliberately excludes email/phone/role/status/internal IDs; the request
+   * schema itself (`.strict()`) already rejects any other field.
+   */
+  public async updateMyProfile(
+    userId: string,
+    input: UpdateMyProfileBody,
+  ): Promise<Awaited<ReturnType<AuthService["getMe"]>>> {
+    const user = await this.userRepository.findById(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const profile = await this.userRepository.findProfileByUserId(user._id);
+
+    if (!profile) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const { firstName, lastName, gender, address, dateOfBirth } = input;
+
+    if (firstName !== undefined || lastName !== undefined || gender !== undefined) {
+      await this.userRepository.updateProfile(profile._id, {
+        ...(firstName !== undefined ? { firstName } : {}),
+        ...(lastName !== undefined ? { lastName } : {}),
+        ...(gender !== undefined ? { gender } : {}),
+      });
+    }
+
+    if (address !== undefined || dateOfBirth !== undefined) {
+      await this.userRepository.upsertCustomerProfile(user._id, {
+        ...(address !== undefined ? { address } : {}),
+        ...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
+      });
+    }
+
+    return this.getMe(userId);
+  }
+
+  public async changeMyPassword(userId: string, input: ChangeMyPasswordBody): Promise<void> {
+    const user = await this.userRepository.findByIdWithPassword(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const isValid = await this.passwordHasher.verify(user.passwordHash, input.currentPassword);
+
+    if (!isValid) {
+      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+    }
+
+    const passwordHash = await this.passwordHasher.hash(input.newPassword);
+    await this.userRepository.updatePasswordHash(user._id, passwordHash);
   }
 
   /**

@@ -42,6 +42,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
   const userRepository = {
     findByEmail: vi.fn().mockResolvedValue(null),
     findByEmailWithPassword: vi.fn(),
+    findByIdWithPassword: vi.fn(),
     findById: vi.fn(),
     findManyByIds: vi.fn().mockResolvedValue([]),
     findProfilesByUserIds: vi.fn().mockResolvedValue([]),
@@ -57,6 +58,9 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     }),
     createProfile: vi.fn(),
     createCustomerProfile: vi.fn(),
+    findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+    upsertCustomerProfile: vi.fn(),
+    updatePasswordHash: vi.fn(),
     findProfileByUserId: vi.fn(),
     findVerifiedCustomerByEmail: vi.fn().mockResolvedValue(null),
     findVerifiedCustomerByPhoneE164: vi.fn().mockResolvedValue(null),
@@ -109,6 +113,12 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     ...(overrides["clientIdentityService"] as object | undefined),
   };
 
+  const passwordHasher = {
+    hash: vi.fn().mockResolvedValue("hashed-password"),
+    verify: vi.fn().mockResolvedValue(true),
+    ...(overrides["passwordHasher"] as object | undefined),
+  };
+
   const service = new AuthService(
     userRepository,
     registrationSessionRepository as unknown as RegistrationSessionRepository,
@@ -119,7 +129,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
       saveCategories: vi.fn(),
     } as unknown as BusinessOnboardingService,
     businessRepository as unknown as BusinessRepository,
-    { hash: vi.fn(), verify: vi.fn() } as unknown as PasswordHasher,
+    passwordHasher as unknown as PasswordHasher,
     { sendOtp: vi.fn() } as unknown as EmailOtpProvider,
     { sendOtp: vi.fn(), verifyOtp: vi.fn().mockResolvedValue(true) } as unknown as PhoneOtpProvider,
     tokenService as unknown as TokenService,
@@ -136,6 +146,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     businessService,
     staffRepository,
     clientIdentityService,
+    passwordHasher,
   };
 };
 
@@ -274,5 +285,99 @@ describe("AuthService repairs", () => {
     await expect(service.logout(undefined)).resolves.toBeUndefined();
 
     expect(tokenService.revokeRefreshToken).not.toHaveBeenCalled();
+  });
+});
+
+describe("AuthService.updateMyProfile", () => {
+  it("allow-lists firstName/lastName/gender to UserProfile and upserts address/dateOfBirth to CustomerProfile", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: profileId,
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue({
+          address: "Limassol, Cyprus",
+          dateOfBirth: "1990-01-01",
+        }),
+      },
+    });
+
+    const result = await service.updateMyProfile(userId.toHexString(), {
+      firstName: "Janet",
+      address: "Nicosia, Cyprus",
+    });
+
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(profileId, { firstName: "Janet" });
+    expect(userRepository.upsertCustomerProfile).toHaveBeenCalledWith(userId, {
+      address: "Nicosia, Cyprus",
+    });
+    expect(result.profile).toMatchObject({ address: "Limassol, Cyprus" });
+  });
+
+  it("rejects updates for a user with no session-backed profile", async () => {
+    const userId = new Types.ObjectId();
+    const { service } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({ _id: userId, role: "CUSTOMER" }),
+        findProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+
+    await expect(
+      service.updateMyProfile(userId.toHexString(), { firstName: "Janet" }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+});
+
+describe("AuthService.changeMyPassword", () => {
+  it("verifies the current password and stores the new hash", async () => {
+    const userId = new Types.ObjectId();
+    const { service, userRepository, passwordHasher } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({ _id: userId, passwordHash: "old-hash" }),
+      },
+      passwordHasher: {
+        verify: vi.fn().mockResolvedValue(true),
+        hash: vi.fn().mockResolvedValue("new-hash"),
+      },
+    });
+
+    await service.changeMyPassword(userId.toHexString(), {
+      currentPassword: "old-password",
+      newPassword: "new-password",
+    });
+
+    expect(passwordHasher.verify).toHaveBeenCalledWith("old-hash", "old-password");
+    expect(passwordHasher.hash).toHaveBeenCalledWith("new-password");
+    expect(userRepository.updatePasswordHash).toHaveBeenCalledWith(userId, "new-hash");
+  });
+
+  it("rejects an incorrect current password without touching the stored hash", async () => {
+    const userId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({ _id: userId, passwordHash: "old-hash" }),
+      },
+      passwordHasher: { verify: vi.fn().mockResolvedValue(false) },
+    });
+
+    await expect(
+      service.changeMyPassword(userId.toHexString(), {
+        currentPassword: "wrong-password",
+        newPassword: "new-password",
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(userRepository.updatePasswordHash).not.toHaveBeenCalled();
   });
 });

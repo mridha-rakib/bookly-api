@@ -10,10 +10,12 @@ import { AuthError } from "./auth.errors.js";
 import type {
   BusinessDetailsBody,
   CategorySelectionBody,
+  ChangeMyPasswordBody,
   EntryBody,
   LoginBody,
   ProfessionalEntryBody,
   ProfileBody,
+  UpdateMyProfileBody,
   VerifyEmailOtpBody,
   VerifyPhoneOtpBody,
   VisitTypeBody,
@@ -178,6 +180,34 @@ export class AuthController {
 
     const result = await this.authService.getMe(userId);
     sendSuccess(response, 200, "Current user", result);
+  };
+
+  public updateMe = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const result = await this.authService.updateMyProfile(
+      userId,
+      request.validated?.body as UpdateMyProfileBody,
+    );
+    sendSuccess(response, 200, "Profile updated", result);
+  };
+
+  public changeMyPassword = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    await this.authService.changeMyPassword(
+      userId,
+      request.validated?.body as ChangeMyPasswordBody,
+    );
+    sendSuccess(response, 200, "Password changed");
   };
 
   private getContext(request: Request) {
