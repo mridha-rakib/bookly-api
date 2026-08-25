@@ -25,6 +25,7 @@ const defaultMessages: Record<string, string> = {
   OTP_DELIVERY_FAILED: "Verification code delivery failed",
   OTP_VERIFICATION_FAILED: "Verification check failed",
   PROVIDER_RATE_LIMITED: "Verification provider rate limit exceeded",
+  INVALID_CURRENT_PASSWORD: "Current password is incorrect",
 };
 
 export class AuthError extends AppError {

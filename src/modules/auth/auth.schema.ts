@@ -111,6 +111,32 @@ export const progressQuerySchema = z.object({
   sessionId: sessionIdSchema,
 });
 
+// Batch 17 — Customer Profile self-edit. Deliberately excludes email/phone (no re-verification
+// flow exists yet — see AskUserQuestion decision) and role/status/internal IDs (never
+// mass-assignable). `.strict()` rejects any other field outright rather than silently ignoring it.
+export const updateMyProfileBodySchema = z
+  .object({
+    firstName: z.string().trim().min(1).optional(),
+    lastName: z.string().trim().min(1).optional(),
+    gender: z.enum(genders).optional(),
+    address: z.string().trim().min(1).max(500).optional(),
+    dateOfBirth: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Date of birth must be in YYYY-MM-DD format")
+      .optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one field must be provided",
+  });
+
+export const changeMyPasswordBodySchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    newPassword: passwordSchema,
+  })
+  .strict();
+
 export const authResponseSchema = z.object({
   accessToken: z.string(),
   accessTokenExpiresAt: z.string().datetime(),
@@ -132,3 +158,5 @@ export type VerifyPhoneOtpBody = z.infer<typeof verifyPhoneOtpBodySchema>;
 export type VisitTypeBody = z.infer<typeof visitTypeBodySchema>;
 export type BusinessDetailsBody = z.infer<typeof businessDetailsBodySchema>;
 export type CategorySelectionBody = z.infer<typeof categorySelectionBodySchema>;
+export type UpdateMyProfileBody = z.infer<typeof updateMyProfileBodySchema>;
+export type ChangeMyPasswordBody = z.infer<typeof changeMyPasswordBodySchema>;

@@ -45,6 +45,10 @@ export class UserRepository {
     return UserModel.findOne({ normalizedEmail }).select("+passwordHash").exec();
   }
 
+  public async findByIdWithPassword(id: Types.ObjectId | string): Promise<UserDocument | null> {
+    return UserModel.findById(id).select("+passwordHash").exec();
+  }
+
   public async findById(id: Types.ObjectId | string): Promise<UserDocument | null> {
     return UserModel.findById(id).exec();
   }
@@ -161,7 +165,7 @@ export class UserRepository {
 
   public async updateProfile(
     profileId: Types.ObjectId,
-    update: Partial<Pick<CreateProfileInput, "firstName" | "lastName">> & {
+    update: Partial<Pick<CreateProfileInput, "firstName" | "lastName" | "gender">> & {
       /** `undefined` clears the phone (via $unset); omit the key entirely to leave it untouched. */
       phone?: CreateProfileInput["phone"];
     },
@@ -219,6 +223,37 @@ export class UserRepository {
     userId: Types.ObjectId | string,
   ): Promise<UserProfileDocument | null> {
     return UserProfileModel.findOne({ userId }).exec();
+  }
+
+  public async findCustomerProfileByUserId(
+    userId: Types.ObjectId | string,
+  ): Promise<CustomerProfileDocument | null> {
+    return CustomerProfileModel.findOne({ userId }).exec();
+  }
+
+  /** Batch 17 — Customer Profile edit. Upserts because CustomerProfile rows are never created at
+   * signup (see createCustomerProfile — dormant until now); the first time a customer sets
+   * address/dateOfBirth from their Profile page, the row must be created on the fly. */
+  public async upsertCustomerProfile(
+    userId: Types.ObjectId,
+    update: Partial<Pick<CustomerProfileDocument, "address" | "dateOfBirth">>,
+  ): Promise<void> {
+    if (Object.keys(update).length === 0) {
+      return;
+    }
+
+    await CustomerProfileModel.updateOne(
+      { userId },
+      { $set: update, $setOnInsert: { userId } },
+      { upsert: true },
+    );
+  }
+
+  public async updatePasswordHash(userId: Types.ObjectId, passwordHash: string): Promise<void> {
+    await UserModel.updateOne(
+      { _id: userId },
+      { $set: { passwordHash, "security.passwordUpdatedAt": new Date() } },
+    );
   }
 
   /**
