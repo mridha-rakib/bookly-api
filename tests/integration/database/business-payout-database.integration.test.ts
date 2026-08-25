@@ -33,6 +33,10 @@ import { FinanceError } from "../../../src/modules/finance/finance.errors.js";
 import { FinanceService } from "../../../src/modules/finance/finance.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
+import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
+import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
+import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -105,6 +109,11 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     financialTransactionService = new BookingFinancialTransactionService(
       new BookingFinancialTransactionRepository(),
     );
+    const promoApplicationService = new PromoApplicationService(
+      new PromoRepository(),
+      new PromoUserUsageRepository(),
+      new PromoRedemptionRepository(),
+    );
     businessPayoutRepository = new BusinessPayoutRepository();
     financeService = new FinanceService(
       businessRepository,
@@ -159,6 +168,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       clientRepository,
       paymentService,
       financialTransactionService,
+      promoApplicationService,
     );
 
     lifecycleService = new BookingLifecycleService(

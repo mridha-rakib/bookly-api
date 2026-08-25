@@ -15,6 +15,10 @@ import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
+import {
+  createCustomerReviewRoute,
+  createPublicBusinessReviewRoute,
+} from "../modules/review/review.route.js";
 import { createSuperAdminRoute } from "../modules/super-admin/super-admin.route.js";
 
 export const createApiRouter = (databaseStateReader: DatabaseStateReader): Router => {
@@ -43,6 +47,9 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Customer self-service "My Bookings" surface — cross-business, never nested under
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).
   router.use("/me", createCustomerBookingRoute());
+  // Batch 14 — Customer self-service Review surface, same "/me" prefix/rationale as "My
+  // Bookings" above (own booking-scoped review, cross-business).
+  router.use("/me", createCustomerReviewRoute());
   // Customer saved-card management — cross-business, same rationale as "My Bookings" above.
   router.use("/payments", createPaymentRoute());
   // Super Admin's own top-level prefix — SUPER_ADMIN-only end to end (see its own comment); no
@@ -53,6 +60,11 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // services/:serviceId/availability` paths above (see createCatalogRoute's own comment). No
   // ordering dependency (distinct path prefix).
   router.use("/catalog", createCatalogRoute());
+  // Batch 14 — public Business rating summary + Reviews list, same `/catalog` prefix and
+  // CUSTOMER-authenticated "public business page" convention as createCatalogRoute() (see
+  // createPublicBusinessReviewRoute's own comment on why this codebase has no true anonymous-
+  // public route). Distinct path suffixes (`/reviews`, `/reviews/summary`), no collision.
+  router.use("/catalog", createPublicBusinessReviewRoute());
 
   return router;
 };

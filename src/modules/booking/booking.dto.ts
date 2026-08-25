@@ -53,6 +53,19 @@ export type BookingDetailDto = {
   noShowStartedAt?: string | undefined;
   noShowDeadlineAt?: string | undefined;
   notes?: string | undefined;
+  /** Batch 13 — present only when a Promo Code was applied. `financials.depositCents` remains
+   * the pre-promo canonical entitlement; `promo.chargeCents` is what was actually charged. */
+  promo?:
+    | {
+        code: string;
+        type: string;
+        value: number;
+        discountCents: number;
+        chargeCents: number;
+        fundingOwner: string;
+        appliedAt: string;
+      }
+    | undefined;
   createdAt: string;
   updatedAt: string;
 };
@@ -174,6 +187,17 @@ export const toBookingDetailDto = (booking: BookingDocument): BookingDetailDto =
   noShowStartedAt: booking.noShowStartedAt?.toISOString(),
   noShowDeadlineAt: booking.noShowDeadlineAt?.toISOString(),
   notes: booking.notes,
+  promo: booking.promo
+    ? {
+        code: booking.promo.code,
+        type: booking.promo.type,
+        value: booking.promo.value,
+        discountCents: booking.promo.discountCents,
+        chargeCents: booking.promo.chargeCents,
+        fundingOwner: booking.promo.fundingOwner,
+        appliedAt: booking.promo.appliedAt.toISOString(),
+      }
+    : undefined,
   createdAt: booking.createdAt.toISOString(),
   updatedAt: booking.updatedAt.toISOString(),
 });

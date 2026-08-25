@@ -25,6 +25,10 @@ import { ClientRepository } from "../client/client.repository.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../payment/payment.service.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
+import { PromoRepository } from "../promo/promo.repository.js";
+import { PromoApplicationService } from "../promo/promo-application.service.js";
+import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
+import { PromoUserUsageRepository } from "../promo/promo-user-usage.repository.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
@@ -78,6 +82,11 @@ const buildController = (): BookingController => {
   const financialTransactionService = new BookingFinancialTransactionService(
     new BookingFinancialTransactionRepository(),
   );
+  const promoApplicationService = new PromoApplicationService(
+    new PromoRepository(),
+    new PromoUserUsageRepository(),
+    new PromoRedemptionRepository(),
+  );
 
   const availabilityService = new AvailabilityService(
     businessRepository,
@@ -114,6 +123,7 @@ const buildController = (): BookingController => {
     clientRepository,
     paymentService,
     financialTransactionService,
+    promoApplicationService,
   );
 
   const lifecycleService = new BookingLifecycleService(

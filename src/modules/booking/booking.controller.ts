@@ -220,6 +220,7 @@ export class BookingController {
       customerCity: body.customerCity,
       notes: body.notes,
       idempotencyKey: body.idempotencyKey,
+      promoCode: body.promoCode,
     });
 
     sendSuccess(response, 200, "Booking preview", preview);
@@ -237,6 +238,7 @@ export class BookingController {
       customerCity: body.customerCity,
       notes: body.notes,
       idempotencyKey: body.idempotencyKey,
+      promoCode: body.promoCode,
     });
 
     if (result.status === "requires_action") {

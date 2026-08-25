@@ -51,6 +51,8 @@ const createBookingBodyBase = z.object({
   customerCity: z.enum(businessCities).optional(),
   notes: z.string().trim().max(2000).optional(),
   idempotencyKey: z.string().trim().min(1).max(200),
+  // Batch 13 — Customer checkout only; createManualBooking never reads this field.
+  promoCode: z.string().trim().min(1).max(40).optional(),
 });
 
 export const createManualBookingBodySchema = createBookingBodyBase

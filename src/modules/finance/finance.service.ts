@@ -239,6 +239,7 @@ export class FinanceService {
         cancellationAmountCents:
           businessBuckets.find((b) => b.type === "CANCELLATION_FEE")?.totalCents ?? 0,
         depositAmountCents: businessBuckets.find((b) => b.type === "DEPOSIT")?.totalCents ?? 0,
+        promoSubsidyAmountCents: totals.promoSubsidyCents,
       });
       totalPendingCents += totals.netCents;
     }
@@ -409,6 +410,7 @@ export class FinanceService {
     let noShowAmountCents = 0;
     let cancellationAmountCents = 0;
     let depositAmountCents = 0;
+    let promoSubsidyAmountCents = 0;
 
     for (const entry of entries) {
       if (entry.type === "NO_SHOW_FEE") {
@@ -420,6 +422,11 @@ export class FinanceService {
       } else if (entry.type === "DEPOSIT") {
         grossCents += entry.amountCents;
         depositAmountCents += entry.amountCents;
+      } else if (entry.type === "PROMO_SUBSIDY") {
+        // Batch 13 — always Business-owned by construction (never `sourceType`-classified —
+        // see finance-ownership.ts's own comment on why this differs from PROCESSING_FEE/REFUND).
+        grossCents += entry.amountCents;
+        promoSubsidyAmountCents += entry.amountCents;
       } else if (entry.type === "PROCESSING_FEE" || entry.type === "REFUND") {
         const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
         if (classifySourceOwner(sourceType) === "BUSINESS") {
@@ -445,6 +452,7 @@ export class FinanceService {
       noShowAmountCents,
       cancellationAmountCents,
       depositAmountCents,
+      promoSubsidyAmountCents,
     };
   }
 

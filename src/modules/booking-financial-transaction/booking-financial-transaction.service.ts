@@ -35,6 +35,10 @@ const fixedDirectionByType: Partial<
   REFUND: "CREDIT",
   BUSINESS_PAYOUT: "CREDIT",
   PROCESSING_FEE: "DEBIT",
+  // Batch 13 — mirrors BUSINESS_PAYOUT's own convention: money arriving to settle/close a
+  // position (here, Bookly making the Business whole for a promo shortfall), never a second
+  // debit against what the customer owes.
+  PROMO_SUBSIDY: "CREDIT",
 };
 
 export type RecordTransactionInput = CreateBookingFinancialTransactionInput;
