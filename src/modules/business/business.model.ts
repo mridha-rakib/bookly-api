@@ -52,6 +52,17 @@ export type BusinessDocument = {
   briefDescription: string;
   category: string;
   subcategories: string[];
+  /** Batch 11 — the Business lifecycle audit trail (mirrors Booking's own embedded
+   * `eventHistory` pattern rather than a separate global audit collection — same established
+   * per-entity convention). Written ONLY by BusinessLifecycleService's approve/reject/suspend
+   * methods, never by a generic status PATCH (no such endpoint exists). */
+  statusHistory: Array<{
+    fromStatus: BusinessStatus;
+    toStatus: BusinessStatus;
+    actorUserId: Types.ObjectId;
+    reason?: string | undefined;
+    changedAt: Date;
+  }>;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -98,11 +109,36 @@ const businessSchema = new Schema<BusinessDocument>(
     briefDescription: { type: String, required: true, trim: true },
     category: { type: String, required: true, trim: true },
     subcategories: { type: [String], required: true },
+    statusHistory: {
+      type: [
+        {
+          _id: false,
+          fromStatus: { type: String, enum: businessStatuses, required: true },
+          toStatus: { type: String, enum: businessStatuses, required: true },
+          actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+          reason: { type: String, trim: true, maxlength: 2000 },
+          changedAt: { type: Date, required: true },
+        },
+      ],
+      required: true,
+      default: [],
+    },
   },
   { timestamps: true },
 );
 
 businessSchema.index({ ownerUserId: 1 }, { unique: true });
 businessSchema.index({ status: 1 });
+// Super Admin Business list — status filter + newest-first, the one paginated list query this
+// collection needs (see business.repository.ts listForSuperAdmin).
+businessSchema.index({ status: 1, createdAt: -1 });
+// Batch 12 — Super Admin Business Analytics "businesses created over time" needs an unfiltered
+// createdAt range/sort; the compound index above can't serve that efficiently since status is
+// its leading key.
+businessSchema.index({ createdAt: -1 });
+// Batch 12 — Super Admin Recent Activity: the most-recently-changed Businesses (a statusHistory
+// push updates this same field) to surface recent approve/reject/suspend events without scanning
+// every Business's full history.
+businessSchema.index({ updatedAt: -1 });
 
 export const BusinessModel = model<BusinessDocument>("Business", businessSchema);

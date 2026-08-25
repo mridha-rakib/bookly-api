@@ -10,6 +10,7 @@ import { createAddonsRoute } from "../addons/addon.route.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
+  requireApprovedBusiness,
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { normalizeEmail } from "../auth/auth.utils.js";
@@ -108,16 +109,9 @@ export const createBusinessRoute = (): Router => {
   // STAFF/SUPERVISOR/CUSTOMER access to it in this phase.
   router.use(authenticate, requireActiveUser(), requireRoles(["BUSINESS_OWNER"]));
 
+  // --- Never gated by Business approval status (see requireApprovedBusiness's own comment for
+  // the confirmed policy this reflects) ---
   router.get("/my-profile", asyncHandler(controller.getMyProfile));
-  router.use(createBusinessMediaRoute());
-  router.use(createBusinessTravelSettingsRoute());
-  router.use(createBusinessBookingSettingsRoute());
-  router.use(createBusinessHoursRoute());
-  router.use(createBusinessCancellationPolicyRoute());
-  router.use(createServicesRoute());
-  router.use(createAddonsRoute());
-  router.use(createStaffRoute());
-  router.use(createStaffAvatarRoute());
   router.use(createFinanceRoute());
 
   router.post(
@@ -149,6 +143,20 @@ export const createBusinessRoute = (): Router => {
     validateRequest({ params: businessIdParamsSchema }),
     asyncHandler(controller.getById),
   );
+
+  // --- Everything below requires the Business to be APPROVED or WARNING (Batch 11) ---
+  router.use(requireApprovedBusiness(businessRepository));
+
+  router.use(createBusinessMediaRoute());
+  router.use(createBusinessTravelSettingsRoute());
+  router.use(createBusinessBookingSettingsRoute());
+  router.use(createBusinessHoursRoute());
+  router.use(createBusinessCancellationPolicyRoute());
+  router.use(createServicesRoute());
+  router.use(createAddonsRoute());
+  router.use(createStaffRoute());
+  router.use(createStaffAvatarRoute());
+
   router.patch(
     "/:businessId",
     validateRequest({ params: businessIdParamsSchema, body: updateBusinessBodySchema }),

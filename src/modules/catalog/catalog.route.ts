@@ -7,6 +7,7 @@ import { AddonServiceAssignmentRepository } from "../addons/addon-service-assign
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
+  requireApprovedBusiness,
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
@@ -83,7 +84,15 @@ export const createCatalogRoute = (): Router => {
   );
   const controller = new CatalogController(catalogService);
 
-  router.use(authenticate, requireActiveUser(), requireRoles(["CUSTOMER"]));
+  // Batch 11 — a PENDING or SUSPENDED Business is not discoverable/bookable by Customers at
+  // all (confirmed policy: "block new customer self-bookings" covers catalog browse, not only
+  // the finalize step). WARNING has no effect here (see requireApprovedBusiness's own comment).
+  router.use(
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+  );
 
   router.get(
     "/businesses/:businessId",

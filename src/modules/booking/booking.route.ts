@@ -7,6 +7,7 @@ import { AddonServiceAssignmentRepository } from "../addons/addon-service-assign
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
+  requireApprovedBusiness,
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
@@ -145,12 +146,18 @@ export const createBusinessBookingRoute = (): Router => {
   const router = Router();
   const authenticate = buildAuthenticate();
   const controller = buildController();
+  const businessRepository = new BusinessRepository();
 
+  // Batch 11 — a PENDING or SUSPENDED Business cannot have a NEW manual booking created for it
+  // (confirmed policy). Existing-booking lifecycle routes below (calendar/list/detail/complete/
+  // no-show/waive-fee/cancel/reschedule) are deliberately NOT gated — those must always remain
+  // available regardless of Business status.
   router.post(
     "/:businessId/bookings",
     authenticate,
     requireActiveUser(),
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    requireApprovedBusiness(businessRepository),
     validateRequest({ params: bookingBusinessParamsSchema, body: createManualBookingBodySchema }),
     asyncHandler(controller.createManual),
   );
@@ -243,11 +250,15 @@ export const createBusinessBookingRoute = (): Router => {
     asyncHandler(controller.rescheduleByOwner),
   );
 
+  // Batch 11 — a PENDING or SUSPENDED Business cannot be previewed/booked by a Customer either
+  // (mirrors the catalog.route.ts gate — a Customer arriving here directly, e.g. a stale tab,
+  // must not slip past the same policy the catalog read routes already enforce).
   router.post(
     "/:businessId/bookings/preview",
     authenticate,
     requireActiveUser(),
     requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
     validateRequest({
       params: bookingBusinessParamsSchema,
       body: createCustomerBookingPreviewBodySchema,
@@ -262,6 +273,7 @@ export const createBusinessBookingRoute = (): Router => {
     authenticate,
     requireActiveUser(),
     requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
     validateRequest({
       params: bookingBusinessParamsSchema,
       body: createCustomerBookingPreviewBodySchema,

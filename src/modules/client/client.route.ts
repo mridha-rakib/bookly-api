@@ -5,6 +5,7 @@ import { validateRequest } from "../../common/middleware/validate-request.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
+  requireApprovedBusiness,
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
@@ -60,6 +61,13 @@ export const createClientRoute = (): Router => {
     requireActiveUser(),
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
   ] as const;
+  // Batch 11 — writes only: a PENDING/SUSPENDED Business's Owner/Supervisor can still SEE their
+  // existing Clients (list/detail stay on the plain `requireClientAccess` above), but cannot
+  // create/edit/archive/restore one while the Business isn't in good standing.
+  const requireClientWriteAccess = [
+    ...requireClientAccess,
+    requireApprovedBusiness(businessRepository),
+  ] as const;
 
   router.get(
     "/:businessId/clients",
@@ -69,7 +77,7 @@ export const createClientRoute = (): Router => {
   );
   router.post(
     "/:businessId/clients",
-    ...requireClientAccess,
+    ...requireClientWriteAccess,
     validateRequest({ params: clientBusinessParamsSchema, body: createClientBodySchema }),
     asyncHandler(controller.create),
   );
@@ -81,19 +89,19 @@ export const createClientRoute = (): Router => {
   );
   router.patch(
     "/:businessId/clients/:clientId",
-    ...requireClientAccess,
+    ...requireClientWriteAccess,
     validateRequest({ params: clientIdParamsSchema, body: updateClientBodySchema }),
     asyncHandler(controller.update),
   );
   router.delete(
     "/:businessId/clients/:clientId",
-    ...requireClientAccess,
+    ...requireClientWriteAccess,
     validateRequest({ params: clientIdParamsSchema }),
     asyncHandler(controller.archive),
   );
   router.post(
     "/:businessId/clients/:clientId/restore",
-    ...requireClientAccess,
+    ...requireClientWriteAccess,
     validateRequest({ params: clientIdParamsSchema }),
     asyncHandler(controller.restore),
   );

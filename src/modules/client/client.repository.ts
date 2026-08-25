@@ -233,6 +233,22 @@ export class ClientRepository {
     return BusinessClientModel.find({ "phone.e164": phoneE164, linkState: "UNLINKED" }).exec();
   }
 
+  /** Batch 12 — Business Analytics "new customers per Business": one Business's real Client
+   * activated (see client.model.ts's own `activatedAt` doc comment — set exactly once, only on
+   * a genuinely succeeded activation charge) within the period. Not paginated: bounded by the
+   * number of distinct Businesses with at least one activation in the period. */
+  public async aggregateNewActivationsByBusiness(
+    from: Date,
+    to: Date,
+  ): Promise<Map<string, number>> {
+    const rows = await BusinessClientModel.aggregate<{ _id: Types.ObjectId; count: number }>([
+      { $match: { activatedAt: { $gte: from, $lt: to } } },
+      { $group: { _id: "$businessId", count: { $sum: 1 } } },
+    ]).exec();
+
+    return new Map(rows.map((row) => [String(row._id), row.count]));
+  }
+
   private stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
     const result: Partial<T> = {};
     for (const [key, val] of Object.entries(value)) {

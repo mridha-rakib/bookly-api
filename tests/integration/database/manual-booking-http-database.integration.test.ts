@@ -26,7 +26,7 @@ import {
 } from "./mongo-replset-helper.js";
 
 const TIMEZONE = "Europe/Nicosia";
-const DATE = "2026-08-25"; // a Tuesday, safely in the future relative to any real "now"
+const DATE = "2030-08-20"; // a Tuesday, safely in the future relative to any real "now"
 
 /**
  * Batch 10 completion pass — the manual-booking-creation gap the investigation flagged: every
@@ -84,7 +84,7 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
       role: "BUSINESS_OWNER",
       status: "ACTIVE",
     });
-    const business = await businessRepository.create({
+    const pending = await businessRepository.create({
       ownerUserId: owner._id,
       name,
       ownerName: "Owner Name",
@@ -97,7 +97,20 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
       category: "Barber",
       subcategories: ["Haircut"],
     });
-    return { owner, business };
+    // Batch 11 — manual booking creation is now gated on Business approval status; every
+    // fixture business in this file needs to be in good standing unless a test specifically
+    // means to exercise the PENDING-block itself (see the dedicated test for that below).
+    const business = await businessRepository.casUpdateStatus(
+      pending._id,
+      ["PENDING"],
+      "APPROVED",
+      {
+        fromStatus: "PENDING",
+        actorUserId: owner._id,
+        changedAt: new Date(),
+      },
+    );
+    return { owner, business: business ?? pending };
   };
 
   const createStaff = async (
@@ -438,5 +451,84 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
     expect(response.status).toBe(404);
     const count = await BookingModel.countDocuments({ businessId: business._id }).exec();
     expect(count).toBe(0);
+  });
+
+  // --- Batch 11: Business approval-status enforcement -----------------------------------------
+
+  it("[Batch 11] a PENDING business cannot have a manual booking created for it (403 BUSINESS_PENDING_APPROVAL)", async () => {
+    const { owner, business: approved } = await createBusiness("Pending Salon");
+    // createBusiness auto-approves (every other test in this file needs a working business) —
+    // revert to genuinely PENDING for this one test, which specifically means to exercise that.
+    const business =
+      (await businessRepository.casUpdateStatus(approved._id, ["APPROVED"], "PENDING", {
+        fromStatus: "APPROVED",
+        actorUserId: owner._id,
+        changedAt: new Date(),
+      })) ?? approved;
+    const { membership } = await createStaff(business._id);
+    const service = await createFixedService(business._id, membership._id);
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(membership._id, business._id);
+    const client = await createClientFor(business._id, owner._id, "pending");
+    const app = buildApp();
+
+    const response = await request(app)
+      .post(`/businesses/${business._id}/bookings`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send(validBody(service._id, membership._id, client._id));
+
+    expect(response.status).toBe(403);
+    expect(response.body.errors?.[0]?.code ?? response.body.message).toContain(
+      "BUSINESS_PENDING_APPROVAL",
+    );
+    const count = await BookingModel.countDocuments({ businessId: business._id }).exec();
+    expect(count).toBe(0);
+  });
+
+  it("[Batch 11] a SUSPENDED business cannot have a manual booking created for it (403 BUSINESS_SUSPENDED)", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+    await businessRepository.casUpdateStatus(business._id, ["APPROVED"], "SUSPENDED", {
+      fromStatus: "APPROVED",
+      actorUserId: new Types.ObjectId(),
+      changedAt: new Date(),
+    });
+    const app = buildApp();
+
+    const response = await request(app)
+      .post(`/businesses/${business._id}/bookings`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send(validBody(service._id, membership._id, client._id));
+
+    expect(response.status).toBe(403);
+    const count = await BookingModel.countDocuments({ businessId: business._id }).exec();
+    expect(count).toBe(0);
+  });
+
+  it("[Batch 11] existing-booking lifecycle actions remain available on a SUSPENDED business (complete stays reachable)", async () => {
+    const { owner, business, membership, service, client } = await setupBookableBusiness();
+    const app = buildApp();
+
+    const created = await request(app)
+      .post(`/businesses/${business._id}/bookings`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send(validBody(service._id, membership._id, client._id));
+    expect(created.status).toBe(201);
+
+    await businessRepository.casUpdateStatus(business._id, ["APPROVED"], "SUSPENDED", {
+      fromStatus: "APPROVED",
+      actorUserId: new Types.ObjectId(),
+      changedAt: new Date(),
+    });
+
+    // The complete/cancel/no-show/reschedule routes are NOT gated by requireApprovedBusiness —
+    // confirm one representative existing-booking action still reaches its own handler (a real
+    // business-rule rejection here, e.g. "too early to complete", is a PASS for this test: it
+    // proves the request was NOT blocked at 403 by the approval gate).
+    const completeResponse = await request(app)
+      .post(`/businesses/${business._id}/bookings/${created.body.data.id}/complete`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send({});
+
+    expect(completeResponse.status).not.toBe(403);
   });
 });

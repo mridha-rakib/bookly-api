@@ -214,7 +214,7 @@ describe("database-backed Availability integration", () => {
   ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
 
   // A Tuesday.
-  const DATE = "2026-08-25";
+  const DATE = "2030-08-20";
 
   it("returns bookable slots for a fully-configured business/service/staff", async () => {
     const { owner, business } = await createBusiness("owner@example.com", "Salon A");

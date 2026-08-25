@@ -1,12 +1,12 @@
-import type { ClientSession, Types } from "mongoose";
-
+import { type ClientSession, Types } from "mongoose";
+import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
 import {
   type BookingDocument,
   type BookingEventHistoryEntry,
   BookingModel,
   type BookingRescheduleEntry,
 } from "./booking.model.js";
-import type { BookingStatus } from "./booking.types.js";
+import { type BookingStatus, bookingStatuses } from "./booking.types.js";
 
 /**
  * `_id` is optional-but-honored: BookingCreationService pre-generates it (`new Types.ObjectId()`)
@@ -329,8 +329,331 @@ export class BookingRepository {
     return this.runPaginatedQuery(query, pagination);
   }
 
+  /** Batch 11 — Super Admin global Bookings list: `businessId` is OPTIONAL here (unlike
+   * `listForBusiness`, where it's mandatory) — omitted means every Business, matching the
+   * explicit cross-business Super Admin surface this batch's own instructions require rather
+   * than reusing the Business-scoped endpoint with its authorization bypassed. `q` is a
+   * best-effort case-insensitive match against the Booking's own denormalized customer-contact
+   * snapshot and reference — never a $lookup/join, never an unbounded scan (pagination always
+   * applies). Reuses `buildListQuery`/`runPaginatedQuery` — same eventHistory/rescheduleHistory
+   * projection-out and pagination bounds as every other list method here. */
+  public async listForSuperAdmin(
+    filter: BookingListFilter & {
+      businessId?: Types.ObjectId | string | undefined;
+      q?: string | undefined;
+    },
+    pagination: BookingListPagination,
+  ): Promise<BookingListResult> {
+    const query = this.buildListQuery({
+      ...filter,
+      ...(filter.businessId ? { businessId: filter.businessId } : {}),
+    });
+
+    if (filter.q) {
+      const escaped = filter.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(escaped, "i");
+      query["$or"] = [
+        { reference: pattern },
+        { "customer.contact.firstName": pattern },
+        { "customer.contact.lastName": pattern },
+        { "customer.contact.normalizedEmail": pattern },
+      ];
+    }
+
+    return this.runPaginatedQuery(query, pagination);
+  }
+
+  /** Batch 11 — Super Admin Business list's "bookings" count column: ONE reduced `$group` for
+   * every Business on the current page, never N individual `countDocuments` calls. */
+  public async countByBusinessIds(
+    businessIds: Array<Types.ObjectId | string>,
+  ): Promise<Map<string, number>> {
+    if (businessIds.length === 0) {
+      return new Map();
+    }
+
+    const objectIds = businessIds.map((id) => new Types.ObjectId(id));
+    const rows = await BookingModel.aggregate<{ _id: Types.ObjectId; count: number }>([
+      { $match: { businessId: { $in: objectIds } } },
+      { $group: { _id: "$businessId", count: { $sum: 1 } } },
+    ]).exec();
+
+    return new Map(rows.map((row) => [String(row._id), row.count]));
+  }
+
+  /** Batch 11 — Super Admin dashboard's platform-wide booking-status counts, ONE reduced
+   * `$group` over the whole collection (bounded by nothing since it's a small, fixed-cardinality
+   * group-by, never a per-document scan result set). */
+  public async countAllByStatus(): Promise<Record<BookingStatus, number>> {
+    const rows = await BookingModel.aggregate<{ _id: BookingStatus; count: number }>([
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]).exec();
+
+    const counts = Object.fromEntries(bookingStatuses.map((status) => [status, 0])) as Record<
+      BookingStatus,
+      number
+    >;
+    for (const row of rows) {
+      counts[row._id] = row.count;
+    }
+    return counts;
+  }
+
+  /** Batch 12 — Super Admin Booking Analytics: same shape as `countAllByStatus`, bounded to a
+   * `createdAt` period. Booking-creation metrics use `createdAt`, never `schedule.startAt` (see
+   * the module's own doc comment distinguishing "when a booking record was made" from "when the
+   * appointment happens"). */
+  public async countByStatusInRange(from: Date, to: Date): Promise<Record<BookingStatus, number>> {
+    const rows = await BookingModel.aggregate<{ _id: BookingStatus; count: number }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]).exec();
+
+    const counts = Object.fromEntries(bookingStatuses.map((status) => [status, 0])) as Record<
+      BookingStatus,
+      number
+    >;
+    for (const row of rows) {
+      counts[row._id] = row.count;
+    }
+    return counts;
+  }
+
+  /** Batch 12 — monthly time-series of bookings created within [from, to), UTC-month-bucketed.
+   * Always returns a fully zero-filled bucket per month in range (never a sparse series a chart
+   * would have to reinterpret). */
+  public async countCreatedByMonth(
+    from: Date,
+    to: Date,
+  ): Promise<Array<{ year: number; month: number; count: number }>> {
+    const rows = await BookingModel.aggregate<{
+      _id: { year: number; month: number };
+      count: number;
+    }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      {
+        $group: {
+          _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
+          count: { $sum: 1 },
+        },
+      },
+    ]).exec();
+
+    const countByKey = new Map(rows.map((row) => [`${row._id.year}-${row._id.month}`, row.count]));
+    return zeroFilledMonths(from, to).map(({ year, month }) => ({
+      year,
+      month,
+      count: countByKey.get(`${year}-${month}`) ?? 0,
+    }));
+  }
+
+  /** Batch 12 — the SAME Manual/New/Returning classification `lib/bookings/format.ts`'s
+   * `bookingClientBadge` already uses on the frontend (source==="MANUAL" -> Manual; else
+   * platformFeeCents>0 -> New, else Returning) — computed server-side here so Booking Analytics
+   * never needs to re-derive it per row. */
+  public async aggregateClientTypeSplit(
+    from: Date,
+    to: Date,
+  ): Promise<{ manual: number; newBooking: number; returning: number }> {
+    const rows = await BookingModel.aggregate<{
+      _id: "MANUAL" | "NEW" | "RETURNING";
+      count: number;
+    }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      {
+        $group: {
+          _id: {
+            $cond: [
+              { $eq: ["$source", "MANUAL"] },
+              "MANUAL",
+              { $cond: [{ $gt: ["$financials.platformFeeCents", 0] }, "NEW", "RETURNING"] },
+            ],
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]).exec();
+
+    const counts = { manual: 0, newBooking: 0, returning: 0 };
+    for (const row of rows) {
+      if (row._id === "MANUAL") counts.manual = row.count;
+      else if (row._id === "NEW") counts.newBooking = row.count;
+      else counts.returning = row.count;
+    }
+    return counts;
+  }
+
+  /** Batch 12 — Premises (AT_BUSINESS_LOCATION) vs Mobile (TRAVEL_TO_CUSTOMER) split, from the
+   * Booking's own `fulfilment.mode` snapshot (never re-derived from the Business's CURRENT
+   * `visitType`, which could have changed since the booking was made). */
+  public async aggregateFulfilmentSplit(
+    from: Date,
+    to: Date,
+  ): Promise<{ premises: number; mobile: number }> {
+    const rows = await BookingModel.aggregate<{ _id: string; count: number }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $group: { _id: "$fulfilment.mode", count: { $sum: 1 } } },
+    ]).exec();
+
+    const counts = { premises: 0, mobile: 0 };
+    for (const row of rows) {
+      if (row._id === "AT_BUSINESS_LOCATION") counts.premises = row.count;
+      else if (row._id === "TRAVEL_TO_CUSTOMER") counts.mobile = row.count;
+    }
+    return counts;
+  }
+
+  /** Batch 12 — per-Business booking stats for the whole period in ONE aggregation pass (Top
+   * Businesses by booking count, no-show rate, return rate all read from this same result rather
+   * than three separate collection scans). Not paginated: bounded by the number of distinct
+   * Businesses with at least one booking in the period, which this platform's real scale keeps
+   * small — the service layer sorts/slices for whichever "Top N by X" view is needed. */
+  public async aggregateBusinessBookingStats(
+    from: Date,
+    to: Date,
+  ): Promise<
+    Array<{
+      businessId: string;
+      totalCount: number;
+      completedCount: number;
+      noShowCount: number;
+      manualCount: number;
+      newCount: number;
+      returningCount: number;
+    }>
+  > {
+    const rows = await BookingModel.aggregate<{
+      _id: Types.ObjectId;
+      totalCount: number;
+      completedCount: number;
+      noShowCount: number;
+      manualCount: number;
+      newCount: number;
+      returningCount: number;
+    }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      {
+        $group: {
+          _id: "$businessId",
+          totalCount: { $sum: 1 },
+          completedCount: { $sum: { $cond: [{ $eq: ["$status", "COMPLETED"] }, 1, 0] } },
+          noShowCount: {
+            $sum: {
+              $cond: [{ $in: ["$status", ["NO_SHOW_CHARGED", "NO_SHOW_WAIVED"]] }, 1, 0],
+            },
+          },
+          manualCount: { $sum: { $cond: [{ $eq: ["$source", "MANUAL"] }, 1, 0] } },
+          newCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $ne: ["$source", "MANUAL"] },
+                    { $gt: ["$financials.platformFeeCents", 0] },
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+          returningCount: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $ne: ["$source", "MANUAL"] },
+                    { $lte: ["$financials.platformFeeCents", 0] },
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]).exec();
+
+    return rows.map((row) => ({
+      businessId: String(row._id),
+      totalCount: row.totalCount,
+      completedCount: row.completedCount,
+      noShowCount: row.noShowCount,
+      manualCount: row.manualCount,
+      newCount: row.newCount,
+      returningCount: row.returningCount,
+    }));
+  }
+
+  /** Batch 12 — Top Services by booking count. Groups by the real, immutable `serviceId` and
+   * reads the NAME from each line's own persisted `serviceSnapshot.name` (never a live Service
+   * lookup) — an archived/deleted Service still resolves correctly since the name traveled with
+   * the Booking at creation time. */
+  public async aggregateTopServices(
+    from: Date,
+    to: Date,
+    limit: number,
+  ): Promise<Array<{ serviceId: string; name: string; businessId: string; count: number }>> {
+    const rows = await BookingModel.aggregate<{
+      _id: Types.ObjectId;
+      name: string;
+      businessId: Types.ObjectId;
+      count: number;
+    }>([
+      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $unwind: "$serviceLines" },
+      {
+        $group: {
+          _id: "$serviceLines.serviceId",
+          name: { $first: "$serviceLines.serviceSnapshot.name" },
+          businessId: { $first: "$businessId" },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { count: -1 } },
+      { $limit: limit },
+    ]).exec();
+
+    return rows.map((row) => ({
+      serviceId: String(row._id),
+      name: row.name,
+      businessId: String(row.businessId),
+      count: row.count,
+    }));
+  }
+
+  /** Batch 12 — global (platform-wide, never per-Business) Customer activity for the Customer
+   * Analytics funnel: how many distinct platform Users have EVER completed a real booking
+   * (`customer.customerUserId` is only ever set for a linked Customer account — see the sparse
+   * index's own comment), and how many of those have more than one. Deliberately all-time, not
+   * period-bounded — "has this Customer ever booked" is not a question a date range can answer
+   * without silently changing its meaning. */
+  public async aggregateCustomerActivity(): Promise<{
+    activatedCount: number;
+    retainedCount: number;
+  }> {
+    const rows = await BookingModel.aggregate<{ activatedCount: number; retainedCount: number }>([
+      { $match: { "customer.customerUserId": { $exists: true } } },
+      { $group: { _id: "$customer.customerUserId", bookingCount: { $sum: 1 } } },
+      {
+        $group: {
+          _id: null,
+          activatedCount: { $sum: 1 },
+          retainedCount: { $sum: { $cond: [{ $gte: ["$bookingCount", 2] }, 1, 0] } },
+        },
+      },
+    ]).exec();
+
+    return {
+      activatedCount: rows[0]?.activatedCount ?? 0,
+      retainedCount: rows[0]?.retainedCount ?? 0,
+    };
+  }
+
   private buildListQuery(
-    input: { businessId?: Types.ObjectId | string } & Record<string, unknown> & BookingListFilter,
+    input: { businessId?: Types.ObjectId | string | undefined } & Record<string, unknown> &
+      BookingListFilter,
   ): Record<string, unknown> {
     const query: Record<string, unknown> = {};
 

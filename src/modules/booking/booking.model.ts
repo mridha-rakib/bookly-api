@@ -858,5 +858,9 @@ bookingSchema.index(
   { status: 1, noShowDeadlineAt: 1 },
   { partialFilterExpression: { noShowDeadlineAt: { $exists: true } } },
 );
+// Batch 12 — Super Admin Booking Analytics: platform-wide (unscoped to one Business) time-series
+// and period-bounded status-distribution queries filter/sort by createdAt across the whole
+// collection; no existing index leads with createdAt.
+bookingSchema.index({ createdAt: -1 });
 
 export const BookingModel = model<BookingDocument>("Booking", bookingSchema);

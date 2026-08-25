@@ -42,7 +42,7 @@ import {
 } from "./mongo-replset-helper.js";
 
 const TIMEZONE = "Europe/Nicosia";
-const DATE = "2026-08-25"; // a Tuesday, safely in the future relative to any real "now"
+const DATE = "2030-08-20"; // a Tuesday, safely in the future relative to any real "now"
 
 describe("database-backed Business Finance (Batch 7)", () => {
   let userRepository: UserRepository;
