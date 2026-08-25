@@ -20,6 +20,7 @@ import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
+import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
@@ -34,7 +35,10 @@ import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { StaffScheduleRepository } from "../staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../staff/staff-time-off.repository.js";
+import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
+import { BookAgainController } from "./book-again.controller.js";
+import { BookAgainService } from "./book-again.service.js";
 import { BookingController } from "./booking.controller.js";
 import { BookingRepository } from "./booking.repository.js";
 import {
@@ -301,6 +305,14 @@ export const createCustomerBookingRoute = (): Router => {
   const router = Router();
   const authenticate = buildAuthenticate();
   const controller = buildController();
+  const bookAgainController = new BookAgainController(
+    new BookAgainService(
+      new BookingRepository(),
+      new BusinessRepository(),
+      new BusinessMediaRepository(),
+      createDeferredStorageServiceFromEnv(),
+    ),
+  );
 
   router.get(
     "/bookings",
@@ -309,6 +321,18 @@ export const createCustomerBookingRoute = (): Router => {
     requireRoles(["CUSTOMER"]),
     validateRequest({ query: listCustomerBookingsQuerySchema }),
     asyncHandler(controller.listForCustomer),
+  );
+
+  // Batch 16 — Book Again. Registered BEFORE "/bookings/:bookingId" so the literal path segment
+  // "book-again" is never swallowed by that param route (which would otherwise 400 it as an
+  // invalid ObjectId — Express matches by registration order for overlapping patterns).
+  router.get(
+    "/bookings/book-again",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ query: listCustomerBookingsQuerySchema }),
+    asyncHandler(bookAgainController.list),
   );
 
   router.get(

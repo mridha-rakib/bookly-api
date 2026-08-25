@@ -10,6 +10,8 @@ import {
 import { createBusinessRoute } from "../modules/business/business.route.js";
 import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
+import { createDiscoveryRoute } from "../modules/discovery/discovery.route.js";
+import { createFavoriteRoute } from "../modules/favorite/favorite.route.js";
 import { HealthController } from "../modules/health/health.controller.js";
 import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
@@ -20,6 +22,8 @@ import {
   createPublicBusinessReviewRoute,
 } from "../modules/review/review.route.js";
 import { createSuperAdminRoute } from "../modules/super-admin/super-admin.route.js";
+import { createContactRoute } from "../modules/support/contact.route.js";
+import { createSupportRoute } from "../modules/support/support.route.js";
 
 export const createApiRouter = (databaseStateReader: DatabaseStateReader): Router => {
   const router = Router();
@@ -50,8 +54,21 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Batch 14 — Customer self-service Review surface, same "/me" prefix/rationale as "My
   // Bookings" above (own booking-scoped review, cross-business).
   router.use("/me", createCustomerReviewRoute());
+  // Batch 15B — Customer/Business Owner/Supervisor/Staff self-service "My Tickets" surface, same
+  // "/me" prefix/rationale as "My Bookings"/"My Reviews" above (own-ticket-scoped, cross-Business).
+  router.use("/me", createSupportRoute());
   // Customer saved-card management — cross-business, same rationale as "My Bookings" above.
   router.use("/payments", createPaymentRoute());
+  // Batch 15B — the public Contact form's real backend. Its own top-level prefix (genuinely
+  // anonymous, no `authenticate` anywhere in its chain — see createContactRoute's own comment) so
+  // it can never collide with any authenticated surface above.
+  router.use("/contact", createContactRoute());
+  // Batch 16 — Explore's real backend. Genuinely public, its own top-level prefix — same
+  // anonymous-route precedent as createContactRoute() above.
+  router.use("/discovery", createDiscoveryRoute());
+  // Batch 16 — Favorites, same "/me" prefix/rationale as "My Bookings"/"My Reviews"/"My Tickets"
+  // above (own-resource-scoped, CUSTOMER-only, cross-Business).
+  router.use("/me", createFavoriteRoute());
   // Super Admin's own top-level prefix — SUPER_ADMIN-only end to end (see its own comment); no
   // ordering dependency with the routers above (distinct path prefix).
   router.use("/super-admin", createSuperAdminRoute());

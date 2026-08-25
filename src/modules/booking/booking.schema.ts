@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { businessCities } from "../business/business.types.js";
 import { clientPropertyTypes } from "../client/client.types.js";
-import { bookingStatuses } from "./booking.types.js";
+import { bookingSources, bookingStatuses } from "./booking.types.js";
 
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid id");
 const isoDateTimeSchema = z.string().datetime({ offset: true }).or(z.string().datetime());
@@ -120,6 +120,10 @@ export const listBusinessBookingsQuerySchema = paginationQuerySchema
 export const listCustomerBookingsQuerySchema = paginationQuerySchema
   .extend({
     status: z.string().optional(),
+    // Batch 16 — Book Again's own real-history query narrows to BOOKLY_MANAGED (a Business
+    // Owner's MANUAL entry was never something the Customer themselves booked). Optional,
+    // same comma-split-and-filter convention as `status` immediately above.
+    source: z.string().optional(),
     fromDate: isoDateTimeSchema.optional(),
     toDate: isoDateTimeSchema.optional(),
   })
@@ -133,6 +137,13 @@ export const listCustomerBookingsQuerySchema = paginationQuerySchema
           .filter((s) =>
             (bookingStatuses as readonly string[]).includes(s),
           ) as (typeof bookingStatuses)[number][])
+      : undefined,
+    source: value.source
+      ? (value.source
+          .split(",")
+          .filter((s) =>
+            (bookingSources as readonly string[]).includes(s),
+          ) as (typeof bookingSources)[number][])
       : undefined,
     fromDate: value.fromDate ? new Date(value.fromDate) : undefined,
     toDate: value.toDate ? new Date(value.toDate) : undefined,

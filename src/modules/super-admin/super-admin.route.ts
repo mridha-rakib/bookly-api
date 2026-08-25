@@ -44,6 +44,18 @@ import {
 } from "../review/review.schema.js";
 import { ReviewService } from "../review/review.service.js";
 import { SessionRepository } from "../session/session.repository.js";
+import { StaffRepository } from "../staff/staff.repository.js";
+import {
+  changeSupportTicketStatusBodySchema,
+  listAdminSupportTicketsQuerySchema,
+  listSupportMessagesQuerySchema,
+  supportMessageBodySchema,
+  supportTicketIdParamsSchema,
+} from "../support/support.schema.js";
+import { SupportService } from "../support/support.service.js";
+import { createSupportEmailProvider } from "../support/support-email.provider.js";
+import { SupportMessageRepository } from "../support/support-message.repository.js";
+import { SupportTicketRepository } from "../support/support-ticket.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import {
   superAdminAnalyticsPeriodQuerySchema,
@@ -78,6 +90,8 @@ import { SuperAdminPromoService } from "./super-admin-promo.service.js";
 import { SuperAdminReviewController } from "./super-admin-review.controller.js";
 import { SuperAdminReviewService } from "./super-admin-review.service.js";
 import { SuperAdminServiceAnalyticsService } from "./super-admin-service-analytics.service.js";
+import { SuperAdminSupportController } from "./super-admin-support.controller.js";
+import { SuperAdminSupportService } from "./super-admin-support.service.js";
 
 /**
  * Batch 8 — the first real Super Admin backend surface in this codebase (confirmed by
@@ -169,6 +183,23 @@ export const createSuperAdminRoute = (): Router => {
   const reviewController = new SuperAdminReviewController(
     new SuperAdminReviewService(
       new ReviewService(new ReviewRepository(), bookingRepository),
+      businessRepository,
+      bookingRepository,
+    ),
+  );
+
+  const supportController = new SuperAdminSupportController(
+    new SuperAdminSupportService(
+      new SupportService(
+        new SupportTicketRepository(),
+        new SupportMessageRepository(),
+        bookingRepository,
+        businessRepository,
+        new StaffRepository(),
+        userRepository,
+        createSupportEmailProvider(),
+      ),
+      userRepository,
       businessRepository,
       bookingRepository,
     ),
@@ -316,6 +347,41 @@ export const createSuperAdminRoute = (): Router => {
     "/reviews/:reviewId/moderate",
     validateRequest({ params: reviewIdParamsSchema, body: moderateReviewBodySchema }),
     asyncHandler(reviewController.moderate),
+  );
+
+  // --- Support Tickets (Batch 15B) ---
+  router.get(
+    "/support/tickets",
+    validateRequest({ query: listAdminSupportTicketsQuerySchema }),
+    asyncHandler(supportController.list),
+  );
+  router.get(
+    "/support/tickets/:ticketId",
+    validateRequest({ params: supportTicketIdParamsSchema }),
+    asyncHandler(supportController.getById),
+  );
+  router.get(
+    "/support/tickets/:ticketId/messages",
+    validateRequest({ params: supportTicketIdParamsSchema, query: listSupportMessagesQuerySchema }),
+    asyncHandler(supportController.listMessages),
+  );
+  router.post(
+    "/support/tickets/:ticketId/messages",
+    validateRequest({ params: supportTicketIdParamsSchema, body: supportMessageBodySchema }),
+    asyncHandler(supportController.reply),
+  );
+  router.post(
+    "/support/tickets/:ticketId/status",
+    validateRequest({
+      params: supportTicketIdParamsSchema,
+      body: changeSupportTicketStatusBodySchema,
+    }),
+    asyncHandler(supportController.changeStatus),
+  );
+  router.post(
+    "/support/tickets/:ticketId/reopen",
+    validateRequest({ params: supportTicketIdParamsSchema }),
+    asyncHandler(supportController.reopen),
   );
 
   // --- Platform-wide ---

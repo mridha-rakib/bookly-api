@@ -264,7 +264,12 @@ export class BookingController {
 
     const result = await this.bookingService.listBookingsForCustomer(
       userId,
-      { status: query.status, fromDate: query.fromDate, toDate: query.toDate },
+      {
+        status: query.status,
+        source: query.source,
+        fromDate: query.fromDate,
+        toDate: query.toDate,
+      },
       { page: query.page, limit: query.limit },
     );
 

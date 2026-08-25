@@ -343,6 +343,12 @@ export const env = createEnv({
     AUTH_REFRESH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
     BUSINESS_LINK_OTP_SEND_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
     BUSINESS_LINK_OTP_SEND_PER_EMAIL_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+    // Batch 15B — the public Contact form's message recipient. Optional: when unset, the Contact
+    // flow falls back to the same EMAIL_FROM/RESEND_FROM_EMAIL address the OTP provider already
+    // sends FROM (see support/contact.controller.ts) rather than requiring a brand-new mandatory
+    // env var just for this narrow purpose.
+    SUPPORT_CONTACT_INBOX_EMAIL: z.string().email().optional(),
+    CONTACT_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
