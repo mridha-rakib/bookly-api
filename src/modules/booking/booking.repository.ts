@@ -6,7 +6,7 @@ import {
   BookingModel,
   type BookingRescheduleEntry,
 } from "./booking.model.js";
-import { type BookingStatus, bookingStatuses } from "./booking.types.js";
+import { type BookingSource, type BookingStatus, bookingStatuses } from "./booking.types.js";
 
 /**
  * `_id` is optional-but-honored: BookingCreationService pre-generates it (`new Types.ObjectId()`)
@@ -20,6 +20,10 @@ export type CreateBookingInput = Omit<BookingDocument, "_id" | "createdAt" | "up
 
 export type BookingListFilter = {
   status?: BookingStatus[] | undefined;
+  /** Batch 16 — Book Again needs only genuinely fulfilled BOOKLY_MANAGED history (never a
+   * Business Owner's MANUAL entry on the Customer's behalf) alongside `status:["COMPLETED"]`.
+   * Optional and additive — every existing caller that omits it is unaffected. */
+  source?: BookingSource[] | undefined;
   staffMembershipId?: Types.ObjectId | string | undefined;
   businessClientId?: Types.ObjectId | string | undefined;
   fromDate?: Date | undefined;
@@ -665,6 +669,9 @@ export class BookingRepository {
     }
     if (input.status && input.status.length > 0) {
       query["status"] = { $in: input.status };
+    }
+    if (input.source && input.source.length > 0) {
+      query["source"] = { $in: input.source };
     }
     if (input.staffMembershipId) {
       query["serviceLines.responsibleStaffMembershipId"] = input.staffMembershipId;
