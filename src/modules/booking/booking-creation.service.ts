@@ -16,6 +16,7 @@ import type { ClientRepository } from "../client/client.repository.js";
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import type { PromoApplicationService, ResolvedPromo } from "../promo/promo-application.service.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
 import type { UserRepository } from "../user/user.repository.js";
@@ -74,6 +75,16 @@ export type BookingCreationPreview = {
   amountDueNowCents: number;
   requiresSavedCard: boolean;
   hasSavedCard: boolean;
+  /** Batch 13 — present only when a valid `promoCode` was supplied. `amountDueNowCents` above
+   * already reflects the discount (== `promo.chargeCents`); this breakdown is what the frontend
+   * displays as "Deposit before promo / Promo discount / Due now" — never recomputed in React. */
+  promo?: {
+    code: string;
+    type: "PERCENTAGE" | "FIXED";
+    value: number;
+    depositBeforePromoCents: number;
+    discountCents: number;
+  };
 };
 
 export type FinalizeBookingResult =
@@ -144,6 +155,7 @@ export class BookingCreationService {
     private readonly clientRepository: ClientRepository,
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
+    private readonly promoApplicationService: PromoApplicationService,
   ) {}
 
   // --- Manual (real, persisted) --------------------------------------------------------------
@@ -251,6 +263,20 @@ export class BookingCreationService {
       lines[0]?.endAt ?? startAt,
     );
 
+    // Batch 13 — read-only, side-effect-free promo preview: resolves and computes the discount
+    // against the ALREADY-canonical deposit (never a second pricing engine), but never claims a
+    // redemption — see PromoApplicationService's own doc comment. A retried/duplicate preview
+    // call can never consume usage.
+    const resolvedPromo = input.promoCode
+      ? await this.promoApplicationService.resolve({
+          code: input.promoCode,
+          business,
+          customerUserId,
+          isFirstBooking,
+          depositBeforePromoCents: financials.depositCents,
+        })
+      : undefined;
+
     return {
       finalizable: true,
       isFirstBooking,
@@ -272,10 +298,24 @@ export class BookingCreationService {
       financials,
       // Batch 6.5: the amount actually charged online is ALWAYS the deposit, first booking or
       // returning — never platformFeeCents, which is 0 for a returning customer even though a
-      // real deposit is still due (see BookingFinancials's own doc comment).
-      amountDueNowCents: financials.depositCents,
+      // real deposit is still due (see BookingFinancials's own doc comment). Batch 13: when a
+      // valid promo is supplied, this becomes the promo-discounted amount instead.
+      amountDueNowCents: resolvedPromo
+        ? resolvedPromo.customerChargeNowCents
+        : financials.depositCents,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
+      ...(resolvedPromo
+        ? {
+            promo: {
+              code: resolvedPromo.promo.code,
+              type: resolvedPromo.promo.type,
+              value: resolvedPromo.promo.value,
+              depositBeforePromoCents: resolvedPromo.depositBeforePromoCents,
+              discountCents: resolvedPromo.promoDiscountCents,
+            },
+          }
+        : {}),
     };
   }
 
@@ -362,6 +402,24 @@ export class BookingCreationService {
       throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
     }
 
+    // Batch 13 — re-validated here from scratch (never trusts a prior preview call). Resolves
+    // BEFORE any charge, using the same optimistic `isFirstBooking` snapshot the rest of this
+    // method already relies on for the pre-charge amount; `persistCustomerBooking`'s transaction
+    // re-checks scope eligibility against the REAL, race-resolved outcome before ever consuming
+    // the redemption (see PromoApplicationService.claimRedemption's own comment).
+    const resolvedPromo = input.promoCode
+      ? await this.promoApplicationService.resolve({
+          code: input.promoCode,
+          business,
+          customerUserId,
+          isFirstBooking,
+          depositBeforePromoCents: financials.depositCents,
+        })
+      : undefined;
+    const customerChargeNowCents = resolvedPromo
+      ? resolvedPromo.customerChargeNowCents
+      : financials.depositCents;
+
     const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
     const customer = this.buildCustomerSnapshot(client);
     const createdBy: BookingActor = {
@@ -390,11 +448,14 @@ export class BookingCreationService {
     // Batch 6.5: the deposit is charged online for EVERY BOOKLY_MANAGED booking, first or
     // returning — never gated on `isFirstBooking` (that only decides who economically keeps
     // it, resolved below, atomically, inside persistCustomerBooking's own transaction).
-    if (financials.depositCents > 0) {
+    // Batch 13: the ACTUAL Stripe charge amount/gate uses `customerChargeNowCents` — a Promo
+    // may fully cover the deposit (rule #7: never a fake €0 charge, but the saved-card
+    // requirement above still applies unconditionally either way).
+    if (customerChargeNowCents > 0) {
       try {
         paymentResult = await this.paymentService.chargeBookingDeposit({
           userId: customerUserId,
-          amountCents: financials.depositCents,
+          amountCents: customerChargeNowCents,
           idempotencyKey: input.idempotencyKey,
           metadata: {
             bookingId: String(bookingId),
@@ -444,15 +505,20 @@ export class BookingCreationService {
         client,
         isFirstBooking,
         paymentResult,
+        resolvedPromo,
+        customerChargeNowCents,
       });
       return { status: "confirmed", booking };
     } catch (error) {
       if (paymentResult) {
+        // Batch 13 — refunds the amount ACTUALLY charged to Stripe (post-promo), never the
+        // pre-promo `financials.depositCents` entitlement: Stripe can only refund what it
+        // actually collected.
         await this.compensateFailedBookingAfterPayment(
           business,
           bookingId,
           client,
-          financials.depositCents,
+          customerChargeNowCents,
           paymentResult,
         );
       } else {
@@ -591,6 +657,8 @@ export class BookingCreationService {
     client: BusinessClientDocument;
     isFirstBooking: boolean;
     paymentResult: PaymentIntentResult | undefined;
+    resolvedPromo: ResolvedPromo | undefined;
+    customerChargeNowCents: number;
   }): Promise<BookingDocument> {
     const dbSession = await mongoose.startSession();
     let created: BookingDocument | undefined;
@@ -647,14 +715,43 @@ export class BookingCreationService {
         // dropped, never double-counted as platform revenue. See
         // ClientRepository.markActivated's own CAS comment for why a "loser" call is a safe,
         // idempotent no-op (returns null), never an error.
+        // Batch 13 — `hasDepositObligation` (not `paymentResult` truthiness) now gates
+        // activation-resolution and ledger-writing: a Promo may reduce the ACTUAL Stripe charge
+        // to €0 while a real deposit ENTITLEMENT still exists (`financials.depositCents > 0`),
+        // and that entitlement must still resolve first/returning + write its ledger entry
+        // exactly as if it had been charged in full. Identical to the prior `paymentResult`
+        // gate for every non-promo booking, since `customerChargeNowCents === depositCents`
+        // whenever no promo was used (so `paymentResult` is defined exactly when
+        // `hasDepositObligation` is true) — a strictly backward-compatible generalization.
+        const hasDepositObligation = params.financials.depositCents > 0;
+
         let reallyFirstBooking = false;
-        if (params.paymentResult) {
+        if (hasDepositObligation) {
           const activation = await this.clientRepository.markActivated(
             params.client._id,
             params.bookingId,
             dbSession,
           );
           reallyFirstBooking = Boolean(activation);
+        }
+
+        // Batch 13 — an ALL_FIRST_BOOKINGS promo must honor the REAL, race-resolved
+        // first/returning outcome, never the pre-charge optimistic snapshot the amount was
+        // computed from. A mismatch here means the customer was charged assuming eligibility
+        // that the activation race just disproved — this throws (never silently drops the
+        // promo or silently changes the charged amount), which the caller's existing
+        // post-payment compensation/refund path already handles correctly.
+        if (params.resolvedPromo) {
+          await this.promoApplicationService.claimRedemption(
+            {
+              resolved: params.resolvedPromo,
+              bookingId: params.bookingId,
+              businessId: params.business._id,
+              customerUserId: params.createdBy.actorUserId,
+              isFirstBooking: reallyFirstBooking,
+            },
+            dbSession,
+          );
         }
 
         const financials: BookingFinancials =
@@ -697,32 +794,89 @@ export class BookingCreationService {
               ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
               : {}),
             ...(params.notes ? { notes: params.notes } : {}),
+            ...(params.resolvedPromo
+              ? {
+                  promo: {
+                    promoId: params.resolvedPromo.promo._id,
+                    code: params.resolvedPromo.promo.code,
+                    type: params.resolvedPromo.promo.type,
+                    value: params.resolvedPromo.promo.value,
+                    discountCents: params.resolvedPromo.promoDiscountCents,
+                    chargeCents: params.customerChargeNowCents,
+                    fundingOwner: "BOOKLY" as const,
+                    appliedAt: new Date(),
+                  },
+                }
+              : {}),
           },
           dbSession,
         );
 
-        if (params.paymentResult) {
+        if (hasDepositObligation) {
           // The SAME deposit charge — the ledger TYPE alone records who economically owns it
           // (see BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first
           // booking, DEPOSIT (already part of this ledger's vocabulary — see
           // booking-financial-transaction.types.ts — never PLATFORM_FEE) for a returning
-          // customer's Business-owned prepayment.
-          await this.financialTransactionService.record(
-            {
-              businessId: params.business._id,
-              bookingId: params.bookingId,
-              businessClientId: params.client._id,
-              customerUserId: params.createdBy.actorUserId,
-              type: reallyFirstBooking ? "PLATFORM_FEE" : "DEPOSIT",
-              direction: "DEBIT",
-              amountCents: params.financials.depositCents,
-              currency: params.financials.currency,
-              status: "SUCCEEDED",
-              providerReference: params.paymentResult.paymentIntentId,
-              idempotencyKey: `${params.idempotencyKey}:deposit`,
-            },
-            dbSession,
-          );
+          // customer's Business-owned prepayment. Batch 13: `amountCents` is the amount
+          // ACTUALLY charged (post-promo) — every downstream reader of "the customer's upfront
+          // payment" (cancellation/no-show netting, refunds — see
+          // BookingFinancialTransactionService.findSucceededUpfrontPayment) already reads this
+          // real ledger amount, never `financials.depositCents` directly, so nothing else needs
+          // to change for promo-aware cancellation/no-show exposure. Skipped entirely when a
+          // Promo fully covers the deposit (`customerChargeNowCents === 0`): the ledger schema's
+          // own `amountCents` invariant requires a positive amount (a real, immutable financial
+          // event must represent SOME money movement) — a real €0 DEBIT would carry no
+          // information no other row already carries, so it is never written rather than
+          // relaxing that invariant for a case with nothing to record. The Booking's own `promo`
+          // snapshot (chargeCents: 0) and the PromoRedemption audit row remain the complete,
+          // truthful record of what happened.
+          if (params.customerChargeNowCents > 0) {
+            await this.financialTransactionService.record(
+              {
+                businessId: params.business._id,
+                bookingId: params.bookingId,
+                businessClientId: params.client._id,
+                customerUserId: params.createdBy.actorUserId,
+                type: reallyFirstBooking ? "PLATFORM_FEE" : "DEPOSIT",
+                direction: "DEBIT",
+                amountCents: params.customerChargeNowCents,
+                currency: params.financials.currency,
+                status: "SUCCEEDED",
+                ...(params.paymentResult
+                  ? { providerReference: params.paymentResult.paymentIntentId }
+                  : {}),
+                idempotencyKey: `${params.idempotencyKey}:deposit`,
+              },
+              dbSession,
+            );
+          }
+
+          // Batch 13 — a RETURNING booking's Promo shortfall: the Business is still owed the
+          // FULL pre-promo deposit (rule #3 — "do NOT simply reduce DEPOSIT... the authoritative
+          // Business-owned economic deposit remains [the full amount]"). Never written for a
+          // FIRST booking's promo — there Bookly simply collects less PLATFORM_FEE and no other
+          // party needs compensating (see PROMO_SUBSIDY's own type-level doc comment).
+          if (
+            params.resolvedPromo &&
+            !reallyFirstBooking &&
+            params.resolvedPromo.promoDiscountCents > 0
+          ) {
+            await this.financialTransactionService.record(
+              {
+                businessId: params.business._id,
+                bookingId: params.bookingId,
+                businessClientId: params.client._id,
+                customerUserId: params.createdBy.actorUserId,
+                type: "PROMO_SUBSIDY",
+                direction: "CREDIT",
+                amountCents: params.resolvedPromo.promoDiscountCents,
+                currency: params.financials.currency,
+                status: "SUCCEEDED",
+                idempotencyKey: `${params.idempotencyKey}:promo-subsidy`,
+              },
+              dbSession,
+            );
+          }
         }
       });
     } catch (error) {

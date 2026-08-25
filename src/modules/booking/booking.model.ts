@@ -207,6 +207,34 @@ export type BookingFinancials = {
   totalCents: number;
 };
 
+// --- Promo Code snapshot (Batch 13) --------------------------------------------------------
+//
+// A Promo Code discounts ONLY the already-computed online booking-time charge
+// (BookingFinancials.depositCents) — it never rewrites Service pricing, `serviceDiscountCents`,
+// `eligiblePlatformFeeBasisCents`, or `totalCents`/`balanceDueCents`. `depositCents` above
+// therefore STAYS the full pre-promo canonical entitlement (what the Business/Bookly is
+// economically owed); this snapshot records only the ADDITIONAL promo facts needed to explain
+// why the actual Stripe charge (and the ledger's DEBIT entry amount — see
+// booking-creation.service.ts) was lower. Present only when a promo was actually applied —
+// absent, never a zero-value object, for every other Booking (additive, matches every other
+// optional snapshot on this model). Denormalizes code/type/value at application time (never a
+// live PromoCode lookup) so a later Promo edit/deactivation can never corrupt this Booking's own
+// history — the SAME immutable-snapshot discipline `serviceSnapshot` already established.
+export type BookingPromoSnapshot = {
+  promoId: Types.ObjectId;
+  code: string;
+  type: "PERCENTAGE" | "FIXED";
+  value: number;
+  discountCents: number;
+  /** What was actually charged online: `financials.depositCents - discountCents`, clamped at 0.
+   * This is ALSO the amount the ledger's PLATFORM_FEE/DEPOSIT entry records (see
+   * booking-creation.service.ts) — everything downstream (cancellation/no-show netting, refunds)
+   * already reads from that real ledger amount, never from this field directly. */
+  chargeCents: number;
+  fundingOwner: "BOOKLY";
+  appliedAt: Date;
+};
+
 // --- Schedule (time architecture) ---------------------------------------------------------
 //
 // startAt/endAt are absolute instants (Mongo Date, UTC-backed) — never display strings like
@@ -394,6 +422,7 @@ export type BookingDocument = {
   cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
   cancellationOutcome?: BookingCancellationOutcome | undefined;
   completionPayment?: BookingCompletionPayment | undefined;
+  promo?: BookingPromoSnapshot | undefined;
   notes?: string | undefined;
   // No hard-delete/archive path is modeled: a Booking is never removed once created — its
   // status changes, but the record (and every snapshot on it) persists indefinitely as the
@@ -751,6 +780,20 @@ const bookingCompletionPaymentSchema = new Schema<BookingCompletionPayment>(
   { _id: false },
 );
 
+const bookingPromoSnapshotSchema = new Schema<BookingPromoSnapshot>(
+  {
+    promoId: { type: Schema.Types.ObjectId, ref: "PromoCode", required: true },
+    code: { type: String, required: true },
+    type: { type: String, enum: ["PERCENTAGE", "FIXED"], required: true },
+    value: { type: Number, required: true, min: 0 },
+    discountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    chargeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    fundingOwner: { type: String, enum: ["BOOKLY"], required: true },
+    appliedAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const bookingSchema = new Schema<BookingDocument>(
   {
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
@@ -787,6 +830,7 @@ const bookingSchema = new Schema<BookingDocument>(
     cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
     cancellationOutcome: { type: bookingCancellationOutcomeSchema },
     completionPayment: { type: bookingCompletionPaymentSchema },
+    promo: { type: bookingPromoSnapshotSchema },
     notes: { type: String, trim: true, maxlength: 2000 },
   },
   { timestamps: true },

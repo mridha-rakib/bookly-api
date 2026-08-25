@@ -38,6 +38,10 @@ export type CreateBookingInput = {
   customerCity?: BusinessCity | undefined;
   notes?: string | undefined;
   idempotencyKey: string;
+  /** Batch 13 — Customer-only (never read by `createManualBooking`): an optional Promo Code
+   * applied against the online booking-time charge. Raw, as typed by the customer — normalized
+   * and validated server-side only, never trusted from the client. */
+  promoCode?: string | undefined;
 };
 
 export type CreateManualBookingInput = CreateBookingInput & {

@@ -60,6 +60,10 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     findProfileByUserId: vi.fn(),
     findVerifiedCustomerByEmail: vi.fn().mockResolvedValue(null),
     findVerifiedCustomerByPhoneE164: vi.fn().mockResolvedValue(null),
+    listByRole: vi.fn().mockResolvedValue({ users: [], total: 0 }),
+    countByRole: vi.fn().mockResolvedValue(0),
+    findRecentlyCreated: vi.fn().mockResolvedValue([]),
+    countCreatedByMonth: vi.fn().mockResolvedValue([]),
     ...(overrides["userRepository"] as object | undefined),
   };
   const registrationSessionRepository = {

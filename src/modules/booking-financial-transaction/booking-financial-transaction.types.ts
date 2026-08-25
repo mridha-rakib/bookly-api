@@ -35,6 +35,18 @@ export const bookingFinancialTransactionTypes = [
    * module); never a hardcoded percentage estimate.
    */
   "PROCESSING_FEE",
+  /**
+   * Batch 13 addition — Bookly's own subsidy of a Promo Code discount on a RETURNING booking.
+   * All Promo Codes are Bookly-funded (confirmed rule); when a returning customer's actual
+   * online charge is reduced by a promo, the Business is still economically entitled to the
+   * FULL pre-promo deposit — this entry is the explicit, auditable CREDIT that makes the
+   * Business whole for the shortfall, always exactly `depositBeforePromoCents -
+   * customerChargeNowCents`. Never written for a FIRST booking's promo (there Bookly simply
+   * collects less PLATFORM_FEE — no other party needs compensating, see
+   * booking-creation.service.ts's promo integration comment). Not itself a real Stripe payment —
+   * no processing fee or refund ever applies to it directly.
+   */
+  "PROMO_SUBSIDY",
 ] as const;
 export type BookingFinancialTransactionType = (typeof bookingFinancialTransactionTypes)[number];
 

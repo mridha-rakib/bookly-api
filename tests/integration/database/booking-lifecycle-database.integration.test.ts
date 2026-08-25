@@ -25,6 +25,10 @@ import { BusinessTravelSettingsRepository } from "../../../src/modules/business-
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
+import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
+import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
+import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
@@ -88,6 +92,11 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     financialTransactionService = new BookingFinancialTransactionService(
       new BookingFinancialTransactionRepository(),
     );
+    const promoApplicationService = new PromoApplicationService(
+      new PromoRepository(),
+      new PromoUserUsageRepository(),
+      new PromoRedemptionRepository(),
+    );
 
     availabilityService = new AvailabilityService(
       businessRepository,
@@ -124,6 +133,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       clientRepository,
       paymentService,
       financialTransactionService,
+      promoApplicationService,
     );
 
     lifecycleService = new BookingLifecycleService(

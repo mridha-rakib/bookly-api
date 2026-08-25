@@ -25,6 +25,24 @@ import {
   platformTransactionsQuerySchema,
 } from "../finance/finance.schema.js";
 import { FinanceService } from "../finance/finance.service.js";
+import { PromoRepository } from "../promo/promo.repository.js";
+import {
+  createPromoBodySchema,
+  listPromoRedemptionsQuerySchema,
+  listPromosQuerySchema,
+  promoIdParamsSchema,
+  setPromoStatusBodySchema,
+  updatePromoBodySchema,
+} from "../promo/promo.schema.js";
+import { PromoService } from "../promo/promo.service.js";
+import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
+import { ReviewRepository } from "../review/review.repository.js";
+import {
+  listModerationReviewsQuerySchema,
+  moderateReviewBodySchema,
+  reviewIdParamsSchema,
+} from "../review/review.schema.js";
+import { ReviewService } from "../review/review.service.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import {
@@ -55,6 +73,10 @@ import { SuperAdminCustomerAnalyticsService } from "./super-admin-customer-analy
 import { SuperAdminDashboardController } from "./super-admin-dashboard.controller.js";
 import { SuperAdminDashboardService } from "./super-admin-dashboard.service.js";
 import { SuperAdminFinanceController } from "./super-admin-finance.controller.js";
+import { SuperAdminPromoController } from "./super-admin-promo.controller.js";
+import { SuperAdminPromoService } from "./super-admin-promo.service.js";
+import { SuperAdminReviewController } from "./super-admin-review.controller.js";
+import { SuperAdminReviewService } from "./super-admin-review.service.js";
 import { SuperAdminServiceAnalyticsService } from "./super-admin-service-analytics.service.js";
 
 /**
@@ -132,6 +154,24 @@ export const createSuperAdminRoute = (): Router => {
     new SuperAdminServiceAnalyticsService(bookingRepository, businessRepository),
     new SuperAdminCityAnalyticsService(businessRepository),
     new SuperAdminActivityService(businessRepository, userRepository, businessPayoutRepository),
+  );
+
+  const promoRedemptionRepository = new PromoRedemptionRepository();
+  const promoController = new SuperAdminPromoController(
+    new SuperAdminPromoService(
+      new PromoService(new PromoRepository(), businessRepository, promoRedemptionRepository),
+      promoRedemptionRepository,
+      businessRepository,
+      userRepository,
+    ),
+  );
+
+  const reviewController = new SuperAdminReviewController(
+    new SuperAdminReviewService(
+      new ReviewService(new ReviewRepository(), bookingRepository),
+      businessRepository,
+      bookingRepository,
+    ),
   );
 
   router.use(authenticate, requireActiveUser(), requireRoles(["SUPER_ADMIN"]));
@@ -224,6 +264,60 @@ export const createSuperAdminRoute = (): Router => {
     asyncHandler(analyticsController.getRecentActivity),
   );
 
+  // --- Promo Codes ---
+  router.get(
+    "/promo-codes",
+    validateRequest({ query: listPromosQuerySchema }),
+    asyncHandler(promoController.list),
+  );
+  router.get(
+    "/promo-codes/:promoId",
+    validateRequest({ params: promoIdParamsSchema }),
+    asyncHandler(promoController.getById),
+  );
+  router.post(
+    "/promo-codes",
+    validateRequest({ body: createPromoBodySchema }),
+    asyncHandler(promoController.create),
+  );
+  router.patch(
+    "/promo-codes/:promoId",
+    validateRequest({ params: promoIdParamsSchema, body: updatePromoBodySchema }),
+    asyncHandler(promoController.update),
+  );
+  router.post(
+    "/promo-codes/:promoId/status",
+    validateRequest({ params: promoIdParamsSchema, body: setPromoStatusBodySchema }),
+    asyncHandler(promoController.setStatus),
+  );
+  router.delete(
+    "/promo-codes/:promoId",
+    validateRequest({ params: promoIdParamsSchema }),
+    asyncHandler(promoController.deletePromo),
+  );
+  router.get(
+    "/promo-codes/:promoId/redemptions",
+    validateRequest({ params: promoIdParamsSchema, query: listPromoRedemptionsQuerySchema }),
+    asyncHandler(promoController.listRedemptions),
+  );
+
+  // --- Reviews (Batch 14) ---
+  router.get(
+    "/reviews",
+    validateRequest({ query: listModerationReviewsQuerySchema }),
+    asyncHandler(reviewController.list),
+  );
+  router.get(
+    "/reviews/:reviewId",
+    validateRequest({ params: reviewIdParamsSchema }),
+    asyncHandler(reviewController.getById),
+  );
+  router.post(
+    "/reviews/:reviewId/moderate",
+    validateRequest({ params: reviewIdParamsSchema, body: moderateReviewBodySchema }),
+    asyncHandler(reviewController.moderate),
+  );
+
   // --- Platform-wide ---
   router.get(
     "/finance/summary",
@@ -236,6 +330,11 @@ export const createSuperAdminRoute = (): Router => {
     asyncHandler(controller.listPlatformTransactions),
   );
   router.get("/finance/pending-payouts", asyncHandler(controller.listPendingPayouts));
+  router.get(
+    "/finance/promo-discounts",
+    validateRequest({ query: financeSummaryQuerySchema }),
+    asyncHandler(promoController.getDiscountedMoney),
+  );
   router.get(
     "/finance/payouts",
     validateRequest({ query: financePayoutHistoryQuerySchema }),

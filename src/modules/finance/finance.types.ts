@@ -123,6 +123,10 @@ export type BusinessPayableSummary = {
   noShowAmountCents: number;
   cancellationAmountCents: number;
   depositAmountCents: number;
+  /** Batch 13 — the portion of `grossCents` that came from Bookly-funded PROMO_SUBSIDY credits
+   * (a returning booking's Promo shortfall) — broken out for the same display-parity reason as
+   * the other source splits above; never folded silently into `depositAmountCents`. */
+  promoSubsidyAmountCents: number;
 };
 
 export type PendingPayoutsPage = {

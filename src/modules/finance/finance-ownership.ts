@@ -36,14 +36,27 @@ export const classifySourceOwner = (sourceType: string | null): FinancialOwner =
   return "UNKNOWN";
 };
 
-/** The types whose ownership is intrinsic (never needs `sourceType`) — always the Business's. */
-const BUSINESS_OWNED_GROSS_TYPES = new Set(["DEPOSIT", "CANCELLATION_FEE", "NO_SHOW_FEE"]);
+/** The types whose ownership is intrinsic (never needs `sourceType`) — always the Business's.
+ * PROMO_SUBSIDY (Batch 13) joins this set: Bookly's compensating CREDIT for a Promo-discounted
+ * returning booking is, by construction, always Business-owned money — never ambiguous, never
+ * `sourceType`-dependent like PROCESSING_FEE/REFUND. */
+const BUSINESS_OWNED_GROSS_TYPES = new Set([
+  "DEPOSIT",
+  "CANCELLATION_FEE",
+  "NO_SHOW_FEE",
+  "PROMO_SUBSIDY",
+]);
 
 export type OwnedTotals = {
   grossCents: number;
   processingFeesCents: number;
   refundsCents: number;
   netCents: number;
+  /** Batch 13 — the portion of `grossCents` (Business side) or the cost against `netCents`
+   * (Bookly side) that came from Bookly-funded PROMO_SUBSIDY entries, broken out for
+   * auditability (rule: "ledger must make clear what customer paid, what Bookly funded, what
+   * Business is owed") — never folded silently into the other buckets. */
+  promoSubsidyCents: number;
 };
 
 /**
@@ -59,10 +72,14 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
   let grossCents = 0;
   let processingFeesCents = 0;
   let refundsCents = 0;
+  let promoSubsidyCents = 0;
 
   for (const bucket of buckets) {
     if (BUSINESS_OWNED_GROSS_TYPES.has(bucket.type)) {
       grossCents += bucket.totalCents;
+      if (bucket.type === "PROMO_SUBSIDY") {
+        promoSubsidyCents += bucket.totalCents;
+      }
     } else if (
       bucket.type === "PROCESSING_FEE" &&
       classifySourceOwner(bucket.sourceType) === "BUSINESS"
@@ -78,6 +95,7 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
     processingFeesCents,
     refundsCents,
     netCents: grossCents - processingFeesCents - refundsCents,
+    promoSubsidyCents,
   };
 };
 
@@ -89,6 +107,7 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
   let grossCents = 0;
   let processingFeesCents = 0;
   let refundsCents = 0;
+  let promoSubsidyCents = 0;
 
   for (const bucket of buckets) {
     if (bucket.type === "PLATFORM_FEE") {
@@ -100,6 +119,11 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
       processingFeesCents += bucket.totalCents;
     } else if (bucket.type === "REFUND" && classifySourceOwner(bucket.sourceType) === "BOOKLY") {
       refundsCents += bucket.totalCents;
+    } else if (bucket.type === "PROMO_SUBSIDY") {
+      // Batch 13 — Bookly's own cost of subsidizing a returning-booking Promo Code, always
+      // Bookly-borne by construction (never `sourceType`-classified). Reduces Bookly's net the
+      // same way a Bookly-borne PROCESSING_FEE/REFUND does.
+      promoSubsidyCents += bucket.totalCents;
     }
   }
 
@@ -107,7 +131,8 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
     grossCents,
     processingFeesCents,
     refundsCents,
-    netCents: grossCents - processingFeesCents - refundsCents,
+    netCents: grossCents - processingFeesCents - refundsCents - promoSubsidyCents,
+    promoSubsidyCents,
   };
 };
 
@@ -142,14 +167,19 @@ export const ALL_OWNERSHIP_RELEVANT_TYPES = [
   "NO_SHOW_FEE",
   "PROCESSING_FEE",
   "REFUND",
+  "PROMO_SUBSIDY",
 ] as const;
 
 /** Just the Business-owned gross-generating types plus their two possible deduction types —
- * used where only the Business side is needed (payout execution, Business-scoped payable). */
+ * used where only the Business side is needed (payout execution, Business-scoped payable).
+ * Batch 13 — PROMO_SUBSIDY joins this list so a Promo-subsidized returning booking's shortfall
+ * is included in Business payable/payout automatically, with zero changes to
+ * BusinessPayoutService/FinanceService's own call sites. */
 export const BUSINESS_PAYABLE_TYPES = [
   "DEPOSIT",
   "CANCELLATION_FEE",
   "NO_SHOW_FEE",
   "PROCESSING_FEE",
   "REFUND",
+  "PROMO_SUBSIDY",
 ] as const;
