@@ -42,6 +42,10 @@ export type BookingListResult = {
   total: number;
 };
 
+/** Dashboard Overview's "Today's schedule" safety bound — see
+ * `findScheduleForBusinessOnDate`'s own comment. */
+const MAX_DASHBOARD_SCHEDULE_ROWS = 200;
+
 /**
  * Deliberately minimal in this phase: create + the read paths needed to prove the schema and
  * its indexes behave correctly (see the corresponding integration test). List/filter/pagination
@@ -118,6 +122,55 @@ export class BookingRepository {
     return BookingModel.find({ status: "PENDING", noShowDeadlineAt: { $lte: now } }, { _id: 1 })
       .limit(limit)
       .exec();
+  }
+
+  /**
+   * Dashboard Overview (business-scoped, unlike the platform-wide `aggregateX` methods further
+   * down which back Super Admin's own Analytics) — a single Business's own bookings whose
+   * `schedule.startAt` falls in one Business-local calendar day, optionally further scoped to
+   * one responsible Staff member (STAFF's own scoped-down Overview — see
+   * DashboardOverviewService). Served by the existing `{businessId, schedule.startAt}` index;
+   * bounded by `MAX_DASHBOARD_SCHEDULE_ROWS` — a single Business's single-day booking volume
+   * never legitimately approaches that, so this is a safety bound, not a real pagination need
+   * (matches this repository's own "bounded, never an unlimited dump" convention).
+   */
+  public async findScheduleForBusinessOnDate(
+    businessId: Types.ObjectId | string,
+    dayStart: Date,
+    dayEnd: Date,
+    staffMembershipId?: Types.ObjectId | string,
+  ): Promise<BookingDocument[]> {
+    const query: Record<string, unknown> = {
+      businessId,
+      "schedule.startAt": { $gte: dayStart, $lt: dayEnd },
+    };
+    if (staffMembershipId) {
+      query["serviceLines.responsibleStaffMembershipId"] = staffMembershipId;
+    }
+
+    return BookingModel.find(query)
+      .sort({ "schedule.startAt": 1 })
+      .limit(MAX_DASHBOARD_SCHEDULE_ROWS)
+      .exec();
+  }
+
+  /** Dashboard Overview's "No-shows this month" count — the SAME `NO_SHOW_CHARGED`/
+   * `NO_SHOW_WAIVED` classification `aggregateBusinessBookingStats` already uses for its own
+   * (platform-wide) `noShowCount`, reused here rather than re-invented, just business-scoped and
+   * bounded to the requested [from, to) window over `schedule.startAt` (the appointment's own
+   * date — matches this method's sibling `findScheduleForBusinessOnDate` above, not the ledger's
+   * `createdAt`, which is a different, unrelated date axis). `NO_SHOW_CANCELLED` is deliberately
+   * excluded, matching `aggregateBusinessBookingStats`'s own precedent. */
+  public async countNoShowsForBusinessInRange(
+    businessId: Types.ObjectId | string,
+    from: Date,
+    to: Date,
+  ): Promise<number> {
+    return BookingModel.countDocuments({
+      businessId,
+      status: { $in: ["NO_SHOW_CHARGED", "NO_SHOW_WAIVED"] },
+      "schedule.startAt": { $gte: from, $lt: to },
+    }).exec();
   }
 
   /** A Customer's own Booking detail read — deliberately scoped by BOTH `_id` and
@@ -407,9 +460,17 @@ export class BookingRepository {
    * `createdAt` period. Booking-creation metrics use `createdAt`, never `schedule.startAt` (see
    * the module's own doc comment distinguishing "when a booking record was made" from "when the
    * appointment happens"). */
-  public async countByStatusInRange(from: Date, to: Date): Promise<Record<BookingStatus, number>> {
+  public async countByStatusInRange(
+    from: Date,
+    to: Date,
+    businessId?: Types.ObjectId | string,
+  ): Promise<Record<BookingStatus, number>> {
+    const match: Record<string, unknown> = { createdAt: { $gte: from, $lt: to } };
+    if (businessId) {
+      match["businessId"] = businessId;
+    }
     const rows = await BookingModel.aggregate<{ _id: BookingStatus; count: number }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: match },
       { $group: { _id: "$status", count: { $sum: 1 } } },
     ]).exec();
 
@@ -515,6 +576,7 @@ export class BookingRepository {
   public async aggregateBusinessBookingStats(
     from: Date,
     to: Date,
+    businessId?: Types.ObjectId | string,
   ): Promise<
     Array<{
       businessId: string;
@@ -526,6 +588,10 @@ export class BookingRepository {
       returningCount: number;
     }>
   > {
+    const match: Record<string, unknown> = { createdAt: { $gte: from, $lt: to } };
+    if (businessId) {
+      match["businessId"] = businessId;
+    }
     const rows = await BookingModel.aggregate<{
       _id: Types.ObjectId;
       totalCount: number;
@@ -535,7 +601,7 @@ export class BookingRepository {
       newCount: number;
       returningCount: number;
     }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: match },
       {
         $group: {
           _id: "$businessId",
@@ -598,14 +664,19 @@ export class BookingRepository {
     from: Date,
     to: Date,
     limit: number,
+    businessId?: Types.ObjectId | string,
   ): Promise<Array<{ serviceId: string; name: string; businessId: string; count: number }>> {
+    const match: Record<string, unknown> = { createdAt: { $gte: from, $lt: to } };
+    if (businessId) {
+      match["businessId"] = businessId;
+    }
     const rows = await BookingModel.aggregate<{
       _id: Types.ObjectId;
       name: string;
       businessId: Types.ObjectId;
       count: number;
     }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: match },
       { $unwind: "$serviceLines" },
       {
         $group: {
@@ -653,6 +724,36 @@ export class BookingRepository {
       activatedCount: rows[0]?.activatedCount ?? 0,
       retainedCount: rows[0]?.retainedCount ?? 0,
     };
+  }
+
+  /** Batch — Business Dashboard "Analytics" tab's Busiest Days heatmap: real, per-Business
+   * booking counts grouped by the LOCAL day-of-week the appointment actually happens on
+   * (`schedule.startAt`, matching this repository's own "appointment-time" vs "creation-time"
+   * distinction — see `countCreatedByMonth`'s own doc comment for the inverse case), bucketed
+   * in the Business's own IANA timezone via Mongo's native `timezone` aggregation option (the
+   * SAME DST-safe boundary-crossing concern `common/time/business-clock.ts` exists to rule out
+   * everywhere else — done here in the aggregation itself since Mongo's `$dayOfWeek` already
+   * supports it natively, rather than pulling raw documents into Node to re-derive it).
+   * Returns Mongo's own `$dayOfWeek` convention (1=Sunday ... 7=Saturday); the service layer
+   * re-maps this to the Monday-first order every other weekday vocabulary in this codebase uses
+   * (`common/time/business-clock.ts`'s `daysOfWeek`). */
+  public async aggregateBookingCountsByWeekday(
+    businessId: Types.ObjectId | string,
+    from: Date,
+    to: Date,
+    timezone: string,
+  ): Promise<Array<{ mongoDayOfWeek: number; count: number }>> {
+    const rows = await BookingModel.aggregate<{ _id: number; count: number }>([
+      { $match: { businessId, "schedule.startAt": { $gte: from, $lt: to } } },
+      {
+        $group: {
+          _id: { $dayOfWeek: { date: "$schedule.startAt", timezone } },
+          count: { $sum: 1 },
+        },
+      },
+    ]).exec();
+
+    return rows.map((row) => ({ mongoDayOfWeek: row._id, count: row.count }));
   }
 
   private buildListQuery(

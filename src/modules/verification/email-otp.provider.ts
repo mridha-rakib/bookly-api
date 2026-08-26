@@ -1,3 +1,4 @@
+import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
 import { Resend } from "resend";
 
@@ -5,7 +6,11 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { AuthError } from "../auth/auth.errors.js";
 
-export type EmailOtpPurpose = "REGISTRATION" | "BUSINESS_LINK" | "STAFF_TEMP_PASSWORD";
+export type EmailOtpPurpose =
+  | "REGISTRATION"
+  | "BUSINESS_LINK"
+  | "STAFF_TEMP_PASSWORD"
+  | "EMAIL_CHANGE";
 
 export interface EmailOtpProvider {
   /**
@@ -15,6 +20,11 @@ export interface EmailOtpProvider {
    * client. The `code` field carries the temporary password for that purpose.
    */
   sendOtp(input: { to: string; code: string; purpose?: EmailOtpPurpose }): Promise<void>;
+
+  /** Batch 18 — plain transactional notice with no secret/code (e.g. "your email was changed").
+   * Reuses the same client/transport plumbing as sendOtp; kept as a separate method because its
+   * subject/text are caller-supplied directly rather than built from a purpose+code pair. */
+  sendNotice(input: { to: string; subject: string; text: string }): Promise<void>;
 }
 
 const buildOtpEmailContent = (
@@ -35,6 +45,13 @@ const buildOtpEmailContent = (
     };
   }
 
+  if (purpose === "EMAIL_CHANGE") {
+    return {
+      subject: "Verify your new Bookly email address",
+      text: `Enter this code in Bookly to confirm your new email address: ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes. If you didn't request this, you can safely ignore this email.`,
+    };
+  }
+
   return {
     subject: "Your Bookly verification code",
     text: `Your Bookly verification code is ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes.`,
@@ -49,6 +66,10 @@ type ResendClient = {
 
 type SmtpTransporter = {
   sendMail(input: { from: string; to: string; subject: string; text: string }): Promise<unknown>;
+};
+
+type SendGridClient = {
+  send(input: { to: string; from: string; subject: string; text: string }): Promise<unknown>;
 };
 
 export class ResendEmailOtpProvider implements EmailOtpProvider {
@@ -77,6 +98,94 @@ export class ResendEmailOtpProvider implements EmailOtpProvider {
     } catch (error) {
       const category = classifyProviderError(error);
       logger.warn({ provider: "resend", category }, "Email OTP delivery failed");
+      throw new AuthError(
+        category === "rate_limited" ? "PROVIDER_RATE_LIMITED" : "OTP_DELIVERY_FAILED",
+        category === "rate_limited" ? 429 : 502,
+      );
+    }
+  }
+
+  public async sendNotice(input: { to: string; subject: string; text: string }): Promise<void> {
+    if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL || !env.RESEND_FROM_NAME) {
+      throw new AuthError("PROVIDER_NOT_CONFIGURED", 503);
+    }
+
+    try {
+      const resend = this.clientFactory(env.RESEND_API_KEY);
+      await resend.emails.send({
+        from: `${env.RESEND_FROM_NAME} <${env.RESEND_FROM_EMAIL}>`,
+        to: input.to,
+        subject: input.subject,
+        text: input.text,
+      });
+    } catch (error) {
+      const category = classifyProviderError(error);
+      logger.warn({ provider: "resend", category }, "Notice email delivery failed");
+      throw new AuthError(
+        category === "rate_limited" ? "PROVIDER_RATE_LIMITED" : "OTP_DELIVERY_FAILED",
+        category === "rate_limited" ? 429 : 502,
+      );
+    }
+  }
+}
+
+/** Batch 19.1 — the real production mailing provider. Same shape/testability pattern as
+ * ResendEmailOtpProvider (constructor-injected client factory), reuses the shared
+ * buildOtpEmailContent/classifyProviderError so templates and rate-limit classification never
+ * diverge between providers. Sender identity reuses EMAIL_FROM/EMAIL_FROM_NAME (see env.ts —
+ * SendGrid has no provider-specific FROM pair of its own in this codebase). */
+export class SendGridEmailOtpProvider implements EmailOtpProvider {
+  public constructor(
+    private readonly clientFactory = (apiKey: string): SendGridClient => {
+      sgMail.setApiKey(apiKey);
+      return sgMail;
+    },
+  ) {}
+
+  public async sendOtp(input: {
+    to: string;
+    code: string;
+    purpose?: EmailOtpPurpose;
+  }): Promise<void> {
+    if (!env.SENDGRID_API_KEY || !env.EMAIL_FROM) {
+      throw new AuthError("PROVIDER_NOT_CONFIGURED", 503);
+    }
+
+    try {
+      const client = this.clientFactory(env.SENDGRID_API_KEY);
+      const { subject, text } = buildOtpEmailContent(input.code, input.purpose ?? "REGISTRATION");
+      await client.send({
+        to: input.to,
+        from: `${env.EMAIL_FROM_NAME} <${env.EMAIL_FROM}>`,
+        subject,
+        text,
+      });
+    } catch (error) {
+      const category = classifyProviderError(error);
+      logger.warn({ provider: "sendgrid", category }, "Email OTP delivery failed");
+      throw new AuthError(
+        category === "rate_limited" ? "PROVIDER_RATE_LIMITED" : "OTP_DELIVERY_FAILED",
+        category === "rate_limited" ? 429 : 502,
+      );
+    }
+  }
+
+  public async sendNotice(input: { to: string; subject: string; text: string }): Promise<void> {
+    if (!env.SENDGRID_API_KEY || !env.EMAIL_FROM) {
+      throw new AuthError("PROVIDER_NOT_CONFIGURED", 503);
+    }
+
+    try {
+      const client = this.clientFactory(env.SENDGRID_API_KEY);
+      await client.send({
+        to: input.to,
+        from: `${env.EMAIL_FROM_NAME} <${env.EMAIL_FROM}>`,
+        subject: input.subject,
+        text: input.text,
+      });
+    } catch (error) {
+      const category = classifyProviderError(error);
+      logger.warn({ provider: "sendgrid", category }, "Notice email delivery failed");
       throw new AuthError(
         category === "rate_limited" ? "PROVIDER_RATE_LIMITED" : "OTP_DELIVERY_FAILED",
         category === "rate_limited" ? 429 : 502,
@@ -125,18 +234,50 @@ export class SmtpEmailOtpProvider implements EmailOtpProvider {
       );
     }
   }
+
+  public async sendNotice(input: { to: string; subject: string; text: string }): Promise<void> {
+    if (!env.SMTP_HOST || !env.SMTP_USER || !env.SMTP_PASS || !env.EMAIL_FROM) {
+      throw new AuthError("PROVIDER_NOT_CONFIGURED", 503);
+    }
+
+    try {
+      await this.transportFactory().sendMail({
+        from: `${env.EMAIL_FROM_NAME} <${env.EMAIL_FROM}>`,
+        to: input.to,
+        subject: input.subject,
+        text: input.text,
+      });
+    } catch (error) {
+      const category = classifyProviderError(error);
+      logger.warn({ provider: "smtp", category }, "Notice email delivery failed");
+      throw new AuthError(
+        category === "rate_limited" ? "PROVIDER_RATE_LIMITED" : "OTP_DELIVERY_FAILED",
+        category === "rate_limited" ? 429 : 502,
+      );
+    }
+  }
 }
 
-export const createEmailOtpProvider = (): EmailOtpProvider =>
-  env.EMAIL_PROVIDER === "resend" ? new ResendEmailOtpProvider() : new SmtpEmailOtpProvider();
+export const createEmailOtpProvider = (): EmailOtpProvider => {
+  if (env.EMAIL_PROVIDER === "sendgrid") {
+    return new SendGridEmailOtpProvider();
+  }
+  if (env.EMAIL_PROVIDER === "resend") {
+    return new ResendEmailOtpProvider();
+  }
+  return new SmtpEmailOtpProvider();
+};
 
 const classifyProviderError = (error: unknown): "rate_limited" | "delivery_failed" => {
   if (typeof error === "object" && error !== null) {
     const statusCode = "statusCode" in error ? error.statusCode : undefined;
     const status = "status" in error ? error.status : undefined;
     const responseCode = "responseCode" in error ? error.responseCode : undefined;
+    // SendGrid's ResponseError exposes the HTTP status as `.code` (e.g. 429), distinct from the
+    // fields above — added for SendGrid without touching Resend/SMTP's existing classification.
+    const code = "code" in error ? error.code : undefined;
 
-    if (statusCode === 429 || status === 429 || responseCode === 429) {
+    if (statusCode === 429 || status === 429 || responseCode === 429 || code === 429) {
       return "rate_limited";
     }
   }

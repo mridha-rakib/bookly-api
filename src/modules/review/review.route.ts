@@ -12,6 +12,7 @@ import { TokenService } from "../auth/token.service.js";
 import { BookingRepository } from "../booking/booking.repository.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
+import { StaffRepository } from "../staff/staff.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { ReviewController } from "./review.controller.js";
 import { ReviewRepository } from "./review.repository.js";
@@ -24,7 +25,14 @@ import {
 import { ReviewService } from "./review.service.js";
 
 const buildController = (): ReviewController =>
-  new ReviewController(new ReviewService(new ReviewRepository(), new BookingRepository()));
+  new ReviewController(
+    new ReviewService(
+      new ReviewRepository(),
+      new BookingRepository(),
+      new BusinessRepository(),
+      new StaffRepository(),
+    ),
+  );
 
 const buildAuthenticate = () => {
   const userRepository = new UserRepository();
@@ -100,6 +108,36 @@ export const createPublicBusinessReviewRoute = (): Router => {
     "/businesses/:businessId/reviews",
     validateRequest({ params: businessIdParamsSchema, query: listPublicReviewsQuerySchema }),
     asyncHandler(controller.listBusinessReviews),
+  );
+
+  return router;
+};
+
+/** Batch 19 — Business dashboard reads of a Business's OWN reviews (Owner/Supervisor only,
+ * mirroring the exact ownership/membership boundary booking.route.ts and client.route.ts already
+ * use for their own `/businesses/:businessId/...` management routes — no product rule grants
+ * STAFF this access, see ReviewService.requireBusinessManagementAccess). Same underlying data as
+ * createPublicBusinessReviewRoute above; that CUSTOMER-only route is untouched — this is an
+ * additive, separately-authorized route, not a change to existing behavior. Not gated by
+ * requireApprovedBusiness, matching booking.route.ts's own convention that read routes (unlike
+ * booking creation) stay available regardless of Business approval status. */
+export const createBusinessReviewRoute = (): Router => {
+  const router = Router();
+  const authenticate = buildAuthenticate();
+  const controller = buildController();
+
+  router.use(authenticate, requireActiveUser(), requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]));
+
+  router.get(
+    "/:businessId/reviews/summary",
+    validateRequest({ params: businessIdParamsSchema }),
+    asyncHandler(controller.getBusinessRatingSummaryForDashboard),
+  );
+
+  router.get(
+    "/:businessId/reviews",
+    validateRequest({ params: businessIdParamsSchema, query: listPublicReviewsQuerySchema }),
+    asyncHandler(controller.listBusinessReviewsForDashboard),
   );
 
   return router;

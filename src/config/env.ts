@@ -7,7 +7,7 @@ import { z } from "zod";
 const nodeEnvSchema = z.enum(["development", "test", "production"]).default("development");
 const rawNodeEnv = nodeEnvSchema.parse(process.env["NODE_ENV"] ?? "development");
 const emailProviderSchema = z
-  .enum(["smtp", "resend"])
+  .enum(["smtp", "resend", "sendgrid"])
   .default(rawNodeEnv === "production" ? "resend" : "smtp");
 const rawEmailProvider = emailProviderSchema.parse(process.env["EMAIL_PROVIDER"] || undefined);
 const phoneOtpProviderSchema = z
@@ -106,15 +106,18 @@ const optionalProductionRequiredString = (name: string) =>
       }
     });
 
-const optionalProviderRequiredString = (provider: "smtp" | "resend", name: string) =>
+const optionalProviderRequiredString = (
+  providers: ReadonlyArray<"smtp" | "resend" | "sendgrid">,
+  name: string,
+) =>
   z
     .string()
     .optional()
     .superRefine((value, context) => {
-      if (rawEmailProvider === provider && !value) {
+      if (providers.includes(rawEmailProvider) && !value) {
         context.addIssue({
           code: "custom",
-          message: `${name} is required when EMAIL_PROVIDER=${provider}`,
+          message: `${name} is required when EMAIL_PROVIDER=${providers.join("|")}`,
         });
       }
     });
@@ -231,28 +234,35 @@ export const env = createEnv({
     OTP_HASH_SECRET: otpHashSecretSchema,
     REGISTRATION_SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
     EMAIL_PROVIDER: emailProviderSchema,
-    EMAIL_FROM: optionalProviderRequiredString("smtp", "EMAIL_FROM"),
+    // Reused as the sender identity for both SMTP and SendGrid — SendGrid has no
+    // SENDGRID_FROM_EMAIL/NAME pair of its own in this codebase's .env, and these two already
+    // exist and are populated; reusing them avoids introducing a redundant provider-specific pair.
+    EMAIL_FROM: optionalProviderRequiredString(["smtp", "sendgrid"], "EMAIL_FROM"),
     EMAIL_FROM_NAME: z
       .string()
       .min(1)
       .default(process.env["APP_NAME"] ?? "Bookly"),
-    SMTP_HOST: optionalProviderRequiredString("smtp", "SMTP_HOST"),
+    SMTP_HOST: optionalProviderRequiredString(["smtp"], "SMTP_HOST"),
     SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
     SMTP_SECURE: booleanString,
-    SMTP_USER: optionalProviderRequiredString("smtp", "SMTP_USER"),
-    SMTP_PASS: optionalProviderRequiredString("smtp", "SMTP_PASS"),
+    SMTP_USER: optionalProviderRequiredString(["smtp"], "SMTP_USER"),
+    SMTP_PASS: optionalProviderRequiredString(["smtp"], "SMTP_PASS"),
     RESEND_API_KEY:
       rawEmailProvider === "resend"
-        ? optionalProviderRequiredString("resend", "RESEND_API_KEY")
+        ? optionalProviderRequiredString(["resend"], "RESEND_API_KEY")
         : optionalProductionRequiredString("RESEND_API_KEY"),
     RESEND_FROM_EMAIL:
       rawEmailProvider === "resend"
-        ? optionalProviderRequiredString("resend", "RESEND_FROM_EMAIL")
+        ? optionalProviderRequiredString(["resend"], "RESEND_FROM_EMAIL")
         : optionalProductionRequiredString("RESEND_FROM_EMAIL"),
     RESEND_FROM_NAME:
       rawEmailProvider === "resend"
-        ? optionalProviderRequiredString("resend", "RESEND_FROM_NAME")
+        ? optionalProviderRequiredString(["resend"], "RESEND_FROM_NAME")
         : optionalProductionRequiredString("RESEND_FROM_NAME"),
+    SENDGRID_API_KEY:
+      rawEmailProvider === "sendgrid"
+        ? optionalProviderRequiredString(["sendgrid"], "SENDGRID_API_KEY")
+        : optionalProductionRequiredString("SENDGRID_API_KEY"),
     OTP_PROVIDER: phoneOtpProviderSchema.superRefine((value, context) => {
       if (rawNodeEnv === "production" && value === "dummy") {
         context.addIssue({

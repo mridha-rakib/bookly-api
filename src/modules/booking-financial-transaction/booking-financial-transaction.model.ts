@@ -140,6 +140,11 @@ bookingFinancialTransactionSchema.index({ businessId: 1, type: 1, status: 1, pay
 // this query at all, so the businessId-prefixed index above cannot serve it — this is the
 // dedicated index for that shape (type+status equality, createdAt range).
 bookingFinancialTransactionSchema.index({ type: 1, status: 1, createdAt: 1 });
+// Dashboard Overview's "Recent activity" feed: a Business's own most-recent ledger entries of
+// ANY type, newest first — the existing `{businessId, type, createdAt}` index cannot serve this
+// (it leads with `type`, which this query never filters on). See
+// BookingFinancialTransactionRepository.listRecentForBusiness.
+bookingFinancialTransactionSchema.index({ businessId: 1, createdAt: -1 });
 
 export const BookingFinancialTransactionModel = model<BookingFinancialTransactionDocument>(
   "BookingFinancialTransaction",

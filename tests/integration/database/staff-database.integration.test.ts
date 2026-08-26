@@ -22,6 +22,7 @@ import { BusinessOnboardingRepository } from "../../../src/modules/business-onbo
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
+import { ContactChangeChallengeRepository } from "../../../src/modules/contact-change/contact-change-challenge.repository.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
@@ -91,6 +92,8 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
     this.lastPurpose = input.purpose;
     this.sentCount += 1;
   }
+
+  public async sendNotice(): Promise<void> {}
 }
 
 describe("database-backed StaffMembership integration", () => {
@@ -737,6 +740,7 @@ describe("database-backed StaffMembership integration", () => {
       businessService,
       new StaffRepository(),
       new ClientIdentityService(userRepository, new ClientRepository()),
+      new ContactChangeChallengeRepository(),
     );
 
     const result = await authService.login(

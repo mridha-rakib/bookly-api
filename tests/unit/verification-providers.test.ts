@@ -11,6 +11,18 @@ const loadEmailProvider = async () => {
   return import("../../src/modules/verification/email-otp.provider.js");
 };
 
+const loadSendGridProvider = async () => {
+  vi.resetModules();
+  process.env["EMAIL_PROVIDER"] = "sendgrid";
+  process.env["SENDGRID_API_KEY"] = "test-sendgrid-key";
+  process.env["EMAIL_FROM"] = "noreply@example.com";
+  process.env["EMAIL_FROM_NAME"] = "Bookly";
+  process.env["OTP_PROVIDER"] = "dummy";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["OTP_EXPIRY_MINUTES"] = "7";
+  return import("../../src/modules/verification/email-otp.provider.js");
+};
+
 const loadSmtpProvider = async () => {
   vi.resetModules();
   process.env["EMAIL_PROVIDER"] = "smtp";
@@ -52,6 +64,7 @@ describe("verification providers", () => {
     delete process.env["RESEND_API_KEY"];
     delete process.env["RESEND_FROM_EMAIL"];
     delete process.env["RESEND_FROM_NAME"];
+    delete process.env["SENDGRID_API_KEY"];
     delete process.env["TWILIO_ACCOUNT_SID"];
     delete process.env["TWILIO_AUTH_TOKEN"];
     delete process.env["TWILIO_VERIFY_SERVICE_SID"];
@@ -125,6 +138,144 @@ describe("verification providers", () => {
     ).rejects.toMatchObject({ details: [{ code: "PROVIDER_RATE_LIMITED" }] });
   });
 
+  it("sends a plain notice email via Resend with caller-supplied subject/text (no code)", async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const { ResendEmailOtpProvider } = await loadEmailProvider();
+
+    await new ResendEmailOtpProvider(() => ({ emails: { send } })).sendNotice({
+      to: "old@example.com",
+      subject: "Your Bookly email was changed",
+      text: "Your Bookly account email was changed to new@example.com.",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "old@example.com",
+        subject: "Your Bookly email was changed",
+        text: "Your Bookly account email was changed to new@example.com.",
+      }),
+    );
+  });
+
+  it("sends a plain notice email via SMTP with caller-supplied subject/text (no code)", async () => {
+    const sendMail = vi.fn().mockResolvedValue({});
+    const { SmtpEmailOtpProvider } = await loadSmtpProvider();
+
+    await new SmtpEmailOtpProvider(() => ({ sendMail })).sendNotice({
+      to: "old@example.com",
+      subject: "Your Bookly email was changed",
+      text: "Your Bookly account email was changed to new@example.com.",
+    });
+
+    expect(sendMail).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "old@example.com", subject: "Your Bookly email was changed" }),
+    );
+  });
+
+  it("fails safely when sending a notice without a configured provider", async () => {
+    vi.resetModules();
+    const { ResendEmailOtpProvider } = await import(
+      "../../src/modules/verification/email-otp.provider.js"
+    );
+
+    await expect(
+      new ResendEmailOtpProvider().sendNotice({ to: "a@example.com", subject: "x", text: "y" }),
+    ).rejects.toMatchObject({ details: [{ code: "PROVIDER_NOT_CONFIGURED" }] });
+  });
+
+  it("includes EMAIL_CHANGE purpose text with configured expiry when sending a change OTP", async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const { ResendEmailOtpProvider } = await loadEmailProvider();
+
+    await new ResendEmailOtpProvider(() => ({ emails: { send } })).sendOtp({
+      to: "new@example.com",
+      code: "1234",
+      purpose: "EMAIL_CHANGE",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: expect.stringContaining("new Bookly email"),
+        text: expect.stringContaining("7 minutes"),
+      }),
+    );
+  });
+
+  it("fails safely when SendGrid is not configured", async () => {
+    vi.resetModules();
+    const { SendGridEmailOtpProvider } = await import(
+      "../../src/modules/verification/email-otp.provider.js"
+    );
+
+    await expect(
+      new SendGridEmailOtpProvider().sendOtp({ to: "a@example.com", code: "1234" }),
+    ).rejects.toMatchObject({ details: [{ code: "PROVIDER_NOT_CONFIGURED" }] });
+  });
+
+  it("sends SendGrid OTP email to the expected recipient/sender with configured expiry text", async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const { SendGridEmailOtpProvider } = await loadSendGridProvider();
+
+    await new SendGridEmailOtpProvider(() => ({ send })).sendOtp({
+      to: "customer@example.com",
+      code: "1234",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "customer@example.com",
+        from: "Bookly <noreply@example.com>",
+        text: expect.stringContaining("7 minutes"),
+      }),
+    );
+  });
+
+  it("normalizes SendGrid provider rejection", async () => {
+    const send = vi.fn().mockRejectedValue({ code: 429 });
+    const { SendGridEmailOtpProvider } = await loadSendGridProvider();
+
+    await expect(
+      new SendGridEmailOtpProvider(() => ({ send })).sendOtp({
+        to: "a@example.com",
+        code: "1234",
+      }),
+    ).rejects.toMatchObject({ details: [{ code: "PROVIDER_RATE_LIMITED" }] });
+  });
+
+  it("sends a plain notice email via SendGrid with caller-supplied subject/text (no code)", async () => {
+    const send = vi.fn().mockResolvedValue({});
+    const { SendGridEmailOtpProvider } = await loadSendGridProvider();
+
+    await new SendGridEmailOtpProvider(() => ({ send })).sendNotice({
+      to: "old@example.com",
+      subject: "Your Bookly email was changed",
+      text: "Your Bookly account email was changed to new@example.com.",
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "old@example.com",
+        subject: "Your Bookly email was changed",
+        text: "Your Bookly account email was changed to new@example.com.",
+      }),
+    );
+  });
+
+  it("never lets a SendGrid API key or provider response reach an error surfaced to the caller", async () => {
+    const send = vi.fn().mockRejectedValue({
+      code: 401,
+      response: { body: { errors: [{ message: "secret leaking test" }] } },
+    });
+    const { SendGridEmailOtpProvider } = await loadSendGridProvider();
+
+    const error = await new SendGridEmailOtpProvider(() => ({ send }))
+      .sendOtp({ to: "a@example.com", code: "1234" })
+      .catch((e: unknown) => e);
+
+    expect(JSON.stringify(error)).not.toContain("test-sendgrid-key");
+    expect(JSON.stringify(error)).not.toContain("secret leaking test");
+  });
+
   it("selects email provider from environment configuration", async () => {
     process.env["EMAIL_PROVIDER"] = "smtp";
     let providers = await loadSmtpProvider();
@@ -137,6 +288,14 @@ describe("verification providers", () => {
     process.env["RESEND_FROM_NAME"] = "Bookly";
     providers = await import("../../src/modules/verification/email-otp.provider.js");
     expect(providers.createEmailOtpProvider()).toBeInstanceOf(providers.ResendEmailOtpProvider);
+
+    vi.resetModules();
+    process.env["EMAIL_PROVIDER"] = "sendgrid";
+    process.env["SENDGRID_API_KEY"] = "test-sendgrid-key";
+    process.env["EMAIL_FROM"] = "noreply@example.com";
+    process.env["EMAIL_FROM_NAME"] = "Bookly";
+    providers = await import("../../src/modules/verification/email-otp.provider.js");
+    expect(providers.createEmailOtpProvider()).toBeInstanceOf(providers.SendGridEmailOtpProvider);
   });
 
   it("selects dummy phone OTP provider from environment configuration", async () => {

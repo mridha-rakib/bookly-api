@@ -13,6 +13,7 @@ import { BusinessOnboardingRepository } from "../business-onboarding/business-on
 import { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import { ClientRepository } from "../client/client.repository.js";
 import { ClientIdentityService } from "../client/client-identity.service.js";
+import { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
@@ -34,9 +35,13 @@ import {
   professionalEntryBodySchema,
   profileBodySchema,
   progressQuerySchema,
+  requestEmailChangeBodySchema,
+  requestPhoneChangeBodySchema,
   sessionBodySchema,
   updateMyProfileBodySchema,
+  verifyEmailChangeBodySchema,
   verifyEmailOtpBodySchema,
+  verifyPhoneChangeBodySchema,
   verifyPhoneOtpBodySchema,
   visitTypeBodySchema,
 } from "./auth.schema.js";
@@ -73,6 +78,7 @@ export const createAuthRoute = (): Router => {
   const tokenService = new TokenService(sessionRepository);
   const staffRepository = new StaffRepository();
   const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
+  const contactChangeChallengeRepository = new ContactChangeChallengeRepository();
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
@@ -86,6 +92,7 @@ export const createAuthRoute = (): Router => {
     businessService,
     staffRepository,
     clientIdentityService,
+    contactChangeChallengeRepository,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
@@ -260,6 +267,47 @@ export const createAuthRoute = (): Router => {
     loginLimiter,
     validateRequest({ body: changeMyPasswordBodySchema }),
     asyncHandler(controller.changeMyPassword),
+  );
+
+  // Batch 18 — Customer email/phone self-change. Reuses the same otpSendLimiter/otpVerifyLimiter
+  // instances the registration flow already uses rather than inventing a second rate limiter;
+  // the per-challenge resend-cooldown/attempt-cap logic (assertOtpResendAllowed, OTP_MAX_
+  // VERIFICATION_ATTEMPTS) is the actual per-identity throttle underneath.
+  router.post(
+    "/me/email/change-request",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    otpSendLimiter,
+    validateRequest({ body: requestEmailChangeBodySchema }),
+    asyncHandler(controller.requestEmailChange),
+  );
+  router.post(
+    "/me/email/verify",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    otpVerifyLimiter,
+    validateRequest({ body: verifyEmailChangeBodySchema }),
+    asyncHandler(controller.verifyEmailChange),
+  );
+  router.post(
+    "/me/phone/change-request",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    otpSendLimiter,
+    validateRequest({ body: requestPhoneChangeBodySchema }),
+    asyncHandler(controller.requestPhoneChange),
+  );
+  router.post(
+    "/me/phone/verify",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    otpVerifyLimiter,
+    validateRequest({ body: verifyPhoneChangeBodySchema }),
+    asyncHandler(controller.verifyPhoneChange),
   );
 
   return router;

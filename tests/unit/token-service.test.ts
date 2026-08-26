@@ -56,6 +56,14 @@ class InMemorySessionRepository {
       }
     }
   }
+
+  public async revokeAllForUser(userId: Types.ObjectId): Promise<void> {
+    for (const session of this.sessions) {
+      if (session.userId.equals(userId)) {
+        session.revokedAt = new Date();
+      }
+    }
+  }
 }
 
 describe("TokenService", () => {
@@ -70,6 +78,24 @@ describe("TokenService", () => {
       "REFRESH_TOKEN_REUSED",
     );
     expect(rotated.refreshToken).not.toBe(initial.refreshToken);
+  });
+
+  it("revokeAllSessionsForUser revokes every session for that user but leaves other users' sessions valid", async () => {
+    const repository = new InMemorySessionRepository();
+    const service = new TokenService(repository);
+    const userId = new Types.ObjectId();
+    const otherUserId = new Types.ObjectId();
+    const mine = await service.createRefreshSession({ userId });
+    const theirs = await service.createRefreshSession({ userId: otherUserId });
+
+    await service.revokeAllSessionsForUser(userId);
+
+    await expect(service.rotateRefreshToken(mine.refreshToken)).rejects.toThrow(
+      "REFRESH_TOKEN_REUSED",
+    );
+    await expect(service.rotateRefreshToken(theirs.refreshToken)).resolves.toMatchObject({
+      userId: otherUserId,
+    });
   });
 
   it("allows only one concurrent refresh rotation to succeed", async () => {

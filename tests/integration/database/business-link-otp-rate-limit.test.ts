@@ -37,6 +37,8 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
     this.sentCount += 1;
     this.sentTo.push(input.to);
   }
+
+  public async sendNotice(): Promise<void> {}
 }
 
 const businessInput = (ownerUserId: import("mongoose").Types.ObjectId, name: string) => ({

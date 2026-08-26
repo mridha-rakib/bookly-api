@@ -21,6 +21,7 @@ import { createBusinessHoursRoute } from "../business-hours/business-hours.route
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { createBusinessMediaRoute } from "../business-media/business-media.route.js";
 import { createBusinessTravelSettingsRoute } from "../business-travel-settings/business-travel-settings.route.js";
+import { createDashboardAnalyticsRoute } from "../dashboard-analytics/dashboard-analytics.route.js";
 import { createFinanceRoute } from "../finance/finance.route.js";
 import { createServicesRoute } from "../services/service.route.js";
 import { SessionRepository } from "../session/session.repository.js";
@@ -113,6 +114,11 @@ export const createBusinessRoute = (): Router => {
   // the confirmed policy this reflects) ---
   router.get("/my-profile", asyncHandler(controller.getMyProfile));
   router.use(createFinanceRoute());
+  // Analytics tab — same "Business Owner surface only, no product rule for Supervisor/Staff/
+  // Customer" precedent as Finance above (see createDashboardAnalyticsRoute's own comment), so
+  // it is mounted the exact same way: inside this router's existing Owner-only gate, never
+  // gated by Business approval status.
+  router.use(createDashboardAnalyticsRoute());
 
   router.post(
     "/links/verification",

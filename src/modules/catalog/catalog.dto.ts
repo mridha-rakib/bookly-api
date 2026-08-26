@@ -1,6 +1,7 @@
 import type { AddonDocument } from "../addons/addon.model.js";
 import type { BusinessAddress, BusinessDocument } from "../business/business.model.js";
 import type { BusinessVisitType } from "../business/business.types.js";
+import type { BusinessMediaRole } from "../business-media/business-media.model.js";
 import type {
   ServiceDocument,
   ServiceFixedPricing,
@@ -9,6 +10,8 @@ import type {
   ServicePerPersonPricing,
 } from "../services/service.model.js";
 import type { ServicePricingMode } from "../services/service.types.js";
+import type { StaffCreatableRole } from "../staff/staff.types.js";
+import type { DayOfWeek } from "../staff/staff-schedule.types.js";
 
 /**
  * Batch 9 — the customer-facing "can I book this" read surface. Every DTO here is a deliberately
@@ -21,6 +24,30 @@ import type { ServicePricingMode } from "../services/service.types.js";
  * "not found," not the anti-enumeration-masked 404 the Owner-management surfaces use.
  */
 
+/** Batch 17 — the venue page's real "open now" read, computed server-side (business-clock.ts,
+ * the same DST-safe local-time primitive the availability engine uses) so the frontend never
+ * re-derives it from a raw weekly schedule. `configured: false` means the Business never set up
+ * Opening Hours at all — distinct from every day being closed — the frontend must show a neutral
+ * "hours not available" state, never fabricate an Open/Closed guess. */
+export type CatalogOpenStatusDto = {
+  configured: boolean;
+  isOpen: boolean;
+  /** Human-readable, e.g. "Open now", "Closed - opens 10:30 AM Monday", or "Hours not available". */
+  label: string;
+};
+
+export type CatalogBusinessHoursDayDto = {
+  dayOfWeek: DayOfWeek;
+  isOpen: boolean;
+  slots: { startTime: string; endTime: string }[];
+};
+
+export type CatalogMediaDto = {
+  id: string;
+  url: string;
+  role: BusinessMediaRole;
+};
+
 export type CatalogBusinessDto = {
   id: string;
   name: string;
@@ -30,9 +57,21 @@ export type CatalogBusinessDto = {
   visitType: BusinessVisitType;
   timezone: string;
   address: BusinessAddress;
+  openStatus: CatalogOpenStatusDto;
+  hours: CatalogBusinessHoursDayDto[];
+  /** Business Media (business-media module), PROFILE first then GALLERY by sortOrder — powers
+   * both the hero banner and the Gallery tab; never a second, separately-uploaded set of images. */
+  media: CatalogMediaDto[];
 };
 
-export const toCatalogBusinessDto = (business: BusinessDocument): CatalogBusinessDto => ({
+export const toCatalogBusinessDto = (
+  business: BusinessDocument,
+  extra: {
+    openStatus: CatalogOpenStatusDto;
+    hours: CatalogBusinessHoursDayDto[];
+    media: CatalogMediaDto[];
+  },
+): CatalogBusinessDto => ({
   id: String(business._id),
   name: business.name,
   category: business.category,
@@ -41,6 +80,9 @@ export const toCatalogBusinessDto = (business: BusinessDocument): CatalogBusines
   visitType: business.visitType,
   timezone: business.timezone,
   address: business.address,
+  openStatus: extra.openStatus,
+  hours: extra.hours,
+  media: extra.media,
 });
 
 export type CatalogServiceDto = {
@@ -125,6 +167,11 @@ export type CatalogStaffDto = {
   id: string;
   firstName: string;
   lastName?: string | undefined;
+  /** StaffMembership.role — the only real "team" job-role field this codebase has (no separate
+   * display title like "Hairdresser"/"Beautician" exists on any model); the frontend displays
+   * this as-is (e.g. "Staff", "Supervisor"). */
+  role: StaffCreatableRole;
+  avatarUrl?: string | undefined;
 };
 
 export type CatalogAddonDto = {

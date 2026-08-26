@@ -110,4 +110,8 @@ export class TokenService {
       await this.sessionRepository.revoke(existing._id);
     }
   }
+
+  public async revokeAllSessionsForUser(userId: Types.ObjectId): Promise<void> {
+    await this.sessionRepository.revokeAllForUser(userId);
+  }
 }

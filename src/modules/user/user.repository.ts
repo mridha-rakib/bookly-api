@@ -163,6 +163,25 @@ export class UserRepository {
     await UserModel.updateOne({ _id: userId }, { $set: { normalizedEmail } });
   }
 
+  /** Batch 18 — commits an OTP-verified email change. Unlike `updateEmail` (used by the Staff
+   * email-change path, which never touches verification state), this always sets a fresh
+   * `emailVerifiedAt` together with the new address in one update — required by the
+   * `findVerifiedCustomerByEmail`/`ByPhoneE164` identity-linking invariant (client-identity.
+   * service.ts): every value those queries can match against must genuinely be OTP-verified.
+   * `normalizedEmail`'s unique index is the final race-safety net if two Customers verify the
+   * same new email concurrently — the loser's update throws a duplicate-key error, surfaced by
+   * the caller as EMAIL_ALREADY_REGISTERED. */
+  public async commitEmailChange(userId: Types.ObjectId, normalizedEmail: string): Promise<void> {
+    await UserModel.updateOne(
+      { _id: userId },
+      { $set: { normalizedEmail, emailVerifiedAt: new Date() } },
+    );
+  }
+
+  public async updatePhoneVerifiedAt(userId: Types.ObjectId, verifiedAt: Date): Promise<void> {
+    await UserModel.updateOne({ _id: userId }, { $set: { phoneVerifiedAt: verifiedAt } });
+  }
+
   public async updateProfile(
     profileId: Types.ObjectId,
     update: Partial<Pick<CreateProfileInput, "firstName" | "lastName" | "gender">> & {

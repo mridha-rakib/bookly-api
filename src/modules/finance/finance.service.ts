@@ -310,6 +310,29 @@ export class FinanceService {
     };
   }
 
+  // --- Dashboard Overview surface -----------------------------------------------------------
+  // No actor-ownership check here (unlike getSummary above) — same "authorization already
+  // happened, just resolve+compute" contract as the Super Admin surface further up. The caller
+  // (DashboardOverviewService) independently re-derives the actor's own Owner-or-Supervisor
+  // access to this businessId before ever calling this, mirroring
+  // BookingService.requireBookingManagementAccess's own precedent of a broader-than-Finance
+  // authorization surface reusing this same shared `buildSummary` core (rule #17: never a second,
+  // independently-invented revenue formula).
+
+  /** Dashboard Overview's "Monthly revenue" card — reuses the EXACT SAME net-payout computation
+   * as the Business Owner/Super Admin Finance summary (`buildSummary`), scoped to whatever
+   * period the caller passes (Dashboard Overview passes the current calendar month). Does not
+   * alter `getSummary`'s existing all-time-capable Payouts tab behavior in any way — purely
+   * additive. */
+  public async getNetPayoutForBusiness(
+    businessId: string,
+    period: { from: Date; to: Date },
+  ): Promise<number> {
+    const business = await this.requireBusiness(businessId);
+    const summary = await this.buildSummary(business._id, period);
+    return summary.netPayoutCents;
+  }
+
   // --- Shared core (used by both Owner-facing and Super-Admin-facing methods above) --------
 
   private async buildSummary(

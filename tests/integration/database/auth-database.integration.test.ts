@@ -26,6 +26,8 @@ import { BusinessOnboardingRepository } from "../../../src/modules/business-onbo
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
+import { ContactChangeChallengeModel } from "../../../src/modules/contact-change/contact-change-challenge.model.js";
+import { ContactChangeChallengeRepository } from "../../../src/modules/contact-change/contact-change-challenge.repository.js";
 import {
   type RegistrationPortal,
   RegistrationSessionModel,
@@ -74,6 +76,8 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
   public async sendOtp(input: { to: string; code: string }): Promise<void> {
     this.lastCode = input.code;
   }
+
+  public async sendNotice(): Promise<void> {}
 }
 
 class TestPhoneOtpProvider implements PhoneOtpProvider {
@@ -151,6 +155,7 @@ const createAuthService = (
       businessService,
       staffRepository,
       clientIdentityService,
+      new ContactChangeChallengeRepository(),
     ),
     emailProvider,
     phoneProvider,
@@ -1091,6 +1096,157 @@ describe("database-backed authentication integration", () => {
       ),
     ).rejects.toMatchObject({ statusCode: 503 });
     startSessionSpy.mockRestore();
+  });
+
+  describe("Batch 18 — Customer email/phone contact-change", () => {
+    it("has exactly the unique (userId, purpose) and TTL (expiresAt) indexes it needs", async () => {
+      const indexes = (await ContactChangeChallengeModel.collection.indexes()) as DbIndex[];
+
+      const uniqueSlotIndex = indexes.find(
+        (index) => index.key["userId"] === 1 && index.key["purpose"] === 1,
+      );
+      expect(uniqueSlotIndex?.unique).toBe(true);
+
+      const ttlIndex = indexes.find((index) => index.key["expiresAt"] === 1);
+      expect(ttlIndex?.expireAfterSeconds).toBe(0);
+    });
+
+    it("commits a verified email change end-to-end, revokes other sessions, and leaves the old email unusable for login", async () => {
+      const { authService, emailProvider, userId, refreshToken } = await (async () => {
+        const parts = await completeCustomer("email-change-src@example.com");
+        return { ...parts, userId: parts.result.user.id, refreshToken: parts.result.refreshToken };
+      })();
+
+      await authService.requestEmailChange(userId, {
+        currentPassword: testPassword,
+        newEmail: "email-change-dst@example.com",
+      });
+      const code = emailProvider.lastCode;
+
+      const before = await UserModel.findById(userId).exec();
+      expect(before?.normalizedEmail).toBe("email-change-src@example.com");
+
+      const me = await authService.verifyEmailChange(userId, { code });
+      expect(me.user.email).toBe("email-change-dst@example.com");
+
+      const after = await UserModel.findById(userId).exec();
+      expect(after?.normalizedEmail).toBe("email-change-dst@example.com");
+      expect(after?.emailVerifiedAt?.getTime()).toBeGreaterThan(
+        before?.emailVerifiedAt?.getTime() ?? 0,
+      );
+
+      // Old email can no longer log in; new email can.
+      await expect(
+        authService.login(
+          "CUSTOMER",
+          { email: "email-change-src@example.com", password: testPassword },
+          context,
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "INVALID_CREDENTIALS" }] });
+      await expect(
+        authService.login(
+          "CUSTOMER",
+          { email: "email-change-dst@example.com", password: testPassword },
+          context,
+        ),
+      ).resolves.toMatchObject({ user: { email: "email-change-dst@example.com" } });
+
+      // The session that existed before the change was revoked.
+      await expect(authService.refresh(refreshToken)).rejects.toMatchObject({
+        details: [{ code: "REFRESH_TOKEN_REUSED" }],
+      });
+
+      // The consumed challenge slot is gone (replay-safe / no leftover row).
+      expect(
+        await ContactChangeChallengeModel.findOne({ userId, purpose: "EMAIL_CHANGE" }).exec(),
+      ).toBeNull();
+    });
+
+    it("rejects verifying the same email-change OTP twice (replay protection)", async () => {
+      const parts = await completeCustomer("email-replay@example.com");
+      const userId = parts.result.user.id;
+      await parts.authService.requestEmailChange(userId, {
+        currentPassword: testPassword,
+        newEmail: "email-replay-dst@example.com",
+      });
+      const code = parts.emailProvider.lastCode;
+
+      await parts.authService.verifyEmailChange(userId, { code });
+
+      await expect(parts.authService.verifyEmailChange(userId, { code })).rejects.toMatchObject({
+        details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }],
+      });
+    });
+
+    it("lets only one of two concurrent verifications targeting the same new email win; the loser sees a safe conflict error, never a raw Mongo error", async () => {
+      const partsA = await completeCustomer("email-race-a@example.com");
+      const partsB = await completeCustomer("email-race-b@example.com");
+      const targetEmail = "email-race-target@example.com";
+
+      await partsA.authService.requestEmailChange(partsA.result.user.id, {
+        currentPassword: testPassword,
+        newEmail: targetEmail,
+      });
+      const codeA = partsA.emailProvider.lastCode;
+      await partsB.authService.requestEmailChange(partsB.result.user.id, {
+        currentPassword: testPassword,
+        newEmail: targetEmail,
+      });
+      const codeB = partsB.emailProvider.lastCode;
+
+      const results = await Promise.allSettled([
+        partsA.authService.verifyEmailChange(partsA.result.user.id, { code: codeA }),
+        partsB.authService.verifyEmailChange(partsB.result.user.id, { code: codeB }),
+      ]);
+
+      const fulfilled = results.filter((result) => result.status === "fulfilled");
+      const rejected = results.filter(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      assertAuthError(rejected[0]?.reason, "EMAIL_ALREADY_REGISTERED", 409);
+
+      // Exactly one User row now owns the contested email — the unique index remained authoritative.
+      expect(await UserModel.countDocuments({ normalizedEmail: targetEmail })).toBe(1);
+    });
+
+    it("commits a verified phone change end-to-end without revoking sessions", async () => {
+      const parts = await completeCustomer("phone-change@example.com");
+      const userId = parts.result.user.id;
+
+      await parts.authService.requestPhoneChange(userId, {
+        currentPassword: testPassword,
+        countryCode: "+357",
+        nationalNumber: "98887766",
+      });
+
+      const before = await UserModel.findById(userId).exec();
+      const me = await parts.authService.verifyPhoneChange(userId, { code: "1234" });
+      expect(me.profile?.phone?.nationalNumber).toBe("98887766");
+
+      const after = await UserModel.findById(userId).exec();
+      expect(after?.phoneVerifiedAt?.getTime()).toBeGreaterThan(
+        before?.phoneVerifiedAt?.getTime() ?? 0,
+      );
+
+      // Phone is not a login credential, so the existing session survives.
+      await expect(parts.authService.refresh(parts.result.refreshToken)).resolves.toMatchObject({
+        user: { id: userId },
+      });
+    });
+
+    it("keeps PATCH-/auth/me-equivalent profile updates from ever touching email/phone directly", async () => {
+      const parts = await completeCustomer("profile-boundary@example.com");
+      const userId = parts.result.user.id;
+
+      const before = await UserModel.findById(userId).exec();
+      await parts.authService.updateMyProfile(userId, { firstName: "Renamed" });
+      const after = await UserModel.findById(userId).exec();
+
+      expect(after?.normalizedEmail).toBe(before?.normalizedEmail);
+      expect(after?.phoneVerifiedAt?.getTime()).toBe(before?.phoneVerifiedAt?.getTime());
+    });
   });
 });
 

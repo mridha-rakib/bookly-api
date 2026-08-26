@@ -137,6 +137,37 @@ export const changeMyPasswordBodySchema = z
   })
   .strict();
 
+// Batch 18 — Customer email/phone self-service change. Requesting a change re-verifies the
+// Customer's current password first (no established precedent existed for this — confirmed via
+// AskUserQuestion) before an OTP is ever sent to the NEW contact; the existing verified contact
+// stays authoritative until that OTP is confirmed via the separate verify endpoint below.
+export const requestEmailChangeBodySchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    newEmail: emailSchema,
+  })
+  .strict();
+
+export const verifyEmailChangeBodySchema = z
+  .object({
+    code: otpCodeSchema,
+  })
+  .strict();
+
+export const requestPhoneChangeBodySchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    countryCode: countryCodeSchema,
+    nationalNumber: nationalNumberSchema,
+  })
+  .strict();
+
+export const verifyPhoneChangeBodySchema = z
+  .object({
+    code: otpCodeSchema,
+  })
+  .strict();
+
 export const authResponseSchema = z.object({
   accessToken: z.string(),
   accessTokenExpiresAt: z.string().datetime(),
@@ -160,3 +191,7 @@ export type BusinessDetailsBody = z.infer<typeof businessDetailsBodySchema>;
 export type CategorySelectionBody = z.infer<typeof categorySelectionBodySchema>;
 export type UpdateMyProfileBody = z.infer<typeof updateMyProfileBodySchema>;
 export type ChangeMyPasswordBody = z.infer<typeof changeMyPasswordBodySchema>;
+export type RequestEmailChangeBody = z.infer<typeof requestEmailChangeBodySchema>;
+export type VerifyEmailChangeBody = z.infer<typeof verifyEmailChangeBodySchema>;
+export type RequestPhoneChangeBody = z.infer<typeof requestPhoneChangeBodySchema>;
+export type VerifyPhoneChangeBody = z.infer<typeof verifyPhoneChangeBodySchema>;
