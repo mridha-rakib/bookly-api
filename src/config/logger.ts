@@ -43,6 +43,8 @@ const redactPaths = [
   "*.set-cookie",
   "RESEND_API_KEY",
   "*.RESEND_API_KEY",
+  "SENDGRID_API_KEY",
+  "*.SENDGRID_API_KEY",
   "SMTP_PASS",
   "*.SMTP_PASS",
   "SMTP_USER",

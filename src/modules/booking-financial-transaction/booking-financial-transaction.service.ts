@@ -17,6 +17,10 @@ import type {
 
 const oneDayMs = 24 * 60 * 60 * 1000;
 
+/** Dashboard Overview's "Recent activity" feed hard cap — see `listRecentForBusiness`'s own
+ * comment. */
+const MAX_RECENT_ACTIVITY_LIMIT = 50;
+
 /** The one direction each type permits — BUSINESS_PAYOUT is always CREDIT (see
  * booking-financial-transaction.types.ts), every charge type is always DEBIT, REFUND is
  * always CREDIT. ADJUSTMENT is the only type where the caller genuinely chooses.
@@ -273,6 +277,21 @@ export class BookingFinancialTransactionService {
   }): Promise<{ rows: BookingFinancialTransactionDocument[]; total: number }> {
     this.requireBoundedRange(input.from, input.to);
     return this.transactionRepository.listGlobalPage(input);
+  }
+
+  /** Dashboard Overview's "Recent activity" feed — thin pass-through to the bounded, capped
+   * repository read (see BookingFinancialTransactionRepository.listRecentForBusiness's own
+   * comment); kept behind this service so every read stays behind it, matching this module's
+   * own "never Mongoose directly" convention. `limit` is additionally clamped here so a future
+   * caller can never accidentally request an unbounded dump. */
+  public async listRecentForBusiness(
+    businessId: Types.ObjectId | string,
+    limit: number,
+  ): Promise<BookingFinancialTransactionDocument[]> {
+    return this.transactionRepository.listRecentForBusiness(
+      businessId,
+      Math.min(Math.max(limit, 1), MAX_RECENT_ACTIVITY_LIMIT),
+    );
   }
 
   private requireBoundedRange(from: Date, to: Date): void {

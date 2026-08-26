@@ -26,6 +26,10 @@ const defaultMessages: Record<string, string> = {
   OTP_VERIFICATION_FAILED: "Verification check failed",
   PROVIDER_RATE_LIMITED: "Verification provider rate limit exceeded",
   INVALID_CURRENT_PASSWORD: "Current password is incorrect",
+  PHONE_ALREADY_REGISTERED: "This phone number is already registered to another account",
+  CONTACT_UNCHANGED: "That's already your current email or phone number",
+  CONTACT_CHANGE_NOT_FOUND:
+    "No pending change request was found. Please request a new verification code",
 };
 
 export class AuthError extends AppError {

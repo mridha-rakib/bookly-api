@@ -56,6 +56,7 @@ export type PromoRedemptionRowDto = {
   id: string;
   promoId: string;
   code: string;
+  customerUserId: string;
   customerEmail: string;
   businessId: string;
   businessName: string;
@@ -74,6 +75,7 @@ export const toPromoRedemptionRowDto = (
   id: String(redemption._id),
   promoId: String(redemption.promoId),
   code: redemption.codeSnapshot,
+  customerUserId: String(redemption.customerUserId),
   customerEmail,
   businessId: String(redemption.businessId),
   businessName,

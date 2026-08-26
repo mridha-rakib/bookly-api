@@ -7,6 +7,7 @@ import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import type { ClientIdentityService } from "../client/client-identity.service.js";
+import type { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
 import type {
   RegistrationPortal,
   RegistrationSessionDocument,
@@ -26,8 +27,12 @@ import type {
   LoginBody,
   ProfessionalEntryBody,
   ProfileBody,
+  RequestEmailChangeBody,
+  RequestPhoneChangeBody,
   UpdateMyProfileBody,
+  VerifyEmailChangeBody,
   VerifyEmailOtpBody,
+  VerifyPhoneChangeBody,
   VerifyPhoneOtpBody,
   VisitTypeBody,
 } from "./auth.schema.js";
@@ -83,6 +88,7 @@ export class AuthService {
     private readonly businessService: BusinessService,
     private readonly staffRepository: StaffRepository,
     private readonly clientIdentityService: ClientIdentityService,
+    private readonly contactChangeChallengeRepository: ContactChangeChallengeRepository,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -617,6 +623,320 @@ export class AuthService {
 
     const passwordHash = await this.passwordHasher.hash(input.newPassword);
     await this.userRepository.updatePasswordHash(user._id, passwordHash);
+  }
+
+  /**
+   * Batch 18 — step 1 of Customer email self-change. Never touches User.normalizedEmail; only
+   * sends an OTP to the NEW address and records the pending challenge. The current verified
+   * email remains authoritative (and the only one that can log in) until `verifyEmailChange`
+   * succeeds.
+   */
+  public async requestEmailChange(
+    userId: string,
+    input: RequestEmailChangeBody,
+  ): Promise<{ expiresAt: string }> {
+    const user = await this.userRepository.findByIdWithPassword(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
+      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+    }
+
+    const newNormalizedEmail = normalizeEmail(input.newEmail);
+
+    if (newNormalizedEmail === user.normalizedEmail) {
+      throw new AuthError("CONTACT_UNCHANGED", 400);
+    }
+
+    if (await this.userRepository.findByEmail(newNormalizedEmail)) {
+      throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
+    }
+
+    const existingChallenge = await this.contactChangeChallengeRepository.findActive(
+      user._id,
+      "EMAIL_CHANGE",
+    );
+    assertOtpResendAllowed(existingChallenge?.resendTimestamps ?? [], existingChallenge?.sentAt);
+
+    const code = generateNumericOtp(env.OTP_LENGTH);
+    await this.emailOtpProvider.sendOtp({ to: newNormalizedEmail, code, purpose: "EMAIL_CHANGE" });
+
+    const now = new Date();
+    const otpExpiresAt = addMinutes(now, env.OTP_EXPIRY_MINUTES);
+    await this.contactChangeChallengeRepository.upsertEmailChallenge(user._id, {
+      newNormalizedEmail,
+      otpHash: this.hashContactChangeOtp(user._id, "EMAIL_CHANGE", newNormalizedEmail, code),
+      otpExpiresAt,
+      sentAt: now,
+      resendTimestamps: pruneRecentTimestamps(
+        [...(existingChallenge?.resendTimestamps ?? []), now],
+        oneHourMs,
+      ),
+      expiresAt: otpExpiresAt,
+    });
+
+    return { expiresAt: otpExpiresAt.toISOString() };
+  }
+
+  /**
+   * Batch 18 — step 2. Only on a correct, unexpired, not-already-consumed OTP does the new email
+   * actually get committed (atomically, with a fresh `emailVerifiedAt`). Also revokes the
+   * Customer's other sessions and best-effort notifies the OLD email address — both confirmed via
+   * AskUserQuestion, neither blocks the response if they fail.
+   */
+  public async verifyEmailChange(
+    userId: string,
+    input: VerifyEmailChangeBody,
+  ): Promise<Awaited<ReturnType<AuthService["getMe"]>>> {
+    const user = await this.userRepository.findById(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const challenge = await this.contactChangeChallengeRepository.findActive(
+      user._id,
+      "EMAIL_CHANGE",
+    );
+
+    if (!challenge?.otpHash || !challenge.otpExpiresAt || !challenge.newNormalizedEmail) {
+      throw new AuthError("CONTACT_CHANGE_NOT_FOUND", 400);
+    }
+
+    if (challenge.attempts >= env.OTP_MAX_VERIFICATION_ATTEMPTS) {
+      throw new AuthError("OTP_ATTEMPTS_EXCEEDED", 429);
+    }
+
+    if (challenge.otpExpiresAt <= new Date()) {
+      throw new AuthError("OTP_EXPIRED", 400);
+    }
+
+    const submittedHash = this.hashContactChangeOtp(
+      user._id,
+      "EMAIL_CHANGE",
+      challenge.newNormalizedEmail,
+      input.code,
+    );
+
+    if (!safeCompare(submittedHash, challenge.otpHash)) {
+      await this.contactChangeChallengeRepository.incrementAttempts(challenge._id);
+      throw new AuthError("OTP_INVALID", 400);
+    }
+
+    // Atomic claim: only the caller that actually deletes the row commits — a concurrent
+    // duplicate verify (or a replay of an already-consumed challenge) gets CONTACT_CHANGE_NOT_FOUND.
+    const claimed = await this.contactChangeChallengeRepository.claimAndDelete(challenge._id);
+
+    if (!claimed?.newNormalizedEmail) {
+      throw new AuthError("CONTACT_CHANGE_NOT_FOUND", 400);
+    }
+
+    if (await this.userRepository.findByEmail(claimed.newNormalizedEmail)) {
+      throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
+    }
+
+    const oldNormalizedEmail = user.normalizedEmail;
+
+    try {
+      await this.userRepository.commitEmailChange(user._id, claimed.newNormalizedEmail);
+    } catch (error) {
+      if (this.isDuplicateKeyError(error)) {
+        throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
+      }
+      throw error;
+    }
+
+    await this.tokenService.revokeAllSessionsForUser(user._id);
+
+    this.emailOtpProvider
+      .sendNotice({
+        to: oldNormalizedEmail,
+        subject: "Your Bookly email was changed",
+        text: `Your Bookly account email was changed to ${claimed.newNormalizedEmail}. If you didn't make this change, please contact support immediately.`,
+      })
+      .catch((error: unknown) => {
+        logger.error(
+          { err: error, userId: String(user._id) },
+          "Email-change notice failed to send",
+        );
+      });
+
+    // linkEligibleClientsForNewCustomer requires the customer's FULL current identity (both
+    // fields) — passing only the just-changed email would make it treat every Client row that
+    // matches solely on the (unchanged) phone as a partial/IDENTITY_CONFLICT match, corrupting
+    // link state that has nothing to do with this email change.
+    const profile = await this.userRepository.findProfileByUserId(user._id);
+    if (profile?.phone?.e164) {
+      this.linkClientIdentityBestEffort(user._id, {
+        normalizedEmail: claimed.newNormalizedEmail,
+        phoneE164: profile.phone.e164,
+      });
+    }
+
+    return this.getMe(userId);
+  }
+
+  /** Batch 18 — step 1 of Customer phone self-change. Never touches the phone on UserProfile. */
+  public async requestPhoneChange(
+    userId: string,
+    input: RequestPhoneChangeBody,
+  ): Promise<{ expiresAt: string }> {
+    const user = await this.userRepository.findByIdWithPassword(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
+      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+    }
+
+    const profile = await this.userRepository.findProfileByUserId(user._id);
+
+    if (!profile) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const newPhone = normalizePhoneNumber(input.countryCode, input.nationalNumber);
+
+    if (newPhone.e164 === profile.phone?.e164) {
+      throw new AuthError("CONTACT_UNCHANGED", 400);
+    }
+
+    const conflict = await this.userRepository.findVerifiedCustomerByPhoneE164(newPhone.e164);
+    if (conflict && String(conflict._id) !== String(user._id)) {
+      throw new AuthError("PHONE_ALREADY_REGISTERED", 409);
+    }
+
+    const existingChallenge = await this.contactChangeChallengeRepository.findActive(
+      user._id,
+      "PHONE_CHANGE",
+    );
+    assertOtpResendAllowed(existingChallenge?.resendTimestamps ?? [], existingChallenge?.sentAt);
+
+    const result = await this.phoneOtpProvider.sendOtp({ toE164: newPhone.e164 });
+
+    const now = new Date();
+    const expiresAt = addMinutes(now, env.OTP_EXPIRY_MINUTES);
+    await this.contactChangeChallengeRepository.upsertPhoneChallenge(user._id, {
+      newPhone,
+      providerVerificationId: result.providerVerificationId,
+      sentAt: now,
+      resendTimestamps: pruneRecentTimestamps(
+        [...(existingChallenge?.resendTimestamps ?? []), now],
+        oneHourMs,
+      ),
+      expiresAt,
+    });
+
+    return { expiresAt: expiresAt.toISOString() };
+  }
+
+  /**
+   * Batch 18 — step 2. Twilio Verify owns OTP generation/expiry for phone (see phone-otp.
+   * provider.ts), so verification is delegated to it; Bookly only enforces its own local attempt
+   * cap and challenge-slot expiry before calling Twilio, matching the registration phone flow.
+   * No session revocation / old-contact notice here — phone is not a login credential, unlike
+   * email (loginBodySchema is email+password only).
+   */
+  public async verifyPhoneChange(
+    userId: string,
+    input: VerifyPhoneChangeBody,
+  ): Promise<Awaited<ReturnType<AuthService["getMe"]>>> {
+    const user = await this.userRepository.findById(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const challenge = await this.contactChangeChallengeRepository.findActive(
+      user._id,
+      "PHONE_CHANGE",
+    );
+
+    if (!challenge?.newPhone) {
+      throw new AuthError("CONTACT_CHANGE_NOT_FOUND", 400);
+    }
+
+    if (challenge.attempts >= env.OTP_MAX_VERIFICATION_ATTEMPTS) {
+      throw new AuthError("OTP_ATTEMPTS_EXCEEDED", 429);
+    }
+
+    if (challenge.expiresAt <= new Date()) {
+      throw new AuthError("OTP_EXPIRED", 400);
+    }
+
+    const verified = await this.phoneOtpProvider.verifyOtp({
+      toE164: challenge.newPhone.e164,
+      code: input.code,
+    });
+
+    if (!verified) {
+      await this.contactChangeChallengeRepository.incrementAttempts(challenge._id);
+      throw new AuthError("OTP_INVALID", 400);
+    }
+
+    const claimed = await this.contactChangeChallengeRepository.claimAndDelete(challenge._id);
+
+    if (!claimed?.newPhone) {
+      throw new AuthError("CONTACT_CHANGE_NOT_FOUND", 400);
+    }
+
+    const conflict = await this.userRepository.findVerifiedCustomerByPhoneE164(
+      claimed.newPhone.e164,
+    );
+    if (conflict && String(conflict._id) !== String(user._id)) {
+      throw new AuthError("PHONE_ALREADY_REGISTERED", 409);
+    }
+
+    const profile = await this.userRepository.findProfileByUserId(user._id);
+
+    if (!profile) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    await this.userRepository.updateProfile(profile._id, { phone: claimed.newPhone });
+    await this.userRepository.updatePhoneVerifiedAt(user._id, new Date());
+
+    // Same full-identity requirement as verifyEmailChange above — pass the current (unchanged)
+    // email alongside the new phone so unrelated Client rows are never mis-flagged.
+    this.linkClientIdentityBestEffort(user._id, {
+      normalizedEmail: user.normalizedEmail,
+      phoneE164: claimed.newPhone.e164,
+    });
+
+    return this.getMe(userId);
+  }
+
+  /** Batch 18 — shared salt scheme for the two contact-change OTPs. Deliberately keyed by
+   * userId+purpose+target (not a challenge document _id, which doesn't exist yet at issue time)
+   * so the same hash can be recomputed identically at both issue and verify time. */
+  private hashContactChangeOtp(
+    userId: Types.ObjectId,
+    purpose: "EMAIL_CHANGE",
+    target: string,
+    code: string,
+  ): string {
+    return sha256(`${userId}:${purpose}:${target}:${code}:${env.OTP_HASH_SECRET}`);
+  }
+
+  /** Best-effort, post-commit, non-blocking — identical pattern/rationale to
+   * verifyCustomerPhoneAndComplete's post-registration linking. A newly-verified contact may now
+   * match a Business-owned Client row; an ambiguous/failed match just leaves existing Client rows
+   * exactly as they were. Never allowed to fail the change-verification response the user is
+   * waiting on. */
+  private linkClientIdentityBestEffort(
+    userId: Types.ObjectId,
+    contact: { normalizedEmail: string; phoneE164: string },
+  ): void {
+    this.clientIdentityService
+      .linkEligibleClientsForNewCustomer({ userId, ...contact })
+      .catch((error: unknown) => {
+        logger.error({ err: error, userId: String(userId) }, "Client identity linking failed");
+      });
   }
 
   /**

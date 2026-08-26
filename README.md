@@ -71,6 +71,7 @@ pnpm seed:super-admin
 | `RESEND_API_KEY` | Required for email OTP delivery | Resend API key. Not required to boot locally; provider calls fail with `PROVIDER_NOT_CONFIGURED` when missing. |
 | `RESEND_FROM_EMAIL` | Required for email OTP delivery | Verified sender email for Resend. |
 | `RESEND_FROM_NAME` | Required for email OTP delivery | Sender display name for Resend. |
+| `SENDGRID_API_KEY` | Required when `EMAIL_PROVIDER=sendgrid` | SendGrid API key. Sender identity reuses `EMAIL_FROM`/`EMAIL_FROM_NAME`, not a separate SendGrid-specific pair. |
 | `TWILIO_ACCOUNT_SID` | Required for phone OTP delivery | Twilio account SID. |
 | `TWILIO_AUTH_TOKEN` | Required for phone OTP delivery | Twilio auth token. |
 | `TWILIO_VERIFY_SERVICE_SID` | Required for phone OTP delivery | Twilio Verify service SID configured for the 4-digit frontend contract. |

@@ -371,6 +371,22 @@ export class BookingFinancialTransactionRepository {
     ]);
     return { rows, total };
   }
+
+  /** Dashboard Overview's "Recent activity" feed — a Business's own N most-recent ledger entries
+   * of ANY type, newest first. Deliberately bounded by `limit` (the caller passes a small,
+   * hardcoded N — see DashboardOverviewService), never an unbounded business-wide dump, matching
+   * this repository's own convention throughout. Backed by the dedicated `{businessId,
+   * createdAt}` index (see the model's own comment) — the existing `{businessId, type,
+   * createdAt}` index cannot serve an any-type query. */
+  public async listRecentForBusiness(
+    businessId: Types.ObjectId | string,
+    limit: number,
+  ): Promise<BookingFinancialTransactionDocument[]> {
+    return BookingFinancialTransactionModel.find({ businessId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .exec();
+  }
 }
 
 const MAX_PAYOUT_CLAIM_BATCH_SIZE = 2000;

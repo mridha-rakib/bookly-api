@@ -2,6 +2,7 @@ import { Router } from "express";
 
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
+import { env } from "../../config/env.js";
 import { AddonRepository } from "../addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../addons/addon-service-assignment.repository.js";
 import {
@@ -16,12 +17,16 @@ import { BookingSlotReservationRepository } from "../booking-slot-reservation/bo
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
+import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { StaffScheduleRepository } from "../staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../staff/staff-time-off.repository.js";
+import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
+import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
+import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { CatalogController } from "./catalog.controller.js";
 import {
@@ -57,9 +62,19 @@ export const createCatalogRoute = (): Router => {
   const staffScheduleRepository = new StaffScheduleRepository();
   const staffTimeOffRepository = new StaffTimeOffRepository();
   const businessHoursRepository = new BusinessHoursRepository();
+  const businessMediaRepository = new BusinessMediaRepository();
   const businessBookingSettingsRepository = new BusinessBookingSettingsRepository();
   const businessTravelSettingsRepository = new BusinessTravelSettingsRepository();
   const reservationRepository = new BookingSlotReservationRepository();
+  const staffAvatarRepository = new StaffAvatarRepository();
+  const storageService = createDeferredStorageServiceFromEnv();
+  const staffAvatarService = new StaffAvatarService(
+    staffAvatarRepository,
+    businessRepository,
+    staffRepository,
+    storageService,
+    { maxUploadBytes: env.STAFF_AVATAR_MAX_UPLOAD_BYTES },
+  );
 
   const availabilityService = new AvailabilityService(
     businessRepository,
@@ -81,6 +96,10 @@ export const createCatalogRoute = (): Router => {
     staffRepository,
     userRepository,
     availabilityService,
+    businessHoursRepository,
+    businessMediaRepository,
+    staffAvatarService,
+    storageService,
   );
   const controller = new CatalogController(catalogService);
 

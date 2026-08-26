@@ -10,6 +10,7 @@ import {
 import { createBusinessRoute } from "../modules/business/business.route.js";
 import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
+import { createDashboardOverviewRoute } from "../modules/dashboard-overview/dashboard-overview.route.js";
 import { createDiscoveryRoute } from "../modules/discovery/discovery.route.js";
 import { createFavoriteRoute } from "../modules/favorite/favorite.route.js";
 import { HealthController } from "../modules/health/health.controller.js";
@@ -18,6 +19,7 @@ import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
 import {
+  createBusinessReviewRoute,
   createCustomerReviewRoute,
   createPublicBusinessReviewRoute,
 } from "../modules/review/review.route.js";
@@ -47,6 +49,16 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Customer-scoped preview endpoint), so it must be registered before createBusinessRoute()'s
   // stricter router-wide gate.
   router.use("/businesses", createBusinessBookingRoute());
+  // Batch 19 — Business dashboard Reviews read (Owner/Supervisor), same per-route-auth-before-
+  // stricter-router-wide-gate rationale as createClientRoute/createAvailabilityRoute/
+  // createBusinessBookingRoute above — must be registered before createBusinessRoute()'s
+  // router-wide BUSINESS_OWNER-only gate or Supervisor would 403 before reaching it.
+  router.use("/businesses", createBusinessReviewRoute());
+  // Dashboard Overview — Owner/Supervisor/Staff, same per-route-auth-before-stricter-router-
+  // wide-gate rationale as the routers above (Staff in particular has no access at all under
+  // createBusinessRoute()'s router-wide BUSINESS_OWNER-only gate, so this MUST be registered
+  // before it).
+  router.use("/businesses", createDashboardOverviewRoute());
   router.use("/businesses", createBusinessRoute());
   // Customer self-service "My Bookings" surface — cross-business, never nested under
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).

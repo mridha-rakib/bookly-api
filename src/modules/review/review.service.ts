@@ -1,6 +1,10 @@
 import { Types } from "mongoose";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import type { BusinessDocument } from "../business/business.model.js";
+import type { BusinessRepository } from "../business/business.repository.js";
+import type { StaffRepository } from "../staff/staff.repository.js";
+import type { UserRole } from "../user/user.types.js";
 import { formatPublicReviewerName } from "./review.dto.js";
 import { ReviewError } from "./review.errors.js";
 import type { ReviewDocument } from "./review.model.js";
@@ -39,6 +43,8 @@ export class ReviewService {
   public constructor(
     private readonly reviewRepository: ReviewRepository,
     private readonly bookingRepository: BookingRepository,
+    private readonly businessRepository?: BusinessRepository,
+    private readonly staffRepository?: StaffRepository,
   ) {}
 
   /** Confirmed rule 1.1/1.2/1.4 — the ONLY entry point that verifies eligibility AND creates a
@@ -134,6 +140,32 @@ export class ReviewService {
     return this.reviewRepository.listPublishedByBusinessId(businessId, pagination);
   }
 
+  // --- Business dashboard reads (Batch 19 — Owner/Supervisor viewing their OWN business's
+  // reviews; same underlying data as the public reads above, just ownership/membership-checked
+  // instead of CUSTOMER-role-checked). STAFF is deliberately excluded — matches the exact
+  // ownership/membership boundary BookingService.requireBookingManagementAccess and
+  // ClientService's requireBusinessAccess already enforce (no product rule grants STAFF
+  // business-management read access; confirmed by that consistent precedent). -------------------
+
+  public async getBusinessRatingSummaryForActor(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+  ): Promise<{ averageRating: number | null; reviewCount: number }> {
+    await this.requireBusinessManagementAccess(actorUserId, actorRole, businessId);
+    return this.getBusinessRatingSummary(businessId);
+  }
+
+  public async listBusinessReviewsForActor(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    pagination: ReviewListPagination,
+  ): Promise<{ reviews: ReviewDocument[]; total: number }> {
+    await this.requireBusinessManagementAccess(actorUserId, actorRole, businessId);
+    return this.listBusinessReviews(businessId, pagination);
+  }
+
   // --- Super Admin moderation (confirmed rule 1.11/1.18) -------------------------------------
 
   public async getById(reviewId: string): Promise<ReviewDocument> {
@@ -187,6 +219,47 @@ export class ReviewService {
   }
 
   // --- Internal ------------------------------------------------------------------------------
+
+  /** Mirrors BookingService.requireBookingManagementAccess / ClientService's requireBusinessAccess
+   * exactly (same ownership/membership shape, same anti-enumeration 404-not-403 on mismatch) —
+   * deliberately not extracted into a shared helper since each caller's error type differs. */
+  private async requireBusinessManagementAccess(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+  ): Promise<BusinessDocument> {
+    if (!this.businessRepository || !this.staffRepository) {
+      throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+    }
+
+    if (!Types.ObjectId.isValid(businessId)) {
+      throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+    }
+
+    const business = await this.businessRepository.findById(businessId);
+
+    if (!business) {
+      throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+    }
+
+    if (actorRole === "BUSINESS_OWNER") {
+      if (!business.ownerUserId.equals(actorUserId)) {
+        throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+      }
+      return business;
+    }
+
+    if (actorRole === "SUPERVISOR") {
+      const membership = await this.staffRepository.findActiveByUserId(actorUserId);
+
+      if (membership?.role !== "SUPERVISOR" || !membership.businessId.equals(business._id)) {
+        throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+      }
+      return business;
+    }
+
+    throw new ReviewError("REVIEW_BUSINESS_NOT_FOUND", 404);
+  }
 
   private async requireOwnedBooking(
     bookingId: string,

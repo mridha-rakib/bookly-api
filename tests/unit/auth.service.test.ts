@@ -1,7 +1,9 @@
 import mongoose, { Types } from "mongoose";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { env } from "../../src/config/env.js";
 import { AuthService } from "../../src/modules/auth/auth.service.js";
+import { sha256 } from "../../src/modules/auth/auth.utils.js";
 import type { PasswordHasher } from "../../src/modules/auth/password-hasher.js";
 import type { TokenService } from "../../src/modules/auth/token.service.js";
 import type { BusinessRepository } from "../../src/modules/business/business.repository.js";
@@ -9,6 +11,7 @@ import type { BusinessService } from "../../src/modules/business/business.servic
 import type { BusinessOnboardingRepository } from "../../src/modules/business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../../src/modules/business-onboarding/business-onboarding.service.js";
 import type { ClientIdentityService } from "../../src/modules/client/client-identity.service.js";
+import type { ContactChangeChallengeRepository } from "../../src/modules/contact-change/contact-change-challenge.repository.js";
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
 import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
@@ -61,6 +64,8 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
     upsertCustomerProfile: vi.fn(),
     updatePasswordHash: vi.fn(),
+    commitEmailChange: vi.fn(),
+    updatePhoneVerifiedAt: vi.fn(),
     findProfileByUserId: vi.fn(),
     findVerifiedCustomerByEmail: vi.fn().mockResolvedValue(null),
     findVerifiedCustomerByPhoneE164: vi.fn().mockResolvedValue(null),
@@ -101,6 +106,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     getAccessTokenExpiresAt: vi.fn(() => new Date(Date.now() + 60_000)),
     rotateRefreshToken: vi.fn(),
     revokeRefreshToken: vi.fn(),
+    revokeAllSessionsForUser: vi.fn(),
     ...(overrides["tokenService"] as object | undefined),
   };
   const staffRepository = {
@@ -112,11 +118,29 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     linkEligibleClientsForNewCustomer: vi.fn().mockResolvedValue(undefined),
     ...(overrides["clientIdentityService"] as object | undefined),
   };
+  const contactChangeChallengeRepository = {
+    findActive: vi.fn().mockResolvedValue(null),
+    upsertEmailChallenge: vi.fn(),
+    upsertPhoneChallenge: vi.fn(),
+    incrementAttempts: vi.fn(),
+    claimAndDelete: vi.fn(),
+    ...(overrides["contactChangeChallengeRepository"] as object | undefined),
+  };
 
   const passwordHasher = {
     hash: vi.fn().mockResolvedValue("hashed-password"),
     verify: vi.fn().mockResolvedValue(true),
     ...(overrides["passwordHasher"] as object | undefined),
+  };
+  const emailOtpProvider = {
+    sendOtp: vi.fn(),
+    sendNotice: vi.fn().mockResolvedValue(undefined),
+    ...(overrides["emailOtpProvider"] as object | undefined),
+  };
+  const phoneOtpProvider = {
+    sendOtp: vi.fn().mockResolvedValue({}),
+    verifyOtp: vi.fn().mockResolvedValue(true),
+    ...(overrides["phoneOtpProvider"] as object | undefined),
   };
 
   const service = new AuthService(
@@ -130,12 +154,13 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     } as unknown as BusinessOnboardingService,
     businessRepository as unknown as BusinessRepository,
     passwordHasher as unknown as PasswordHasher,
-    { sendOtp: vi.fn() } as unknown as EmailOtpProvider,
-    { sendOtp: vi.fn(), verifyOtp: vi.fn().mockResolvedValue(true) } as unknown as PhoneOtpProvider,
+    emailOtpProvider as unknown as EmailOtpProvider,
+    phoneOtpProvider as unknown as PhoneOtpProvider,
     tokenService as unknown as TokenService,
     businessService as unknown as BusinessService,
     staffRepository as unknown as StaffRepository,
     clientIdentityService as unknown as ClientIdentityService,
+    contactChangeChallengeRepository as unknown as ContactChangeChallengeRepository,
   );
 
   return {
@@ -147,6 +172,9 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     staffRepository,
     clientIdentityService,
     passwordHasher,
+    contactChangeChallengeRepository,
+    emailOtpProvider,
+    phoneOtpProvider,
   };
 };
 
@@ -379,5 +407,323 @@ describe("AuthService.changeMyPassword", () => {
       }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(userRepository.updatePasswordHash).not.toHaveBeenCalled();
+  });
+});
+
+describe("AuthService.requestEmailChange", () => {
+  const userId = new Types.ObjectId();
+  const baseUser = {
+    _id: userId,
+    normalizedEmail: "current@example.com",
+    passwordHash: "old-hash",
+  };
+
+  it("sends an OTP to the new email without touching the current email", async () => {
+    const { service, userRepository, contactChangeChallengeRepository, emailOtpProvider } =
+      createAuthService({
+        userRepository: { findByIdWithPassword: vi.fn().mockResolvedValue(baseUser) },
+      });
+
+    const result = await service.requestEmailChange(userId.toHexString(), {
+      currentPassword: "correct-password",
+      newEmail: "New@Example.com",
+    });
+
+    expect(emailOtpProvider.sendOtp).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "new@example.com", purpose: "EMAIL_CHANGE" }),
+    );
+    expect(contactChangeChallengeRepository.upsertEmailChallenge).toHaveBeenCalledWith(
+      userId,
+      expect.objectContaining({ newNormalizedEmail: "new@example.com" }),
+    );
+    expect(userRepository.commitEmailChange).not.toHaveBeenCalled();
+    expect(result.expiresAt).toBeTruthy();
+  });
+
+  it("rejects with the wrong current password and never sends an OTP", async () => {
+    const { service, contactChangeChallengeRepository } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue(baseUser),
+      },
+      passwordHasher: { verify: vi.fn().mockResolvedValue(false) },
+    });
+
+    await expect(
+      service.requestEmailChange(userId.toHexString(), {
+        currentPassword: "wrong-password",
+        newEmail: "new@example.com",
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(contactChangeChallengeRepository.upsertEmailChallenge).not.toHaveBeenCalled();
+  });
+
+  it("rejects requesting a change to the same current email", async () => {
+    const { service } = createAuthService({
+      userRepository: { findByIdWithPassword: vi.fn().mockResolvedValue(baseUser) },
+    });
+
+    await expect(
+      service.requestEmailChange(userId.toHexString(), {
+        currentPassword: "correct-password",
+        newEmail: "current@example.com",
+      }),
+    ).rejects.toMatchObject({ details: [{ code: "CONTACT_UNCHANGED" }] });
+  });
+
+  it("rejects a new email already registered to another account", async () => {
+    const { service } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue(baseUser),
+        findByEmail: vi.fn().mockResolvedValue({ _id: new Types.ObjectId() }),
+      },
+    });
+
+    await expect(
+      service.requestEmailChange(userId.toHexString(), {
+        currentPassword: "correct-password",
+        newEmail: "taken@example.com",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+});
+
+describe("AuthService.verifyEmailChange", () => {
+  const userId = new Types.ObjectId();
+  const challengeId = new Types.ObjectId();
+  const baseUser = { _id: userId, normalizedEmail: "current@example.com" };
+
+  const hashChallengeOtp = (code: string) =>
+    sha256(`${userId}:EMAIL_CHANGE:new@example.com:${code}:${env.OTP_HASH_SECRET}`);
+
+  const buildChallenge = (code: string, overrides: Record<string, unknown> = {}) => ({
+    _id: challengeId,
+    newNormalizedEmail: "new@example.com",
+    otpHash: hashChallengeOtp(code),
+    otpExpiresAt: new Date(Date.now() + 60_000),
+    attempts: 0,
+    ...overrides,
+  });
+
+  it("commits the new email, revokes other sessions, and notifies the old email on a correct OTP", async () => {
+    const challenge = buildChallenge("1234");
+
+    const {
+      service,
+      userRepository,
+      tokenService,
+      contactChangeChallengeRepository,
+      emailOtpProvider,
+    } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue(baseUser),
+        findByEmail: vi.fn().mockResolvedValue(null),
+        findProfileByUserId: vi.fn().mockResolvedValue({ phone: { e164: "+35799999999" } }),
+      },
+      contactChangeChallengeRepository: {
+        findActive: vi.fn().mockResolvedValue(challenge),
+        claimAndDelete: vi.fn().mockResolvedValue(challenge),
+      },
+    });
+
+    await service.verifyEmailChange(userId.toHexString(), { code: "1234" });
+
+    expect(contactChangeChallengeRepository.claimAndDelete).toHaveBeenCalledWith(challengeId);
+    expect(userRepository.commitEmailChange).toHaveBeenCalledWith(userId, "new@example.com");
+    expect(tokenService.revokeAllSessionsForUser).toHaveBeenCalledWith(userId);
+    expect(emailOtpProvider.sendNotice).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "current@example.com" }),
+    );
+  });
+
+  it("rejects a wrong OTP, increments attempts, and never commits", async () => {
+    const challenge = buildChallenge("1234", { otpHash: "not-a-real-hash" });
+    const { service, userRepository, contactChangeChallengeRepository } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: { findActive: vi.fn().mockResolvedValue(challenge) },
+    });
+
+    await expect(
+      service.verifyEmailChange(userId.toHexString(), { code: "9999" }),
+    ).rejects.toMatchObject({ statusCode: 400, details: [{ code: "OTP_INVALID" }] });
+    expect(contactChangeChallengeRepository.incrementAttempts).toHaveBeenCalledWith(challengeId);
+    expect(userRepository.commitEmailChange).not.toHaveBeenCalled();
+  });
+
+  it("rejects an expired challenge", async () => {
+    const challenge = buildChallenge("1234", {
+      otpHash: "irrelevant",
+      otpExpiresAt: new Date(Date.now() - 1000),
+    });
+    const { service } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: { findActive: vi.fn().mockResolvedValue(challenge) },
+    });
+
+    await expect(
+      service.verifyEmailChange(userId.toHexString(), { code: "1234" }),
+    ).rejects.toMatchObject({ details: [{ code: "OTP_EXPIRED" }] });
+  });
+
+  it("rejects when there is no active challenge", async () => {
+    const { service } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: { findActive: vi.fn().mockResolvedValue(null) },
+    });
+
+    await expect(
+      service.verifyEmailChange(userId.toHexString(), { code: "1234" }),
+    ).rejects.toMatchObject({ details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }] });
+  });
+
+  it("rejects a replayed challenge that another request already consumed (claim race)", async () => {
+    const challenge = buildChallenge("1234");
+    const { service, userRepository } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: {
+        findActive: vi.fn().mockResolvedValue(challenge),
+        // Simulates a concurrent verify already having deleted the row.
+        claimAndDelete: vi.fn().mockResolvedValue(null),
+      },
+    });
+
+    await expect(
+      service.verifyEmailChange(userId.toHexString(), { code: "1234" }),
+    ).rejects.toMatchObject({ details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }] });
+    expect(userRepository.commitEmailChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("AuthService.requestPhoneChange", () => {
+  const userId = new Types.ObjectId();
+  const baseUser = { _id: userId, passwordHash: "old-hash" };
+  const currentProfile = { phone: { e164: "+35799999999" } };
+
+  it("sends an OTP to the new phone via the phone provider without committing it", async () => {
+    const { service, userRepository, contactChangeChallengeRepository, phoneOtpProvider } =
+      createAuthService({
+        userRepository: {
+          findByIdWithPassword: vi.fn().mockResolvedValue(baseUser),
+          findProfileByUserId: vi.fn().mockResolvedValue(currentProfile),
+        },
+        phoneOtpProvider: {
+          sendOtp: vi.fn().mockResolvedValue({ providerVerificationId: "verif-1" }),
+        },
+      });
+
+    await service.requestPhoneChange(userId.toHexString(), {
+      currentPassword: "correct-password",
+      countryCode: "+357",
+      nationalNumber: "12345678",
+    });
+
+    expect(phoneOtpProvider.sendOtp).toHaveBeenCalledWith({ toE164: "+35712345678" });
+    expect(contactChangeChallengeRepository.upsertPhoneChallenge).toHaveBeenCalledWith(
+      userId,
+      expect.objectContaining({ newPhone: expect.objectContaining({ e164: "+35712345678" }) }),
+    );
+    expect(userRepository.updateProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects requesting a change to the same current phone", async () => {
+    const { service } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue(baseUser),
+        findProfileByUserId: vi.fn().mockResolvedValue(currentProfile),
+      },
+    });
+
+    await expect(
+      service.requestPhoneChange(userId.toHexString(), {
+        currentPassword: "correct-password",
+        countryCode: "+357",
+        nationalNumber: "99999999",
+      }),
+    ).rejects.toMatchObject({ details: [{ code: "CONTACT_UNCHANGED" }] });
+  });
+
+  it("rejects a phone already registered to another verified customer", async () => {
+    const { service } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue(baseUser),
+        findProfileByUserId: vi.fn().mockResolvedValue(currentProfile),
+        findVerifiedCustomerByPhoneE164: vi.fn().mockResolvedValue({ _id: new Types.ObjectId() }),
+      },
+    });
+
+    await expect(
+      service.requestPhoneChange(userId.toHexString(), {
+        currentPassword: "correct-password",
+        countryCode: "+357",
+        nationalNumber: "12345678",
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+});
+
+describe("AuthService.verifyPhoneChange", () => {
+  const userId = new Types.ObjectId();
+  const challengeId = new Types.ObjectId();
+  const baseUser = { _id: userId, normalizedEmail: "current@example.com" };
+  const newPhone = { countryCode: "+357", nationalNumber: "12345678", e164: "+35712345678" };
+  const profile = { _id: new Types.ObjectId() };
+
+  it("commits the new phone on a correct OTP and never revokes sessions", async () => {
+    const challenge = {
+      _id: challengeId,
+      newPhone,
+      attempts: 0,
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+    const { service, userRepository, tokenService, phoneOtpProvider } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue(baseUser),
+        findProfileByUserId: vi.fn().mockResolvedValue(profile),
+      },
+      contactChangeChallengeRepository: {
+        findActive: vi.fn().mockResolvedValue(challenge),
+        claimAndDelete: vi.fn().mockResolvedValue(challenge),
+      },
+    });
+
+    await service.verifyPhoneChange(userId.toHexString(), { code: "1234" });
+
+    expect(phoneOtpProvider.verifyOtp).toHaveBeenCalledWith({
+      toE164: "+35712345678",
+      code: "1234",
+    });
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(profile._id, { phone: newPhone });
+    expect(userRepository.updatePhoneVerifiedAt).toHaveBeenCalledWith(userId, expect.any(Date));
+    expect(tokenService.revokeAllSessionsForUser).not.toHaveBeenCalled();
+  });
+
+  it("rejects a wrong OTP, increments attempts, and never commits", async () => {
+    const challenge = {
+      _id: challengeId,
+      newPhone,
+      attempts: 0,
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+    const { service, userRepository, contactChangeChallengeRepository } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: { findActive: vi.fn().mockResolvedValue(challenge) },
+      phoneOtpProvider: { verifyOtp: vi.fn().mockResolvedValue(false) },
+    });
+
+    await expect(
+      service.verifyPhoneChange(userId.toHexString(), { code: "0000" }),
+    ).rejects.toMatchObject({ details: [{ code: "OTP_INVALID" }] });
+    expect(contactChangeChallengeRepository.incrementAttempts).toHaveBeenCalledWith(challengeId);
+    expect(userRepository.updateProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects when there is no active challenge", async () => {
+    const { service } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(baseUser) },
+      contactChangeChallengeRepository: { findActive: vi.fn().mockResolvedValue(null) },
+    });
+
+    await expect(
+      service.verifyPhoneChange(userId.toHexString(), { code: "1234" }),
+    ).rejects.toMatchObject({ details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }] });
   });
 });

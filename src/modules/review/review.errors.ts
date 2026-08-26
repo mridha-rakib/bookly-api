@@ -7,6 +7,7 @@ const defaultMessages: Record<string, string> = {
   REVIEW_NOT_FOUND: "Review not found",
   REVIEW_EDIT_WINDOW_EXPIRED: "The 14-day edit window for this review has expired",
   REVIEW_INVALID_STATUS_TRANSITION: "This review cannot move to the requested status",
+  REVIEW_BUSINESS_NOT_FOUND: "Business not found",
 };
 
 export class ReviewError extends AppError {

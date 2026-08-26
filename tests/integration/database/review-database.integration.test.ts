@@ -832,4 +832,95 @@ describe("database-backed Review domain (Batch 14)", () => {
     expect(formatPublicReviewerName("Maria")).toBe("Maria");
     expect(formatPublicReviewerName("Maria", "")).toBe("Maria");
   });
+
+  // --- Batch 19 — business dashboard review-read access control -----------------------------
+
+  describe("business dashboard access control (getBusinessRatingSummaryForActor / listBusinessReviewsForActor)", () => {
+    it("[24] allows the owning Business Owner and rejects an unrelated Business Owner", async () => {
+      const dashboardReviewService = new ReviewService(
+        reviewRepository,
+        bookingRepository,
+        businessRepository,
+        staffRepository,
+      );
+      const { owner: ownerA, business: businessA } = await createBusiness("Salon A");
+      const { owner: ownerB } = await createBusiness("Salon B");
+
+      await expect(
+        dashboardReviewService.getBusinessRatingSummaryForActor(
+          String(ownerA._id),
+          "BUSINESS_OWNER",
+          String(businessA._id),
+        ),
+      ).resolves.toEqual({ averageRating: null, reviewCount: 0 });
+
+      await expect(
+        dashboardReviewService.getBusinessRatingSummaryForActor(
+          String(ownerB._id),
+          "BUSINESS_OWNER",
+          String(businessA._id),
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "REVIEW_BUSINESS_NOT_FOUND" }] });
+    });
+
+    it("[25] allows a Supervisor of the business and rejects a Supervisor of a different business", async () => {
+      const dashboardReviewService = new ReviewService(
+        reviewRepository,
+        bookingRepository,
+        businessRepository,
+        staffRepository,
+      );
+      const { business: businessA } = await createBusiness("Salon A");
+      const { business: businessB } = await createBusiness("Salon B");
+      const supervisorUser = await userRepository.create({
+        normalizedEmail: `supervisor-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPERVISOR",
+        status: "ACTIVE",
+      });
+      await staffRepository.create({
+        userId: supervisorUser._id,
+        businessId: businessA._id,
+        role: "SUPERVISOR",
+        createdByUserId: supervisorUser._id,
+      });
+
+      await expect(
+        dashboardReviewService.listBusinessReviewsForActor(
+          String(supervisorUser._id),
+          "SUPERVISOR",
+          String(businessA._id),
+          { page: 1, limit: 10 },
+        ),
+      ).resolves.toEqual({ reviews: [], total: 0 });
+
+      await expect(
+        dashboardReviewService.listBusinessReviewsForActor(
+          String(supervisorUser._id),
+          "SUPERVISOR",
+          String(businessB._id),
+          { page: 1, limit: 10 },
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "REVIEW_BUSINESS_NOT_FOUND" }] });
+    });
+
+    it("[26] rejects STAFF entirely, even for their own business", async () => {
+      const dashboardReviewService = new ReviewService(
+        reviewRepository,
+        bookingRepository,
+        businessRepository,
+        staffRepository,
+      );
+      const { business: businessA } = await createBusiness("Salon A");
+      const { user: staffUser } = await createStaff(businessA._id);
+
+      await expect(
+        dashboardReviewService.getBusinessRatingSummaryForActor(
+          String(staffUser._id),
+          "STAFF",
+          String(businessA._id),
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "REVIEW_BUSINESS_NOT_FOUND" }] });
+    });
+  });
 });

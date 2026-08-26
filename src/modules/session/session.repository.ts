@@ -37,6 +37,16 @@ export class SessionRepository {
     );
   }
 
+  /** Batch 18 — used after a verified email change to force re-login everywhere. Access tokens
+   * are stateless JWTs and remain valid until their own short TTL naturally expires; this only
+   * blocks future refreshes. */
+  public async revokeAllForUser(userId: Types.ObjectId): Promise<void> {
+    await SessionModel.updateMany(
+      { userId, revokedAt: { $exists: false } },
+      { $set: { revokedAt: new Date() } },
+    );
+  }
+
   public async rotate(
     oldSession: SessionDocument,
     refreshTokenHash: string,

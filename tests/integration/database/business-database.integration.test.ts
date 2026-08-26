@@ -50,6 +50,8 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
     this.lastTo = input.to;
     this.sentCount += 1;
   }
+
+  public async sendNotice(): Promise<void> {}
 }
 
 describe("database-backed Business and BusinessAccess integration", () => {

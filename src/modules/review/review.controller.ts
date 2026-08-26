@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
+import type { UserRole } from "../user/user.types.js";
 import { toCustomerReviewDto, toPublicReviewDto } from "./review.dto.js";
 import type {
   BookingIdReviewParams,
@@ -85,6 +86,60 @@ export class ReviewController {
       pagination: { page: query.page, limit: query.limit, total: result.total },
     });
   };
+
+  // --- Business dashboard (Owner/Supervisor viewing their own business's reviews) -------------
+
+  public getBusinessRatingSummaryForDashboard = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const { userId, role } = this.requireBusinessActor(request);
+    const params = request.validated?.params as ReviewBusinessIdParams;
+
+    const summary = await this.reviewService.getBusinessRatingSummaryForActor(
+      userId,
+      role,
+      params.businessId,
+    );
+
+    sendSuccess(response, 200, "Business rating summary", {
+      businessId: params.businessId,
+      averageRating: summary.averageRating,
+      reviewCount: summary.reviewCount,
+    });
+  };
+
+  public listBusinessReviewsForDashboard = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const { userId, role } = this.requireBusinessActor(request);
+    const params = request.validated?.params as ReviewBusinessIdParams;
+    const query = request.validated?.query as ListPublicReviewsQuery;
+
+    const result = await this.reviewService.listBusinessReviewsForActor(
+      userId,
+      role,
+      params.businessId,
+      { page: query.page, limit: query.limit },
+    );
+
+    sendSuccess(response, 200, "Business reviews", {
+      reviews: result.reviews.map(toPublicReviewDto),
+      pagination: { page: query.page, limit: query.limit, total: result.total },
+    });
+  };
+
+  private requireBusinessActor(request: Request): { userId: string; role: UserRole } {
+    const userId = request.auth?.userId;
+    const role = request.auth?.role;
+
+    if (!userId || !role) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    return { userId, role };
+  }
 
   private requireCustomerId(request: Request): string {
     const userId = request.auth?.userId;

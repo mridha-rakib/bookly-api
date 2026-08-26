@@ -134,6 +134,15 @@ export const addCalendarDays = (dateStr: string, days: number): string => {
   return DateTime.fromObject({ year, month, day }).plus({ days }).toFormat("yyyy-MM-dd");
 };
 
+/** Adds whole calendar months to a "YYYY-MM-DD" string, in no particular zone (pure calendar
+ * arithmetic) — used to compute a Business-local calendar month's [start, end) boundary (see
+ * DashboardOverviewService's own "this calendar month, server 'today' based" convention). */
+export const addCalendarMonths = (dateStr: string, months: number): string => {
+  requireValidDateStr(dateStr);
+  const [year, month, day] = dateStr.split("-").map(Number) as [number, number, number];
+  return DateTime.fromObject({ year, month, day }).plus({ months }).toFormat("yyyy-MM-dd");
+};
+
 /** Inclusive list of "YYYY-MM-DD" calendar dates from `fromDateStr` to `toDateStr`. Bounded by
  * the caller (see AvailabilityService's own range guard) — never called with an unbounded
  * span. */

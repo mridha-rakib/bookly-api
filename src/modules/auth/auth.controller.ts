@@ -15,8 +15,12 @@ import type {
   LoginBody,
   ProfessionalEntryBody,
   ProfileBody,
+  RequestEmailChangeBody,
+  RequestPhoneChangeBody,
   UpdateMyProfileBody,
+  VerifyEmailChangeBody,
   VerifyEmailOtpBody,
+  VerifyPhoneChangeBody,
   VerifyPhoneOtpBody,
   VisitTypeBody,
 } from "./auth.schema.js";
@@ -208,6 +212,62 @@ export class AuthController {
       request.validated?.body as ChangeMyPasswordBody,
     );
     sendSuccess(response, 200, "Password changed");
+  };
+
+  public requestEmailChange = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const result = await this.authService.requestEmailChange(
+      userId,
+      request.validated?.body as RequestEmailChangeBody,
+    );
+    sendSuccess(response, 200, "Verification code sent to new email", result);
+  };
+
+  public verifyEmailChange = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const result = await this.authService.verifyEmailChange(
+      userId,
+      request.validated?.body as VerifyEmailChangeBody,
+    );
+    sendSuccess(response, 200, "Email changed", result);
+  };
+
+  public requestPhoneChange = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const result = await this.authService.requestPhoneChange(
+      userId,
+      request.validated?.body as RequestPhoneChangeBody,
+    );
+    sendSuccess(response, 200, "Verification code sent to new phone", result);
+  };
+
+  public verifyPhoneChange = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const result = await this.authService.verifyPhoneChange(
+      userId,
+      request.validated?.body as VerifyPhoneChangeBody,
+    );
+    sendSuccess(response, 200, "Phone changed", result);
   };
 
   private getContext(request: Request) {
