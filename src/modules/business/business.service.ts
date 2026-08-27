@@ -69,6 +69,8 @@ export type BusinessDetailDto = {
   briefDescription: string;
   category: string;
   subcategories: string[];
+  instagramHandle?: string | undefined;
+  facebookPageUrl?: string | undefined;
   relationship: "OWNER" | "LINKED";
   createdAt: string;
   updatedAt: string;
@@ -401,6 +403,8 @@ export class BusinessService {
     if (input.briefDescription !== undefined) update["briefDescription"] = input.briefDescription;
     if (input.category !== undefined) update["category"] = input.category;
     if (input.subcategories !== undefined) update["subcategories"] = input.subcategories;
+    if (input.instagramHandle !== undefined) update["instagramHandle"] = input.instagramHandle;
+    if (input.facebookPageUrl !== undefined) update["facebookPageUrl"] = input.facebookPageUrl;
 
     if (input.countryCode !== undefined && input.nationalNumber !== undefined) {
       update["phone"] = normalizePhoneNumber(input.countryCode, input.nationalNumber);
@@ -498,6 +502,8 @@ export class BusinessService {
       briefDescription: business.briefDescription,
       category: business.category,
       subcategories: business.subcategories,
+      instagramHandle: business.instagramHandle,
+      facebookPageUrl: business.facebookPageUrl,
       relationship,
       createdAt: business.createdAt.toISOString(),
       updatedAt: business.updatedAt.toISOString(),

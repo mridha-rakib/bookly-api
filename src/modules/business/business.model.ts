@@ -52,6 +52,15 @@ export type BusinessDocument = {
   briefDescription: string;
   category: string;
   subcategories: string[];
+  /** Explicit, Super Admin-controlled marketing flag (Business Detail action + public landing
+   * "Trusted by local businesses" section). Never inferred from age / approval date / bookings —
+   * an admin sets it. Defaults to false; pre-existing rows read as false via this schema default
+   * (no destructive backfill). */
+  isFoundingPartner: boolean;
+  /** Manual link-only integration fields (no OAuth) — shown on Settings → Integration and the
+   * public business profile. Not fetched or verified via Meta's Graph API. */
+  instagramHandle?: string | undefined;
+  facebookPageUrl?: string | undefined;
   /** Batch 11 — the Business lifecycle audit trail (mirrors Booking's own embedded
    * `eventHistory` pattern rather than a separate global audit collection — same established
    * per-entity convention). Written ONLY by BusinessLifecycleService's approve/reject/suspend
@@ -109,6 +118,9 @@ const businessSchema = new Schema<BusinessDocument>(
     briefDescription: { type: String, required: true, trim: true },
     category: { type: String, required: true, trim: true },
     subcategories: { type: [String], required: true },
+    isFoundingPartner: { type: Boolean, required: true, default: false },
+    instagramHandle: { type: String, trim: true },
+    facebookPageUrl: { type: String, trim: true },
     statusHistory: {
       type: [
         {
@@ -140,5 +152,8 @@ businessSchema.index({ createdAt: -1 });
 // push updates this same field) to surface recent approve/reject/suspend events without scanning
 // every Business's full history.
 businessSchema.index({ updatedAt: -1 });
+// Public landing "Trusted by local businesses" — the founding-partners read filters on exactly
+// {isFoundingPartner, status} (a tiny subset), keeping that anonymous path off a collection scan.
+businessSchema.index({ isFoundingPartner: 1, status: 1 });
 
 export const BusinessModel = model<BusinessDocument>("Business", businessSchema);

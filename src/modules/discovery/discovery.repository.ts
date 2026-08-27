@@ -1,9 +1,23 @@
 import type { PipelineStage, Types } from "mongoose";
 
+import { BookingModel } from "../booking/booking.model.js";
 import { BusinessModel } from "../business/business.model.js";
-import type { BusinessCity, BusinessVisitType } from "../business/business.types.js";
+import {
+  type BusinessCity,
+  type BusinessVisitType,
+  businessCities,
+} from "../business/business.types.js";
 import type { ServicePricingMode } from "../services/service.types.js";
-import type { DiscoverySortOption } from "./discovery.types.js";
+import {
+  type DiscoverySortOption,
+  HOME_POPULAR_WEIGHT_COMPLETED_BOOKING,
+  HOME_POPULAR_WEIGHT_FAVORITE,
+  HOME_POPULAR_WEIGHT_REVIEW,
+  HOME_RECOMMENDED_AFFINITY_BOOKING_SAMPLE,
+  HOME_RECOMMENDED_AFFINITY_CATEGORY_RANK,
+  HOME_RECOMMENDED_AFFINITY_CITY_RANK,
+  homeSectionBookingPopularityStatuses,
+} from "./discovery.types.js";
 
 export type DiscoveryFilter = {
   q?: string | undefined;
@@ -29,6 +43,12 @@ export type DiscoveryAggregateRow = {
   startingPriceCents: number | null;
   startingPricingMode: ServicePricingMode | null;
   isAvailable: boolean;
+};
+
+export type FoundingPartnerRow = {
+  _id: Types.ObjectId;
+  name: string;
+  address: { city: BusinessCity };
 };
 
 type RawAggregateRow = {
@@ -130,6 +150,35 @@ const cardProjection = {
   startingPriceCents: 1,
   startingPricingMode: 1,
 };
+
+/** Batch 17 — the null-safe sort scaffolding every home-section ranking shares. `qualityScore`
+ * is `avg(rating) * log10(reviewCount + 1)` — a Business with zero PUBLISHED reviews scores
+ * exactly 0 (log10(1)) and sinks, but is never removed (small-inventory rows must still show). */
+const homeSortFieldsStage: PipelineStage = {
+  $addFields: {
+    averageRatingSortValue: { $ifNull: ["$averageRating", 0] },
+    reviewCountSortValue: { $ifNull: ["$reviewCount", 0] },
+    qualityScore: {
+      $multiply: [
+        { $ifNull: ["$averageRating", 0] },
+        { $log10: { $add: [{ $ifNull: ["$reviewCount", 0] }, 1] } },
+      ],
+    },
+  },
+};
+
+export type HomeRankParams = {
+  /** Businesses already placed in an earlier section — excluded unless backfilling. */
+  excludeIds: Types.ObjectId[];
+  limit: number;
+};
+
+export type CustomerAffinity = { categories: string[]; cities: BusinessCity[] };
+
+const homeVisibilityMatch = (excludeIds: Types.ObjectId[]): Record<string, unknown> => ({
+  status: { $in: PUBLICLY_VISIBLE_STATUSES },
+  ...(excludeIds.length > 0 ? { _id: { $nin: excludeIds } } : {}),
+});
 
 const toAggregateRow = (row: RawAggregateRow): DiscoveryAggregateRow => ({
   _id: row._id,
@@ -258,6 +307,239 @@ export class DiscoveryRepository {
 
     const rows = await BusinessModel.aggregate<RawAggregateRow>(pipeline).exec();
     return rows.map(toAggregateRow);
+  }
+
+  // --- Batch 17: homepage discovery sections -------------------------------------------------
+  //
+  // Three genuinely different rankings over the SAME publicly-visible set (APPROVED/WARNING).
+  // Each is ONE aggregation: the shared rating/cheapest-price lookups, then a section-specific
+  // score, then a fully-deterministic sort (every tie broken down to `_id`), then the same
+  // `cardProjection` Explore returns. Cover-photo signing stays a batched follow-up in the
+  // service, exactly like `search`.
+
+  /** "Recommended". `affinity` (a logged-in Customer's really-booked categories/cities) tiers
+   * the results — category match outranks city match — with quality ordering inside each tier.
+   * Empty affinity (logged-out / no history) collapses to pure quality, optionally narrowed to
+   * a real `contextCategories` list. Never reads a stored recommendation/score. */
+  public async rankRecommended(
+    params: HomeRankParams & {
+      affinity: CustomerAffinity;
+      contextCategories?: string[] | undefined;
+    },
+  ): Promise<DiscoveryAggregateRow[]> {
+    const match = homeVisibilityMatch(params.excludeIds);
+    if (params.contextCategories && params.contextCategories.length > 0) {
+      match["category"] = { $in: params.contextCategories };
+    }
+
+    const pipeline: PipelineStage[] = [
+      { $match: match },
+      ...ratingAndPriceLookupStages,
+      homeSortFieldsStage,
+      {
+        $addFields: {
+          affinityRank: {
+            $add: [
+              {
+                $cond: [
+                  { $in: ["$category", params.affinity.categories] },
+                  HOME_RECOMMENDED_AFFINITY_CATEGORY_RANK,
+                  0,
+                ],
+              },
+              {
+                $cond: [
+                  { $in: ["$address.city", params.affinity.cities] },
+                  HOME_RECOMMENDED_AFFINITY_CITY_RANK,
+                  0,
+                ],
+              },
+            ],
+          },
+        },
+      },
+      {
+        $sort: {
+          affinityRank: -1,
+          qualityScore: -1,
+          reviewCountSortValue: -1,
+          averageRatingSortValue: -1,
+          _id: 1,
+        },
+      },
+      { $limit: params.limit },
+      { $project: cardProjection },
+    ];
+
+    const rows = await BusinessModel.aggregate<RawAggregateRow>(pipeline).exec();
+    return rows.map(toAggregateRow);
+  }
+
+  /** "Services near you". `city` is the hero-search city the visitor picked — the only real
+   * geographic signal the product has. With a city it is a hard filter (quality-ordered
+   * within). With no city it falls back to "can serve you anywhere": TRAVEL_TO_CUSTOMER
+   * Businesses first, then quality. No coordinates, no distance — ever. */
+  public async rankNearYou(
+    params: HomeRankParams & { city?: BusinessCity | undefined },
+  ): Promise<DiscoveryAggregateRow[]> {
+    const match = homeVisibilityMatch(params.excludeIds);
+    if (params.city) {
+      match["address.city"] = params.city;
+    }
+    const travelFirst = !params.city;
+
+    const pipeline: PipelineStage[] = [
+      { $match: match },
+      ...ratingAndPriceLookupStages,
+      homeSortFieldsStage,
+      ...(travelFirst
+        ? [
+            {
+              $addFields: {
+                travelRank: {
+                  $cond: [{ $eq: ["$visitType", "TRAVEL_TO_CUSTOMER"] }, 0, 1],
+                },
+              },
+            } satisfies PipelineStage,
+          ]
+        : []),
+      {
+        $sort: {
+          ...(travelFirst ? { travelRank: 1 } : {}),
+          qualityScore: -1,
+          reviewCountSortValue: -1,
+          averageRatingSortValue: -1,
+          _id: 1,
+        },
+      },
+      { $limit: params.limit },
+      { $project: cardProjection },
+    ];
+
+    const rows = await BusinessModel.aggregate<RawAggregateRow>(pipeline).exec();
+    return rows.map(toAggregateRow);
+  }
+
+  /** "Popular" — `completedBookings*3 + favorites*2 + publishedReviewCount`. Every term is a
+   * live COUNT resolved here, never a stored `popularityScore`/`viewCount`/seeded rank. A
+   * Business with no activity at all scores 0 and falls to a deterministic `_id` tail. */
+  public async rankByPopularity(params: HomeRankParams): Promise<DiscoveryAggregateRow[]> {
+    const pipeline: PipelineStage[] = [
+      { $match: homeVisibilityMatch(params.excludeIds) },
+      ...ratingAndPriceLookupStages,
+      homeSortFieldsStage,
+      {
+        $lookup: {
+          from: "bookings",
+          let: { businessId: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: { $eq: ["$businessId", "$$businessId"] },
+                status: { $in: [...homeSectionBookingPopularityStatuses] },
+              },
+            },
+            { $count: "count" },
+          ],
+          as: "completedBookingAgg",
+        },
+      },
+      {
+        $lookup: {
+          from: "favorites",
+          let: { businessId: "$_id" },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$businessId", "$$businessId"] } } },
+            { $count: "count" },
+          ],
+          as: "favoriteAgg",
+        },
+      },
+      {
+        $addFields: {
+          completedBookings: {
+            $ifNull: [{ $arrayElemAt: ["$completedBookingAgg.count", 0] }, 0],
+          },
+          favoritesCount: { $ifNull: [{ $arrayElemAt: ["$favoriteAgg.count", 0] }, 0] },
+        },
+      },
+      {
+        $addFields: {
+          popularityScore: {
+            $add: [
+              { $multiply: ["$completedBookings", HOME_POPULAR_WEIGHT_COMPLETED_BOOKING] },
+              { $multiply: ["$favoritesCount", HOME_POPULAR_WEIGHT_FAVORITE] },
+              { $multiply: ["$reviewCountSortValue", HOME_POPULAR_WEIGHT_REVIEW] },
+            ],
+          },
+        },
+      },
+      {
+        $sort: {
+          popularityScore: -1,
+          completedBookings: -1,
+          favoritesCount: -1,
+          reviewCountSortValue: -1,
+          averageRatingSortValue: -1,
+          _id: 1,
+        },
+      },
+      { $limit: params.limit },
+      { $project: cardProjection },
+    ];
+
+    const rows = await BusinessModel.aggregate<RawAggregateRow>(pipeline).exec();
+    return rows.map(toAggregateRow);
+  }
+
+  /** The real personalization signal for "Recommended": the DISTINCT `category` / `address.city`
+   * of the Businesses this Customer has actually booked (any Booking status — a cancelled
+   * booking still expresses interest), capped to their most recent bookings. Empty for a
+   * Customer who has never booked. */
+  public async getCustomerAffinity(customerUserId: Types.ObjectId): Promise<CustomerAffinity> {
+    const [row] = await BookingModel.aggregate<{ categories: string[]; cities: string[] }>([
+      { $match: { "customer.customerUserId": customerUserId } },
+      { $sort: { createdAt: -1 } },
+      { $limit: HOME_RECOMMENDED_AFFINITY_BOOKING_SAMPLE },
+      {
+        $lookup: {
+          from: "businesses",
+          localField: "businessId",
+          foreignField: "_id",
+          as: "business",
+        },
+      },
+      { $unwind: "$business" },
+      {
+        $group: {
+          _id: null,
+          categories: { $addToSet: "$business.category" },
+          cities: { $addToSet: "$business.address.city" },
+        },
+      },
+    ]).exec();
+
+    return {
+      categories: row?.categories ?? [],
+      cities: ((row?.cities ?? []) as BusinessCity[]).filter((c) =>
+        (businessCities as readonly string[]).includes(c),
+      ),
+    };
+  }
+
+  /** Public landing "Trusted by local businesses across Cyprus" — founding partners that are
+   * ALSO publicly visible (same `PUBLICLY_VISIBLE_STATUSES` as Explore). Filtered + projected at
+   * the DB level via the `{isFoundingPartner:1, status:1}` index; returns only the public-safe
+   * fields the landing card renders (id/name/city). Cover-photo signing is a separate batched
+   * step in the service, exactly like `search`. */
+  public async listFoundingPartners(): Promise<FoundingPartnerRow[]> {
+    return BusinessModel.find(
+      { isFoundingPartner: true, status: { $in: PUBLICLY_VISIBLE_STATUSES } },
+      { _id: 1, name: 1, "address.city": 1 },
+    )
+      .sort({ name: 1 })
+      .lean<FoundingPartnerRow[]>()
+      .exec();
   }
 
   /** Category filter options — derived from the DISTINCT category strings actually present on

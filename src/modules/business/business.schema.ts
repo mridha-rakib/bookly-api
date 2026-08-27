@@ -48,6 +48,19 @@ export const updateBusinessBodySchema = z
     briefDescription: z.string().trim().min(1).optional(),
     category: z.string().trim().min(1).optional(),
     subcategories: z.array(z.string().trim().min(1)).min(1).max(5).optional(),
+    instagramHandle: z
+      .string()
+      .trim()
+      .min(1)
+      .max(60)
+      .regex(/^@?[A-Za-z0-9._]+$/, "Enter a valid Instagram handle")
+      .optional(),
+    facebookPageUrl: z
+      .string()
+      .trim()
+      .url()
+      .regex(/^https:\/\/(www\.)?facebook\.com\//i, "Enter a valid Facebook Page URL")
+      .optional(),
     coordinates: z
       .object({
         lat: z.number().min(-90).max(90),

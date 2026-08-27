@@ -43,6 +43,10 @@ export const superAdminSuspendBusinessBodySchema = z
   .object({ reason: z.string().trim().max(2000).optional() })
   .strict();
 
+export const superAdminSetFoundingPartnerBodySchema = z
+  .object({ isFoundingPartner: z.boolean() })
+  .strict();
+
 // --- Global Bookings ---------------------------------------------------------------------------
 
 export const superAdminBookingIdParamsSchema = z.object({ bookingId: objectIdSchema }).strict();
@@ -142,6 +146,9 @@ export type SuperAdminBusinessIdParams = z.infer<typeof superAdminBusinessIdPara
 export type SuperAdminListBusinessesQuery = z.infer<typeof superAdminListBusinessesQuerySchema>;
 export type SuperAdminRejectBusinessBody = z.infer<typeof superAdminRejectBusinessBodySchema>;
 export type SuperAdminSuspendBusinessBody = z.infer<typeof superAdminSuspendBusinessBodySchema>;
+export type SuperAdminSetFoundingPartnerBody = z.infer<
+  typeof superAdminSetFoundingPartnerBodySchema
+>;
 export type SuperAdminBookingIdParams = z.infer<typeof superAdminBookingIdParamsSchema>;
 export type SuperAdminListBookingsQuery = z.infer<typeof superAdminListBookingsQuerySchema>;
 export type SuperAdminUserIdParams = z.infer<typeof superAdminUserIdParamsSchema>;

@@ -28,5 +28,8 @@ const favoriteSchema = new Schema<FavoriteDocument>(
 favoriteSchema.index({ customerUserId: 1, businessId: 1 }, { unique: true });
 // "My Favorites" list — a Customer's own saved Businesses, newest first.
 favoriteSchema.index({ customerUserId: 1, createdAt: -1 });
+// Batch 17 — the home "Popular" ranking counts favorites-per-Business (a real engagement
+// signal); this keeps that correlated aggregation lookup off a collection scan.
+favoriteSchema.index({ businessId: 1 });
 
 export const FavoriteModel = model<FavoriteDocument>("Favorite", favoriteSchema);

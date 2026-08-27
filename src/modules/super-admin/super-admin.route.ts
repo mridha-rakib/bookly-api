@@ -13,7 +13,17 @@ import { BookingFinancialTransactionRepository } from "../booking-financial-tran
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessLifecycleService } from "../business/business-lifecycle.service.js";
+import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { FaqRepository } from "../content/faq.repository.js";
+import {
+  createFaqBodySchema,
+  faqIdParamsSchema,
+  listAdminFaqsQuerySchema,
+  reorderFaqsBodySchema,
+  updateFaqBodySchema,
+} from "../content/faq.schema.js";
+import { FaqService } from "../content/faq.service.js";
 import { BusinessPayoutRepository } from "../finance/business-payout.repository.js";
 import { BusinessPayoutService } from "../finance/business-payout.service.js";
 import {
@@ -43,6 +53,7 @@ import {
   reviewIdParamsSchema,
 } from "../review/review.schema.js";
 import { ReviewService } from "../review/review.service.js";
+import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import {
@@ -66,6 +77,7 @@ import {
   superAdminListCustomersQuerySchema,
   superAdminRecentActivityQuerySchema,
   superAdminRejectBusinessBodySchema,
+  superAdminSetFoundingPartnerBodySchema,
   superAdminSuspendBusinessBodySchema,
   superAdminTopServicesQuerySchema,
   superAdminUserIdParamsSchema,
@@ -79,6 +91,7 @@ import { SuperAdminBusinessController } from "./super-admin-business.controller.
 import { SuperAdminBusinessService } from "./super-admin-business.service.js";
 import { SuperAdminBusinessAnalyticsService } from "./super-admin-business-analytics.service.js";
 import { SuperAdminCityAnalyticsService } from "./super-admin-city-analytics.service.js";
+import { SuperAdminContentController } from "./super-admin-content.controller.js";
 import { SuperAdminCustomerController } from "./super-admin-customer.controller.js";
 import { SuperAdminCustomerService } from "./super-admin-customer.service.js";
 import { SuperAdminCustomerAnalyticsService } from "./super-admin-customer-analytics.service.js";
@@ -115,6 +128,9 @@ export const createSuperAdminRoute = (): Router => {
   );
   const bookingRepository = new BookingRepository();
   const businessPayoutRepository = new BusinessPayoutRepository();
+  const reviewRepository = new ReviewRepository();
+  const businessBookingSettingsRepository = new BusinessBookingSettingsRepository();
+  const serviceRepository = new ServiceRepository();
 
   const financeService = new FinanceService(
     businessRepository,
@@ -136,6 +152,9 @@ export const createSuperAdminRoute = (): Router => {
       bookingRepository,
       userRepository,
       businessLifecycleService,
+      reviewRepository,
+      businessBookingSettingsRepository,
+      serviceRepository,
     ),
   );
   const bookingController = new SuperAdminBookingController(
@@ -188,6 +207,8 @@ export const createSuperAdminRoute = (): Router => {
     ),
   );
 
+  const contentController = new SuperAdminContentController(new FaqService(new FaqRepository()));
+
   const supportController = new SuperAdminSupportController(
     new SuperAdminSupportService(
       new SupportService(
@@ -238,6 +259,14 @@ export const createSuperAdminRoute = (): Router => {
       body: superAdminSuspendBusinessBodySchema,
     }),
     asyncHandler(businessController.suspend),
+  );
+  router.patch(
+    "/businesses/:businessId/founding-partner",
+    validateRequest({
+      params: superAdminBusinessIdParamsSchema,
+      body: superAdminSetFoundingPartnerBodySchema,
+    }),
+    asyncHandler(businessController.setFoundingPartner),
   );
 
   // --- Global Bookings ---
@@ -347,6 +376,37 @@ export const createSuperAdminRoute = (): Router => {
     "/reviews/:reviewId/moderate",
     validateRequest({ params: reviewIdParamsSchema, body: moderateReviewBodySchema }),
     asyncHandler(reviewController.moderate),
+  );
+
+  // --- Content Manager: FAQ (Phase 1) ---
+  // Every route below is SUPER_ADMIN-only via the router-wide gate above. Public reads live on
+  // the separate anonymous `/content` router (see content.route.ts) — never here.
+  router.get(
+    "/content/faqs",
+    validateRequest({ query: listAdminFaqsQuerySchema }),
+    asyncHandler(contentController.listFaqs),
+  );
+  router.post(
+    "/content/faqs",
+    validateRequest({ body: createFaqBodySchema }),
+    asyncHandler(contentController.createFaq),
+  );
+  // Registered before the `:faqId` param routes: distinct method+path, but keeping the literal
+  // path first avoids any future ambiguity.
+  router.post(
+    "/content/faqs/reorder",
+    validateRequest({ body: reorderFaqsBodySchema }),
+    asyncHandler(contentController.reorderFaqs),
+  );
+  router.patch(
+    "/content/faqs/:faqId",
+    validateRequest({ params: faqIdParamsSchema, body: updateFaqBodySchema }),
+    asyncHandler(contentController.updateFaq),
+  );
+  router.delete(
+    "/content/faqs/:faqId",
+    validateRequest({ params: faqIdParamsSchema }),
+    asyncHandler(contentController.deleteFaq),
   );
 
   // --- Support Tickets (Batch 15B) ---

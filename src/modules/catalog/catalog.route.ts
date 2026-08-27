@@ -7,6 +7,7 @@ import { AddonRepository } from "../addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../addons/addon-service-assignment.repository.js";
 import {
   createAuthenticateAccessTokenMiddleware,
+  createOptionalAuthenticateAccessTokenMiddleware,
   requireActiveUser,
   requireApprovedBusiness,
   requireRoles,
@@ -42,9 +43,16 @@ import { CatalogService } from "./catalog.service.js";
  * with `business.route.ts`'s Owner-only-gated `/businesses/:businessId` or
  * `availability.route.ts`'s Owner/Supervisor-only `/businesses/:businessId/services/:serviceId/
  * availability` — same path shapes, deliberately different prefix, deliberately different
- * (CUSTOMER-only) authorization. Reuses AvailabilityService/ServiceRepository/AddonRepository/
+ * authorization. Reuses AvailabilityService/ServiceRepository/AddonRepository/
  * StaffRepository directly (see catalog.service.ts's own doc comment) — no booking/pricing/
  * eligibility logic is re-implemented here.
+ *
+ * Authorization split (Phase: public Explore/Venue):
+ *  - `GET /catalog/businesses/:businessId` is genuinely PUBLIC (optional-auth) — the venue
+ *    detail page is browsable by unregistered visitors.
+ *  - the `/services/:serviceId/addons` and `/availability` sub-routes stay CUSTOMER-only — they
+ *    are the booking wizard's own reads, and booking requires authentication.
+ *  - both keep `requireApprovedBusiness` (APPROVED/WARNING only; PENDING/SUSPENDED -> 403).
  */
 export const createCatalogRoute = (): Router => {
   const router = Router();
@@ -53,6 +61,10 @@ export const createCatalogRoute = (): Router => {
   const sessionRepository = new SessionRepository();
   const tokenService = new TokenService(sessionRepository);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
+  const optionalAuthenticate = createOptionalAuthenticateAccessTokenMiddleware(
+    tokenService,
+    userRepository,
+  );
 
   const businessRepository = new BusinessRepository();
   const serviceRepository = new ServiceRepository();
@@ -103,31 +115,43 @@ export const createCatalogRoute = (): Router => {
   );
   const controller = new CatalogController(catalogService);
 
-  // Batch 11 — a PENDING or SUSPENDED Business is not discoverable/bookable by Customers at
-  // all (confirmed policy: "block new customer self-bookings" covers catalog browse, not only
-  // the finalize step). WARNING has no effect here (see requireApprovedBusiness's own comment).
-  router.use(
-    authenticate,
-    requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
-    requireApprovedBusiness(businessRepository),
-  );
-
+  // The venue detail read is genuinely PUBLIC — an unregistered visitor opening a shared
+  // `/venue?id=...` link must see the business identity, its ACTIVE bookable services, team,
+  // about, hours and gallery with no account. `optionalAuthenticate` still attaches
+  // `request.auth` when a valid token IS present (never rejects its absence), and
+  // `requireActiveUser()` still blocks a SUSPENDED logged-in caller. `requireApprovedBusiness`
+  // keeps the canonical public-visibility rule unchanged: only APPROVED/WARNING businesses
+  // resolve — PENDING/SUSPENDED stay hidden (403), matching Discovery's PUBLICLY_VISIBLE_STATUSES.
   router.get(
     "/businesses/:businessId",
+    optionalAuthenticate,
+    requireActiveUser(),
     validateRequest({ params: catalogBusinessParamsSchema }),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.getBusinessCatalog),
   );
 
+  // The add-ons and availability reads drive the booking wizard itself, so they stay
+  // CUSTOMER-authenticated exactly as before (Batch 11 policy). A logged-out visitor is sent to
+  // the customer login/register flow before the wizard ever opens (see the frontend venue page),
+  // so these never need an anonymous path. Same PENDING/SUSPENDED block as the public read above.
   router.get(
     "/businesses/:businessId/services/:serviceId/addons",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
     validateRequest({ params: catalogServiceParamsSchema }),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.listServiceAddons),
   );
 
   router.get(
     "/businesses/:businessId/services/:serviceId/availability",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
     validateRequest({ params: catalogServiceParamsSchema, query: catalogAvailabilityQuerySchema }),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.getServiceAvailability),
   );
 

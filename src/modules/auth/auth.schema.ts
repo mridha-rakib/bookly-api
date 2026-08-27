@@ -6,7 +6,7 @@ import {
   businessVisitTypes,
   normalizeBusinessVisitType,
 } from "../business/business.types.js";
-import { genders } from "../user/user.types.js";
+import { genders, userLanguages } from "../user/user.types.js";
 
 const emailSchema = z.email();
 const sessionIdSchema = z.string().min(1);
@@ -111,14 +111,18 @@ export const progressQuerySchema = z.object({
   sessionId: sessionIdSchema,
 });
 
-// Batch 17 — Customer Profile self-edit. Deliberately excludes email/phone (no re-verification
-// flow exists yet — see AskUserQuestion decision) and role/status/internal IDs (never
-// mass-assignable). `.strict()` rejects any other field outright rather than silently ignoring it.
+// Batch 17 — Customer Profile self-edit; Phase 1 — also the Super Admin Settings → Admin Account
+// name/language edit surface (same PATCH /auth/me route, now gated CUSTOMER + SUPER_ADMIN).
+// Deliberately excludes email/phone (email stays read-only for SUPER_ADMIN — no verified
+// admin-email-change flow exists yet; Customer email uses the separate OTP endpoints) and
+// role/status/internal IDs (never mass-assignable). `address`/`dateOfBirth` are CUSTOMER-only
+// sink fields the Super Admin UI never sends. `.strict()` rejects any other field outright.
 export const updateMyProfileBodySchema = z
   .object({
     firstName: z.string().trim().min(1).optional(),
     lastName: z.string().trim().min(1).optional(),
     gender: z.enum(genders).optional(),
+    defaultLanguage: z.enum(userLanguages).optional(),
     address: z.string().trim().min(1).max(500).optional(),
     dateOfBirth: z
       .string()

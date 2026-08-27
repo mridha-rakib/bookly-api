@@ -13,6 +13,7 @@ import type { BusinessCancellationPolicyRepository } from "../business-cancellat
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
+import type { IntegrationService } from "../integration/integration.service.js";
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
@@ -156,6 +157,10 @@ export class BookingCreationService {
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
     private readonly promoApplicationService: PromoApplicationService,
+    // Optional (like BusinessService's own trailing optional deps) so the many existing
+    // integration test suites that construct this service directly, without Google Calendar in
+    // scope, don't all need updating just to pass a mock — see syncBookingCreatedToGoogleCalendar.
+    private readonly integrationService?: Pick<IntegrationService, "createEventForBooking">,
   ) {}
 
   // --- Manual (real, persisted) --------------------------------------------------------------
@@ -894,6 +899,8 @@ export class BookingCreationService {
       throw new Error("Booking creation failed without throwing");
     }
 
+    await this.syncBookingCreatedToGoogleCalendar(created);
+
     return created;
   }
 
@@ -1419,6 +1426,8 @@ export class BookingCreationService {
       throw new Error("Booking creation failed without throwing");
     }
 
+    await this.syncBookingCreatedToGoogleCalendar(created);
+
     return created;
   }
 
@@ -1460,6 +1469,39 @@ export class BookingCreationService {
         code: "BOOKING_TRANSACTION_UNAVAILABLE",
       },
     ]);
+  }
+
+  /**
+   * Best-effort, post-commit Google Calendar sync (product scope: one-way Bookly -> Google,
+   * UPCOMING creates the event). Runs strictly AFTER the booking transaction has already
+   * committed, and never throws — a Google API failure must not corrupt a valid Booking (ground
+   * rule). IntegrationService.createEventForBooking itself swallows all provider errors and
+   * records them for the owner instead of propagating.
+   */
+  private async syncBookingCreatedToGoogleCalendar(created: BookingDocument): Promise<void> {
+    if (!this.integrationService) {
+      return;
+    }
+
+    const eventId = await this.integrationService.createEventForBooking(created.businessId, {
+      summary: `Bookly — ${created.reference}`,
+      description: `Booking ${created.reference} (${created.serviceLines.length} service line(s))`,
+      startAt: created.schedule.startAt,
+      endAt: created.schedule.endAt,
+      timezone: created.schedule.timezone,
+    });
+
+    if (!eventId) {
+      return;
+    }
+
+    // CAS-scoped to UPCOMING: if the booking was already cancelled by the time this best-effort
+    // call lands (e.g. a fast concurrent cancellation), leave it alone rather than resurrecting
+    // a googleCalendarEventId onto a booking whose event may already be in the process of being
+    // deleted by the cancellation path.
+    await this.bookingRepository.casUpdate(created.businessId, created._id, ["UPCOMING"], {
+      set: { googleCalendarEventId: eventId },
+    });
   }
 
   private async generateUniqueReference(): Promise<string> {

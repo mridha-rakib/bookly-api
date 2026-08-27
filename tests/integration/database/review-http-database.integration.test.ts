@@ -537,6 +537,58 @@ describe("HTTP-level Review endpoints (Batch 14)", () => {
     expect(after.body.data.reviewCount).toBe(1);
   });
 
+  it("an anonymous (no token) visitor can read the public rating summary and published reviews list", async () => {
+    const customer = await createCustomer("anon-public");
+    const { booking, business } = await createCompletedBooklyManagedBooking(customer._id);
+    const app = buildApp();
+
+    await request(app)
+      .post(`/me/bookings/${booking._id}/review`)
+      .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
+      .send({ rating: 5, comment: "Great" });
+
+    const summary = await request(app).get(`/catalog/businesses/${business._id}/reviews/summary`);
+    expect(summary.status).toBe(200);
+    expect(summary.body.data.averageRating).toBe(5);
+    expect(summary.body.data.reviewCount).toBe(1);
+
+    const list = await request(app).get(`/catalog/businesses/${business._id}/reviews`);
+    expect(list.status).toBe(200);
+    expect(list.body.data.reviews).toHaveLength(1);
+    const row = list.body.data.reviews[0];
+    expect(row.verified).toBe(true);
+    // Public-safe DTO even anonymously — no raw customer/user identifiers.
+    expect(row.customerUserId).toBeUndefined();
+    expect(row.email).toBeUndefined();
+    expect(row.phone).toBeUndefined();
+  });
+
+  it("hides public review reads for a PENDING / SUSPENDED business (403), anonymously and authenticated", async () => {
+    const owner = await createCustomer("pending-owner");
+    const pending = await businessRepository.create({
+      ownerUserId: owner._id,
+      name: "Not Yet Approved",
+      ownerName: "Owner Name",
+      email: `owner-${new Types.ObjectId().toString()}@example.com`,
+      phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+      visitType: "AT_BUSINESS_LOCATION",
+      timezone: TIMEZONE,
+      address: { city: "Larnaca", area: "Center", streetName: "Main", streetNumber: "1" },
+      briefDescription: "A great business",
+      category: "Barber",
+      subcategories: ["Haircut"],
+    });
+    const app = buildApp();
+
+    const anon = await request(app).get(`/catalog/businesses/${pending._id}/reviews/summary`);
+    expect(anon.status).toBe(403);
+
+    const authed = await request(app)
+      .get(`/catalog/businesses/${pending._id}/reviews`)
+      .set("Authorization", await bearerFor(owner._id, "CUSTOMER"));
+    expect(authed.status).toBe(403);
+  });
+
   // --- Super Admin moderation -----------------------------------------------------------------
 
   it("only SUPER_ADMIN can moderate — every other role is denied 403", async () => {
