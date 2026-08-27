@@ -1,7 +1,12 @@
 import { z } from "zod";
 
 import { businessCities, businessVisitTypes } from "../business/business.types.js";
-import { DISCOVERY_SEARCH_MAX_LENGTH, discoverySortOptions } from "./discovery.types.js";
+import {
+  DISCOVERY_SEARCH_MAX_LENGTH,
+  discoverySortOptions,
+  HOME_SECTION_DEFAULT_LIMIT,
+  HOME_SECTION_MAX_LIMIT,
+} from "./discovery.types.js";
 
 export const listDiscoveryBusinessesQuerySchema = z
   .object({
@@ -40,3 +45,31 @@ export const listDiscoveryBusinessesQuerySchema = z
   }));
 
 export type ListDiscoveryBusinessesQuery = z.infer<typeof listDiscoveryBusinessesQuerySchema>;
+
+/**
+ * Batch 17 — homepage discovery sections. `city` (single, real enum) is the hero search bar's
+ * picked city and drives "Services near you". `category` (comma-separated real category
+ * strings) is an optional context that narrows "Recommended" for logged-out visitors. Both are
+ * optional — with neither, every section still returns an honest ranking.
+ */
+export const homeSectionsQuerySchema = z
+  .object({
+    city: z.enum(businessCities).optional(),
+    category: z.string().optional(),
+    limit: z.string().regex(/^\d+$/, "Invalid limit").optional(),
+  })
+  .strict()
+  .transform((value) => ({
+    city: value.city,
+    category: value.category
+      ? value.category
+          .split(",")
+          .map((c) => c.trim())
+          .filter((c) => c.length > 0)
+      : undefined,
+    limit: value.limit
+      ? Math.min(HOME_SECTION_MAX_LIMIT, Math.max(1, Number(value.limit)))
+      : HOME_SECTION_DEFAULT_LIMIT,
+  }));
+
+export type HomeSectionsQuery = z.infer<typeof homeSectionsQuerySchema>;

@@ -23,6 +23,7 @@ import { createBusinessMediaRoute } from "../business-media/business-media.route
 import { createBusinessTravelSettingsRoute } from "../business-travel-settings/business-travel-settings.route.js";
 import { createDashboardAnalyticsRoute } from "../dashboard-analytics/dashboard-analytics.route.js";
 import { createFinanceRoute } from "../finance/finance.route.js";
+import { createIntegrationRoute } from "../integration/integration.route.js";
 import { createServicesRoute } from "../services/service.route.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { createStaffRoute } from "../staff/staff.route.js";
@@ -162,6 +163,7 @@ export const createBusinessRoute = (): Router => {
   router.use(createAddonsRoute());
   router.use(createStaffRoute());
   router.use(createStaffAvatarRoute());
+  router.use(createIntegrationRoute());
 
   router.patch(
     "/:businessId",

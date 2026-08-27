@@ -44,6 +44,7 @@ import {
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { EmailOtpProvider } from "../../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../../src/modules/verification/phone-otp.provider.js";
+import { seedDemoCustomer } from "../../../src/scripts/seed-demo-customer.js";
 import { seedSuperAdmin } from "../../../src/scripts/seed-super-admin.js";
 import {
   clearIsolatedDatabase,
@@ -1060,6 +1061,158 @@ describe("database-backed authentication integration", () => {
     ).rejects.toThrow("Missing required Super Admin seed environment values");
     expect(await UserModel.countDocuments()).toBe(0);
     expect(JSON.stringify(logs)).not.toContain(config.password);
+  });
+
+  describe("seed-demo-customer (local development helper)", () => {
+    const logger = { info: () => undefined };
+    const config = {
+      email: "Demo.Customer@Bookly.Local",
+      password: "DemoCustomer123!",
+      firstName: "Demo",
+      lastName: "Customer",
+    };
+    const deps = () => ({
+      userRepository: new UserRepository(),
+      passwordHasher: new Argon2PasswordHasher(),
+      logger,
+      nodeEnv: "development",
+    });
+
+    it("creates an ACTIVE, pre-verified CUSTOMER with an argon2id-hashed password and no privileged role", async () => {
+      await expect(seedDemoCustomer(config, deps())).resolves.toBe("created");
+
+      const user = await UserModel.findOne({ normalizedEmail: "demo.customer@bookly.local" })
+        .select("+passwordHash")
+        .orFail();
+      const profile = await UserProfileModel.findOne({ userId: user._id }).orFail();
+
+      expect(user.role).toBe("CUSTOMER");
+      expect(user.status).toBe("ACTIVE");
+      expect(user.emailVerifiedAt).toBeInstanceOf(Date);
+      expect(user.phoneVerifiedAt).toBeInstanceOf(Date);
+      expect(user.passwordHash).toMatch(/^\$argon2id\$/);
+      expect(user.passwordHash).not.toBe(config.password);
+      expect(await new Argon2PasswordHasher().verify(user.passwordHash, config.password)).toBe(
+        true,
+      );
+      expect(profile.firstName).toBe("Demo");
+      expect(profile.phone?.e164).toBe("+35799000000");
+    });
+
+    it("is idempotent — a second run is a no-op that keeps exactly one user and the same hash", async () => {
+      await expect(seedDemoCustomer(config, deps())).resolves.toBe("created");
+      const first = await UserModel.findOne({ normalizedEmail: "demo.customer@bookly.local" })
+        .select("+passwordHash")
+        .orFail();
+
+      await expect(seedDemoCustomer(config, deps())).resolves.toBe("already_exists");
+
+      expect(await UserModel.countDocuments()).toBe(1);
+      const second = await UserModel.findById(first._id).select("+passwordHash").orFail();
+      expect(second.passwordHash).toBe(first.passwordHash);
+    });
+
+    it("the seeded demo customer can log in through the real customer login flow", async () => {
+      await seedDemoCustomer(config, deps());
+      const { authService } = createAuthService();
+
+      const result = await authService.login(
+        "CUSTOMER",
+        { email: "demo.customer@bookly.local", password: config.password },
+        context,
+      );
+
+      expect(result.user.role).toBe("CUSTOMER");
+      expect(result.accessToken).toEqual(expect.any(String));
+    });
+
+    it("refuses to overwrite an existing non-Customer account, and refuses to run in production", async () => {
+      await new UserRepository().create({
+        normalizedEmail: "demo.customer@bookly.local",
+        passwordHash: "existing-hash",
+        role: "BUSINESS_OWNER",
+        status: "ACTIVE",
+      });
+      await expect(seedDemoCustomer(config, deps())).rejects.toThrow("non-Customer");
+
+      await clearIsolatedDatabase();
+      await expect(seedDemoCustomer(config, { ...deps(), nodeEnv: "production" })).rejects.toThrow(
+        "must never run in production",
+      );
+
+      await expect(
+        seedDemoCustomer({ firstName: "Demo", lastName: "Customer" }, deps()),
+      ).rejects.toThrow("Missing required Demo Customer seed environment values");
+    });
+  });
+
+  describe("AuthService.login — SUPER_ADMIN portal", () => {
+    const createSuperAdmin = async (
+      userRepository: UserRepository,
+      overrides: { normalizedEmail: string; status?: "ACTIVE" | "SUSPENDED" },
+    ) => {
+      const passwordHasher = new Argon2PasswordHasher();
+      return userRepository.create({
+        normalizedEmail: overrides.normalizedEmail,
+        passwordHash: await passwordHasher.hash(testPassword),
+        role: "SUPER_ADMIN",
+        status: overrides.status ?? "ACTIVE",
+      });
+    };
+
+    it("logs in with valid SUPER_ADMIN credentials and issues a session", async () => {
+      const { authService, userRepository } = createAuthService();
+      await createSuperAdmin(userRepository, { normalizedEmail: "root@example.com" });
+
+      const result = await authService.login(
+        "SUPER_ADMIN",
+        { email: "root@example.com", password: testPassword },
+        context,
+      );
+
+      expect(result.user.role).toBe("SUPER_ADMIN");
+      expect(result.accessToken).toEqual(expect.any(String));
+    });
+
+    it("rejects a wrong password with INVALID_CREDENTIALS", async () => {
+      const { authService, userRepository } = createAuthService();
+      await createSuperAdmin(userRepository, { normalizedEmail: "root-badpass@example.com" });
+
+      const error = await authService
+        .login(
+          "SUPER_ADMIN",
+          { email: "root-badpass@example.com", password: "not-the-password" },
+          context,
+        )
+        .catch((caught: unknown) => caught);
+      assertAuthError(error, "INVALID_CREDENTIALS", 401);
+    });
+
+    it("rejects a non-SUPER_ADMIN account with PORTAL_MISMATCH", async () => {
+      const { authService } = await completeCustomer("not-admin@example.com");
+
+      const error = await authService
+        .login("SUPER_ADMIN", { email: "not-admin@example.com", password: testPassword }, context)
+        .catch((caught: unknown) => caught);
+      assertAuthError(error, "PORTAL_MISMATCH", 409);
+    });
+
+    it("rejects a suspended SUPER_ADMIN account with USER_SUSPENDED", async () => {
+      const { authService, userRepository } = createAuthService();
+      await createSuperAdmin(userRepository, {
+        normalizedEmail: "root-suspended@example.com",
+        status: "SUSPENDED",
+      });
+
+      const error = await authService
+        .login(
+          "SUPER_ADMIN",
+          { email: "root-suspended@example.com", password: testPassword },
+          context,
+        )
+        .catch((caught: unknown) => caught);
+      assertAuthError(error, "USER_SUSPENDED", 403);
+    });
   });
 
   it("reports transaction-unavailable behavior through a stable AuthError when sessions cannot transact", async () => {

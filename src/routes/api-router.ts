@@ -10,6 +10,7 @@ import {
 import { createBusinessRoute } from "../modules/business/business.route.js";
 import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
+import { createPublicContentRoute } from "../modules/content/content.route.js";
 import { createDashboardOverviewRoute } from "../modules/dashboard-overview/dashboard-overview.route.js";
 import { createDiscoveryRoute } from "../modules/discovery/discovery.route.js";
 import { createFavoriteRoute } from "../modules/favorite/favorite.route.js";
@@ -17,6 +18,7 @@ import { HealthController } from "../modules/health/health.controller.js";
 import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
+import { createGoogleCalendarCallbackRoute } from "../modules/integration/integration.route.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
 import {
   createBusinessReviewRoute,
@@ -35,6 +37,17 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
 
   router.use("/health", createReadinessHealthRoute(healthController));
   router.use("/auth", createAuthRoute());
+  // Google Calendar OAuth callback — MUST be the first "/businesses" router registered. Google
+  // redirects the browser here with no Authorization header at all (see its own comment in
+  // integration.route.ts for why), so it cannot pass through ANY authenticated gate. Several
+  // "/businesses" routers below (createBusinessReviewRoute is the one that actually intercepted
+  // this route in practice) apply their `authenticate` middleware via a path-less `router.use(...)`
+  // at the top of their own router — that runs for every request entering that router regardless
+  // of whether any of ITS OWN routes match the path, so registering the callback after any such
+  // router previously made it 401 with SESSION_EXPIRED before ever reaching the callback handler.
+  // Registering it here, first, guarantees Express matches its exact static path before any later
+  // "/businesses" router (present or future) gets a chance to gate it.
+  router.use("/businesses", createGoogleCalendarCallbackRoute());
   // createClientRoute() is mounted first: it applies auth per-route (not a blanket gate), so
   // it only intercepts requests it actually owns (/:businessId/clients...) and everything else
   // falls through untouched to createBusinessRoute()'s stricter BUSINESS_OWNER-only gate below.
@@ -78,6 +91,10 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Batch 16 — Explore's real backend. Genuinely public, its own top-level prefix — same
   // anonymous-route precedent as createContactRoute() above.
   router.use("/discovery", createDiscoveryRoute());
+  // Content Manager public reads (Phase 1: FAQ only). Genuinely anonymous, its own top-level
+  // prefix — same anonymous-route precedent as createContactRoute()/createDiscoveryRoute().
+  // Super Admin FAQ mutations live under `/super-admin/content` (SUPER_ADMIN-gated), never here.
+  router.use("/content", createPublicContentRoute());
   // Batch 16 — Favorites, same "/me" prefix/rationale as "My Bookings"/"My Reviews"/"My Tickets"
   // above (own-resource-scoped, CUSTOMER-only, cross-Business).
   router.use("/me", createFavoriteRoute());

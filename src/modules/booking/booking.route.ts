@@ -23,6 +23,8 @@ import { BusinessHoursRepository } from "../business-hours/business-hours.reposi
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { IntegrationRepository } from "../integration/integration.repository.js";
+import { IntegrationService } from "../integration/integration.service.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../payment/payment.service.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
@@ -91,6 +93,10 @@ const buildController = (): BookingController => {
     new PromoUserUsageRepository(),
     new PromoRedemptionRepository(),
   );
+  const integrationService = new IntegrationService(
+    new IntegrationRepository(),
+    businessRepository,
+  );
 
   const availabilityService = new AvailabilityService(
     businessRepository,
@@ -128,6 +134,7 @@ const buildController = (): BookingController => {
     paymentService,
     financialTransactionService,
     promoApplicationService,
+    integrationService,
   );
 
   const lifecycleService = new BookingLifecycleService(
@@ -140,6 +147,7 @@ const buildController = (): BookingController => {
     staffRepository,
     paymentService,
     financialTransactionService,
+    integrationService,
   );
 
   return new BookingController(bookingService, creationService, lifecycleService);

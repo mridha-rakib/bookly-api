@@ -9,7 +9,7 @@ import {
   type UserProfileDocument,
   UserProfileModel,
 } from "./user.model.js";
-import type { UserRole, UserStatus } from "./user.types.js";
+import type { UserLanguage, UserRole, UserStatus } from "./user.types.js";
 
 type CreateUserInput = {
   normalizedEmail: string;
@@ -187,6 +187,8 @@ export class UserRepository {
     update: Partial<Pick<CreateProfileInput, "firstName" | "lastName" | "gender">> & {
       /** `undefined` clears the phone (via $unset); omit the key entirely to leave it untouched. */
       phone?: CreateProfileInput["phone"];
+      /** Account UI language preference (Super Admin Settings). */
+      defaultLanguage?: UserLanguage;
     },
   ): Promise<void> {
     const { phone, ...rest } = update;

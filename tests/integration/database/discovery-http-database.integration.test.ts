@@ -4,6 +4,7 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { createCustomerBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { createDiscoveryRoute } from "../../../src/modules/discovery/discovery.route.js";
@@ -123,6 +124,72 @@ describe("HTTP-level Discovery/Favorites/Book Again endpoints (Batch 16)", () =>
     expect(response.body.data.categories).toContain("Barber");
   });
 
+  it("GET /discovery/founding-partners is public and returns only isFoundingPartner + publicly-visible businesses, with public-safe fields only", async () => {
+    const { business: fp } = await createBusiness("Founding Salon");
+    await businessRepository.setFoundingPartner(fp._id, true);
+    // A non-founding but approved business — must NOT appear.
+    await createBusiness("Ordinary Salon");
+    // A founding partner that is not publicly visible (still PENDING) — must NOT appear.
+    const pendingEmail = `owner-${new Types.ObjectId().toString()}@example.com`;
+    const pendingOwner = await userRepository.create({
+      normalizedEmail: pendingEmail,
+      passwordHash: "hash",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+    });
+    const pendingFp = await businessRepository.create({
+      ownerUserId: pendingOwner._id,
+      name: "Pending Founding Salon",
+      ownerName: "Owner Name",
+      email: pendingEmail,
+      phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+      visitType: "AT_BUSINESS_LOCATION",
+      timezone: "Europe/Nicosia",
+      address: { city: "Larnaca", area: "Center", streetName: "Main", streetNumber: "1" },
+      briefDescription: "A great business",
+      category: "Barber",
+      subcategories: [],
+    });
+    await businessRepository.setFoundingPartner(pendingFp._id, true);
+
+    const app = buildApp();
+    const response = await request(app).get("/discovery/founding-partners");
+
+    expect(response.status).toBe(200);
+    const rows = response.body.data.businesses as Array<Record<string, unknown>>;
+    expect(rows.map((r) => r["id"])).toEqual([String(fp._id)]);
+    expect(rows[0]).toEqual({ id: String(fp._id), name: "Founding Salon", city: "Larnaca" });
+    // No private fields ever.
+    expect(JSON.stringify(response.body.data)).not.toContain("ownerUserId");
+    expect(JSON.stringify(response.body.data)).not.toContain(pendingEmail);
+    expect(rows[0]).not.toHaveProperty("status");
+    expect(rows[0]).not.toHaveProperty("statusHistory");
+  });
+
+  it("GET /discovery/founding-partners excludes a founding partner that is later SUSPENDED", async () => {
+    const { owner, business: fp } = await createBusiness("Temp Founding Salon");
+    await businessRepository.setFoundingPartner(fp._id, true);
+    await businessRepository.casUpdateStatus(fp._id, ["APPROVED"], "SUSPENDED", {
+      fromStatus: "APPROVED",
+      actorUserId: owner._id,
+      changedAt: new Date(),
+    });
+
+    const app = buildApp();
+    const response = await request(app).get("/discovery/founding-partners");
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.businesses).toEqual([]);
+  });
+
+  it("GET /discovery/founding-partners returns an empty array (never fabricated demo cards) when there are none", async () => {
+    await createBusiness("Just A Salon");
+    const app = buildApp();
+    const response = await request(app).get("/discovery/founding-partners");
+    expect(response.status).toBe(200);
+    expect(response.body.data.businesses).toEqual([]);
+  });
+
   it("GET /discovery/businesses rejects unknown query params (schema .strict())", async () => {
     const app = buildApp();
     const response = await request(app).get("/discovery/businesses").query({ trending: "true" });
@@ -185,6 +252,110 @@ describe("HTTP-level Discovery/Favorites/Book Again endpoints (Batch 16)", () =>
       .get("/me/favorites/ids")
       .set("Authorization", await bearerFor(customerB._id, "CUSTOMER"));
     expect(bList.body.data.businessIds).toEqual([]);
+  });
+
+  // --- Home sections: public, OPTIONALLY personalized -------------------------------------------
+
+  it("GET /discovery/home-sections works with no auth, returns all three rows + meta, leaks nothing private", async () => {
+    const { business } = await createBusiness("Home Salon");
+    const app = buildApp();
+
+    const response = await request(app).get("/discovery/home-sections");
+
+    expect(response.status).toBe(200);
+    const { recommended, nearYou, popular, meta } = response.body.data;
+    expect(Array.isArray(recommended)).toBe(true);
+    expect(Array.isArray(nearYou)).toBe(true);
+    expect(Array.isArray(popular)).toBe(true);
+    expect(meta.personalized).toBe(false);
+    expect(meta.nearYouCity).toBeNull();
+    const row = [...recommended, ...nearYou, ...popular].find(
+      (b: { id: string }) => b.id === String(business._id),
+    );
+    expect(row).toBeDefined();
+    expect(row.ownerUserId).toBeUndefined();
+    expect(row.email).toBeUndefined();
+    expect(row.distance).toBeUndefined();
+  });
+
+  it("GET /discovery/home-sections rejects unknown query params (.strict)", async () => {
+    const app = buildApp();
+    const response = await request(app).get("/discovery/home-sections?foo=bar");
+    expect(response.status).toBe(400);
+  });
+
+  it("GET /discovery/home-sections?city=Larnaca drives Services near you and echoes the city", async () => {
+    const app = buildApp();
+    const larnacaEmail = `owner-${new Types.ObjectId().toString()}@example.com`;
+    const larnacaOwner = await userRepository.create({
+      normalizedEmail: larnacaEmail,
+      passwordHash: "hash",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+    });
+    const larnacaPending = await businessRepository.create({
+      ownerUserId: larnacaOwner._id,
+      name: "Larnaca Only",
+      ownerName: "Owner Name",
+      email: larnacaEmail,
+      phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+      visitType: "AT_BUSINESS_LOCATION",
+      timezone: "Europe/Nicosia",
+      address: { city: "Larnaca", area: "Center", streetName: "Main", streetNumber: "1" },
+      briefDescription: "A great business",
+      category: "Barber",
+      subcategories: [],
+    });
+    await businessRepository.casUpdateStatus(larnacaPending._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: larnacaOwner._id,
+      changedAt: new Date(),
+    });
+    await createBusiness("Nicosia Default"); // createBusiness() defaults to Larnaca too — keep name distinct
+
+    const response = await request(app).get("/discovery/home-sections?city=Larnaca");
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.meta.nearYouCity).toBe("Larnaca");
+    for (const row of response.body.data.nearYou) {
+      expect(row.city).toBe("Larnaca");
+    }
+  });
+
+  it("GET /discovery/home-sections personalizes 'Recommended' for a CUSTOMER with booking history", async () => {
+    const { business } = await createBusiness("Booked Before");
+    const customer = await createCustomer("has-history");
+    await BookingModel.collection.insertOne({
+      _id: new Types.ObjectId(),
+      businessId: business._id,
+      reference: `BK-${new Types.ObjectId().toString()}`,
+      status: "COMPLETED",
+      customer: { customerUserId: customer._id },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const app = buildApp();
+
+    const anon = await request(app).get("/discovery/home-sections");
+    expect(anon.body.data.meta.personalized).toBe(false);
+
+    const authed = await request(app)
+      .get("/discovery/home-sections")
+      .set("Authorization", await bearerFor(customer._id, "CUSTOMER"));
+    expect(authed.status).toBe(200);
+    expect(authed.body.data.meta.personalized).toBe(true);
+  });
+
+  it("GET /discovery/home-sections degrades to anonymous on a garbage bearer token (never 401)", async () => {
+    await createBusiness("Still Public");
+    const app = buildApp();
+
+    const response = await request(app)
+      .get("/discovery/home-sections")
+      .set("Authorization", "Bearer not-a-real-token");
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.meta.personalized).toBe(false);
   });
 
   // --- Book Again: CUSTOMER-only, own-resource-scoped --------------------------------------------

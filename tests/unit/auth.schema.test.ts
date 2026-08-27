@@ -33,6 +33,13 @@ describe("updateMyProfileBodySchema", () => {
       false,
     );
   });
+
+  it("accepts defaultLanguage EN/GR and rejects any other value (Phase 1 — Super Admin Settings)", () => {
+    expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "EN" }).success).toBe(true);
+    expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "GR" }).success).toBe(true);
+    expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "FR" }).success).toBe(false);
+    expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "en" }).success).toBe(false);
+  });
 });
 
 describe("Batch 18 contact-change schemas", () => {

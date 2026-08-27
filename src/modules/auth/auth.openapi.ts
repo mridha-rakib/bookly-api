@@ -138,6 +138,7 @@ const meResponseSchema = z.object({
       lastName: z.string(),
       fullName: z.string(),
       gender: z.enum(["male", "female", "other"]),
+      defaultLanguage: z.enum(["EN", "GR"]),
       phone: z
         .object({
           countryCode: z.string(),

@@ -4,6 +4,7 @@ import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import {
   createAuthenticateAccessTokenMiddleware,
+  createOptionalAuthenticateAccessTokenMiddleware,
   requireActiveUser,
   requireApprovedBusiness,
   requireRoles,
@@ -39,6 +40,13 @@ const buildAuthenticate = () => {
   const sessionRepository = new SessionRepository();
   const tokenService = new TokenService(sessionRepository);
   return createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
+};
+
+const buildOptionalAuthenticate = () => {
+  const userRepository = new UserRepository();
+  const sessionRepository = new SessionRepository();
+  const tokenService = new TokenService(sessionRepository);
+  return createOptionalAuthenticateAccessTokenMiddleware(tokenService, userRepository);
 };
 
 /** Batch 14 — Customer self-service Review surface, mounted at `/me` (same top-level prefix as
@@ -79,34 +87,35 @@ export const createCustomerReviewRoute = (): Router => {
   return router;
 };
 
-/** Batch 14 — the public (CUSTOMER-authenticated, matching catalog.route.ts's own "public
- * business page" convention — there is no true anonymous-public route architecture anywhere in
- * this codebase) Business rating summary + Reviews list, mounted at `/catalog` alongside
- * createCatalogRoute's own `/businesses/:businessId` surface. A separate route module (not added
- * directly to catalog.route.ts) to keep the Review domain self-contained; same prefix, same
- * authorization gate, no collision (distinct path suffixes). */
+/** Batch 14 / Phase public Explore+Venue — the public Business rating summary + published
+ * Reviews list, mounted at `/catalog` alongside createCatalogRoute's own `/businesses/:businessId`
+ * surface. These are genuinely PUBLIC reads now: an unregistered visitor on a shared `/venue`
+ * link sees the real aggregate rating and published reviews with no account. `optionalAuthenticate`
+ * still attaches `request.auth` when a valid token is present (never rejects its absence);
+ * `requireActiveUser()` still blocks a SUSPENDED logged-in caller; `requireApprovedBusiness`
+ * keeps the canonical public-visibility rule (APPROVED/WARNING only; PENDING/SUSPENDED -> 403).
+ * Writing a review is UNCHANGED — that stays on the CUSTOMER-only `/me/bookings/:id/review`
+ * surface (createCustomerReviewRoute). A separate route module (not folded into catalog.route.ts)
+ * to keep the Review domain self-contained; distinct path suffixes, no collision. */
 export const createPublicBusinessReviewRoute = (): Router => {
   const router = Router();
-  const authenticate = buildAuthenticate();
+  const optionalAuthenticate = buildOptionalAuthenticate();
   const controller = buildController();
   const businessRepository = new BusinessRepository();
 
-  router.use(
-    authenticate,
-    requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
-    requireApprovedBusiness(businessRepository),
-  );
+  router.use(optionalAuthenticate, requireActiveUser());
 
   router.get(
     "/businesses/:businessId/reviews/summary",
     validateRequest({ params: businessIdParamsSchema }),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.getBusinessRatingSummary),
   );
 
   router.get(
     "/businesses/:businessId/reviews",
     validateRequest({ params: businessIdParamsSchema, query: listPublicReviewsQuerySchema }),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.listBusinessReviews),
   );
 

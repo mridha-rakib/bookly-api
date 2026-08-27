@@ -1,6 +1,6 @@
 import { type ClientSession, Types } from "mongoose";
 import { type ServiceDocument, ServiceModel } from "./service.model.js";
-import type { ServiceStatus } from "./service.types.js";
+import type { ServiceScheduleMode, ServiceStatus } from "./service.types.js";
 
 export type CreateServiceInput = Omit<
   ServiceDocument,
@@ -24,6 +24,8 @@ export type ServiceStatusCounts = {
   inactive: number;
   archived: number;
 };
+
+export type ServiceScheduleModeCounts = { auto: number; manual: number };
 
 export class ServiceRepository {
   public async create(
@@ -83,6 +85,28 @@ export class ServiceRepository {
       else if (row._id === "ACTIVE") counts.active = row.count;
       else if (row._id === "INACTIVE") counts.inactive = row.count;
       else if (row._id === "ARCHIVED") counts.archived = row.count;
+    }
+    return counts;
+  }
+
+  /** Batch — booking-mode breakdown for a Business's ACTIVE services. `scheduleMode` is a
+   * per-Service setting (AUTO = follows the Business's general hours, MANUAL = its own fixed
+   * times); there is no business-wide mode. Single grouped query — never one per mode. */
+  public async countActiveByScheduleMode(
+    businessId: Types.ObjectId | string,
+  ): Promise<ServiceScheduleModeCounts> {
+    const businessObjectId =
+      typeof businessId === "string" ? new Types.ObjectId(businessId) : businessId;
+
+    const rows = await ServiceModel.aggregate<{ _id: ServiceScheduleMode; count: number }>([
+      { $match: { businessId: businessObjectId, status: "ACTIVE" } },
+      { $group: { _id: "$scheduleMode", count: { $sum: 1 } } },
+    ]).exec();
+
+    const counts: ServiceScheduleModeCounts = { auto: 0, manual: 0 };
+    for (const row of rows) {
+      if (row._id === "AUTO") counts.auto = row.count;
+      else if (row._id === "MANUAL") counts.manual = row.count;
     }
     return counts;
   }

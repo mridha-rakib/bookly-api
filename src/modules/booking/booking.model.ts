@@ -394,6 +394,10 @@ export type BookingDocument = {
    * Staff/calendar time and participate in conflict detection (Phase 2). */
   source: BookingSource;
   status: BookingStatus;
+  /** Google Calendar event id for this Booking's one-way sync (see integration/ module).
+   * Present only while a synced event exists — cleared once the event is deleted (booking
+   * cancelled) so idempotent re-sync attempts don't leak/duplicate events. */
+  googleCalendarEventId?: string | undefined;
   customer: BookingCustomer;
   createdBy: BookingActor;
   fulfilment: BookingFulfilment;
@@ -800,6 +804,7 @@ const bookingSchema = new Schema<BookingDocument>(
     reference: { type: String, required: true, trim: true, uppercase: true },
     source: { type: String, enum: bookingSources, required: true, default: "BOOKLY_MANAGED" },
     status: { type: String, enum: bookingStatuses, required: true, default: "UPCOMING" },
+    googleCalendarEventId: { type: String },
     customer: { type: bookingCustomerSchema, required: true },
     createdBy: { type: bookingActorSchema, required: true },
     fulfilment: { type: bookingFulfilmentSchema, required: true },

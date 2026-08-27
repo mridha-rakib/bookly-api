@@ -366,6 +366,88 @@ describe("AuthService.updateMyProfile", () => {
       service.updateMyProfile(userId.toHexString(), { firstName: "Janet" }),
     ).rejects.toMatchObject({ statusCode: 401 });
   });
+
+  it("persists a Super Admin name + defaultLanguage change to UserProfile in one update", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "admin@example.com",
+          role: "SUPER_ADMIN",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: profileId,
+          firstName: "Root",
+          lastName: "Admin",
+          gender: "other",
+          defaultLanguage: "EN",
+        }),
+      },
+    });
+
+    const result = await service.updateMyProfile(userId.toHexString(), {
+      firstName: "Georgino",
+      lastName: "Mansour",
+      defaultLanguage: "GR",
+    });
+
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(profileId, {
+      firstName: "Georgino",
+      lastName: "Mansour",
+      defaultLanguage: "GR",
+    });
+    expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
+    expect(result.profile).toMatchObject({ defaultLanguage: "EN" });
+  });
+});
+
+describe("AuthService.getMe", () => {
+  it("echoes the stored defaultLanguage and defaults legacy profiles to EN", async () => {
+    const userId = new Types.ObjectId();
+    const withLanguage = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "admin@example.com",
+          role: "SUPER_ADMIN",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Root",
+          lastName: "Admin",
+          gender: "other",
+          defaultLanguage: "GR",
+        }),
+      },
+    });
+    await expect(withLanguage.service.getMe(userId.toHexString())).resolves.toMatchObject({
+      profile: { fullName: "Root Admin", defaultLanguage: "GR" },
+    });
+
+    const legacy = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "admin@example.com",
+          role: "SUPER_ADMIN",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Root",
+          lastName: "Admin",
+          gender: "other",
+        }),
+      },
+    });
+    await expect(legacy.service.getMe(userId.toHexString())).resolves.toMatchObject({
+      profile: { defaultLanguage: "EN" },
+    });
+  });
 });
 
 describe("AuthService.changeMyPassword", () => {

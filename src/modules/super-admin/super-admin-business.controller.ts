@@ -6,6 +6,7 @@ import type {
   SuperAdminBusinessIdParams,
   SuperAdminListBusinessesQuery,
   SuperAdminRejectBusinessBody,
+  SuperAdminSetFoundingPartnerBody,
   SuperAdminSuspendBusinessBody,
 } from "./super-admin.schema.js";
 import type { SuperAdminBusinessService } from "./super-admin-business.service.js";
@@ -58,6 +59,19 @@ export class SuperAdminBusinessController {
     const superAdminUserId = this.requireActorId(request);
     const business = await this.service.suspend(superAdminUserId, params.businessId, body.reason);
     sendSuccess(response, 200, "Business suspended", business);
+  };
+
+  public setFoundingPartner = async (request: Request, response: Response): Promise<void> => {
+    const params = request.validated?.params as SuperAdminBusinessIdParams;
+    const body = request.validated?.body as SuperAdminSetFoundingPartnerBody;
+    // Router-wide requireRoles(["SUPER_ADMIN"]) already gates this; requireActorId keeps the
+    // same "a write must have an acting Super Admin" invariant as the lifecycle actions.
+    this.requireActorId(request);
+    const business = await this.service.setFoundingPartner(
+      params.businessId,
+      body.isFoundingPartner,
+    );
+    sendSuccess(response, 200, "Business founding partner updated", business);
   };
 
   private requireActorId(request: Request): string {

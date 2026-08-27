@@ -34,6 +34,36 @@ export const createAuthenticateAccessTokenMiddleware =
     }
   };
 
+/**
+ * Batch 17 — "authenticate if a Bearer token is present, otherwise proceed anonymously".
+ * Used only by genuinely-public read endpoints that OPTIONALLY personalize when a logged-in
+ * Customer calls them (home discovery sections). Any failure to resolve the token — missing,
+ * malformed, expired, revoked — is a silent fall-through to the anonymous path, never a 401:
+ * the endpoint is fully usable logged-out, so a stale token must degrade to "not personalized",
+ * not to an error. It never throws and never calls `next(error)`.
+ */
+export const createOptionalAuthenticateAccessTokenMiddleware =
+  (tokenService: TokenService, userRepository: UserRepository): RequestHandler =>
+  async (request: Request, _response: Response, next: NextFunction): Promise<void> => {
+    try {
+      const authorization = request.headers.authorization;
+      if (authorization?.startsWith("Bearer ")) {
+        const claims = await tokenService.verifyAccessToken(authorization.slice("Bearer ".length));
+        const user = await userRepository.findById(claims.sub);
+        if (user) {
+          request.auth = {
+            userId: String(user._id),
+            role: user.role,
+            status: user.status,
+          };
+        }
+      }
+    } catch {
+      // Intentionally swallowed — see doc comment. The request continues anonymously.
+    }
+    next();
+  };
+
 export const requireRoles =
   (roles: UserRole[]): RequestHandler =>
   (request: Request, _response: Response, next: NextFunction): void => {

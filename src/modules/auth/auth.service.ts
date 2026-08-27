@@ -551,6 +551,8 @@ export class AuthService {
             fullName: `${profile.firstName} ${profile.lastName}`.trim(),
             gender: profile.gender,
             phone: profile.phone,
+            // Profiles created before this field existed read back as "EN" rather than undefined.
+            defaultLanguage: profile.defaultLanguage ?? "EN",
             address: customerProfile?.address,
             dateOfBirth: customerProfile?.dateOfBirth,
           }
@@ -567,9 +569,11 @@ export class AuthService {
   }
 
   /**
-   * Batch 17 — Customer Profile self-edit. Allow-lists exactly firstName/lastName/gender
-   * (UserProfile) and address/dateOfBirth (CustomerProfile — upserted since no signup path ever
-   * creates that row). Deliberately excludes email/phone/role/status/internal IDs; the request
+   * Batch 17 — Customer Profile self-edit. Phase 1 — also the Super Admin Settings → Admin
+   * Account name/language edit (same route, gated CUSTOMER + SUPER_ADMIN). Allow-lists exactly
+   * firstName/lastName/gender/defaultLanguage (UserProfile) and address/dateOfBirth
+   * (CustomerProfile — upserted since no signup path ever creates that row; never sent by the
+   * Super Admin UI). Deliberately excludes email/phone/role/status/internal IDs; the request
    * schema itself (`.strict()`) already rejects any other field.
    */
   public async updateMyProfile(
@@ -588,13 +592,19 @@ export class AuthService {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
-    const { firstName, lastName, gender, address, dateOfBirth } = input;
+    const { firstName, lastName, gender, defaultLanguage, address, dateOfBirth } = input;
 
-    if (firstName !== undefined || lastName !== undefined || gender !== undefined) {
+    if (
+      firstName !== undefined ||
+      lastName !== undefined ||
+      gender !== undefined ||
+      defaultLanguage !== undefined
+    ) {
       await this.userRepository.updateProfile(profile._id, {
         ...(firstName !== undefined ? { firstName } : {}),
         ...(lastName !== undefined ? { lastName } : {}),
         ...(gender !== undefined ? { gender } : {}),
+        ...(defaultLanguage !== undefined ? { defaultLanguage } : {}),
       });
     }
 

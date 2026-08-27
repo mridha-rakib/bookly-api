@@ -5,6 +5,7 @@ import type { BookingFinancialTransactionDocument } from "../booking-financial-t
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { IntegrationService } from "../integration/integration.service.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
@@ -52,7 +53,30 @@ export class BookingLifecycleService {
     private readonly staffRepository: StaffRepository,
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
+    // Optional — see BookingCreationService's identical trailing-optional-dep pattern/comment.
+    private readonly integrationService?: Pick<IntegrationService, "deleteEventForBooking">,
   ) {}
+
+  /**
+   * Best-effort Google Calendar cleanup for CANCELLED_BY_CUSTOMER / CANCELLED_BY_BUSINESS /
+   * LATE_CANCELLATION (product scope: "any cancellation status deletes the synced event" — see
+   * this batch's audit). Deliberately NOT wired into cancelNoShowByBusiness's NO_SHOW_CANCELLED
+   * transition — that is a distinct no-show code path outside this pass's confirmed scope.
+   * Never throws (see IntegrationService.deleteEventForBooking's own contract).
+   */
+  private async syncBookingCancelledToGoogleCalendar(booking: BookingDocument): Promise<void> {
+    if (!booking.googleCalendarEventId || !this.integrationService) {
+      return;
+    }
+
+    await this.integrationService.deleteEventForBooking(
+      booking.businessId,
+      booking.googleCalendarEventId,
+    );
+    await this.bookingRepository.casUpdate(booking.businessId, booking._id, [booking.status], {
+      unset: { googleCalendarEventId: "" },
+    });
+  }
 
   // --- Completion ---------------------------------------------------------------------------
 
@@ -231,6 +255,8 @@ export class BookingLifecycleService {
       scopedToCustomerUserId: customerUserId,
     });
 
+    await this.syncBookingCancelledToGoogleCalendar(cancelled);
+
     if (outcome.settlementStatus !== "PENDING" || outcome.additionalChargeCents <= 0) {
       return cancelled;
     }
@@ -299,6 +325,8 @@ export class BookingLifecycleService {
       cancellationOutcome: outcome,
       event,
     });
+
+    await this.syncBookingCancelledToGoogleCalendar(cancelled);
 
     if (!upfrontPayment || refundOwedCents <= 0) {
       return cancelled;

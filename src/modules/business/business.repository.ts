@@ -130,6 +130,20 @@ export class BusinessRepository {
     ).exec();
   }
 
+  /** Super Admin-controlled Founding Partner flag — a plain attribute set (both directions),
+   * not a lifecycle transition, so no CAS/statusHistory. Returns null when the id doesn't exist
+   * (caller maps to 404). */
+  public async setFoundingPartner(
+    businessId: Types.ObjectId | string,
+    isFoundingPartner: boolean,
+  ): Promise<BusinessDocument | null> {
+    return BusinessModel.findByIdAndUpdate(
+      businessId,
+      { $set: { isFoundingPartner } },
+      { returnDocument: "after", runValidators: true },
+    ).exec();
+  }
+
   /** Batch 11 — Super Admin Business list: bounded, server-side paginated, filtered by the
    * `{status:1, createdAt:-1}` index. `q` (name/email/ownerName) is a best-effort
    * case-insensitive substring match — acceptable at this product's current Business volume;

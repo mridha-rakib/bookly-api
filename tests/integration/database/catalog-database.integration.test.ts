@@ -150,7 +150,10 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
 
   // --- Fixtures --------------------------------------------------------------------------------
 
-  const createBusiness = async (name: string) => {
+  const createBusiness = async (
+    name: string,
+    status: "APPROVED" | "PENDING" | "SUSPENDED" = "APPROVED",
+  ) => {
     const email = `owner-${new Types.ObjectId().toString()}@example.com`;
     const owner = await userRepository.create({
       normalizedEmail: email,
@@ -158,7 +161,7 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
       role: "BUSINESS_OWNER",
       status: "ACTIVE",
     });
-    const business = await businessRepository.create({
+    const pending = await businessRepository.create({
       ownerUserId: owner._id,
       name,
       ownerName: "Owner Name",
@@ -171,7 +174,18 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
       category: "Barber",
       subcategories: ["Haircut"],
     });
-    return { owner, business };
+    // The public catalog read enforces `requireApprovedBusiness` (APPROVED/WARNING only), so the
+    // default fixture is an APPROVED business — the same approach review-http-database's own
+    // `createBusiness` helper already takes. Pass "PENDING"/"SUSPENDED" to test the hidden path.
+    if (status === "PENDING") {
+      return { owner, business: pending };
+    }
+    const business = await businessRepository.casUpdateStatus(pending._id, ["PENDING"], status, {
+      fromStatus: "PENDING",
+      actorUserId: owner._id,
+      changedAt: new Date(),
+    });
+    return { owner, business: business ?? pending };
   };
 
   const createStaff = async (businessId: Types.ObjectId) => {
@@ -406,26 +420,67 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     expect(response.body.data.staff[0].firstName).toBe("Loay");
   });
 
-  it("denies a Business Owner/Staff/Supervisor from using the customer catalog route", async () => {
+  it("allows an anonymous (no Authorization header) visitor to read the public venue catalog", async () => {
+    const { business, service } = await setupBookableBusiness(8000);
+    const app = buildCatalogApp();
+
+    const response = await request(app).get(`/catalog/businesses/${business._id}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.business.id).toBe(String(business._id));
+    expect(response.body.data.services[0].id).toBe(String(service._id));
+    // Public-safe fields only, even anonymously — never email/phone/ownerUserId.
+    expect(response.body.data.business.email).toBeUndefined();
+    expect(response.body.data.business.phone).toBeUndefined();
+    expect(response.body.data.business.ownerUserId).toBeUndefined();
+  });
+
+  it("still serves the public venue catalog to a logged-in Business Owner / Staff (no role gate on the read)", async () => {
     const { business, owner, membership } = await setupBookableBusiness(8000);
     const app = buildCatalogApp();
 
     const ownerResponse = await request(app)
       .get(`/catalog/businesses/${business._id}`)
       .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
-    expect(ownerResponse.status).toBe(403);
+    expect(ownerResponse.status).toBe(200);
 
     const staffResponse = await request(app)
       .get(`/catalog/businesses/${business._id}`)
       .set("Authorization", await bearerFor(membership.userId, "STAFF"));
-    expect(staffResponse.status).toBe(403);
+    expect(staffResponse.status).toBe(200);
   });
 
-  it("rejects a request with no Authorization header", async () => {
-    const { business } = await setupBookableBusiness(8000);
+  it("hides a PENDING or SUSPENDED business from the public venue catalog (403)", async () => {
     const app = buildCatalogApp();
-    const response = await request(app).get(`/catalog/businesses/${business._id}`);
-    expect(response.status).toBe(401);
+
+    const { business: pending } = await createBusiness("Pending Co", "PENDING");
+    const pendingResponse = await request(app).get(`/catalog/businesses/${pending._id}`);
+    expect(pendingResponse.status).toBe(403);
+
+    const { business: suspended } = await createBusiness("Suspended Co", "SUSPENDED");
+    const suspendedResponse = await request(app).get(`/catalog/businesses/${suspended._id}`);
+    expect(suspendedResponse.status).toBe(403);
+  });
+
+  it("keeps the booking-wizard sub-routes (add-ons / availability) CUSTOMER-authenticated", async () => {
+    const { business, service } = await setupBookableBusiness(8000);
+    const app = buildCatalogApp();
+
+    const anonAddons = await request(app).get(
+      `/catalog/businesses/${business._id}/services/${service._id}/addons`,
+    );
+    expect(anonAddons.status).toBe(401);
+
+    const anonAvailability = await request(app)
+      .get(`/catalog/businesses/${business._id}/services/${service._id}/availability`)
+      .query({ fromDate: DATE, toDate: DATE });
+    expect(anonAvailability.status).toBe(401);
+
+    const { owner } = await createBusiness("Owner On Wizard");
+    const ownerAddons = await request(app)
+      .get(`/catalog/businesses/${business._id}/services/${service._id}/addons`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
+    expect(ownerAddons.status).toBe(403);
   });
 
   it("excludes DRAFT/ARCHIVED services and add-ons from the customer-facing catalog", async () => {

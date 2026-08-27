@@ -343,6 +343,14 @@ export const env = createEnv({
     SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
     SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),
     SUPER_ADMIN_LAST_NAME: z.string().min(1).optional(),
+    // Local-development-only demo CUSTOMER (see src/scripts/seed-demo-customer.ts). Same
+    // optional-secret convention as SUPER_ADMIN_* above — blank in .env.example, real values in
+    // the local .env. The seed script itself refuses to run when NODE_ENV=production, so these
+    // never need to be set (or valid) in a production environment.
+    DEMO_CUSTOMER_EMAIL: z.string().email().optional(),
+    DEMO_CUSTOMER_PASSWORD: z.string().min(6).optional(),
+    DEMO_CUSTOMER_FIRST_NAME: z.string().min(1).default("Demo"),
+    DEMO_CUSTOMER_LAST_NAME: z.string().min(1).default("Customer"),
     ARGON2_MEMORY_COST: z.coerce.number().int().positive().default(65_536),
     ARGON2_TIME_COST: z.coerce.number().int().positive().default(3),
     ARGON2_PARALLELISM: z.coerce.number().int().positive().default(1),
@@ -359,6 +367,32 @@ export const env = createEnv({
     // env var just for this narrow purpose.
     SUPPORT_CONTACT_INBOX_EMAIL: z.string().email().optional(),
     CONTACT_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+    // Google Calendar (one-way Bookly -> Google booking sync): required in production, optional
+    // in development/test — same provider-optionality convention as Stripe above. No real Google
+    // Cloud OAuth client exists in this environment yet; the integration throws a clear
+    // GOOGLE_CALENDAR_NOT_CONFIGURED domain error at connect-time rather than failing app boot.
+    GOOGLE_CLIENT_ID: optionalProductionRequiredString("GOOGLE_CLIENT_ID"),
+    GOOGLE_CLIENT_SECRET: optionalProductionRequiredString("GOOGLE_CLIENT_SECRET"),
+    // The backend's own callback URL registered in Google Cloud Console (e.g.
+    // https://api.bookly.cy/businesses/integrations/google-calendar/callback for production,
+    // http://localhost:4000/businesses/integrations/google-calendar/callback for local dev).
+    // No existing "our own base URL" env var exists in this codebase to derive this from (see
+    // S3_PUBLIC_BASE_URL for the closest precedent), so it is configured directly.
+    GOOGLE_CALENDAR_REDIRECT_URI: z.string().url().optional(),
+    // 32-byte AES-256-GCM key, hex-encoded (64 hex chars) — encrypts Google OAuth
+    // access/refresh tokens at rest. Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+    GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i, "must be a 64-character hex string (32 bytes)")
+      .optional()
+      .superRefine((value, context) => {
+        if (rawNodeEnv === "production" && !value) {
+          context.addIssue({
+            code: "custom",
+            message: "GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY is required in production",
+          });
+        }
+      }),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

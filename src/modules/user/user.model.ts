@@ -1,6 +1,14 @@
 import { model, Schema, type Types } from "mongoose";
 
-import { genders, type UserRole, type UserStatus, userRoles, userStatuses } from "./user.types.js";
+import {
+  genders,
+  type UserLanguage,
+  type UserRole,
+  type UserStatus,
+  userLanguages,
+  userRoles,
+  userStatuses,
+} from "./user.types.js";
 
 export type UserDocument = {
   _id: Types.ObjectId;
@@ -54,6 +62,9 @@ export type UserProfileDocument = {
         e164: string;
       }
     | undefined;
+  /** Account UI language preference. Optional: rows created before this field default to "EN"
+   * at read time (see AuthService.getMe). */
+  defaultLanguage?: UserLanguage | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   createdAt: Date;
@@ -71,6 +82,7 @@ const userProfileSchema = new Schema<UserProfileDocument>(
       nationalNumber: { type: String },
       e164: { type: String },
     },
+    defaultLanguage: { type: String, enum: userLanguages },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
   },

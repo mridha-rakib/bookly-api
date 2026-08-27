@@ -5,8 +5,29 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessStatus, BusinessVisitType } from "../business/business.types.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessLifecycleService } from "../business/business-lifecycle.service.js";
+import type { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import type { ReviewAggregate, ReviewRepository } from "../review/review.repository.js";
+import type {
+  ServiceRepository,
+  ServiceScheduleModeCounts,
+} from "../services/service.repository.js";
 import type { UserDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
+
+/** Booking mode is a per-Service setting (Service.scheduleMode) — there is no business-wide
+ * mode. This is the business-level rollup the Super Admin header badge shows:
+ *   AUTO   = every ACTIVE service follows the Business's general hours
+ *   MANUAL = every ACTIVE service defines its own fixed times
+ *   MIXED  = both kinds exist
+ *   null   = the Business has no ACTIVE service yet (badge is omitted, never guessed) */
+export type SuperAdminBusinessBookingMode = "AUTO" | "MANUAL" | "MIXED" | null;
+
+const deriveBookingMode = (counts: ServiceScheduleModeCounts): SuperAdminBusinessBookingMode => {
+  if (counts.auto > 0 && counts.manual > 0) return "MIXED";
+  if (counts.auto > 0) return "AUTO";
+  if (counts.manual > 0) return "MANUAL";
+  return null;
+};
 
 export type SuperAdminBusinessListItemDto = {
   id: string;
@@ -15,8 +36,11 @@ export type SuperAdminBusinessListItemDto = {
   visitType: BusinessVisitType;
   city: string;
   status: BusinessStatus;
-  /** No review/rating system exists anywhere in this codebase (confirmed by investigation) —
-   * always null, never fabricated. */
+  /** The Reviews & Ratings system (Batch 14) does expose a real per-Business published aggregate
+   * (see ReviewRepository.getAggregate), but the Super Admin Business LIST intentionally does not
+   * fan out one aggregate query per row — that would be an N+1 on the paginated list. The
+   * per-Business rating is surfaced on the Business DETAIL DTO instead (getDetail below). These
+   * stay null here until a batched list aggregate is added; they are never fabricated. */
   rating: null;
   reviewsCount: null;
   bookingsCount: number;
@@ -41,7 +65,24 @@ export type SuperAdminBusinessDetailDto = {
   briefDescription: string;
   category: string;
   subcategories: string[];
-  owner: { id: string; email: string; status: string };
+  owner: { id: string; email: string; status: string; lastLoginAt: string | null };
+  /** Published-review aggregate for this Business (Batch 14 — ReviewRepository.getAggregate,
+   * the single existing on-demand aggregation, reused here — never a second calculation).
+   * `rating` is null when there are no PUBLISHED reviews (`reviewsCount === 0`); it is never a
+   * fabricated 0.0. */
+  rating: number | null;
+  reviewsCount: number;
+  /** Business-scoped Gap Elimination toggle (BusinessBookingSettings.gapEliminationEnabled).
+   * Defaults to false when the Business has no settings document yet — the same default the
+   * owning BusinessBookingSettingsService applies. */
+  gapEliminationEnabled: boolean;
+  /** Business-level rollup of the per-Service `scheduleMode` (see SuperAdminBusinessBookingMode).
+   * null only when the Business has no ACTIVE service — the header omits the badge, never
+   * fabricates a mode. */
+  bookingMode: SuperAdminBusinessBookingMode;
+  /** Explicit Super Admin-controlled marketing flag (Business.isFoundingPartner). Never
+   * inferred. */
+  isFoundingPartner: boolean;
   bookingsCount: number;
   statusHistory: Array<{
     fromStatus: BusinessStatus;
@@ -61,6 +102,9 @@ export class SuperAdminBusinessService {
     private readonly bookingRepository: BookingRepository,
     private readonly userRepository: UserRepository,
     private readonly lifecycleService: BusinessLifecycleService,
+    private readonly reviewRepository: ReviewRepository,
+    private readonly businessBookingSettingsRepository: BusinessBookingSettingsRepository,
+    private readonly serviceRepository: ServiceRepository,
   ) {}
 
   public async list(
@@ -100,11 +144,15 @@ export class SuperAdminBusinessService {
     const business = await this.requireBusiness(businessId);
 
     const actorIds = [...new Set(business.statusHistory.map((entry) => String(entry.actorUserId)))];
-    const [owner, bookingCounts, actors] = await Promise.all([
-      this.userRepository.findById(business.ownerUserId),
-      this.bookingRepository.countByBusinessIds([business._id]),
-      this.userRepository.findManyByIds(actorIds),
-    ]);
+    const [owner, bookingCounts, actors, ratingAggregate, bookingSettings, scheduleModeCounts] =
+      await Promise.all([
+        this.userRepository.findById(business.ownerUserId),
+        this.bookingRepository.countByBusinessIds([business._id]),
+        this.userRepository.findManyByIds(actorIds),
+        this.reviewRepository.getAggregate(business._id),
+        this.businessBookingSettingsRepository.findByBusinessId(business._id),
+        this.serviceRepository.countActiveByScheduleMode(business._id),
+      ]);
     const actorEmailById = new Map(
       actors.map((actor) => [String(actor._id), actor.normalizedEmail]),
     );
@@ -114,6 +162,9 @@ export class SuperAdminBusinessService {
       owner,
       bookingCounts.get(String(business._id)) ?? 0,
       actorEmailById,
+      ratingAggregate,
+      bookingSettings?.gapEliminationEnabled ?? false,
+      deriveBookingMode(scheduleModeCounts),
     );
   }
 
@@ -140,6 +191,20 @@ export class SuperAdminBusinessService {
     reason: string | undefined,
   ): Promise<SuperAdminBusinessDetailDto> {
     await this.lifecycleService.suspendBusiness(superAdminUserId, businessId, reason);
+    return this.getDetail(businessId);
+  }
+
+  /** Explicit Super Admin toggle of `Business.isFoundingPartner` (both directions). A plain
+   * attribute set — not a lifecycle transition — so no statusHistory/CAS. */
+  public async setFoundingPartner(
+    businessId: string,
+    isFoundingPartner: boolean,
+  ): Promise<SuperAdminBusinessDetailDto> {
+    await this.requireBusiness(businessId);
+    const updated = await this.businessRepository.setFoundingPartner(businessId, isFoundingPartner);
+    if (!updated) {
+      throw new BusinessError("BUSINESS_NOT_FOUND", 404);
+    }
     return this.getDetail(businessId);
   }
 
@@ -174,6 +239,9 @@ export class SuperAdminBusinessService {
     owner: UserDocument | null,
     bookingsCount: number,
     actorEmailById: Map<string, string>,
+    ratingAggregate: ReviewAggregate,
+    gapEliminationEnabled: boolean,
+    bookingMode: SuperAdminBusinessBookingMode,
   ): SuperAdminBusinessDetailDto {
     return {
       id: String(business._id),
@@ -188,8 +256,20 @@ export class SuperAdminBusinessService {
       category: business.category,
       subcategories: business.subcategories,
       owner: owner
-        ? { id: String(owner._id), email: owner.normalizedEmail, status: owner.status }
-        : { id: String(business.ownerUserId), email: "", status: "UNKNOWN" },
+        ? {
+            id: String(owner._id),
+            email: owner.normalizedEmail,
+            status: owner.status,
+            lastLoginAt: owner.security.lastLoginAt
+              ? owner.security.lastLoginAt.toISOString()
+              : null,
+          }
+        : { id: String(business.ownerUserId), email: "", status: "UNKNOWN", lastLoginAt: null },
+      rating: ratingAggregate.averageRating,
+      reviewsCount: ratingAggregate.reviewCount,
+      gapEliminationEnabled,
+      bookingMode,
+      isFoundingPartner: business.isFoundingPartner,
       bookingsCount,
       statusHistory: business.statusHistory
         .slice()

@@ -251,19 +251,24 @@ export const createAuthRoute = (): Router => {
   router.post("/refresh", refreshLimiter, asyncHandler(controller.refresh));
   router.post("/logout", asyncHandler(controller.logout));
   router.get("/me", authenticate, requireActiveUser(), asyncHandler(controller.me));
+  // Phase 1 — Super Admin Settings → Admin Account reuses this exact route for name/language
+  // edits (schema allow-lists the fields; address/dateOfBirth are CUSTOMER-only sinks the admin
+  // UI never sends). BUSINESS_OWNER/SUPERVISOR/STAFF stay excluded.
   router.patch(
     "/me",
     authenticate,
     requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
+    requireRoles(["CUSTOMER", "SUPER_ADMIN"]),
     validateRequest({ body: updateMyProfileBodySchema }),
     asyncHandler(controller.updateMe),
   );
+  // Phase 1 — Super Admin "Change Password" reuses this secure Argon2 verify+rehash path
+  // as-is (no session revocation, matching the existing behavior for CUSTOMER).
   router.patch(
     "/me/password",
     authenticate,
     requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
+    requireRoles(["CUSTOMER", "SUPER_ADMIN"]),
     loginLimiter,
     validateRequest({ body: changeMyPasswordBodySchema }),
     asyncHandler(controller.changeMyPassword),

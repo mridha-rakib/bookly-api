@@ -8,9 +8,11 @@ import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { createBusinessBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { ReviewRepository } from "../../../src/modules/review/review.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -42,6 +44,8 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
   let businessHoursRepository: BusinessHoursRepository;
   let businessHoursService: BusinessHoursService;
   let clientRepository: ClientRepository;
+  let reviewRepository: ReviewRepository;
+  let businessBookingSettingsRepository: BusinessBookingSettingsRepository;
   let tokenService: TokenService;
 
   beforeAll(async () => {
@@ -58,6 +62,8 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
     businessHoursRepository = new BusinessHoursRepository();
     businessHoursService = new BusinessHoursService(businessHoursRepository, businessRepository);
     clientRepository = new ClientRepository();
+    reviewRepository = new ReviewRepository();
+    businessBookingSettingsRepository = new BusinessBookingSettingsRepository();
     tokenService = new TokenService(new SessionRepository());
   });
 
@@ -161,6 +167,27 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
       manualSchedule: [],
       servedCities: [],
       assignedStaffMembershipIds: [staffId],
+    });
+
+  const createActiveServiceWithMode = async (
+    businessId: Types.ObjectId,
+    scheduleMode: "AUTO" | "MANUAL",
+    status: "ACTIVE" | "INACTIVE" = "ACTIVE",
+  ) =>
+    serviceRepository.create({
+      businessId,
+      status,
+      isFeatured: false,
+      isPackageDeal: false,
+      category: "Barber",
+      name: `Svc ${scheduleMode} ${new Types.ObjectId().toString()}`,
+      pricingMode: "FIXED",
+      fixedPricing: { priceCents: 5000, durationMin: 60, bookingIntervalMin: 60 },
+      sessionExpiryAlert: { enabled: false },
+      scheduleMode,
+      manualSchedule: [],
+      servedCities: [],
+      assignedStaffMembershipIds: [],
     });
 
   const createClientFor = async (
@@ -737,5 +764,326 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
     expect(response.body.data.customers.total).toBe(1);
     expect(typeof response.body.data.platformRevenueCents).toBe("number");
     expect(typeof response.body.data.pendingBusinessPayableCents).toBe("number");
+  });
+
+  // --- Business detail header: real published-review aggregate, owner lastLoginAt, Gap
+  //     Elimination — every value from its own persisted source, never fabricated ----------------
+
+  const seedPublishedReview = async (businessId: Types.ObjectId, rating: number) =>
+    reviewRepository.create({
+      bookingId: new Types.ObjectId(),
+      businessId,
+      customerUserId: new Types.ObjectId(),
+      reviewerDisplayName: "A. Customer",
+      rating,
+    });
+
+  it("business detail returns the real published-review aggregate (average + count) for that business only", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Rated Salon", superAdmin);
+    const { business: other } = await createApprovedBusiness("Other Salon", superAdmin);
+    await seedPublishedReview(business._id, 5);
+    await seedPublishedReview(business._id, 4);
+    await seedPublishedReview(other._id, 1); // must not bleed into the first business's aggregate
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rating).toBe(4.5);
+    expect(response.body.data.reviewsCount).toBe(2);
+  });
+
+  it("business detail returns rating=null and reviewsCount=0 when the business has no published reviews", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Unrated Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rating).toBeNull();
+    expect(response.body.data.reviewsCount).toBe(0);
+  });
+
+  it("business detail excludes HIDDEN/REMOVED reviews from the rating aggregate", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Moderated Salon", superAdmin);
+    await seedPublishedReview(business._id, 5);
+    const toHide = await seedPublishedReview(business._id, 1);
+    if (!toHide) throw new Error("failed to seed review");
+    await reviewRepository.transitionStatus(toHide._id, "PUBLISHED", "HIDDEN", {
+      action: "HIDE",
+      actorUserId: superAdmin._id,
+      previousStatus: "PUBLISHED",
+      resultingStatus: "HIDDEN",
+      createdAt: new Date(),
+    });
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rating).toBe(5);
+    expect(response.body.data.reviewsCount).toBe(1);
+  });
+
+  it("business detail returns owner.lastLoginAt as an ISO string once the owner has logged in", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { owner, business } = await createApprovedBusiness("Login Salon", superAdmin);
+    await userRepository.updateLastLogin(owner._id);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(typeof response.body.data.owner.lastLoginAt).toBe("string");
+    expect(Number.isNaN(Date.parse(response.body.data.owner.lastLoginAt))).toBe(false);
+  });
+
+  it("business detail returns owner.lastLoginAt = null when the owner has never logged in", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Never Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.owner.lastLoginAt).toBeNull();
+  });
+
+  it("business detail reflects a persisted gapEliminationEnabled=true setting", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Gap Salon", superAdmin);
+    await businessBookingSettingsRepository.upsertByBusinessId(business._id, true);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.gapEliminationEnabled).toBe(true);
+  });
+
+  it("business detail defaults gapEliminationEnabled to false when no BusinessBookingSettings document exists", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("No-Settings Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.gapEliminationEnabled).toBe(false);
+  });
+
+  it("business detail never emits a standalone Auto Booking flag (booking mode is derived, not a persisted business field)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Honest Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).not.toHaveProperty("autoBooking");
+    expect(response.body.data).not.toHaveProperty("autoBookingEnabled");
+    // bookingMode IS emitted, but as a derived rollup — null here (no ACTIVE service), never a
+    // fabricated default.
+    expect(response.body.data.bookingMode).toBeNull();
+  });
+
+  // --- Booking mode: derived from per-Service scheduleMode (there is no business-wide mode) ------
+
+  it("business detail bookingMode = AUTO when every ACTIVE service follows the general schedule", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Auto Salon", superAdmin);
+    await createActiveServiceWithMode(business._id, "AUTO");
+    await createActiveServiceWithMode(business._id, "AUTO");
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.bookingMode).toBe("AUTO");
+  });
+
+  it("business detail bookingMode = MANUAL when every ACTIVE service defines its own times", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Manual Salon", superAdmin);
+    await createActiveServiceWithMode(business._id, "MANUAL");
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.bookingMode).toBe("MANUAL");
+  });
+
+  it("business detail bookingMode = MIXED when ACTIVE services use both modes", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Mixed Salon", superAdmin);
+    await createActiveServiceWithMode(business._id, "AUTO");
+    await createActiveServiceWithMode(business._id, "MANUAL");
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.bookingMode).toBe("MIXED");
+  });
+
+  it("business detail bookingMode ignores non-ACTIVE services (an INACTIVE MANUAL service does not flip an AUTO business to MIXED)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Active-only Salon", superAdmin);
+    await createActiveServiceWithMode(business._id, "AUTO");
+    await createActiveServiceWithMode(business._id, "MANUAL", "INACTIVE");
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.bookingMode).toBe("AUTO");
+  });
+
+  // --- Founding Partner: explicit, persisted, SUPER_ADMIN-only ----------------------------------
+
+  it("business detail isFoundingPartner defaults to false for a newly created business", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Plain Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.isFoundingPartner).toBe(false);
+  });
+
+  it("a SUPER_ADMIN can mark then unmark a business as Founding Partner; the flag persists across re-fetch", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Partner Salon", superAdmin);
+    const app = buildSuperAdminApp();
+    const auth = await bearerFor(superAdmin._id, "SUPER_ADMIN");
+
+    const marked = await request(app)
+      .patch(`/super-admin/businesses/${business._id}/founding-partner`)
+      .set("Authorization", auth)
+      .send({ isFoundingPartner: true });
+    expect(marked.status).toBe(200);
+    expect(marked.body.data.isFoundingPartner).toBe(true);
+
+    const refetch1 = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", auth);
+    expect(refetch1.body.data.isFoundingPartner).toBe(true);
+    // Persisted on the actual document, not just echoed.
+    expect((await businessRepository.findById(business._id))?.isFoundingPartner).toBe(true);
+
+    const unmarked = await request(app)
+      .patch(`/super-admin/businesses/${business._id}/founding-partner`)
+      .set("Authorization", auth)
+      .send({ isFoundingPartner: false });
+    expect(unmarked.status).toBe(200);
+    expect(unmarked.body.data.isFoundingPartner).toBe(false);
+
+    const refetch2 = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", auth);
+    expect(refetch2.body.data.isFoundingPartner).toBe(false);
+  });
+
+  it("a BUSINESS_OWNER cannot mark their own business as Founding Partner (403), and the flag stays false", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { owner, business } = await createApprovedBusiness("Owner Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .patch(`/super-admin/businesses/${business._id}/founding-partner`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send({ isFoundingPartner: true });
+
+    expect(response.status).toBe(403);
+    expect((await businessRepository.findById(business._id))?.isFoundingPartner).toBe(false);
+  });
+
+  it("the Founding Partner route 404s for an unknown business id and 400s on a missing/!boolean body", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Body Salon", superAdmin);
+    const app = buildSuperAdminApp();
+    const auth = await bearerFor(superAdmin._id, "SUPER_ADMIN");
+
+    const notFound = await request(app)
+      .patch(`/super-admin/businesses/${new Types.ObjectId().toString()}/founding-partner`)
+      .set("Authorization", auth)
+      .send({ isFoundingPartner: true });
+    expect(notFound.status).toBe(404);
+
+    const missing = await request(app)
+      .patch(`/super-admin/businesses/${business._id}/founding-partner`)
+      .set("Authorization", auth)
+      .send({});
+    expect(missing.status).toBe(400);
+
+    const wrongType = await request(app)
+      .patch(`/super-admin/businesses/${business._id}/founding-partner`)
+      .set("Authorization", auth)
+      .send({ isFoundingPartner: "yes" });
+    expect(wrongType.status).toBe(400);
+  });
+
+  it("business detail owner object exposes only id/email/status/lastLoginAt — no password hash or security internals", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { business } = await createApprovedBusiness("Safe Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(Object.keys(response.body.data.owner).sort()).toEqual([
+      "email",
+      "id",
+      "lastLoginAt",
+      "status",
+    ]);
+    expect(JSON.stringify(response.body.data)).not.toContain("passwordHash");
+    expect(response.body.data.owner).not.toHaveProperty("security");
+    expect(response.body.data.owner).not.toHaveProperty("passwordHash");
+  });
+
+  it("rejects a BUSINESS_OWNER token on the enriched business detail route (SUPER_ADMIN gate intact)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { owner, business } = await createApprovedBusiness("Gated Salon", superAdmin);
+
+    const app = buildSuperAdminApp();
+    const response = await request(app)
+      .get(`/super-admin/businesses/${business._id}`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
+
+    expect(response.status).toBe(403);
   });
 });
