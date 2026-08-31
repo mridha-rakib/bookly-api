@@ -146,6 +146,10 @@ const meResponseSchema = z.object({
           e164: z.string(),
         })
         .optional(),
+      // CUSTOMER only — a ready-to-render URL for the uploaded avatar (PUT /auth/me/avatar);
+      // absent until the customer uploads one. Only the reference is exposed, never storage
+      // credentials or keys.
+      avatarUrl: z.string().optional(),
     })
     .nullable(),
   business: z

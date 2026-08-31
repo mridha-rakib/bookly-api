@@ -27,6 +27,12 @@
     "sync:indexes": "tsx src/scripts/sync-indexes.ts",
     "worker:no-show": "tsx src/scripts/run-no-show-worker.ts",
     "worker:no-show:once": "tsx src/scripts/run-no-show-worker.ts --once",
+    "worker:email": "tsx src/scripts/run-email-worker.ts",
+    "worker:email:once": "tsx src/scripts/run-email-worker.ts --once",
+    "worker:reminder": "tsx src/scripts/run-appointment-reminder-worker.ts",
+    "worker:reminder:once": "tsx src/scripts/run-appointment-reminder-worker.ts --once",
+    "worker:sms": "tsx src/scripts/run-sms-worker.ts",
+    "worker:sms:once": "tsx src/scripts/run-sms-worker.ts --once",
     "prepare": "node scripts/prepare-husky.mjs"
   },
   "lint-staged": {
@@ -51,9 +57,11 @@
     "mongoose": "^9.8.1",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5",
+    "pdfkit": "^0.20.1",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",
     "resend": "^6.18.1",
+    "sanitize-html": "^2.17.7",
     "stripe": "^22.5.0",
     "twilio": "^6.0.2",
     "zod": "^4.4.3"
@@ -67,6 +75,8 @@
     "@types/multer": "^2.2.0",
     "@types/node": "^26.1.2",
     "@types/nodemailer": "^8.0.1",
+    "@types/pdfkit": "^0.17.6",
+    "@types/sanitize-html": "^2.16.1",
     "@types/supertest": "^7.2.1",
     "@vitest/coverage-v8": "^4.1.10",
     "husky": "^9.1.7",

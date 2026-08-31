@@ -19,6 +19,7 @@ import type {
   CreateManualBookingBody,
   ListBusinessBookingsQuery,
   ListCustomerBookingsQuery,
+  MarkNoShowBody,
   RescheduleBookingBody,
   WaiveFeeBody,
 } from "./booking.schema.js";
@@ -132,12 +133,15 @@ export class BookingController {
   public markNoShow = async (request: Request, response: Response): Promise<void> => {
     const { userId, role } = this.requireBusinessActor(request);
     const params = request.validated?.params as BookingIdParams;
+    const body = (request.validated?.body ?? {}) as MarkNoShowBody;
 
     const booking = await this.lifecycleService.markNoShow(
       userId,
       role,
       params.businessId,
       params.bookingId,
+      body.reason,
+      body.internalNote,
     );
 
     sendSuccess(response, 200, "Booking marked as no-show", toBookingDetailDto(booking));

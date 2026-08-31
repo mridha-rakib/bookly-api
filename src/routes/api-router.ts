@@ -20,6 +20,7 @@ import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createGoogleCalendarCallbackRoute } from "../modules/integration/integration.route.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
+import { createPlatformConfigRoute } from "../modules/platform-settings/platform-settings.route.js";
 import {
   createBusinessReviewRoute,
   createCustomerReviewRoute,
@@ -111,6 +112,9 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // createPublicBusinessReviewRoute's own comment on why this codebase has no true anonymous-
   // public route). Distinct path suffixes (`/reviews`, `/reviews/summary`), no collision.
   router.use("/catalog", createPublicBusinessReviewRoute());
+  // Anonymous read of the server-authoritative booking limit (maxServicesPerBooking) so the
+  // customer / business booking UIs can mirror it. Distinct `/platform` prefix, no collision.
+  router.use("/platform", createPlatformConfigRoute());
 
   return router;
 };

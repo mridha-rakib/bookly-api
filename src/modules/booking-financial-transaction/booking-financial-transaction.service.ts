@@ -260,10 +260,15 @@ export class BookingFinancialTransactionService {
    * dump. */
   public async aggregateAllTimeOwnedBySource(input: {
     types: BookingFinancialTransactionType[];
+    /** Split the result per Business (Super Admin Business Analytics "Top by revenue") instead
+     * of collapsing to one platform-wide total per (type, source). Read-only pass-through — no
+     * effect on the aggregation itself. */
+    groupByBusiness?: boolean;
   }): Promise<OwnershipAggregateBucket[]> {
     return this.transactionRepository.aggregateBusinessOwnedBySource({
       types: input.types,
       unclaimedOnly: false,
+      ...(input.groupByBusiness === undefined ? {} : { groupByBusiness: input.groupByBusiness }),
     });
   }
 

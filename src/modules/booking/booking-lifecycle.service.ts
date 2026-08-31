@@ -1,11 +1,16 @@
 import mongoose, { Types } from "mongoose";
 
+import { logger } from "../../config/logger.js";
+import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
+import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { IntegrationService } from "../integration/integration.service.js";
+import type { BookingRescheduledCustomerNotificationPort } from "../notification/booking-rescheduled-customer.notifier.js";
+import type { StaffBookingNotificationPort } from "../notification/staff-booking.notifier.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
@@ -27,6 +32,41 @@ import {
   NO_SHOW_RESOLUTION_WINDOW_MINUTES,
 } from "./booking.types.js";
 import { buildCancellationOutcome } from "./booking-cancellation-classification.js";
+
+/**
+ * Stage C mailing observer. Optional + trailing so every existing construction site is
+ * unchanged; invoked only from completeBooking's post-commit tail and must never throw (the
+ * implementation swallows its own errors, exactly like the Google Calendar side effects).
+ */
+export type BookingCompletedNotificationPort = {
+  notifyBookingCompleted(booking: BookingDocument, business: BusinessDocument): Promise<void>;
+};
+
+/** Stage D mailing observer ports (optional + trailing, never throw). */
+export type BookingCancelledNotificationPort = {
+  notifyBookingCancelled(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+  ): Promise<void>;
+};
+export type NoShowNotificationPort = {
+  notifyNoShowWaived(booking: BookingDocument, context: { businessName: string }): Promise<void>;
+  notifyNoShowCancelled(booking: BookingDocument, context: { businessName: string }): Promise<void>;
+};
+
+/**
+ * Business-owner "Complete Booking" venue-payment settlement. Explicit 3-state discriminator
+ * (never inferred from an ambiguous `paid` + `amountCents` pair):
+ *  - FULL     — the whole remaining `balanceDueCents` was received off-platform.
+ *  - PARTIAL  — `amountCents` was received; must be a whole number strictly in (0, balanceDue).
+ *  - NOT_PAID — nothing received yet.
+ * Bookkeeping only — never triggers a saved-card charge.
+ */
+export type CompleteVenuePaymentInput =
+  | { settlement: "FULL"; note?: string | undefined }
+  | { settlement: "PARTIAL"; amountCents: number; note?: string | undefined }
+  | { settlement: "NOT_PAID"; note?: string | undefined };
 
 /**
  * Batch 3's canonical, non-bypassable status-transition surface — every mutation here (a) CAS's
@@ -54,8 +94,49 @@ export class BookingLifecycleService {
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
     // Optional — see BookingCreationService's identical trailing-optional-dep pattern/comment.
-    private readonly integrationService?: Pick<IntegrationService, "deleteEventForBooking">,
+    // `deleteEventForBooking` (cancellation) + `updateEventScheduleForBooking` (reschedule).
+    private readonly integrationService?: Pick<
+      IntegrationService,
+      "deleteEventForBooking" | "updateEventScheduleForBooking"
+    >,
+    // Optional trailing dep (same rationale). Stage C mailing: enqueues the customer
+    // BOOKING_COMPLETED notification from completeBooking's post-commit tail. Absent in the
+    // integration suites that construct this service directly — a safe no-op there.
+    private readonly bookingCompletedNotifier?: BookingCompletedNotificationPort,
+    // Stage D mailing observers — same optional-trailing pattern. Cancellation notifications
+    // (customer + owner) and no-show waived/cancelled notifications (customer). Absent in the
+    // integration suites that construct this service directly.
+    private readonly bookingCancelledNotifier?: BookingCancelledNotificationPort,
+    private readonly noShowNotifier?: Pick<
+      NoShowNotificationPort,
+      "notifyNoShowWaived" | "notifyNoShowCancelled"
+    >,
+    // Important-staff-notification observer (optional + trailing, never throws). Emails the
+    // staff actually assigned to a booking when it is cancelled or its appointment time moves.
+    private readonly staffBookingNotifier?: StaffBookingNotificationPort,
+    // Appointment reminders (optional + trailing, never throws). Retires the pending 24h
+    // reminder on any transition out of UPCOMING, and re-schedules it on a reschedule. Absent
+    // in the integration suites that construct this service directly.
+    private readonly appointmentReminderScheduler?: AppointmentReminderSchedulingPort,
+    // MANDATORY customer reschedule confirmation (optional + trailing, never throws). Enqueues
+    // the BOOKING_RESCHEDULED_CUSTOMER email from performReschedule's post-commit tail — for a
+    // customer reschedule AND an Owner/Supervisor reschedule alike. Deliberately independent of
+    // any reminder-preference gate. Absent in the integration suites that construct this service
+    // directly — a safe no-op there.
+    private readonly bookingRescheduledCustomerNotifier?: BookingRescheduledCustomerNotificationPort,
   ) {}
+
+  /** Post-commit tail — retire the 24h reminder for a booking leaving UPCOMING. Best-effort,
+   * never throws (the scheduler swallows its own errors). No-op when no scheduler was injected. */
+  private async retireAppointmentReminder(
+    booking: BookingDocument,
+    reasonCategory: string,
+  ): Promise<void> {
+    if (!this.appointmentReminderScheduler) {
+      return;
+    }
+    await this.appointmentReminderScheduler.onBookingRetired(booking, reasonCategory);
+  }
 
   /**
    * Best-effort Google Calendar cleanup for CANCELLED_BY_CUSTOMER / CANCELLED_BY_BUSINESS /
@@ -97,7 +178,7 @@ export class BookingLifecycleService {
     actorRole: UserRole,
     businessId: string,
     bookingId: string,
-    venuePayment?: { paid: boolean; amountCents?: number | undefined; note?: string | undefined },
+    venuePayment?: CompleteVenuePaymentInput,
   ): Promise<BookingDocument> {
     const business = await this.bookingService.requireBookingManagementAccess(
       actorUserId,
@@ -117,18 +198,38 @@ export class BookingLifecycleService {
       createdAt: now,
     };
 
-    // The actual venue-collected amount, once known: defaults to the snapshotted balance due
-    // (booking.financials.balanceDueCents) when the Business doesn't override it — an explicit
-    // 0/absent amount with paid:false records nothing (there is nothing to reconcile). Computed
-    // once and reused for BOTH the Booking's own completionPayment record and the ledger entry,
-    // so the two can never disagree.
-    const venueAmountCents = venuePayment?.paid
-      ? (venuePayment.amountCents ?? booking.financials.balanceDueCents)
-      : 0;
+    // The remaining venue balance the customer owes off-platform. FULL = it was all received;
+    // PARTIAL = a validated amount strictly between 0 and the balance; NOT_PAID = nothing yet.
+    // This is bookkeeping only — NO saved-card charge ever happens here (see
+    // BookingCompletionPayment's own doc comment). `venueAmountCents` is computed once and
+    // reused for BOTH the Booking's own completionPayment record and the ledger entry, so the
+    // two can never disagree.
+    const balanceDueCents = booking.financials.balanceDueCents;
+    let venuePaid = false;
+    let venueAmountCents = 0;
+    if (venuePayment) {
+      if (venuePayment.settlement === "FULL") {
+        venuePaid = true;
+        venueAmountCents = balanceDueCents;
+      } else if (venuePayment.settlement === "NOT_PAID") {
+        venuePaid = false;
+        venueAmountCents = 0;
+      } else {
+        // PARTIAL — must be a whole number strictly inside (0, balanceDueCents). When the
+        // deposit already covered everything (balanceDueCents === 0) a PARTIAL is impossible
+        // and is rejected here.
+        const amount = venuePayment.amountCents;
+        if (!Number.isInteger(amount) || amount <= 0 || amount >= balanceDueCents) {
+          throw new BookingError("BOOKING_INVALID_VENUE_PAYMENT_AMOUNT", 400);
+        }
+        venuePaid = true;
+        venueAmountCents = amount;
+      }
+    }
 
     const completionPayment = venuePayment
       ? {
-          paid: venuePayment.paid,
+          paid: venuePaid,
           ...(venueAmountCents > 0 ? { amountCents: venueAmountCents } : {}),
           ...(venuePayment.note ? { note: venuePayment.note } : {}),
           recordedAt: now,
@@ -197,7 +298,24 @@ export class BookingLifecycleService {
     if (!updated) {
       throw new Error("Booking completion failed without throwing");
     }
+
+    // Stage C mailing — enqueue the customer's BOOKING_COMPLETED email strictly AFTER the
+    // completion transaction has committed. Best-effort, never throws: a notification / PDF /
+    // provider problem can never undo the completed booking.
+    await this.dispatchBookingCompletedNotification(updated, business);
+    await this.retireAppointmentReminder(updated, "BOOKING_COMPLETED");
+
     return updated;
+  }
+
+  private async dispatchBookingCompletedNotification(
+    completed: BookingDocument,
+    business: BusinessDocument,
+  ): Promise<void> {
+    if (!this.bookingCompletedNotifier) {
+      return;
+    }
+    await this.bookingCompletedNotifier.notifyBookingCompleted(completed, business);
   }
 
   // --- Cancellation --------------------------------------------------------------------------
@@ -256,12 +374,18 @@ export class BookingLifecycleService {
     });
 
     await this.syncBookingCancelledToGoogleCalendar(cancelled);
+    await this.retireAppointmentReminder(cancelled, `BOOKING_${cancelled.status}`);
 
     if (outcome.settlementStatus !== "PENDING" || outcome.additionalChargeCents <= 0) {
+      await this.dispatchCancellationNotifications(cancelled, "CUSTOMER");
+      await this.dispatchStaffCancellationNotification(cancelled, "CUSTOMER");
       return cancelled;
     }
 
-    return this.executeCancellationFeeCharge(cancelled);
+    const charged = await this.executeCancellationFeeCharge(cancelled);
+    await this.dispatchCancellationNotifications(charged, "CUSTOMER");
+    await this.dispatchStaffCancellationNotification(charged, "CUSTOMER");
+    return charged;
   }
 
   /**
@@ -327,12 +451,173 @@ export class BookingLifecycleService {
     });
 
     await this.syncBookingCancelledToGoogleCalendar(cancelled);
+    await this.retireAppointmentReminder(cancelled, "BOOKING_CANCELLED_BY_BUSINESS");
 
     if (!upfrontPayment || refundOwedCents <= 0) {
+      await this.dispatchCancellationNotifications(cancelled, "BUSINESS", business);
+      await this.dispatchStaffCancellationNotification(cancelled, "BUSINESS", business);
       return cancelled;
     }
 
-    return this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
+    const refunded = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
+    await this.dispatchCancellationNotifications(refunded, "BUSINESS", business);
+    await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
+    return refunded;
+  }
+
+  /**
+   * Stage D — enqueue the customer + Business Owner cancellation emails AFTER the cancellation
+   * and its refund/fee leg have reached their authoritative settled state. Best-effort: never
+   * throws. `cancelByBusiness` already holds the Business document; `cancelByCustomer` does not,
+   * so it is fetched once here.
+   */
+  private async dispatchCancellationNotifications(
+    booking: BookingDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    business?: BusinessDocument,
+  ): Promise<void> {
+    if (!this.bookingCancelledNotifier) {
+      return;
+    }
+    const resolvedBusiness =
+      business ?? (await this.businessRepository.findById(booking.businessId));
+    if (!resolvedBusiness) {
+      return;
+    }
+    await this.bookingCancelledNotifier.notifyBookingCancelled(
+      booking,
+      resolvedBusiness,
+      cancelledBy,
+    );
+  }
+
+  /**
+   * Important-staff-notification tail for a cancellation — emails ONLY the staff assigned to the
+   * booking's service lines. Runs after the customer/owner notifications, best-effort, and can
+   * never throw (the notifier swallows its own errors; this wrapper guards the business fetch).
+   */
+  private async dispatchStaffCancellationNotification(
+    booking: BookingDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    business?: BusinessDocument,
+  ): Promise<void> {
+    if (!this.staffBookingNotifier) {
+      return;
+    }
+    try {
+      const resolvedBusiness =
+        business ?? (await this.businessRepository.findById(booking.businessId));
+      if (!resolvedBusiness) {
+        return;
+      }
+      await this.staffBookingNotifier.notifyBookingCancelledToStaff(
+        booking,
+        resolvedBusiness.name,
+        cancelledBy,
+      );
+    } catch (error) {
+      logger.error(
+        { err: error, bookingId: String(booking._id) },
+        "Failed to dispatch staff cancellation notification (the cancellation is unaffected)",
+      );
+    }
+  }
+
+  /**
+   * Best-effort, post-commit Google Calendar sync for a reschedule (product scope: one-way
+   * Bookly -> Google). Runs strictly AFTER the reschedule transaction committed and never throws
+   * — a Google API failure must not roll back a valid reschedule (ground rule; mirrors
+   * syncBookingCancelledToGoogleCalendar). The SAME event is PATCHed (start/end only); its
+   * identity (calendarId + googleCalendarEventId) is never changed here.
+   *
+   * The live re-read immediately before the provider call is REQUIRED, not a query to optimise
+   * away:
+   *  - rapid A(10->11) then B(11->12): whichever sync sends last re-reads 12:00 and PATCHes
+   *    12:00, so the external event converges to the newest committed time (never regresses);
+   *  - cancel-after-reschedule: the re-read sees status != UPCOMING and skips the PATCH, so a
+   *    delayed reschedule sync can never move a just-cancelled event.
+   */
+  private async syncBookingRescheduledToGoogleCalendar(booking: BookingDocument): Promise<void> {
+    if (!booking.googleCalendarEventId || !this.integrationService) {
+      return;
+    }
+
+    try {
+      const latest = await this.bookingRepository.findById(booking.businessId, booking._id);
+      if (latest?.status !== "UPCOMING" || !latest.googleCalendarEventId) {
+        return;
+      }
+
+      await this.integrationService.updateEventScheduleForBooking(
+        latest.businessId,
+        latest.googleCalendarEventId,
+        {
+          startAt: latest.schedule.startAt,
+          endAt: latest.schedule.endAt,
+          timezone: latest.schedule.timezone,
+        },
+      );
+    } catch (error) {
+      logger.error(
+        {
+          err: error,
+          bookingId: String(booking._id),
+          businessId: String(booking.businessId),
+          integration: "google_calendar",
+          operation: "reschedule",
+        },
+        "Failed to sync rescheduled booking to Google Calendar (the reschedule is unaffected)",
+      );
+    }
+  }
+
+  /**
+   * Important-staff-notification tail for a reschedule — emails ONLY the assigned staff that the
+   * appointment date/time moved. Best-effort, never throws.
+   */
+  private async dispatchStaffRescheduleNotification(booking: BookingDocument): Promise<void> {
+    if (!this.staffBookingNotifier) {
+      return;
+    }
+    try {
+      const business = await this.businessRepository.findById(booking.businessId);
+      if (!business) {
+        return;
+      }
+      await this.staffBookingNotifier.notifyBookingRescheduledToStaff(booking, business.name);
+    } catch (error) {
+      logger.error(
+        { err: error, bookingId: String(booking._id) },
+        "Failed to dispatch staff reschedule notification (the reschedule is unaffected)",
+      );
+    }
+  }
+
+  /**
+   * MANDATORY customer transactional email — enqueues the BOOKING_RESCHEDULED_CUSTOMER
+   * confirmation strictly AFTER the reschedule transaction committed. Best-effort, never throws
+   * (the notifier swallows its own errors). Reuses the Business the caller already loaded, so no
+   * extra query is issued. Deliberately NOT gated by any reminder preference — a reminder
+   * opt-out must never suppress a committed booking-reschedule confirmation.
+   */
+  private async dispatchRescheduledCustomerNotification(
+    booking: BookingDocument,
+    business: BusinessDocument,
+  ): Promise<void> {
+    if (!this.bookingRescheduledCustomerNotifier) {
+      return;
+    }
+    try {
+      await this.bookingRescheduledCustomerNotifier.notifyBookingRescheduledToCustomer(
+        booking,
+        business,
+      );
+    } catch (error) {
+      logger.error(
+        { err: error, bookingId: String(booking._id) },
+        "Failed to dispatch customer reschedule notification (the reschedule is unaffected)",
+      );
+    }
   }
 
   /**
@@ -530,6 +815,8 @@ export class BookingLifecycleService {
     actorRole: UserRole,
     businessId: string,
     bookingId: string,
+    reason?: string | undefined,
+    internalNote?: string | undefined,
   ): Promise<BookingDocument> {
     const business = await this.bookingService.requireBookingManagementAccess(
       actorUserId,
@@ -538,6 +825,29 @@ export class BookingLifecycleService {
     );
     const booking = await this.requireBookingForBusiness(business._id, bookingId, ["UPCOMING"]);
     const now = new Date();
+
+    // Category no-show eligibility window (confirmed rule): a business may only START the
+    // no-show flow while `startAt + opensAfter <= now < startAt + closesAfter` — open
+    // boundary INCLUSIVE, close boundary EXCLUSIVE, server time authoritative. Enforced only
+    // for bookings that carry a `noShowEligibilitySnapshot` (captured at creation time);
+    // pre-existing bookings without one keep the legacy status-only behavior (backward
+    // compatibility rule).
+    const eligibility = booking.noShowEligibilitySnapshot;
+    if (eligibility) {
+      const startMs = booking.schedule.startAt.getTime();
+      const opensAtMs = startMs + eligibility.opensAfterMinutes * 60_000;
+      const closesAtMs = startMs + eligibility.closesAfterMinutes * 60_000;
+      const nowMs = now.getTime();
+      if (nowMs < opensAtMs) {
+        throw new BookingError("BOOKING_NO_SHOW_WINDOW_NOT_OPEN", 409);
+      }
+      if (nowMs >= closesAtMs) {
+        throw new BookingError("BOOKING_NO_SHOW_WINDOW_CLOSED", 409);
+      }
+    }
+
+    // The 90-minute resolution timer begins NOW (the confirmation/mark instant), never at
+    // appointment start — see NO_SHOW_RESOLUTION_WINDOW_MINUTES's own doc comment.
     const deadline = new Date(now.getTime() + NO_SHOW_RESOLUTION_WINDOW_MINUTES * 60_000);
 
     const updated = await this.bookingRepository.casUpdate(
@@ -552,6 +862,11 @@ export class BookingLifecycleService {
           nextStatus: "PENDING",
           actorUserId: new Types.ObjectId(actorUserId),
           actorRole: actorRole as BookingActorRole,
+          // Mark-no-show reason taxonomy is SEPARATE from the waive-fee reason taxonomy and is
+          // internal-only (never serialized in any customer-facing DTO — booking.dto.ts does
+          // not include eventHistory). Optional per the current design.
+          ...(reason ? { reason } : {}),
+          ...(internalNote ? { note: internalNote } : {}),
           createdAt: now,
         },
       },
@@ -560,6 +875,10 @@ export class BookingLifecycleService {
     if (!updated) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
+
+    // A no-show means the appointment start has already passed — the worker's own eligibility
+    // check would skip the reminder anyway; retiring it explicitly just keeps the collection tidy.
+    await this.retireAppointmentReminder(updated, "BOOKING_NO_SHOW");
     return updated;
   }
 
@@ -644,10 +963,28 @@ export class BookingLifecycleService {
       if (!updated) {
         throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
       }
+      await this.dispatchNoShowWaivedNotification(updated, business.name);
       return updated;
     }
 
-    return this.claimAndApplyWaiver(business._id, booking, plan, event, reason);
+    const result = await this.claimAndApplyWaiver(business._id, booking, plan, event, reason);
+    await this.dispatchNoShowWaivedNotification(result, business.name);
+    return result;
+  }
+
+  /**
+   * Stage D — the customer NO_SHOW_WAIVED email. Only fires when the waiver actually resolved
+   * a NO-SHOW (status now NO_SHOW_WAIVED); a LATE_CANCELLATION fee waiver keeps its own status
+   * and is out of Stage D scope. Best-effort.
+   */
+  private async dispatchNoShowWaivedNotification(
+    booking: BookingDocument,
+    businessName: string,
+  ): Promise<void> {
+    if (!this.noShowNotifier || booking.status !== "NO_SHOW_WAIVED") {
+      return;
+    }
+    await this.noShowNotifier.notifyNoShowWaived(booking, { businessName });
   }
 
   private async planFeeWaiver(booking: BookingDocument): Promise<{
@@ -902,6 +1239,16 @@ export class BookingLifecycleService {
     if (!updated) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
+
+    // Stage D — customer notification for the terminal no-show outcome. Best-effort.
+    if (this.noShowNotifier) {
+      if (nextStatus === "NO_SHOW_CANCELLED") {
+        await this.noShowNotifier.notifyNoShowCancelled(updated, { businessName: business.name });
+      } else if (nextStatus === "NO_SHOW_WAIVED") {
+        await this.noShowNotifier.notifyNoShowWaived(updated, { businessName: business.name });
+      }
+    }
+
     return updated;
   }
 
@@ -1147,6 +1494,28 @@ export class BookingLifecycleService {
     if (!updated) {
       throw new Error("Booking transition failed without throwing");
     }
+
+    // Google Calendar sync — first best-effort post-commit side effect, matching the
+    // create/cancel integration-first convention. Never throws; a Google failure can't roll
+    // back the reschedule. Live-re-reads the booking so rapid reschedules converge to the
+    // newest committed time and a raced cancellation is respected.
+    await this.syncBookingRescheduledToGoogleCalendar(updated);
+
+    // Important-staff notification — strictly AFTER the reschedule transaction committed.
+    await this.dispatchStaffRescheduleNotification(updated);
+
+    // Retire the reminder for the OLD schedule version and schedule one for the new
+    // `schedule.startAt` (or record it skipped if the new time is inside the 24h window).
+    // Best-effort, never throws — a reminder problem can never roll back the reschedule.
+    if (this.appointmentReminderScheduler) {
+      await this.appointmentReminderScheduler.onBookingRescheduled(updated);
+    }
+
+    // MANDATORY customer transactional email — the reschedule confirmation. Strictly after
+    // commit, best-effort, reuses the already-loaded Business (no extra query), and is
+    // deliberately NOT gated by any reminder preference.
+    await this.dispatchRescheduledCustomerNotification(updated, params.business);
+
     return updated;
   }
 

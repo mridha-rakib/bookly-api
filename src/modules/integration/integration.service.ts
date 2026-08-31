@@ -10,6 +10,8 @@ import {
   deleteGoogleCalendarEvent,
   exchangeGoogleAuthCode,
   type GoogleCalendarEventInput,
+  type GoogleCalendarEventScheduleInput,
+  patchGoogleCalendarEventSchedule,
   refreshGoogleAccessToken,
 } from "./integration.google-client.js";
 import type { GoogleCalendarIntegrationDocument } from "./integration.model.js";
@@ -121,6 +123,44 @@ export class IntegrationService {
       await this.recordSyncFailure(businessId, error);
 
       return undefined;
+    }
+  }
+
+  /**
+   * Moves a previously-synced event to the booking's new start/end (reschedule). Never throws —
+   * a Google API failure must not roll back a valid reschedule (same contract as
+   * createEventForBooking / deleteEventForBooking). No-ops when the business has no connection.
+   * A 404/410 (event manually deleted) is treated as a soft outcome: logged, NOT recorded as an
+   * integration error, and the event is never recreated here.
+   */
+  public async updateEventScheduleForBooking(
+    businessId: Types.ObjectId | string,
+    eventId: string,
+    schedule: GoogleCalendarEventScheduleInput,
+  ): Promise<void> {
+    const integration = await this.integrationRepository.findByBusinessId(businessId);
+
+    if (!integration) {
+      return;
+    }
+
+    try {
+      const accessToken = await this.getValidAccessToken(integration);
+      const outcome = await patchGoogleCalendarEventSchedule(
+        accessToken,
+        integration.calendarId,
+        eventId,
+        schedule,
+      );
+
+      if (outcome === "EVENT_NOT_FOUND") {
+        logger.warn(
+          { businessId: String(businessId) },
+          "Google Calendar event no longer exists — skipping reschedule sync (not recreating it)",
+        );
+      }
+    } catch (error) {
+      await this.recordSyncFailure(businessId, error);
     }
   }
 

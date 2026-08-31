@@ -22,6 +22,21 @@ export type GoogleCalendarEventInput = {
   timezone: string;
 };
 
+/** Just the schedule fields a reschedule PATCH changes — never the event's content. */
+export type GoogleCalendarEventScheduleInput = {
+  startAt: Date;
+  endAt: Date;
+  timezone: string;
+};
+
+/**
+ * "UPDATED" — the existing event was patched. "EVENT_NOT_FOUND" — Google returned 404/410, i.e.
+ * the Owner (or another tool) deleted the event out from under us: a soft external-state
+ * condition, NOT a broken integration, so the caller neither recreates it nor marks the whole
+ * connection errored.
+ */
+export type GoogleCalendarPatchOutcome = "UPDATED" | "EVENT_NOT_FOUND";
+
 function requireGoogleOAuthConfig(): {
   clientId: string;
   clientSecret: string;
@@ -167,6 +182,46 @@ export async function createGoogleCalendarEvent(
   const body = (await response.json()) as { id: string };
 
   return body.id;
+}
+
+/**
+ * Moves an already-synced event to a new start/end. Uses HTTP PATCH (a partial update), NOT a
+ * full-resource PUT: the Owner may have added Google Meet / conferenceData, attendees, custom
+ * reminders or extendedProperties after Bookly created the event, and a full update would wipe
+ * every field not resent. This PATCH therefore carries ONLY `start` and `end` — never summary,
+ * description, location, attendees, conferenceData, reminders, extendedProperties, or any
+ * booking/customer data (a reschedule changes none of those). Single attempt, no retry/backoff
+ * (see callCalendarApi's own contract).
+ */
+export async function patchGoogleCalendarEventSchedule(
+  accessToken: string,
+  calendarId: string,
+  eventId: string,
+  schedule: GoogleCalendarEventScheduleInput,
+): Promise<GoogleCalendarPatchOutcome> {
+  const response = await callCalendarApi(
+    accessToken,
+    `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        start: { dateTime: schedule.startAt.toISOString(), timeZone: schedule.timezone },
+        end: { dateTime: schedule.endAt.toISOString(), timeZone: schedule.timezone },
+      }),
+    },
+  );
+
+  // 404/410 = the event is gone (manually deleted by the Owner, or the id is stale). Soft
+  // condition: the caller must not recreate it and must not mark the integration broken.
+  if (response.status === 404 || response.status === 410) {
+    return "EVENT_NOT_FOUND";
+  }
+
+  if (!response.ok) {
+    throw new IntegrationError("GOOGLE_CALENDAR_OAUTH_FAILED", 502);
+  }
+
+  return "UPDATED";
 }
 
 export async function deleteGoogleCalendarEvent(

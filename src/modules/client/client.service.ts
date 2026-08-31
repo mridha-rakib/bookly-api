@@ -17,6 +17,21 @@ import type { CreateClientBody, UpdateClientBody } from "./client.schema.js";
 import type { ClientLinkState, ClientTag } from "./client.types.js";
 import type { ClientIdentityService } from "./client-identity.service.js";
 
+/**
+ * Optional observer for Trigger 1 (Stage B mailing). Enqueues the "you've been added as a
+ * client" email after a client is persisted. Optional + trailing so every existing construction
+ * site (route + tests) is unchanged, and it NEVER affects the client-creation result — the
+ * implementation swallows its own errors.
+ */
+export type ClientCreatedNotificationPort = {
+  notifyClientCreated(input: {
+    clientId: string;
+    clientFirstName: string;
+    clientEmail: string;
+    businessName: string;
+  }): Promise<void>;
+};
+
 export type BusinessClientDto = {
   id: string;
   businessId: string;
@@ -71,6 +86,7 @@ export class ClientService {
     private readonly staffRepository: StaffRepository,
     private readonly userRepository: UserRepository,
     private readonly clientIdentityService: ClientIdentityService,
+    private readonly clientCreatedNotifier?: ClientCreatedNotificationPort,
   ) {}
 
   public async listClients(
@@ -148,6 +164,17 @@ export class ClientService {
 
     try {
       const created = await this.clientRepository.create(input);
+
+      // Trigger 1 (Stage B) — enqueue the client-created email AFTER the client row is
+      // persisted. Never awaited into the failure surface: the notifier swallows its own
+      // errors, so this cannot turn a successful client creation into a failure.
+      await this.clientCreatedNotifier?.notifyClientCreated({
+        clientId: String(created._id),
+        clientFirstName: created.firstName,
+        clientEmail: created.normalizedEmail,
+        businessName: business.name,
+      });
+
       const [dto] = await this.toClientDtos([created]);
       return dto as BusinessClientDto;
     } catch (error) {

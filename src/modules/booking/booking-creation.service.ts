@@ -1,4 +1,5 @@
 import mongoose, { Types } from "mongoose";
+import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
@@ -17,6 +18,8 @@ import type { IntegrationService } from "../integration/integration.service.js";
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
+import type { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import type { PromoApplicationService, ResolvedPromo } from "../promo/promo-application.service.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
@@ -30,6 +33,7 @@ import type {
   BookingDocument,
   BookingFinancials,
   BookingFulfilment,
+  BookingNoShowEligibilitySnapshot,
   BookingServiceLine,
   BookingServiceLineAddon,
 } from "./booking.model.js";
@@ -39,6 +43,15 @@ import type { BookingActorRole, BookingSource } from "./booking.types.js";
 import { generateBookingReference } from "./booking.utils.js";
 import type { CreateBookingInput, CreateManualBookingInput } from "./booking-creation.types.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
+
+/**
+ * Stage B mailing observer for Triggers 2/3/4. Optional + trailing so every existing
+ * construction site is unchanged; invoked only from the post-commit tail and must never throw
+ * (the implementation swallows its own errors, exactly like syncBookingCreatedToGoogleCalendar).
+ */
+export type BookingCreatedNotificationPort = {
+  notifyBookingCreated(booking: BookingDocument, business: BusinessDocument): Promise<void>;
+};
 
 const REFERENCE_GENERATION_MAX_ATTEMPTS = 5;
 const IDEMPOTENCY_CLAIM_POLL_ATTEMPTS = 6;
@@ -161,7 +174,67 @@ export class BookingCreationService {
     // integration test suites that construct this service directly, without Google Calendar in
     // scope, don't all need updating just to pass a mock — see syncBookingCreatedToGoogleCalendar.
     private readonly integrationService?: Pick<IntegrationService, "createEventForBooking">,
+    // Optional trailing dep (same rationale). When absent, max-services falls back to the
+    // structural Zod ceiling only and no noShowEligibilitySnapshot is written (legacy
+    // behavior) — a safe no-op for the pre-existing test suites.
+    private readonly platformSettingsService?: Pick<
+      PlatformSettingsService,
+      "getMaxServicesPerBooking" | "resolveNoShowWindow"
+    >,
+    // Optional trailing dep (same rationale as integrationService above). Stage B mailing:
+    // enqueues booking-creation notifications from the post-commit tail. Absent in the many
+    // integration suites that construct this service directly — a safe no-op there.
+    private readonly bookingCreatedNotifier?: BookingCreatedNotificationPort,
+    // Optional trailing dep (same rationale). Appointment reminders: schedules the 24h reminder
+    // row from the post-commit tail. Best-effort, never throws — a reminder problem can never
+    // roll back a committed booking. Absent in suites that construct this service directly.
+    private readonly appointmentReminderScheduler?: AppointmentReminderSchedulingPort,
   ) {}
+
+  /**
+   * Product-limit enforcement for how many service lines one booking may contain — the
+   * server-authoritative check (the structural Zod `serviceLines.max(...)` is only an abuse
+   * ceiling). Applied on EVERY creation path (manual, customer preview, customer finalize).
+   * No-ops when platform settings are unavailable (legacy/test construction).
+   */
+  private async enforceMaxServicesPerBooking(lineCount: number): Promise<void> {
+    if (!this.platformSettingsService) {
+      return;
+    }
+    const max = await this.platformSettingsService.getMaxServicesPerBooking();
+    if (lineCount > max) {
+      throw new BookingError("BOOKING_TOO_MANY_SERVICE_LINES", 400, [
+        {
+          message: `A booking may include at most ${max} service${max === 1 ? "" : "s"}`,
+          code: "BOOKING_TOO_MANY_SERVICE_LINES",
+        },
+      ]);
+    }
+  }
+
+  /**
+   * Booking-time snapshot of the no-show eligibility window (see
+   * BookingNoShowEligibilitySnapshot). Returns undefined — preserving legacy status-only
+   * markNoShow behavior — when platform settings are unavailable or the Business category
+   * cannot be safely resolved to a canonical key.
+   */
+  private async resolveNoShowEligibilitySnapshot(
+    business: BusinessDocument,
+  ): Promise<BookingNoShowEligibilitySnapshot | undefined> {
+    if (!this.platformSettingsService) {
+      return undefined;
+    }
+    const categoryKey = business.categoryKey ?? resolveBusinessCategoryKey(business.category);
+    if (!categoryKey) {
+      return undefined;
+    }
+    const window = await this.platformSettingsService.resolveNoShowWindow(categoryKey);
+    return {
+      categoryKey,
+      opensAfterMinutes: window.opensAfterMinutes,
+      closesAfterMinutes: window.closesAfterMinutes,
+    };
+  }
 
   // --- Manual (real, persisted) --------------------------------------------------------------
 
@@ -172,6 +245,7 @@ export class BookingCreationService {
     input: CreateManualBookingInput,
   ): Promise<BookingDocument> {
     this.requireIdempotencyKey(input.idempotencyKey);
+    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
 
     const business = await this.bookingService.requireBookingManagementAccess(
       actorUserId,
@@ -200,6 +274,7 @@ export class BookingCreationService {
     });
 
     const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
+    const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
     const customer = this.buildCustomerSnapshot(client);
     const createdBy: BookingActor = {
       actorUserId: new Types.ObjectId(actorUserId),
@@ -215,6 +290,7 @@ export class BookingCreationService {
       lines,
       financials,
       cancellationPolicySnapshot,
+      noShowEligibilitySnapshot,
       startAt,
       notes: input.notes,
       idempotencyKey: input.idempotencyKey,
@@ -238,6 +314,7 @@ export class BookingCreationService {
     input: CreateBookingInput,
   ): Promise<BookingCreationPreview> {
     const business = await this.requireBusiness(businessId);
+    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
 
     const startAt = this.parseStartAt(input.startAt);
     const lines = await this.resolveServiceLines(business, startAt, input);
@@ -372,6 +449,7 @@ export class BookingCreationService {
     input: CreateBookingInput,
   ): Promise<FinalizeBookingResult> {
     this.requireIdempotencyKey(input.idempotencyKey);
+    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
     const business = await this.requireBusiness(businessId);
 
     const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
@@ -426,6 +504,7 @@ export class BookingCreationService {
       : financials.depositCents;
 
     const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
+    const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
     const customer = this.buildCustomerSnapshot(client);
     const createdBy: BookingActor = {
       actorUserId: new Types.ObjectId(customerUserId),
@@ -504,6 +583,7 @@ export class BookingCreationService {
         lines,
         financials,
         cancellationPolicySnapshot,
+        noShowEligibilitySnapshot,
         startAt,
         notes: input.notes,
         idempotencyKey: input.idempotencyKey,
@@ -656,6 +736,7 @@ export class BookingCreationService {
     lines: ResolvedServiceLine[];
     financials: BookingFinancials;
     cancellationPolicySnapshot: BookingCancellationPolicySnapshot | undefined;
+    noShowEligibilitySnapshot: BookingNoShowEligibilitySnapshot | undefined;
     startAt: Date;
     notes: string | undefined;
     idempotencyKey: string;
@@ -798,6 +879,9 @@ export class BookingCreationService {
             ...(params.cancellationPolicySnapshot
               ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
               : {}),
+            ...(params.noShowEligibilitySnapshot
+              ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
+              : {}),
             ...(params.notes ? { notes: params.notes } : {}),
             ...(params.resolvedPromo
               ? {
@@ -900,6 +984,8 @@ export class BookingCreationService {
     }
 
     await this.syncBookingCreatedToGoogleCalendar(created);
+    await this.dispatchBookingCreatedNotifications(created, params.business);
+    await this.dispatchAppointmentReminderScheduling(created);
 
     return created;
   }
@@ -1315,6 +1401,7 @@ export class BookingCreationService {
     lines: ResolvedServiceLine[];
     financials: BookingFinancials;
     cancellationPolicySnapshot: BookingCancellationPolicySnapshot | undefined;
+    noShowEligibilitySnapshot: BookingNoShowEligibilitySnapshot | undefined;
     startAt: Date;
     notes: string | undefined;
     idempotencyKey: string;
@@ -1406,6 +1493,9 @@ export class BookingCreationService {
             ...(params.cancellationPolicySnapshot
               ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
               : {}),
+            ...(params.noShowEligibilitySnapshot
+              ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
+              : {}),
             ...(params.notes ? { notes: params.notes } : {}),
           },
           dbSession,
@@ -1427,6 +1517,8 @@ export class BookingCreationService {
     }
 
     await this.syncBookingCreatedToGoogleCalendar(created);
+    await this.dispatchBookingCreatedNotifications(created, params.business);
+    await this.dispatchAppointmentReminderScheduling(created);
 
     return created;
   }
@@ -1502,6 +1594,35 @@ export class BookingCreationService {
     await this.bookingRepository.casUpdate(created.businessId, created._id, ["UPCOMING"], {
       set: { googleCalendarEventId: eventId },
     });
+  }
+
+  /**
+   * Stage B mailing (Triggers 2/3/4): enqueue booking-creation notifications strictly AFTER the
+   * booking transaction has committed. Same discipline as syncBookingCreatedToGoogleCalendar —
+   * best-effort, never throws (the notifier swallows its own errors), so a notification problem
+   * can never roll back a real booking. No-op when no notifier was injected.
+   */
+  private async dispatchBookingCreatedNotifications(
+    created: BookingDocument,
+    business: BusinessDocument,
+  ): Promise<void> {
+    if (!this.bookingCreatedNotifier) {
+      return;
+    }
+    await this.bookingCreatedNotifier.notifyBookingCreated(created, business);
+  }
+
+  /**
+   * Post-commit tail — schedule the 24h appointment reminder. Same best-effort discipline as the
+   * mailing / Google Calendar side effects: the scheduler itself never throws (it swallows and
+   * logs its own errors), so a reminder problem can never roll back a committed booking. No-op
+   * when no scheduler was injected.
+   */
+  private async dispatchAppointmentReminderScheduling(created: BookingDocument): Promise<void> {
+    if (!this.appointmentReminderScheduler) {
+      return;
+    }
+    await this.appointmentReminderScheduler.onBookingCreated(created);
   }
 
   private async generateUniqueReference(): Promise<string> {

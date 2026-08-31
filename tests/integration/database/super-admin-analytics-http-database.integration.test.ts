@@ -710,4 +710,86 @@ describe("HTTP-level Super Admin Analytics (Batch 12)", () => {
 
     expect(response.status).toBe(400);
   });
+
+  // --- Regression: an all-time / >92-day period must NOT 400 -------------------------------------
+  // Root cause the Analytics screen was stuck on "Loading…": with no dates the period resolver
+  // produced a >92-day window, which BookingFinancialTransactionService.aggregateOwnedBySource
+  // rejected with BOOKING_FINANCIAL_TRANSACTION_RANGE_TOO_WIDE (400). Bookings/Businesses now use
+  // the unbounded all-time primitive (no dates) or <=90-day chunking (explicit wide range).
+
+  it("GET /analytics/bookings with NO date params returns 200 all-time (never RANGE_TOO_WIDE)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildApp();
+
+    const response = await request(app)
+      .get("/super-admin/analytics/bookings")
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(typeof response.body.data.totalCount).toBe("number");
+    expect(typeof response.body.data.platformRevenueCents).toBe("number");
+    // All-time trend series is windowed, never dozens of empty months.
+    expect(response.body.data.monthlySeries.length).toBeLessThanOrEqual(12);
+  });
+
+  it("GET /analytics/businesses with NO date params returns 200 all-time (never RANGE_TOO_WIDE)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildApp();
+
+    const response = await request(app)
+      .get("/super-admin/analytics/businesses")
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.createdOverTime.length).toBeLessThanOrEqual(12);
+    expect(Array.isArray(response.body.data.topByRevenue)).toBe(true);
+  });
+
+  it("GET /analytics/bookings with an explicit range wider than 92 days returns 200 (chunked)", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildApp();
+    const now = Date.now();
+
+    const response = await request(app)
+      .get("/super-admin/analytics/bookings")
+      .query({
+        fromDate: new Date(now - 200 * 24 * 60 * 60 * 1000).toISOString(),
+        toDate: new Date(now).toISOString(),
+      })
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+  });
+
+  it("[financial-ownership] a €16 PLATFORM_FEE is counted exactly once when the query range spans multiple 90-day chunks", async () => {
+    const superAdmin = await createSuperAdmin();
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
+    const customer = await createCustomer("chunked");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+    const result = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "10:00"),
+    );
+    if (result.status !== "confirmed") throw new Error("expected confirmed");
+    expect(result.booking.financials.platformFeeCents).toBe(1600);
+
+    const app = buildApp();
+    const now = Date.now();
+    const response = await request(app)
+      .get("/super-admin/analytics/bookings")
+      .query({
+        // ~210 days => 3 chunks; the booking's createdAt (now) falls in the last one.
+        fromDate: new Date(now - 150 * 24 * 60 * 60 * 1000).toISOString(),
+        toDate: new Date(now + 60 * 24 * 60 * 60 * 1000).toISOString(),
+      })
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.totalCount).toBe(1);
+    // Not 3200 (double/triple-counted across chunks), not 0 (dropped) — exactly the one fee.
+    expect(response.body.data.platformRevenueCents).toBe(1600);
+  });
 });

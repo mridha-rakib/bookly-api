@@ -583,7 +583,7 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
       "BUSINESS_OWNER",
       String(business._id),
       String(result.booking._id),
-      { paid: true, note: "Paid by card in person" },
+      { settlement: "FULL", note: "Paid by card in person" },
     );
 
     expect(completed.status).toBe("COMPLETED");

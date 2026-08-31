@@ -4,7 +4,11 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessStatus } from "../business/business.types.js";
 import type { ClientRepository } from "../client/client.repository.js";
 import { combineBooklyOwnedBuckets, groupBucketsByBusiness } from "../finance/finance-ownership.js";
-import { resolveAnalyticsPeriod } from "./super-admin-analytics.util.js";
+import {
+  aggregateOwnershipForPeriod,
+  resolveAnalyticsPeriod,
+  resolveSeriesWindow,
+} from "./super-admin-analytics.util.js";
 
 export type SuperAdminTopBusinessRow = {
   businessId: string;
@@ -52,19 +56,19 @@ export class SuperAdminBusinessAnalyticsService {
     fromDate?: Date | undefined;
     toDate?: Date | undefined;
   }): Promise<SuperAdminBusinessAnalyticsDto> {
-    const { from, to } = resolveAnalyticsPeriod(query);
+    const period = resolveAnalyticsPeriod(query);
+    const { from, to } = period;
+    const series = resolveSeriesWindow(period);
 
     const [createdOverTime, statusCounts, bookingStats, newCustomersByBusiness, revenueBuckets] =
       await Promise.all([
-        this.businessRepository.countCreatedByMonth(from, to),
+        this.businessRepository.countCreatedByMonth(series.from, series.to),
         this.businessRepository.countByStatus(),
         this.bookingRepository.aggregateBusinessBookingStats(from, to),
         this.clientRepository.aggregateNewActivationsByBusiness(from, to),
-        this.financialTransactionService.aggregateOwnedBySource({
+        aggregateOwnershipForPeriod(this.financialTransactionService, {
           types: ["PLATFORM_FEE", "PROCESSING_FEE", "REFUND"],
-          unclaimedOnly: false,
-          from,
-          to,
+          period,
           groupByBusiness: true,
         }),
       ]);

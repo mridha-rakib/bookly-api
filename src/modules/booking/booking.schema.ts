@@ -74,15 +74,46 @@ export const waiveFeeBodySchema = z
   })
   .strict();
 
+/**
+ * Mark-no-show reason taxonomy — SEPARATE from waiveFeeBodySchema. Both optional and
+ * internal-only (never surfaced in a customer-facing DTO).
+ */
+export const markNoShowBodySchema = z
+  .object({
+    reason: z.string().trim().max(500).optional(),
+    internalNote: z.string().trim().max(2000).optional(),
+  })
+  .strict();
+
+/**
+ * Complete-booking venue settlement — explicit 3-state discriminator. FULL/NOT_PAID carry no
+ * amount; PARTIAL requires a positive integer `amountCents` (the service additionally checks it
+ * is strictly below the booking's remaining balance). No saved-card charge is ever triggered.
+ */
 export const completeBookingBodySchema = z
   .object({
     venuePayment: z
-      .object({
-        paid: z.boolean(),
-        amountCents: z.coerce.number().int().min(0).max(10_000_000).optional(),
-        note: z.string().trim().max(2000).optional(),
-      })
-      .strict()
+      .discriminatedUnion("settlement", [
+        z
+          .object({
+            settlement: z.literal("FULL"),
+            note: z.string().trim().max(2000).optional(),
+          })
+          .strict(),
+        z
+          .object({
+            settlement: z.literal("PARTIAL"),
+            amountCents: z.number().int().positive().max(10_000_000),
+            note: z.string().trim().max(2000).optional(),
+          })
+          .strict(),
+        z
+          .object({
+            settlement: z.literal("NOT_PAID"),
+            note: z.string().trim().max(2000).optional(),
+          })
+          .strict(),
+      ])
       .optional(),
   })
   .strict();
@@ -163,6 +194,7 @@ export type CreateCustomerBookingPreviewBody = z.infer<
 export type RescheduleBookingBody = z.infer<typeof rescheduleBookingBodySchema>;
 export type CancelBookingBody = z.infer<typeof cancelBookingBodySchema>;
 export type WaiveFeeBody = z.infer<typeof waiveFeeBodySchema>;
+export type MarkNoShowBody = z.infer<typeof markNoShowBodySchema>;
 export type CompleteBookingBody = z.infer<typeof completeBookingBodySchema>;
 export type ListBusinessBookingsQuery = z.infer<typeof listBusinessBookingsQuerySchema>;
 export type ListCustomerBookingsQuery = z.infer<typeof listCustomerBookingsQuerySchema>;

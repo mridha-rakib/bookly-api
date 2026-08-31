@@ -301,6 +301,13 @@ export const env = createEnv({
       rawPhoneOtpProvider === "twilio"
         ? optionalPhoneProviderRequiredString("twilio", "TWILIO_VERIFY_SERVICE_SID")
         : optionalProductionRequiredString("TWILIO_VERIFY_SERVICE_SID"),
+    // Twilio **Messaging** Service SID (starts "MG...") — the sender for appointment-reminder
+    // SMS. DISTINCT from TWILIO_VERIFY_SERVICE_SID (OTP, starts "VA..."). Plain-optional even in
+    // production: appointment-reminder SMS defaults OFF and its worker is opt-in, so requiring
+    // this would break every existing deploy that doesn't run it. TwilioSmsTransport.send throws
+    // SmsError("NOT_CONFIGURED") the moment a send is attempted without it (deferred-provider
+    // pattern, same as STRIPE_SECRET_KEY).
+    TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
     STORAGE_PROVIDER: storageProviderSchema,
     S3_ENDPOINT: optionalStorageRequiredString("S3_ENDPOINT"),
     S3_REGION: z.string().min(1).default("us-east-1"),
@@ -326,6 +333,14 @@ export const env = createEnv({
       .int()
       .positive()
       .default(5 * 1024 * 1024),
+    // Governs the Customer self-service avatar endpoint (PUT /auth/me/avatar) only. Separate
+    // from STAFF_AVATAR_MAX_UPLOAD_BYTES so the two identity-media surfaces stay independently
+    // tunable; read URLs reuse BUSINESS_MEDIA_SIGNED_URL_TTL_SECONDS like every other object.
+    CUSTOMER_AVATAR_MAX_UPLOAD_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5 * 1024 * 1024),
     // Stripe: required in production (real payment flows), optional in development/test — no
     // real Stripe TEST credentials exist in this environment as of Batch 4 (confirmed by
     // inspecting every .env/.env.example file in the repo; none define STRIPE_*). The payment
@@ -339,6 +354,66 @@ export const env = createEnv({
     STRIPE_WEBHOOK_SECRET: optionalProductionRequiredString("STRIPE_WEBHOOK_SECRET"),
     NO_SHOW_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
     NO_SHOW_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+    // Canonical public URL of the Bookly customer/business web app. Frontend and backend are
+    // separate repos that deploy independently, so this is configured directly and never
+    // derived from CORS_ORIGINS. Used to build transactional-email links (/privacy,
+    // /terms-of-use, and future booking/dashboard deep links). Trailing slashes are stripped
+    // here so link builders can plain-concatenate. Dev default matches the local frontend;
+    // production must override it with a real public https URL.
+    FRONTEND_BASE_URL: z
+      .string()
+      .min(1)
+      .default("http://localhost:3000")
+      .transform((value) => value.replace(/\/+$/, ""))
+      .superRefine((value, context) => {
+        if (!/^https?:\/\//.test(value)) {
+          context.addIssue({
+            code: "custom",
+            message: "FRONTEND_BASE_URL must start with http:// or https://",
+          });
+        }
+        if (rawNodeEnv === "production" && /localhost|127\.0\.0\.1/.test(value)) {
+          context.addIssue({
+            code: "custom",
+            message: "FRONTEND_BASE_URL must be a public URL in production",
+          });
+        }
+      }),
+    // Async transactional-email delivery (EmailOutbox + worker, see
+    // scripts/run-email-worker.ts). OTP stays synchronous and is never queued. Mirrors the
+    // NO_SHOW_WORKER_* convention above.
+    EMAIL_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5_000),
+    EMAIL_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(20),
+    EMAIL_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(5),
+    EMAIL_WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    EMAIL_WORKER_RETRY_BASE_MS: z.coerce.number().int().positive().default(60_000),
+    EMAIL_OUTBOX_CLAIM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+    // 24h appointment-reminder scheduler drain (AppointmentReminder + worker, see
+    // scripts/run-appointment-reminder-worker.ts). Mirrors the EMAIL_WORKER_* convention; the
+    // actual email send still goes through the EmailOutbox worker above. `MAX_ATTEMPTS` bounds
+    // reminder ORCHESTRATION retries only — provider retries stay owned by the EmailOutbox.
+    APPOINTMENT_REMINDER_WORKER_POLL_INTERVAL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(60_000),
+    APPOINTMENT_REMINDER_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+    APPOINTMENT_REMINDER_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(5),
+    APPOINTMENT_REMINDER_WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    APPOINTMENT_REMINDER_WORKER_CLAIM_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(120_000),
+    // Transactional-SMS outbox worker (SmsOutbox + worker, see scripts/run-sms-worker.ts).
+    // Mirrors the EMAIL_WORKER_* convention. Stage 3A ships the infrastructure only — nothing
+    // enqueues an SMS row until Stage 3B.
+    SMS_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
+    SMS_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(20),
+    SMS_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(5),
+    SMS_WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    SMS_WORKER_RETRY_BASE_MS: z.coerce.number().int().positive().default(60_000),
+    SMS_OUTBOX_CLAIM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
     SUPER_ADMIN_EMAIL: z.string().email().optional(),
     SUPER_ADMIN_PASSWORD: z.string().min(6).optional(),
     SUPER_ADMIN_FIRST_NAME: z.string().min(1).optional(),

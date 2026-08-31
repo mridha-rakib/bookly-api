@@ -22,6 +22,13 @@ const defaultMessages: Record<string, string> = {
   BOOKING_RANGE_INVALID: "The date range's start must be before its end",
   BOOKING_RANGE_TOO_WIDE: "The requested date range is too wide",
   BOOKING_NO_SERVICE_LINES: "A booking must include at least one service line",
+  BOOKING_TOO_MANY_SERVICE_LINES: "This booking has more services than the platform allows",
+  BOOKING_NO_SHOW_WINDOW_NOT_OPEN:
+    "The no-show window for this booking's category has not opened yet",
+  BOOKING_NO_SHOW_WINDOW_CLOSED:
+    "The no-show window for this booking's category has already closed",
+  BOOKING_INVALID_VENUE_PAYMENT_AMOUNT:
+    "A partial venue payment must be a whole-cent amount greater than 0 and less than the remaining balance",
   BOOKING_PACKAGE_SERVICE_NOT_SUPPORTED_YET:
     "Booking a package service is not yet supported — package remaining-session tracking is not built yet",
   BOOKING_PRICING_INPUT_INVALID: "The booked quantity for this service line is invalid",
