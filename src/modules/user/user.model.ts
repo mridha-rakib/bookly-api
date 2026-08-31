@@ -2,6 +2,7 @@ import { model, Schema, type Types } from "mongoose";
 
 import {
   genders,
+  type NotificationPreferences,
   type UserLanguage,
   type UserRole,
   type UserStatus,
@@ -65,6 +66,11 @@ export type UserProfileDocument = {
   /** Account UI language preference. Optional: rows created before this field default to "EN"
    * at read time (see AuthService.getMe). */
   defaultLanguage?: UserLanguage | undefined;
+  /** Customer-configurable OPTIONAL notification channels (24h appointment reminder only).
+   * Absent — or an absent sub-field — means "product default" (see resolveNotificationPreferences
+   * / NOTIFICATION_PREFERENCE_DEFAULTS); no migration needed. Never suppresses mandatory
+   * transactional or security mail. */
+  notifications?: NotificationPreferences | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   createdAt: Date;
@@ -83,6 +89,18 @@ const userProfileSchema = new Schema<UserProfileDocument>(
       e164: { type: String },
     },
     defaultLanguage: { type: String, enum: userLanguages },
+    // Optional, no `_id`, `default: undefined` — mirrors the CustomerAvatar sub-doc pattern
+    // below. A dot-path `$set` (see UserRepository.updateProfile) writes one channel without
+    // touching the sibling; an absent field is resolved to the product default at read time.
+    notifications: {
+      type: {
+        appointmentReminderEmail: { type: Boolean },
+        appointmentReminderSms: { type: Boolean },
+      },
+      required: false,
+      _id: false,
+      default: undefined,
+    },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
   },
@@ -93,11 +111,26 @@ userProfileSchema.index({ "phone.e164": 1 });
 
 export const UserProfileModel = model<UserProfileDocument>("UserProfile", userProfileSchema);
 
+/**
+ * Minimal storage reference for the Customer's self-uploaded avatar — mirrors the fields
+ * StaffAvatar keeps, minus `createdBy` (a Customer only ever uploads their own). The bytes
+ * live in the S3-compatible object store under `storageKey`; nothing image-related (blob,
+ * Base64, data URL) is ever persisted in Mongo. Absent until the Customer uploads one.
+ */
+export type CustomerAvatarMetadata = {
+  storageKey: string;
+  bucket: string;
+  mimeType: string;
+  size: number;
+  updatedAt: Date;
+};
+
 export type CustomerProfileDocument = {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
   address?: string | undefined;
   dateOfBirth?: string | undefined;
+  avatar?: CustomerAvatarMetadata | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -107,6 +140,18 @@ const customerProfileSchema = new Schema<CustomerProfileDocument>(
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
     address: { type: String, trim: true },
     dateOfBirth: { type: String },
+    avatar: {
+      type: {
+        storageKey: { type: String, required: true, trim: true },
+        bucket: { type: String, required: true, trim: true },
+        mimeType: { type: String, required: true, trim: true },
+        size: { type: Number, required: true, min: 1 },
+        updatedAt: { type: Date, required: true },
+      },
+      required: false,
+      _id: false,
+      default: undefined,
+    },
   },
   { timestamps: true },
 );

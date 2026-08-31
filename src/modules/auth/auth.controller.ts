@@ -214,6 +214,25 @@ export class AuthController {
     sendSuccess(response, 200, "Password changed");
   };
 
+  public updateMyAvatar = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const file = request.file
+      ? {
+          buffer: request.file.buffer,
+          mimeType: request.file.mimetype,
+          size: request.file.size,
+        }
+      : undefined;
+
+    const result = await this.authService.updateMyAvatar(userId, file);
+    sendSuccess(response, 200, "Avatar updated", result);
+  };
+
   public requestEmailChange = async (request: Request, response: Response): Promise<void> => {
     const userId = request.auth?.userId;
 

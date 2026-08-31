@@ -32,12 +32,36 @@ export type NoShowResolutionOutcome =
  * silent misattribution; flagged in the Batch 4 final report as worth reconsidering once/if a
  * genuine system-actor concept is ever introduced.
  */
+/**
+ * Stage D mailing observer (optional + trailing, never throws). Fed the domain's OWN computed
+ * no-show amounts — this service never asks the notifier to recompute anything.
+ */
+export type NoShowResolutionNotificationPort = {
+  notifyNoShowCharged(
+    booking: BookingDocument,
+    context: {
+      businessName: string;
+      amounts: {
+        noShowPercentage: number;
+        eligibleBasisCents: number;
+        grossFeeCents: number;
+        upfrontAppliedCents: number;
+        additionalChargeCents: number;
+      };
+    },
+  ): Promise<void>;
+  notifyNoShowWaived(booking: BookingDocument, context: { businessName: string }): Promise<void>;
+};
+
 export class NoShowResolutionService {
   public constructor(
     private readonly bookingRepository: BookingRepository,
     private readonly businessRepository: BusinessRepository,
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
+    // Stage D mailing — same optional-trailing pattern as elsewhere. Absent in the integration
+    // suites that construct this service directly.
+    private readonly noShowNotifier?: NoShowResolutionNotificationPort,
   ) {}
 
   /**
@@ -98,6 +122,17 @@ export class NoShowResolutionService {
           ? "Auto-resolved: no cancellation/no-show policy was configured for this business at booking time"
           : "Auto-resolved: no chargeable amount or payment method available",
       });
+      // Only notify the customer of a "fee waived" outcome when there genuinely WAS a no-show
+      // fee to waive: a policy existed, it is a real online customer, and it is not a MANUAL
+      // booking (i.e. the ONLY reason we reached this branch is amountCents <= 0 — the deposit
+      // already covered the fee). No email for "no policy was ever configured" / MANUAL.
+      const feeCoveredByDeposit =
+        Boolean(noShowPercentage) &&
+        booking.source !== "MANUAL" &&
+        Boolean(booking.customer.customerUserId);
+      if (waived && feeCoveredByDeposit) {
+        await this.dispatchNoShowWaived(waived);
+      }
       return waived
         ? noShowPercentage
           ? "waived_no_charge_possible"
@@ -155,10 +190,54 @@ export class NoShowResolutionService {
       return "skipped_already_resolved";
     }
 
-    await this.transitionViaOwner(booking, "NO_SHOW_CHARGED", {
+    const charged = await this.transitionViaOwner(booking, "NO_SHOW_CHARGED", {
       note: providerReference ? `Charged via ${providerReference}` : undefined,
     });
+
+    // Stage D — the customer NO_SHOW_CHARGED email, only after the charge SUCCEEDED and the
+    // status transition won its CAS. Amounts are this method's OWN already-computed domain
+    // values — the notifier/template runs no formula and applies no clamp.
+    if (charged && noShowPercentage) {
+      await this.dispatchNoShowCharged(charged, {
+        noShowPercentage,
+        eligibleBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
+        grossFeeCents,
+        upfrontAppliedCents: upfrontPayment?.amountCents ?? 0,
+        additionalChargeCents: amountCents,
+      });
+    }
+
     return "charged";
+  }
+
+  private async dispatchNoShowWaived(booking: BookingDocument): Promise<void> {
+    if (!this.noShowNotifier) {
+      return;
+    }
+    const business = await this.businessRepository.findById(booking.businessId);
+    await this.noShowNotifier.notifyNoShowWaived(booking, {
+      businessName: business?.name ?? "the business",
+    });
+  }
+
+  private async dispatchNoShowCharged(
+    booking: BookingDocument,
+    amounts: {
+      noShowPercentage: number;
+      eligibleBasisCents: number;
+      grossFeeCents: number;
+      upfrontAppliedCents: number;
+      additionalChargeCents: number;
+    },
+  ): Promise<void> {
+    if (!this.noShowNotifier) {
+      return;
+    }
+    const business = await this.businessRepository.findById(booking.businessId);
+    await this.noShowNotifier.notifyNoShowCharged(booking, {
+      businessName: business?.name ?? "the business",
+      amounts,
+    });
   }
 
   /** Bounded, index-backed batch entry point — see BookingRepository.findManyOverdueNoShows's

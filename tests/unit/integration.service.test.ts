@@ -24,6 +24,7 @@ const exchangeGoogleAuthCode = vi.fn();
 const refreshGoogleAccessToken = vi.fn();
 const createGoogleCalendarEvent = vi.fn();
 const deleteGoogleCalendarEvent = vi.fn();
+const patchGoogleCalendarEventSchedule = vi.fn();
 
 vi.mock("../../src/modules/integration/integration.google-client.js", () => ({
   buildGoogleAuthUrl,
@@ -31,6 +32,7 @@ vi.mock("../../src/modules/integration/integration.google-client.js", () => ({
   refreshGoogleAccessToken,
   createGoogleCalendarEvent,
   deleteGoogleCalendarEvent,
+  patchGoogleCalendarEventSchedule,
 }));
 
 const { IntegrationService } = await import("../../src/modules/integration/integration.service.js");
@@ -291,6 +293,152 @@ describe("IntegrationService (Google Calendar)", () => {
         service.deleteEventForBooking(integration.businessId, "some-event-id"),
       ).resolves.toBeUndefined();
       expect(integrationRepository.markSyncError).toHaveBeenCalledTimes(1);
+    });
+
+    it("updateEventScheduleForBooking no-ops when the business has no Google Calendar connection", async () => {
+      const businessRepository = {} as BusinessRepository;
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(null),
+        markSyncError: vi.fn(),
+      } as unknown as IntegrationRepository;
+      const service = new IntegrationService(integrationRepository, businessRepository);
+
+      await expect(
+        service.updateEventScheduleForBooking(new Types.ObjectId(), "evt-1", {
+          startAt: new Date("2026-09-08T13:30:00.000Z"),
+          endAt: new Date("2026-09-08T14:15:00.000Z"),
+          timezone: "Europe/Nicosia",
+        }),
+      ).resolves.toBeUndefined();
+      expect(patchGoogleCalendarEventSchedule).not.toHaveBeenCalled();
+      expect(
+        (integrationRepository as unknown as { markSyncError: ReturnType<typeof vi.fn> })
+          .markSyncError,
+      ).not.toHaveBeenCalled();
+    });
+
+    it("updateEventScheduleForBooking PATCHes with a valid non-expired token (no refresh)", async () => {
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        tokenExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        encryptedAccessToken: crypto.encryptSecret("live-access-token"),
+        encryptedRefreshToken: crypto.encryptSecret("refresh-token"),
+      });
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(integration),
+        updateTokens: vi.fn(),
+        markSyncError: vi.fn(),
+      } as unknown as IntegrationRepository;
+      patchGoogleCalendarEventSchedule.mockResolvedValue("UPDATED");
+      const service = new IntegrationService(integrationRepository, {} as BusinessRepository);
+
+      const schedule = {
+        startAt: new Date("2026-09-08T13:30:00.000Z"),
+        endAt: new Date("2026-09-08T14:15:00.000Z"),
+        timezone: "Europe/Nicosia",
+      };
+      await service.updateEventScheduleForBooking(integration.businessId, "evt-42", schedule);
+
+      expect(refreshGoogleAccessToken).not.toHaveBeenCalled();
+      expect(patchGoogleCalendarEventSchedule).toHaveBeenCalledWith(
+        "live-access-token",
+        integration.calendarId,
+        "evt-42",
+        schedule,
+      );
+      expect(
+        (integrationRepository as unknown as { markSyncError: ReturnType<typeof vi.fn> })
+          .markSyncError,
+      ).not.toHaveBeenCalled();
+    });
+
+    it("updateEventScheduleForBooking reuses the existing refresh flow for an expired token", async () => {
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        tokenExpiresAt: new Date(Date.now() - 1000),
+        encryptedAccessToken: crypto.encryptSecret("stale-access-token"),
+        encryptedRefreshToken: crypto.encryptSecret("refresh-token"),
+      });
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(integration),
+        updateTokens: vi.fn(),
+        markSyncError: vi.fn(),
+      } as unknown as IntegrationRepository;
+      refreshGoogleAccessToken.mockResolvedValue({
+        accessToken: "fresh-access-token",
+        refreshToken: "refresh-token",
+        expiresAt: new Date(Date.now() + 3600_000),
+      });
+      patchGoogleCalendarEventSchedule.mockResolvedValue("UPDATED");
+      const service = new IntegrationService(integrationRepository, {} as BusinessRepository);
+
+      await service.updateEventScheduleForBooking(integration.businessId, "evt-9", {
+        startAt: new Date("2026-09-08T13:30:00.000Z"),
+        endAt: new Date("2026-09-08T14:15:00.000Z"),
+        timezone: "Europe/Nicosia",
+      });
+
+      expect(refreshGoogleAccessToken).toHaveBeenCalledWith("refresh-token");
+      expect(integrationRepository.updateTokens).toHaveBeenCalledTimes(1);
+      expect(patchGoogleCalendarEventSchedule).toHaveBeenCalledWith(
+        "fresh-access-token",
+        integration.calendarId,
+        "evt-9",
+        expect.any(Object),
+      );
+    });
+
+    it("updateEventScheduleForBooking records a provider failure and never throws outward", async () => {
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        encryptedAccessToken: crypto.encryptSecret("live-access-token"),
+        encryptedRefreshToken: crypto.encryptSecret("refresh-token"),
+      });
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(integration),
+        markSyncError: vi.fn(),
+      } as unknown as IntegrationRepository;
+      patchGoogleCalendarEventSchedule.mockRejectedValue(new Error("Google API down"));
+      const service = new IntegrationService(integrationRepository, {} as BusinessRepository);
+
+      await expect(
+        service.updateEventScheduleForBooking(integration.businessId, "evt-1", {
+          startAt: new Date("2026-09-08T13:30:00.000Z"),
+          endAt: new Date("2026-09-08T14:15:00.000Z"),
+          timezone: "Europe/Nicosia",
+        }),
+      ).resolves.toBeUndefined();
+      expect(
+        (integrationRepository as unknown as { markSyncError: ReturnType<typeof vi.fn> })
+          .markSyncError,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it("updateEventScheduleForBooking treats a missing event (soft EVENT_NOT_FOUND) as non-fatal, NOT an integration error", async () => {
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        encryptedAccessToken: crypto.encryptSecret("live-access-token"),
+        encryptedRefreshToken: crypto.encryptSecret("refresh-token"),
+      });
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(integration),
+        markSyncError: vi.fn(),
+      } as unknown as IntegrationRepository;
+      patchGoogleCalendarEventSchedule.mockResolvedValue("EVENT_NOT_FOUND");
+      const service = new IntegrationService(integrationRepository, {} as BusinessRepository);
+
+      await expect(
+        service.updateEventScheduleForBooking(integration.businessId, "evt-gone", {
+          startAt: new Date("2026-09-08T13:30:00.000Z"),
+          endAt: new Date("2026-09-08T14:15:00.000Z"),
+          timezone: "Europe/Nicosia",
+        }),
+      ).resolves.toBeUndefined();
+      expect(createGoogleCalendarEvent).not.toHaveBeenCalled();
+      expect(
+        (integrationRepository as unknown as { markSyncError: ReturnType<typeof vi.fn> })
+          .markSyncError,
+      ).not.toHaveBeenCalled();
     });
 
     it("refreshes an expiring access token before syncing, and persists the new tokens", async () => {

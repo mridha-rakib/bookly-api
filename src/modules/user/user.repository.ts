@@ -2,6 +2,7 @@ import type { ClientSession, Types } from "mongoose";
 
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
 import {
+  type CustomerAvatarMetadata,
   type CustomerProfileDocument,
   CustomerProfileModel,
   type UserDocument,
@@ -9,7 +10,7 @@ import {
   type UserProfileDocument,
   UserProfileModel,
 } from "./user.model.js";
-import type { UserLanguage, UserRole, UserStatus } from "./user.types.js";
+import type { NotificationPreferences, UserLanguage, UserRole, UserStatus } from "./user.types.js";
 
 type CreateUserInput = {
   normalizedEmail: string;
@@ -189,9 +190,14 @@ export class UserRepository {
       phone?: CreateProfileInput["phone"];
       /** Account UI language preference (Super Admin Settings). */
       defaultLanguage?: UserLanguage;
+      /** Partial nested update of the optional reminder channels: only the provided key(s) are
+       * written, via a dot-path `$set` (`notifications.<channel>`), so toggling one channel
+       * never clobbers the sibling. A dot-path set also auto-creates the sub-doc on a row that
+       * never had one. */
+      notifications?: NotificationPreferences;
     },
   ): Promise<void> {
-    const { phone, ...rest } = update;
+    const { phone, notifications, ...rest } = update;
     const setFields: Record<string, unknown> = { ...rest };
     const unsetFields: Record<string, unknown> = {};
 
@@ -200,6 +206,14 @@ export class UserRepository {
         setFields["phone"] = phone;
       } else {
         unsetFields["phone"] = "";
+      }
+    }
+
+    if (notifications) {
+      for (const [channel, value] of Object.entries(notifications)) {
+        if (typeof value === "boolean") {
+          setFields[`notifications.${channel}`] = value;
+        }
       }
     }
 
@@ -266,6 +280,22 @@ export class UserRepository {
     await CustomerProfileModel.updateOne(
       { userId },
       { $set: update, $setOnInsert: { userId } },
+      { upsert: true },
+    );
+  }
+
+  /**
+   * Customer avatar upload/replace. Upserts for the same reason as upsertCustomerProfile — the
+   * CustomerProfile row may not exist yet the first time a customer sets a photo. Writes only
+   * the storage reference; the bytes themselves live in the object store.
+   */
+  public async setCustomerAvatar(
+    userId: Types.ObjectId | string,
+    avatar: CustomerAvatarMetadata,
+  ): Promise<void> {
+    await CustomerProfileModel.updateOne(
+      { userId },
+      { $set: { avatar }, $setOnInsert: { userId } },
       { upsert: true },
     );
   }

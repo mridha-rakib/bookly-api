@@ -2,6 +2,10 @@ import { model, Schema, type Types } from "mongoose";
 
 import { DEFAULT_BUSINESS_TIMEZONE, isValidIanaTimeZone } from "../../common/time/timezone.js";
 import {
+  type BusinessCategoryKey,
+  businessCategoryKeys,
+} from "../platform-settings/business-category.js";
+import {
   type BusinessStatus,
   type BusinessVisitType,
   businessStatuses,
@@ -51,6 +55,14 @@ export type BusinessDocument = {
     | undefined;
   briefDescription: string;
   category: string;
+  /**
+   * Canonical machine identity for the display `category` string, used by platform business
+   * rules (currently the no-show eligibility window). Derived from `category` via
+   * resolveBusinessCategoryKey on every create/update; absent on legacy rows and whenever the
+   * display string cannot be safely mapped (no destructive backfill — callers fall back to
+   * legacy behavior). See platform-settings/business-category.ts.
+   */
+  categoryKey?: BusinessCategoryKey | undefined;
   subcategories: string[];
   /** Explicit, Super Admin-controlled marketing flag (Business Detail action + public landing
    * "Trusted by local businesses" section). Never inferred from age / approval date / bookings —
@@ -117,6 +129,7 @@ const businessSchema = new Schema<BusinessDocument>(
     },
     briefDescription: { type: String, required: true, trim: true },
     category: { type: String, required: true, trim: true },
+    categoryKey: { type: String, enum: businessCategoryKeys, required: false },
     subcategories: { type: [String], required: true },
     isFoundingPartner: { type: Boolean, required: true, default: false },
     instagramHandle: { type: String, trim: true },

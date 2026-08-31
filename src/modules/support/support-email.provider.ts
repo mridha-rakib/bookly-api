@@ -1,47 +1,26 @@
-import sgMail from "@sendgrid/mail";
-import nodemailer from "nodemailer";
-import { Resend } from "resend";
-
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
+import { EmailError } from "../email/email.errors.js";
+import type { EmailTransport } from "../email/email-transport.js";
+import { ResendEmailTransport } from "../email/resend-email-transport.js";
+import { SendGridEmailTransport } from "../email/sendgrid-email-transport.js";
+import { SmtpEmailTransport } from "../email/smtp-email-transport.js";
 
 /**
- * Batch 15B — minimal generic transactional email sender for Support/Contact. The codebase's
- * existing `EmailOtpProvider` (verification/email-otp.provider.ts) cannot be reused directly: its
- * own interface is deliberately hardcoded to a `{code, purpose}` shape with a fixed template per
- * purpose (confirmed by investigation — it is NOT a generic "send arbitrary email" facility).
- * Support genuinely needs a free subject/text (a ticket reference + acknowledgement, or an admin
- * reply notice) that doesn't fit that contract.
+ * Support/Contact transactional sender. Previously this file carried a second, fully parallel
+ * SMTP/Resend/SendGrid hierarchy plus its own `classifyProviderError`. It now delegates to the
+ * ONE central {@link EmailTransport} (Phase B / Phase W); the class names, factory,
+ * `SupportEmailProvider` interface, `SupportEmailDeliveryError`, and `resolveContactInboxEmail`
+ * are preserved so support/contact business behaviour is unchanged.
  *
- * Rather than widen the OTP provider's contract (risking behavior changes to unrelated
- * registration/staff-password flows) or build a new notification platform (explicitly out of
- * scope), this mirrors the EXACT SAME Resend/SMTP construction, env-var config, and error
- * classification as `EmailOtpProvider` — same transport, same failure handling, just a narrower
- * "arbitrary subject/text" method instead of a purpose-templated one. This is "reuse the existing
- * email infrastructure" at the transport/config level, since the interface itself is genuinely
- * incompatible.
+ * Content stays plain-text here (no branded layout) so the raw acknowledgement / admin-reply
+ * semantics — and callers that catch-and-log rather than fail the surrounding request — are
+ * untouched.
  */
 export interface SupportEmailProvider {
   send(input: { to: string; subject: string; text: string }): Promise<void>;
 }
 
-type ResendClient = {
-  emails: {
-    send(input: { from: string; to: string; subject: string; text: string }): Promise<unknown>;
-  };
-};
-
-type SmtpTransporter = {
-  sendMail(input: { from: string; to: string; subject: string; text: string }): Promise<unknown>;
-};
-
-type SendGridClient = {
-  send(input: { to: string; from: string; subject: string; text: string }): Promise<unknown>;
-};
-
-/** Thrown only for a genuine send failure; callers in this module always catch this and log
- * rather than let it fail the surrounding request (confirmed rule: "An email-provider failure
- * must NOT cause an already-created valid SupportTicket to disappear"). */
 export class SupportEmailDeliveryError extends Error {
   public constructor(
     public readonly category: "not_configured" | "rate_limited" | "delivery_failed",
@@ -52,96 +31,59 @@ export class SupportEmailDeliveryError extends Error {
   }
 }
 
-export class ResendSupportEmailProvider implements SupportEmailProvider {
-  public constructor(
-    private readonly clientFactory = (apiKey: string): ResendClient => new Resend(apiKey),
-  ) {}
+const toSupportCategory = (
+  error: EmailError,
+): "not_configured" | "rate_limited" | "delivery_failed" => {
+  if (error.category === "NOT_CONFIGURED") {
+    return "not_configured";
+  }
+  if (error.category === "RATE_LIMITED") {
+    return "rate_limited";
+  }
+  return "delivery_failed";
+};
+
+abstract class TransportBackedSupportEmailProvider implements SupportEmailProvider {
+  protected constructor(private readonly transport: EmailTransport) {}
 
   public async send(input: { to: string; subject: string; text: string }): Promise<void> {
-    if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL || !env.RESEND_FROM_NAME) {
-      throw new SupportEmailDeliveryError("not_configured");
-    }
-
     try {
-      const resend = this.clientFactory(env.RESEND_API_KEY);
-      await resend.emails.send({
-        from: `${env.RESEND_FROM_NAME} <${env.RESEND_FROM_EMAIL}>`,
-        to: input.to,
-        subject: input.subject,
-        text: input.text,
-      });
+      await this.transport.send({ to: input.to, subject: input.subject, text: input.text });
     } catch (error) {
-      const category = classifyProviderError(error);
-      logger.warn({ provider: "resend", category }, "Support email delivery failed");
-      throw new SupportEmailDeliveryError(category, error);
+      if (error instanceof EmailError) {
+        const category = toSupportCategory(error);
+        logger.warn(
+          { provider: this.transport.provider, category },
+          "Support email delivery failed",
+        );
+        throw new SupportEmailDeliveryError(category, error);
+      }
+      throw error;
     }
   }
 }
 
-/** Batch 19.1 — mirrors ResendSupportEmailProvider exactly, same rationale as
- * SendGridEmailOtpProvider in verification/email-otp.provider.ts (kept as a parallel hierarchy
- * rather than merged, per this file's own top-of-file comment on why Support can't reuse the OTP
- * provider's purpose-templated interface). */
-export class SendGridSupportEmailProvider implements SupportEmailProvider {
-  public constructor(
-    private readonly clientFactory = (apiKey: string): SendGridClient => {
-      sgMail.setApiKey(apiKey);
-      return sgMail;
-    },
-  ) {}
+type SendGridClientFactory = ConstructorParameters<typeof SendGridEmailTransport>[0];
+type SmtpTransporterFactory = ConstructorParameters<typeof SmtpEmailTransport>[0];
+type ResendClientFactory = ConstructorParameters<typeof ResendEmailTransport>[0];
 
-  public async send(input: { to: string; subject: string; text: string }): Promise<void> {
-    if (!env.SENDGRID_API_KEY || !env.EMAIL_FROM) {
-      throw new SupportEmailDeliveryError("not_configured");
-    }
-
-    try {
-      const client = this.clientFactory(env.SENDGRID_API_KEY);
-      await client.send({
-        to: input.to,
-        from: `${env.EMAIL_FROM_NAME} <${env.EMAIL_FROM}>`,
-        subject: input.subject,
-        text: input.text,
-      });
-    } catch (error) {
-      const category = classifyProviderError(error);
-      logger.warn({ provider: "sendgrid", category }, "Support email delivery failed");
-      throw new SupportEmailDeliveryError(category, error);
-    }
+export class SendGridSupportEmailProvider extends TransportBackedSupportEmailProvider {
+  public constructor(clientFactory?: SendGridClientFactory) {
+    super(clientFactory ? new SendGridEmailTransport(clientFactory) : new SendGridEmailTransport());
   }
 }
 
-export class SmtpSupportEmailProvider implements SupportEmailProvider {
-  public constructor(
-    private readonly transportFactory = (): SmtpTransporter =>
-      nodemailer.createTransport({
-        host: env.SMTP_HOST,
-        port: env.SMTP_PORT,
-        secure: env.SMTP_SECURE,
-        auth: {
-          user: env.SMTP_USER,
-          pass: env.SMTP_PASS,
-        },
-      }),
-  ) {}
+export class SmtpSupportEmailProvider extends TransportBackedSupportEmailProvider {
+  public constructor(transporterFactory?: SmtpTransporterFactory) {
+    super(
+      transporterFactory ? new SmtpEmailTransport(transporterFactory) : new SmtpEmailTransport(),
+    );
+  }
+}
 
-  public async send(input: { to: string; subject: string; text: string }): Promise<void> {
-    if (!env.SMTP_HOST || !env.SMTP_USER || !env.SMTP_PASS || !env.EMAIL_FROM) {
-      throw new SupportEmailDeliveryError("not_configured");
-    }
-
-    try {
-      await this.transportFactory().sendMail({
-        from: `${env.EMAIL_FROM_NAME} <${env.EMAIL_FROM}>`,
-        to: input.to,
-        subject: input.subject,
-        text: input.text,
-      });
-    } catch (error) {
-      const category = classifyProviderError(error);
-      logger.warn({ provider: "smtp", category }, "Support email delivery failed");
-      throw new SupportEmailDeliveryError(category, error);
-    }
+export class ResendSupportEmailProvider extends TransportBackedSupportEmailProvider {
+  public constructor(clientFactory?: ResendClientFactory) {
+    super(clientFactory ? new ResendEmailTransport(clientFactory) : new ResendEmailTransport());
   }
 }
 
@@ -155,26 +97,8 @@ export const createSupportEmailProvider = (): SupportEmailProvider => {
   return new SmtpSupportEmailProvider();
 };
 
-/** The address the public Contact form's message is sent TO — falls back to whichever address
- * the configured provider already sends FROM, so no brand-new mandatory env var is required just
- * to stand this up (see env.ts's own comment on SUPPORT_CONTACT_INBOX_EMAIL). Returns `undefined`
- * only if genuinely nothing is configured (e.g. local dev with no email env vars at all) — the
- * caller treats that the same as any other delivery failure. */
+/** The address the public Contact form's message is sent TO — unchanged: falls back to whichever
+ * address the configured provider already sends FROM. */
 export const resolveContactInboxEmail = (): string | undefined =>
   env.SUPPORT_CONTACT_INBOX_EMAIL ??
   (env.EMAIL_PROVIDER === "resend" ? env.RESEND_FROM_EMAIL : env.EMAIL_FROM);
-
-const classifyProviderError = (error: unknown): "rate_limited" | "delivery_failed" => {
-  if (typeof error === "object" && error !== null) {
-    const statusCode = "statusCode" in error ? error.statusCode : undefined;
-    const status = "status" in error ? error.status : undefined;
-    const responseCode = "responseCode" in error ? error.responseCode : undefined;
-    const code = "code" in error ? error.code : undefined;
-
-    if (statusCode === 429 || status === 429 || responseCode === 429 || code === 429) {
-      return "rate_limited";
-    }
-  }
-
-  return "delivery_failed";
-};

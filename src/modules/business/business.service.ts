@@ -16,6 +16,7 @@ import {
 } from "../auth/auth.utils.js";
 import type { BusinessMediaDocument } from "../business-media/business-media.model.js";
 import type { BusinessMediaRepository } from "../business-media/business-media.repository.js";
+import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { StorageService } from "../storage/storage.service.js";
 import type { UserDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
@@ -401,7 +402,16 @@ export class BusinessService {
     if (input.visitType !== undefined) update["visitType"] = input.visitType;
     if (input.timezone !== undefined) update["timezone"] = input.timezone;
     if (input.briefDescription !== undefined) update["briefDescription"] = input.briefDescription;
-    if (input.category !== undefined) update["category"] = input.category;
+    if (input.category !== undefined) {
+      update["category"] = input.category;
+      // Keep the canonical key in sync with the display string whenever it can be safely
+      // resolved (the business form only ever submits one of the known categories). An
+      // unresolvable string leaves any existing key untouched rather than guessing.
+      const categoryKey = resolveBusinessCategoryKey(input.category);
+      if (categoryKey) {
+        update["categoryKey"] = categoryKey;
+      }
+    }
     if (input.subcategories !== undefined) update["subcategories"] = input.subcategories;
     if (input.instagramHandle !== undefined) update["instagramHandle"] = input.instagramHandle;
     if (input.facebookPageUrl !== undefined) update["facebookPageUrl"] = input.facebookPageUrl;

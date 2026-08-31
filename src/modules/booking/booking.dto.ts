@@ -52,6 +52,19 @@ export type BookingDetailDto = {
    * truth (confirmed rule: "the frontend countdown must derive from backend deadline"). */
   noShowStartedAt?: string | undefined;
   noShowDeadlineAt?: string | undefined;
+  /** Batch 21 — the no-show eligibility window captured at creation time, plus the absolute
+   * open/close instants derived from `schedule.startAt`, so the business UI can show/enable the
+   * "Start No-show" action truthfully. Absent for legacy bookings (see markNoShow's legacy
+   * fallback); the backend remains authoritative regardless. */
+  noShowEligibilitySnapshot?:
+    | {
+        categoryKey: string;
+        opensAfterMinutes: number;
+        closesAfterMinutes: number;
+        opensAt: string;
+        closesAt: string;
+      }
+    | undefined;
   notes?: string | undefined;
   /** Batch 13 — present only when a Promo Code was applied. `financials.depositCents` remains
    * the pre-promo canonical entitlement; `promo.chargeCents` is what was actually charged. */
@@ -110,6 +123,11 @@ export type BookingCalendarEntryDto = {
   customerName: string;
   totalCents: number;
   currency: string;
+  /** Batch 21 — lets the calendar action menu offer/disable "Start No-show" truthfully. The
+   * backend still re-checks it on submit. Absent for legacy bookings. */
+  noShowEligibilitySnapshot?:
+    | { opensAfterMinutes: number; closesAfterMinutes: number; opensAt: string; closesAt: string }
+    | undefined;
 };
 
 const toServiceLineDto = (
@@ -186,6 +204,21 @@ export const toBookingDetailDto = (booking: BookingDocument): BookingDetailDto =
     : undefined,
   noShowStartedAt: booking.noShowStartedAt?.toISOString(),
   noShowDeadlineAt: booking.noShowDeadlineAt?.toISOString(),
+  noShowEligibilitySnapshot: booking.noShowEligibilitySnapshot
+    ? {
+        categoryKey: booking.noShowEligibilitySnapshot.categoryKey,
+        opensAfterMinutes: booking.noShowEligibilitySnapshot.opensAfterMinutes,
+        closesAfterMinutes: booking.noShowEligibilitySnapshot.closesAfterMinutes,
+        opensAt: new Date(
+          booking.schedule.startAt.getTime() +
+            booking.noShowEligibilitySnapshot.opensAfterMinutes * 60_000,
+        ).toISOString(),
+        closesAt: new Date(
+          booking.schedule.startAt.getTime() +
+            booking.noShowEligibilitySnapshot.closesAfterMinutes * 60_000,
+        ).toISOString(),
+      }
+    : undefined,
   notes: booking.notes,
   promo: booking.promo
     ? {
@@ -244,4 +277,18 @@ export const toBookingCalendarEntryDto = (booking: BookingDocument): BookingCale
     .join(" "),
   totalCents: booking.financials.totalCents,
   currency: booking.financials.currency,
+  noShowEligibilitySnapshot: booking.noShowEligibilitySnapshot
+    ? {
+        opensAfterMinutes: booking.noShowEligibilitySnapshot.opensAfterMinutes,
+        closesAfterMinutes: booking.noShowEligibilitySnapshot.closesAfterMinutes,
+        opensAt: new Date(
+          booking.schedule.startAt.getTime() +
+            booking.noShowEligibilitySnapshot.opensAfterMinutes * 60_000,
+        ).toISOString(),
+        closesAt: new Date(
+          booking.schedule.startAt.getTime() +
+            booking.noShowEligibilitySnapshot.closesAfterMinutes * 60_000,
+        ).toISOString(),
+      }
+    : undefined,
 });

@@ -5,6 +5,8 @@ import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { Argon2PasswordHasher } from "../auth/password-hasher.js";
 import { BusinessRepository } from "../business/business.repository.js";
+import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import { StaffAccessNotifier } from "../notification/staff-access.notifier.js";
 import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
@@ -22,6 +24,7 @@ import {
   updateStaffBodySchema,
 } from "./staff.schema.js";
 import { StaffService } from "./staff.service.js";
+import { StaffAccessEventRepository } from "./staff-access-event.repository.js";
 import { StaffScheduleRepository } from "./staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "./staff-time-off.repository.js";
 
@@ -40,6 +43,7 @@ export const createStaffRoute = (): Router => {
   const emailOtpProvider = createEmailOtpProvider();
   const staffScheduleRepository = new StaffScheduleRepository();
   const staffTimeOffRepository = new StaffTimeOffRepository();
+  const staffAccessEventRepository = new StaffAccessEventRepository();
   const staffAvatarRepository = new StaffAvatarRepository();
   const staffAvatarStorageService = createDeferredStorageServiceFromEnv();
   const staffAvatarService = new StaffAvatarService(
@@ -58,6 +62,8 @@ export const createStaffRoute = (): Router => {
     staffScheduleRepository,
     staffTimeOffRepository,
     staffAvatarService,
+    new StaffAccessNotifier(new EmailOutboxService(), userRepository),
+    staffAccessEventRepository,
   );
   const controller = new StaffController(service);
 

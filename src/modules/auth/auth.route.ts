@@ -1,5 +1,7 @@
+import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
+import multer from "multer";
 
 import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
@@ -14,9 +16,14 @@ import { BusinessOnboardingService } from "../business-onboarding/business-onboa
 import { ClientRepository } from "../client/client.repository.js";
 import { ClientIdentityService } from "../client/client-identity.service.js";
 import { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
+import { CustomerAvatarError } from "../customer-avatar/customer-avatar.errors.js";
+import { CustomerAvatarService } from "../customer-avatar/customer-avatar.service.js";
+import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import { BusinessRegisteredNotifier } from "../notification/business-registered.notifier.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
+import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import { createPhoneOtpProvider } from "../verification/phone-otp.provider.js";
@@ -49,6 +56,36 @@ import { AuthService } from "./auth.service.js";
 import { Argon2PasswordHasher } from "./password-hasher.js";
 import { TokenService } from "./token.service.js";
 
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: env.CUSTOMER_AVATAR_MAX_UPLOAD_BYTES,
+    files: 1,
+  },
+});
+
+// Single multipart `file` field, mirroring the Staff avatar endpoint. Maps multer's size-limit
+// rejection to the same domain error the service raises so the client sees one consistent code.
+const uploadSingleAvatarImage: RequestHandler = (
+  request: Request,
+  response: Response,
+  next: NextFunction,
+): void => {
+  avatarUpload.single("file")(request, response, (error: unknown) => {
+    if (!error) {
+      next();
+      return;
+    }
+
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      next(new CustomerAvatarError("CUSTOMER_AVATAR_TOO_LARGE", 413));
+      return;
+    }
+
+    next(error);
+  });
+};
+
 const authRateLimit = (limit: number, windowMs = 15 * 60 * 1000) =>
   rateLimit({
     windowMs,
@@ -79,6 +116,11 @@ export const createAuthRoute = (): Router => {
   const staffRepository = new StaffRepository();
   const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
   const contactChangeChallengeRepository = new ContactChangeChallengeRepository();
+  const customerAvatarService = new CustomerAvatarService(
+    userRepository,
+    createDeferredStorageServiceFromEnv(),
+    { maxUploadBytes: env.CUSTOMER_AVATAR_MAX_UPLOAD_BYTES },
+  );
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
@@ -93,6 +135,8 @@ export const createAuthRoute = (): Router => {
     staffRepository,
     clientIdentityService,
     contactChangeChallengeRepository,
+    new BusinessRegisteredNotifier(new EmailOutboxService()),
+    customerAvatarService,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
@@ -272,6 +316,19 @@ export const createAuthRoute = (): Router => {
     loginLimiter,
     validateRequest({ body: changeMyPasswordBodySchema }),
     asyncHandler(controller.changeMyPassword),
+  );
+
+  // Customer self-service avatar. CUSTOMER-only (SUPER_ADMIN excluded — no Super Admin avatar
+  // surface exists); acts on request.auth.userId only, never a client-supplied id. multer runs
+  // after the auth/role gates so an unauthenticated or wrong-role caller is rejected before any
+  // multipart body is buffered into memory.
+  router.put(
+    "/me/avatar",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    uploadSingleAvatarImage,
+    asyncHandler(controller.updateMyAvatar),
   );
 
   // Batch 18 — Customer email/phone self-change. Reuses the same otpSendLimiter/otpVerifyLimiter

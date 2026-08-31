@@ -1,8 +1,11 @@
 import mongoose from "mongoose";
+
+import { logger } from "../../config/logger.js";
 import { normalizeEmail } from "../auth/auth.utils.js";
 import type { PasswordHasher } from "../auth/password-hasher.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import type { UserDocument, UserProfileDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
@@ -17,6 +20,8 @@ import {
   parseFreeTextPhone,
   splitStaffName,
 } from "./staff.utils.js";
+import type { StaffAccessEventDocument } from "./staff-access-event.model.js";
+import type { StaffAccessEventRepository } from "./staff-access-event.repository.js";
 import type { StaffScheduleDayDocument, StaffScheduleDocument } from "./staff-schedule.model.js";
 import type { StaffScheduleRepository } from "./staff-schedule.repository.js";
 import type { DayOfWeek, ScheduleDay } from "./staff-schedule.types.js";
@@ -89,6 +94,13 @@ export class StaffService {
     private readonly staffScheduleRepository: StaffScheduleRepository,
     private readonly staffTimeOffRepository: StaffTimeOffRepository,
     private readonly staffAvatarService: StaffAvatarService,
+    // Optional + trailing (never throws): emails the affected staff member after removal or an
+    // access-state change. Absent in unit suites that construct this directly.
+    private readonly staffAccessNotifier?: StaffAccessNotificationPort,
+    // Optional + trailing: the append-only access-change audit log. When present, a ROLE_CHANGED
+    // / DEACTIVATED / REACTIVATED event is inserted in the SAME transaction as the role /
+    // employment write it records, and its `_id` becomes the stable email-dedupe identity.
+    private readonly staffAccessEventRepository?: StaffAccessEventRepository,
   ) {}
 
   public async listStaff(actorUserId: string, businessId: string): Promise<StaffListDto> {
@@ -287,17 +299,37 @@ export class StaffService {
       throw new StaffError("STAFF_NOT_FOUND", 404);
     }
 
+    // Access-state changes (role, active/inactive) each persist an additive StaffAccessEvent in
+    // the SAME transaction as the change, and — only for a real change — feed a post-commit
+    // email. A no-op (STAFF->STAFF, true->true, …) produces neither.
+    const accessEvents: StaffAccessEventDocument[] = [];
+
     if (input.role) {
-      await this.updateRoleTransactionally(business._id, staffId, membership, user, input.role);
+      const roleEvent = await this.updateRoleTransactionally(
+        business._id,
+        staffId,
+        membership,
+        user,
+        input.role,
+        actorUserId,
+        membership.role,
+      );
+      if (roleEvent) {
+        accessEvents.push(roleEvent);
+      }
     }
 
     if (input.employmentActive !== undefined) {
-      const updatedMembership = await this.staffRepository.updateActiveById(business._id, staffId, {
-        employmentActive: input.employmentActive,
-      });
-
-      if (updatedMembership) {
-        membership.employmentActive = updatedMembership.employmentActive;
+      const employmentEvent = await this.updateEmploymentActiveTransactionally(
+        business._id,
+        staffId,
+        membership,
+        actorUserId,
+        membership.employmentActive,
+        input.employmentActive,
+      );
+      if (employmentEvent) {
+        accessEvents.push(employmentEvent);
       }
     }
 
@@ -350,6 +382,12 @@ export class StaffService {
       this.staffAvatarService.getAvatarUrlsByUserIds([String(membership.userId)]),
     ]);
 
+    // Best-effort, strictly AFTER every write above has committed. One email per persisted
+    // access event; never blocks or rolls back the staff update.
+    for (const event of accessEvents) {
+      await this.dispatchStaffAccessChangeNotification(event, business.name);
+    }
+
     return this.toMembershipDto(
       membership,
       user,
@@ -360,12 +398,42 @@ export class StaffService {
     ) as StaffMemberDto;
   }
 
+  private async dispatchStaffAccessChangeNotification(
+    event: StaffAccessEventDocument,
+    businessName: string,
+  ): Promise<void> {
+    if (!this.staffAccessNotifier) {
+      return;
+    }
+    try {
+      await this.staffAccessNotifier.notifyStaffAccessChanged({
+        eventId: String(event._id),
+        type: event.type,
+        staffUserId: String(event.staffUserId),
+        businessName,
+        ...(event.previousRole ? { previousRole: event.previousRole } : {}),
+        ...(event.newRole ? { newRole: event.newRole } : {}),
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, eventId: String(event._id) },
+        "Failed to dispatch staff access-change notification (the staff change is unaffected)",
+      );
+    }
+  }
+
   /**
    * StaffMembership.role and User.role are two independent documents in two different
    * collections that must never disagree — the Booking module's authorization check reads
    * both. Wrapped in a transaction so a mid-write failure (e.g. a dropped connection between
    * the two updates) can never leave one collection updated and the other stale — either both
    * roles move together or neither does.
+   *
+   * ADDITIVE (this phase): when a `staffAccessEventRepository` is wired AND the role actually
+   * changed (`previousRole !== role`), a `ROLE_CHANGED` `StaffAccessEvent` is inserted inside
+   * this SAME transaction and returned, so its `_id` can key the follow-up email. A no-op
+   * role "change" persists nothing new and returns `null`. The dual-write semantics above are
+   * untouched.
    */
   private async updateRoleTransactionally(
     businessId: BusinessDocument["_id"],
@@ -373,11 +441,18 @@ export class StaffService {
     membership: StaffMembershipDocument,
     user: UserDocument,
     role: StaffCreatableRole,
-  ): Promise<void> {
+    changedByUserId: string,
+    previousRole: StaffCreatableRole,
+  ): Promise<StaffAccessEventDocument | null> {
     const dbSession = await mongoose.startSession();
+    let accessEvent: StaffAccessEventDocument | null = null;
 
     try {
       await dbSession.withTransaction(async () => {
+        // Reset on withTransaction's own retry-on-TransientTransactionError, so an aborted
+        // attempt never leaks a stale event document out of here.
+        accessEvent = null;
+
         const updatedMembership = await this.staffRepository.updateActiveById(
           businessId,
           staffId,
@@ -398,6 +473,21 @@ export class StaffService {
           await this.userRepository.updateRole(user._id, role, dbSession);
           user.role = role;
         }
+
+        if (this.staffAccessEventRepository && previousRole !== role) {
+          accessEvent = await this.staffAccessEventRepository.create(
+            {
+              businessId,
+              staffMembershipId: updatedMembership._id,
+              staffUserId: membership.userId,
+              type: "ROLE_CHANGED",
+              changedByUserId: new mongoose.Types.ObjectId(changedByUserId),
+              previousRole,
+              newRole: role,
+            },
+            dbSession,
+          );
+        }
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
@@ -408,6 +498,70 @@ export class StaffService {
     } finally {
       await dbSession.endSession();
     }
+
+    return accessEvent;
+  }
+
+  /**
+   * Sets `employmentActive` and — when it actually flips AND a `staffAccessEventRepository` is
+   * wired — inserts a `DEACTIVATED` / `REACTIVATED` `StaffAccessEvent` in the SAME transaction,
+   * so the membership write and its audit record commit atomically (an event-insert failure
+   * rolls the flag back too). The field value / guard / result are exactly as before; the only
+   * added constraint is that this now needs a transaction-capable server, matching the role
+   * path above. A no-op (`previousActive === nextActive`) writes no event and returns `null`.
+   */
+  private async updateEmploymentActiveTransactionally(
+    businessId: BusinessDocument["_id"],
+    staffId: string,
+    membership: StaffMembershipDocument,
+    changedByUserId: string,
+    previousActive: boolean,
+    nextActive: boolean,
+  ): Promise<StaffAccessEventDocument | null> {
+    const dbSession = await mongoose.startSession();
+    let accessEvent: StaffAccessEventDocument | null = null;
+
+    try {
+      await dbSession.withTransaction(async () => {
+        accessEvent = null;
+
+        const updatedMembership = await this.staffRepository.updateActiveById(
+          businessId,
+          staffId,
+          { employmentActive: nextActive },
+          dbSession,
+        );
+
+        if (updatedMembership) {
+          membership.employmentActive = updatedMembership.employmentActive;
+        }
+
+        if (updatedMembership && this.staffAccessEventRepository && previousActive !== nextActive) {
+          accessEvent = await this.staffAccessEventRepository.create(
+            {
+              businessId,
+              staffMembershipId: updatedMembership._id,
+              staffUserId: membership.userId,
+              type: nextActive ? "REACTIVATED" : "DEACTIVATED",
+              changedByUserId: new mongoose.Types.ObjectId(changedByUserId),
+              previousEmploymentActive: previousActive,
+              newEmploymentActive: nextActive,
+            },
+            dbSession,
+          );
+        }
+      });
+    } catch (error) {
+      if (this.isTransactionUnsupported(error)) {
+        throw new StaffError("STAFF_TRANSACTION_UNAVAILABLE", 503);
+      }
+
+      throw error;
+    } finally {
+      await dbSession.endSession();
+    }
+
+    return accessEvent;
   }
 
   public async removeStaff(
@@ -426,6 +580,32 @@ export class StaffService {
     // identity + login capability survive removal; only the employment membership ends.
     // Schedule/time-off are intentionally left in place too (not deleted) — they remain
     // available for future booking-history reference, same rationale as identity survival.
+
+    // Best-effort staff notification, strictly AFTER the soft-remove has persisted. `removedAt`
+    // is written exactly once (repo guards on `removedAt: {$exists:false}`), so a retried remove
+    // 404s above and never re-notifies. Never blocks the response.
+    await this.dispatchStaffRemovedNotification(removed, business.name);
+  }
+
+  private async dispatchStaffRemovedNotification(
+    membership: StaffMembershipDocument,
+    businessName: string,
+  ): Promise<void> {
+    if (!this.staffAccessNotifier) {
+      return;
+    }
+    try {
+      await this.staffAccessNotifier.notifyStaffRemoved({
+        membershipId: String(membership._id),
+        userId: String(membership.userId),
+        businessName,
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, membershipId: String(membership._id) },
+        "Failed to dispatch STAFF_ACCESS_REMOVED notification (the staff removal is unaffected)",
+      );
+    }
   }
 
   public async getSchedule(

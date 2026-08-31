@@ -2,7 +2,11 @@ import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingStatus } from "../booking/booking.types.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import { combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
-import { resolveAnalyticsPeriod } from "./super-admin-analytics.util.js";
+import {
+  aggregateOwnershipForPeriod,
+  resolveAnalyticsPeriod,
+  resolveSeriesWindow,
+} from "./super-admin-analytics.util.js";
 
 export type SuperAdminBookingAnalyticsDto = {
   period: { from: string; to: string };
@@ -38,19 +42,19 @@ export class SuperAdminBookingAnalyticsService {
     fromDate?: Date | undefined;
     toDate?: Date | undefined;
   }): Promise<SuperAdminBookingAnalyticsDto> {
-    const { from, to } = resolveAnalyticsPeriod(query);
+    const period = resolveAnalyticsPeriod(query);
+    const { from, to } = period;
+    const series = resolveSeriesWindow(period);
 
     const [statusCounts, monthlySeries, clientTypeSplit, fulfilmentSplit, revenueBuckets] =
       await Promise.all([
         this.bookingRepository.countByStatusInRange(from, to),
-        this.bookingRepository.countCreatedByMonth(from, to),
+        this.bookingRepository.countCreatedByMonth(series.from, series.to),
         this.bookingRepository.aggregateClientTypeSplit(from, to),
         this.bookingRepository.aggregateFulfilmentSplit(from, to),
-        this.financialTransactionService.aggregateOwnedBySource({
+        aggregateOwnershipForPeriod(this.financialTransactionService, {
           types: ["PLATFORM_FEE", "PROCESSING_FEE", "REFUND"],
-          unclaimedOnly: false,
-          from,
-          to,
+          period,
         }),
       ]);
 

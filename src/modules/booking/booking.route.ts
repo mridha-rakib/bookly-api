@@ -4,6 +4,8 @@ import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { AddonRepository } from "../addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../addons/addon-service-assignment.repository.js";
+import { AppointmentReminderRepository } from "../appointment-reminder/appointment-reminder.repository.js";
+import { AppointmentReminderScheduler } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
@@ -23,11 +25,20 @@ import { BusinessHoursRepository } from "../business-hours/business-hours.reposi
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { IntegrationRepository } from "../integration/integration.repository.js";
 import { IntegrationService } from "../integration/integration.service.js";
+import { BookingCancelledNotifier } from "../notification/booking-cancelled.notifier.js";
+import { BookingCompletedNotifier } from "../notification/booking-completed.notifier.js";
+import { BookingCreatedNotifier } from "../notification/booking-created.notifier.js";
+import { BookingRescheduledCustomerNotifier } from "../notification/booking-rescheduled-customer.notifier.js";
+import { NoShowNotifier } from "../notification/no-show.notifier.js";
+import { StaffBookingNotifier } from "../notification/staff-booking.notifier.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../payment/payment.service.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
+import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import { PromoRepository } from "../promo/promo.repository.js";
 import { PromoApplicationService } from "../promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
@@ -54,6 +65,7 @@ import {
   createManualBookingBodySchema,
   listBusinessBookingsQuerySchema,
   listCustomerBookingsQuerySchema,
+  markNoShowBodySchema,
   rescheduleBookingBodySchema,
   waiveFeeBodySchema,
 } from "./booking.schema.js";
@@ -120,6 +132,20 @@ const buildController = (): BookingController => {
     bookingRepository,
   );
 
+  const platformSettingsService = new PlatformSettingsService(new PlatformSettingsRepository());
+
+  const bookingCreatedNotifier = new BookingCreatedNotifier(
+    new EmailOutboxService(),
+    userRepository,
+  );
+
+  // Appointment reminders — shared across the creation and lifecycle services so a booking's
+  // 24h reminder is scheduled on create, re-scheduled on reschedule, and retired on cancel/
+  // complete/no-show. Delivery happens later in run-appointment-reminder-worker.ts.
+  const appointmentReminderScheduler = new AppointmentReminderScheduler(
+    new AppointmentReminderRepository(),
+  );
+
   const creationService = new BookingCreationService(
     businessRepository,
     bookingService,
@@ -135,6 +161,9 @@ const buildController = (): BookingController => {
     financialTransactionService,
     promoApplicationService,
     integrationService,
+    platformSettingsService,
+    bookingCreatedNotifier,
+    appointmentReminderScheduler,
   );
 
   const lifecycleService = new BookingLifecycleService(
@@ -148,6 +177,12 @@ const buildController = (): BookingController => {
     paymentService,
     financialTransactionService,
     integrationService,
+    new BookingCompletedNotifier(new EmailOutboxService()),
+    new BookingCancelledNotifier(new EmailOutboxService(), userRepository),
+    new NoShowNotifier(new EmailOutboxService()),
+    new StaffBookingNotifier(new EmailOutboxService(), staffRepository, userRepository),
+    appointmentReminderScheduler,
+    new BookingRescheduledCustomerNotifier(new EmailOutboxService()),
   );
 
   return new BookingController(bookingService, creationService, lifecycleService);
@@ -228,7 +263,7 @@ export const createBusinessBookingRoute = (): Router => {
     authenticate,
     requireActiveUser(),
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
-    validateRequest({ params: bookingIdParamsSchema }),
+    validateRequest({ params: bookingIdParamsSchema, body: markNoShowBodySchema }),
     asyncHandler(controller.markNoShow),
   );
 

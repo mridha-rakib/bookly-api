@@ -310,6 +310,22 @@ export type BookingCancellationPolicySnapshot = {
 };
 
 /**
+ * No-show eligibility window captured at Booking-creation time — the SAME historical-integrity
+ * discipline as `cancellationPolicySnapshot`: a later Super Admin edit of the category window,
+ * or a Business changing its category, must never retroactively change when this Booking was
+ * eligible to be marked no-show. `categoryKey` is the resolved canonical business category
+ * (see platform-settings/business-category.ts); the two minute offsets are relative to
+ * `schedule.startAt`. Absent when the Business's category could not be safely resolved at
+ * creation time (or the Booking predates this field) — in that case markNoShow keeps its
+ * legacy behavior (status-only gate), see BookingLifecycleService.markNoShow.
+ */
+export type BookingNoShowEligibilitySnapshot = {
+  categoryKey: string;
+  opensAfterMinutes: number;
+  closesAfterMinutes: number;
+};
+
+/**
  * `cancellationFeeCents`/`refundOwedCents` are the CLASSIFIED amounts (what the policy says is
  * owed/refundable) — never proof that money actually moved. `settlementStatus` is the honest,
  * separately-tracked record of whether the associated Stripe charge/refund actually succeeded
@@ -424,6 +440,7 @@ export type BookingDocument = {
   noShowStartedAt?: Date | undefined;
   noShowDeadlineAt?: Date | undefined;
   cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
+  noShowEligibilitySnapshot?: BookingNoShowEligibilitySnapshot | undefined;
   cancellationOutcome?: BookingCancellationOutcome | undefined;
   completionPayment?: BookingCompletionPayment | undefined;
   promo?: BookingPromoSnapshot | undefined;
@@ -748,6 +765,15 @@ const bookingCancellationPolicySnapshotSchema = new Schema<BookingCancellationPo
   { _id: false },
 );
 
+const bookingNoShowEligibilitySnapshotSchema = new Schema<BookingNoShowEligibilitySnapshot>(
+  {
+    categoryKey: { type: String, required: true, trim: true },
+    opensAfterMinutes: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    closesAfterMinutes: { type: Number, required: true, min: 0, validate: Number.isInteger },
+  },
+  { _id: false },
+);
+
 const bookingCancellationOutcomeSchema = new Schema<BookingCancellationOutcome>(
   {
     classifiedAt: { type: Date, required: true },
@@ -833,6 +859,7 @@ const bookingSchema = new Schema<BookingDocument>(
     noShowStartedAt: { type: Date },
     noShowDeadlineAt: { type: Date },
     cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
+    noShowEligibilitySnapshot: { type: bookingNoShowEligibilitySnapshotSchema },
     cancellationOutcome: { type: bookingCancellationOutcomeSchema },
     completionPayment: { type: bookingCompletionPaymentSchema },
     promo: { type: bookingPromoSnapshotSchema },

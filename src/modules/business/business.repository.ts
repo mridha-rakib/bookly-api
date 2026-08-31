@@ -1,6 +1,7 @@
 import type { ClientSession, Types } from "mongoose";
 
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
+import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import { type BusinessDocument, BusinessModel } from "./business.model.js";
 import type { BusinessStatus, BusinessVisitType } from "./business.types.js";
 
@@ -41,9 +42,12 @@ export class BusinessRepository {
     input: CreateBusinessInput,
     session?: ClientSession,
   ): Promise<BusinessDocument> {
-    return new BusinessModel({ ...input, status: "PENDING" }).save(
-      session ? { session } : undefined,
-    );
+    const categoryKey = resolveBusinessCategoryKey(input.category);
+    return new BusinessModel({
+      ...input,
+      ...(categoryKey ? { categoryKey } : {}),
+      status: "PENDING",
+    }).save(session ? { session } : undefined);
   }
 
   public async findByOwnerUserId(

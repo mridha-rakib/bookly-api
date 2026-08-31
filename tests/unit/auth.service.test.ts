@@ -12,6 +12,7 @@ import type { BusinessOnboardingRepository } from "../../src/modules/business-on
 import type { BusinessOnboardingService } from "../../src/modules/business-onboarding/business-onboarding.service.js";
 import type { ClientIdentityService } from "../../src/modules/client/client-identity.service.js";
 import type { ContactChangeChallengeRepository } from "../../src/modules/contact-change/contact-change-challenge.repository.js";
+import type { CustomerAvatarService } from "../../src/modules/customer-avatar/customer-avatar.service.js";
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
 import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
@@ -63,6 +64,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     createCustomerProfile: vi.fn(),
     findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
     upsertCustomerProfile: vi.fn(),
+    setCustomerAvatar: vi.fn(),
     updatePasswordHash: vi.fn(),
     commitEmailChange: vi.fn(),
     updatePhoneVerifiedAt: vi.fn(),
@@ -142,6 +144,17 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     verifyOtp: vi.fn().mockResolvedValue(true),
     ...(overrides["phoneOtpProvider"] as object | undefined),
   };
+  const customerAvatarService = {
+    uploadOrReplaceAvatar: vi
+      .fn()
+      .mockResolvedValue({ avatarUrl: "https://signed.example/users/x/avatar/new.jpg" }),
+    resolveAvatarUrl: vi.fn(async (profile: { avatar?: { storageKey?: string } } | null) =>
+      profile?.avatar?.storageKey
+        ? `https://signed.example/${profile.avatar.storageKey}`
+        : undefined,
+    ),
+    ...(overrides["customerAvatarService"] as object | undefined),
+  };
 
   const service = new AuthService(
     userRepository,
@@ -161,6 +174,8 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     staffRepository as unknown as StaffRepository,
     clientIdentityService as unknown as ClientIdentityService,
     contactChangeChallengeRepository as unknown as ContactChangeChallengeRepository,
+    undefined,
+    customerAvatarService as unknown as CustomerAvatarService,
   );
 
   return {
@@ -175,6 +190,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     contactChangeChallengeRepository,
     emailOtpProvider,
     phoneOtpProvider,
+    customerAvatarService,
   };
 };
 
@@ -402,6 +418,38 @@ describe("AuthService.updateMyProfile", () => {
     expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
     expect(result.profile).toMatchObject({ defaultLanguage: "EN" });
   });
+
+  it("forwards a single reminder-channel change to UserProfile without touching the sibling channel or CustomerProfile", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: profileId,
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+          notifications: { appointmentReminderEmail: true },
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+
+    await service.updateMyProfile(userId.toHexString(), {
+      notifications: { appointmentReminderSms: true },
+    });
+
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(profileId, {
+      notifications: { appointmentReminderSms: true },
+    });
+    expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
+  });
 });
 
 describe("AuthService.getMe", () => {
@@ -446,6 +494,168 @@ describe("AuthService.getMe", () => {
     });
     await expect(legacy.service.getMe(userId.toHexString())).resolves.toMatchObject({
       profile: { defaultLanguage: "EN" },
+    });
+  });
+
+  it("exposes the persisted customer avatar as profile.avatarUrl, and undefined when none is set", async () => {
+    const userId = new Types.ObjectId();
+
+    const withAvatar = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue({
+          avatar: { storageKey: "users/abc/avatar/pic.jpg" },
+        }),
+      },
+    });
+    await expect(withAvatar.service.getMe(userId.toHexString())).resolves.toMatchObject({
+      profile: { avatarUrl: "https://signed.example/users/abc/avatar/pic.jpg" },
+    });
+
+    const withoutAvatar = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+    const result = await withoutAvatar.service.getMe(userId.toHexString());
+    expect(result.profile?.avatarUrl).toBeUndefined();
+  });
+
+  it("resolves notification preferences with product defaults for a legacy profile and echoes stored values otherwise", async () => {
+    const userId = new Types.ObjectId();
+
+    const legacy = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+    await expect(legacy.service.getMe(userId.toHexString())).resolves.toMatchObject({
+      profile: { notifications: { appointmentReminderEmail: true, appointmentReminderSms: false } },
+    });
+
+    const configured = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+          notifications: { appointmentReminderEmail: false, appointmentReminderSms: true },
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+    await expect(configured.service.getMe(userId.toHexString())).resolves.toMatchObject({
+      profile: { notifications: { appointmentReminderEmail: false, appointmentReminderSms: true } },
+    });
+  });
+});
+
+describe("AuthService.updateMyAvatar", () => {
+  const file = { buffer: Buffer.from([0xff, 0xd8, 0xff]), mimeType: "image/jpeg", size: 3 };
+
+  it("delegates to CustomerAvatarService for the acting session user and returns the fresh getMe payload", async () => {
+    const userId = new Types.ObjectId();
+    const { service, customerAvatarService } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi
+          .fn()
+          .mockResolvedValue({ avatar: { storageKey: "users/abc/avatar/new.jpg" } }),
+      },
+    });
+
+    const result = await service.updateMyAvatar(userId.toHexString(), file);
+
+    expect(customerAvatarService.uploadOrReplaceAvatar).toHaveBeenCalledWith(
+      userId.toHexString(),
+      file,
+    );
+    expect(result.profile).toMatchObject({
+      avatarUrl: "https://signed.example/users/abc/avatar/new.jpg",
+    });
+  });
+
+  it("rejects when the session user no longer exists (no storage side effect)", async () => {
+    const { service, customerAvatarService } = createAuthService({
+      userRepository: { findById: vi.fn().mockResolvedValue(null) },
+    });
+
+    await expect(
+      service.updateMyAvatar(new Types.ObjectId().toHexString(), file),
+    ).rejects.toMatchObject({ statusCode: 401 });
+    expect(customerAvatarService.uploadOrReplaceAvatar).not.toHaveBeenCalled();
+  });
+
+  it("propagates a validation rejection from CustomerAvatarService unchanged", async () => {
+    const userId = new Types.ObjectId();
+    const { service } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({ _id: userId, role: "CUSTOMER", status: "ACTIVE" }),
+      },
+      customerAvatarService: {
+        uploadOrReplaceAvatar: vi.fn().mockRejectedValue(
+          Object.assign(new Error("Only JPEG, PNG, and WebP images are allowed"), {
+            statusCode: 400,
+          }),
+        ),
+      },
+    });
+
+    await expect(service.updateMyAvatar(userId.toHexString(), file)).rejects.toMatchObject({
+      statusCode: 400,
     });
   });
 });

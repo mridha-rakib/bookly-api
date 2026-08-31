@@ -23,6 +23,10 @@ import { BusinessHoursRepository } from "../../../src/modules/business-hours/bus
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
+import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
+import { BookingRescheduledCustomerNotifier } from "../../../src/modules/notification/booking-rescheduled-customer.notifier.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
@@ -44,6 +48,46 @@ import {
 const TIMEZONE = "Europe/Nicosia";
 const DATE = "2030-08-20"; // a Tuesday, safely in the future relative to any real "now"
 
+/**
+ * Records every Google Calendar reschedule PATCH the lifecycle service issues. `throwOnUpdate`
+ * proves the booking-side wrapper's try/catch keeps a misbehaving integration from affecting the
+ * committed reschedule (stronger than the real IntegrationService, which swallows internally).
+ */
+class FakeIntegrationService {
+  public patchCalls: Array<{
+    eventId: string;
+    startIso: string;
+    endIso: string;
+    timezone: string;
+  }> = [];
+  public deleteCalls: string[] = [];
+  public appliedStartIso: string | null = null;
+  public throwOnUpdate = false;
+  public createCalled = false;
+
+  public async updateEventScheduleForBooking(
+    _businessId: unknown,
+    eventId: string,
+    schedule: { startAt: Date; endAt: Date; timezone: string },
+  ): Promise<void> {
+    this.patchCalls.push({
+      eventId,
+      startIso: schedule.startAt.toISOString(),
+      endIso: schedule.endAt.toISOString(),
+      timezone: schedule.timezone,
+    });
+    if (this.throwOnUpdate) {
+      throw new Error("fake google update failure");
+    }
+    this.appliedStartIso = schedule.startAt.toISOString();
+  }
+
+  public async deleteEventForBooking(_businessId: unknown, eventId: string): Promise<void> {
+    this.deleteCalls.push(eventId);
+    this.appliedStartIso = null;
+  }
+}
+
 describe("database-backed Booking creation + lifecycle integration", () => {
   let userRepository: UserRepository;
   let businessRepository: BusinessRepository;
@@ -64,6 +108,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
   let paymentGateway: FakePaymentGateway;
   let paymentService: PaymentService;
   let financialTransactionService: BookingFinancialTransactionService;
+  let fakeIntegration: FakeIntegrationService;
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -71,6 +116,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
 
   beforeEach(async () => {
     await clearIsolatedDatabase();
+    fakeIntegration = new FakeIntegrationService();
     userRepository = new UserRepository();
     businessRepository = new BusinessRepository();
     serviceRepository = new ServiceRepository();
@@ -146,6 +192,13 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       staffRepository,
       paymentService,
       financialTransactionService,
+      fakeIntegration, // integrationService (fake — records reschedule PATCHes)
+      undefined, // bookingCompletedNotifier
+      undefined, // bookingCancelledNotifier
+      undefined, // noShowNotifier
+      undefined, // staffBookingNotifier
+      undefined, // appointmentReminderScheduler
+      new BookingRescheduledCustomerNotifier(new EmailOutboxService(new EmailOutboxRepository())),
     );
   });
 
@@ -967,4 +1020,354 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     const finalBooking = await bookingRepository.findById(business._id, booking._id);
     expect(finalBooking?.customerRescheduleCount).toBe(1);
   }, 20_000);
+
+  // --- Reschedule → mandatory customer confirmation email ------------------------------------
+
+  describe("customer reschedule confirmation email", () => {
+    const linkCustomer = async (clientId: Types.ObjectId, bookingId: Types.ObjectId) => {
+      const customer = await userRepository.create({
+        normalizedEmail: `cust-resched-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      await clientRepository.setLinkState(clientId, {
+        linkState: "LINKED",
+        linkedUserId: customer._id,
+      });
+      await BookingModel.updateOne(
+        { _id: bookingId },
+        { $set: { "customer.customerUserId": customer._id } },
+      ).exec();
+      return customer;
+    };
+
+    it("owner reschedule enqueues one PENDING BOOKING_RESCHEDULED_CUSTOMER row for the booking contact", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+
+      const rescheduled = await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+
+      const rows = await EmailOutboxModel.find({
+        templateKey: "BOOKING_RESCHEDULED_CUSTOMER",
+      }).lean();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("PENDING");
+      expect(rows[0]?.eventKey).toBe(`BOOKING_RESCHEDULED:${String(booking._id)}:1`);
+      expect(rows[0]?.recipient).toBe(booking.customer.contact.normalizedEmail);
+      expect(rows[0]?.payload["rescheduledByBusiness"]).toBe(true);
+    });
+
+    it("customer reschedule enqueues the row; a second genuine reschedule is its own :2 row", async () => {
+      const { business, booking, client } = await createUpcomingBooking("10:00");
+      const customer = await linkCustomer(client._id, booking._id);
+
+      await lifecycleService.rescheduleByCustomer(
+        String(customer._id),
+        String(booking._id),
+        startAtFor("13:00"),
+      );
+      await lifecycleService.rescheduleByCustomer(
+        String(customer._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      const rows = await EmailOutboxModel.find({
+        templateKey: "BOOKING_RESCHEDULED_CUSTOMER",
+      })
+        .sort({ createdAt: 1 })
+        .lean();
+      expect(rows.map((r) => r.eventKey)).toEqual([
+        `BOOKING_RESCHEDULED:${String(booking._id)}:1`,
+        `BOOKING_RESCHEDULED:${String(booking._id)}:2`,
+      ]);
+      expect(rows.every((r) => r.payload["rescheduledByBusiness"] === false)).toBe(true);
+      void business;
+    });
+
+    it("a failing outbox enqueue never rolls back the committed reschedule", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+
+      const brokenLifecycle = new BookingLifecycleService(
+        bookingService,
+        bookingRepository,
+        businessRepository,
+        reservationService,
+        availabilityService,
+        serviceRepository,
+        staffRepository,
+        paymentService,
+        financialTransactionService,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new BookingRescheduledCustomerNotifier({
+          enqueue: async () => {
+            throw new Error("outbox unavailable");
+          },
+        } as never),
+      );
+
+      const rescheduled = await brokenLifecycle.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      expect(rescheduled.rescheduleHistory).toHaveLength(1);
+      const persisted = await bookingRepository.findById(business._id, booking._id);
+      expect(persisted?.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+    });
+  });
+
+  // --- Reschedule → Google Calendar sync ----------------------------------------------------
+
+  describe("Google Calendar reschedule sync", () => {
+    const linkEvent = async (bookingId: Types.ObjectId, eventId = "gcal-evt-1") => {
+      await BookingModel.updateOne(
+        { _id: bookingId },
+        { $set: { googleCalendarEventId: eventId } },
+      ).exec();
+    };
+
+    const linkCustomer = async (clientId: Types.ObjectId, bookingId: Types.ObjectId) => {
+      const customer = await userRepository.create({
+        normalizedEmail: `cust-gcal-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      await clientRepository.setLinkState(clientId, {
+        linkState: "LINKED",
+        linkedUserId: customer._id,
+      });
+      await BookingModel.updateOne(
+        { _id: bookingId },
+        { $set: { "customer.customerUserId": customer._id } },
+      ).exec();
+      return customer;
+    };
+
+    // Reach the private best-effort wrapper directly to drive the race scenarios deterministically.
+    const runSync = (booking: unknown): Promise<void> =>
+      (
+        lifecycleService as unknown as {
+          syncBookingRescheduledToGoogleCalendar: (b: unknown) => Promise<void>;
+        }
+      ).syncBookingRescheduledToGoogleCalendar(booking);
+
+    it("owner reschedule PATCHes the SAME event with the new time; no create; id unchanged", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+
+      const rescheduled = await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(fakeIntegration.patchCalls).toHaveLength(1);
+      expect(fakeIntegration.patchCalls[0]?.eventId).toBe("gcal-evt-1");
+      expect(fakeIntegration.patchCalls[0]?.startIso).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.patchCalls[0]?.endIso).toBe(rescheduled.schedule.endAt.toISOString());
+      expect(fakeIntegration.patchCalls[0]?.timezone).toBe(TIMEZONE);
+      expect(fakeIntegration.createCalled).toBe(false);
+
+      const persisted = await bookingRepository.findById(business._id, booking._id);
+      expect(persisted?.googleCalendarEventId).toBe("gcal-evt-1");
+    });
+
+    it("customer reschedule PATCHes the same event", async () => {
+      const { business, booking, client } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+      const customer = await linkCustomer(client._id, booking._id);
+
+      await lifecycleService.rescheduleByCustomer(
+        String(customer._id),
+        String(booking._id),
+        startAtFor("13:00"),
+      );
+
+      expect(fakeIntegration.patchCalls).toHaveLength(1);
+      expect(fakeIntegration.patchCalls[0]?.eventId).toBe("gcal-evt-1");
+      expect(fakeIntegration.patchCalls[0]?.startIso).toBe(startAtFor("13:00"));
+    });
+
+    it("no linked Google event → no PATCH, reschedule still succeeds", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+
+      const rescheduled = await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.patchCalls).toHaveLength(0);
+    });
+
+    it("a throwing integration service never rolls back the reschedule; customer email still enqueued", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+      fakeIntegration.throwOnUpdate = true;
+
+      const rescheduled = await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      const persisted = await bookingRepository.findById(business._id, booking._id);
+      expect(persisted?.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.patchCalls).toHaveLength(1); // it WAS attempted
+      expect(
+        await EmailOutboxModel.countDocuments({ templateKey: "BOOKING_RESCHEDULED_CUSTOMER" }),
+      ).toBe(1);
+    });
+
+    it("[race] rapid double reschedule: external event converges to the newest committed time", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+
+      await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("13:00"),
+      );
+      await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(fakeIntegration.patchCalls).toHaveLength(2);
+      expect(fakeIntegration.patchCalls.at(-1)?.startIso).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.appliedStartIso).toBe(startAtFor("15:00"));
+    });
+
+    it("[race] the sync live-re-reads: a STALE snapshot still PATCHes the latest committed time", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+
+      // Commit the real move to 15:00.
+      await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+      fakeIntegration.patchCalls = [];
+      fakeIntegration.appliedStartIso = null;
+
+      // Now drive the wrapper with a stale snapshot claiming the booking is still at 13:00
+      // (as a slow first reschedule's post-commit tail would carry). The wrapper must ignore
+      // the snapshot's schedule and PATCH the DB's current 15:00.
+      const staleSnapshot = {
+        _id: booking._id,
+        businessId: business._id,
+        googleCalendarEventId: "gcal-evt-1",
+        status: "UPCOMING",
+        schedule: {
+          timezone: TIMEZONE,
+          startAt: new Date(startAtFor("13:00")),
+          endAt: new Date(startAtFor("13:00")),
+        },
+      };
+      await runSync(staleSnapshot);
+
+      expect(fakeIntegration.patchCalls).toHaveLength(1);
+      expect(fakeIntegration.patchCalls[0]?.startIso).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.patchCalls[0]?.startIso).not.toBe(startAtFor("13:00"));
+    });
+
+    it("[race] cancel-after-reschedule: the live re-read sees non-UPCOMING and skips the PATCH", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+
+      await lifecycleService.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+      fakeIntegration.patchCalls = [];
+
+      // Booking is cancelled out from under a still-pending reschedule sync.
+      await BookingModel.updateOne(
+        { _id: booking._id },
+        { $set: { status: "CANCELLED_BY_BUSINESS" } },
+      ).exec();
+
+      const staleUpcomingSnapshot = {
+        _id: booking._id,
+        businessId: business._id,
+        googleCalendarEventId: "gcal-evt-1",
+        status: "UPCOMING",
+        schedule: {
+          timezone: TIMEZONE,
+          startAt: new Date(startAtFor("15:00")),
+          endAt: new Date(startAtFor("15:00")),
+        },
+      };
+      await runSync(staleUpcomingSnapshot);
+
+      expect(fakeIntegration.patchCalls).toHaveLength(0);
+    });
+
+    it("disconnected integration (no method wired) → safe skip, reschedule succeeds", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await linkEvent(booking._id);
+
+      const noIntegrationLifecycle = new BookingLifecycleService(
+        bookingService,
+        bookingRepository,
+        businessRepository,
+        reservationService,
+        availabilityService,
+        serviceRepository,
+        staffRepository,
+        paymentService,
+        financialTransactionService,
+        undefined, // integrationService absent
+      );
+
+      const rescheduled = await noIntegrationLifecycle.rescheduleByOwner(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+
+      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
+      expect(fakeIntegration.patchCalls).toHaveLength(0);
+    });
+  });
 });

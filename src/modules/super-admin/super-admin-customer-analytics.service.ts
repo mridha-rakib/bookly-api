@@ -1,6 +1,6 @@
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
-import { resolveAnalyticsPeriod } from "./super-admin-analytics.util.js";
+import { resolveAnalyticsPeriod, resolveSeriesWindow } from "./super-admin-analytics.util.js";
 
 export type SuperAdminCustomerAnalyticsDto = {
   period: { from: string; to: string };
@@ -28,10 +28,12 @@ export class SuperAdminCustomerAnalyticsService {
     fromDate?: Date | undefined;
     toDate?: Date | undefined;
   }): Promise<SuperAdminCustomerAnalyticsDto> {
-    const { from, to } = resolveAnalyticsPeriod(query);
+    const period = resolveAnalyticsPeriod(query);
+    const { from, to } = period;
+    const series = resolveSeriesWindow(period);
 
     const [registeredOverTime, registeredTotal, activity] = await Promise.all([
-      this.userRepository.countCreatedByMonth("CUSTOMER", from, to),
+      this.userRepository.countCreatedByMonth("CUSTOMER", series.from, series.to),
       this.userRepository.countByRole("CUSTOMER"),
       this.bookingRepository.aggregateCustomerActivity(),
     ]);

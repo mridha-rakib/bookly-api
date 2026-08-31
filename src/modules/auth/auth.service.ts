@@ -9,13 +9,22 @@ import type { BusinessOnboardingService } from "../business-onboarding/business-
 import type { ClientIdentityService } from "../client/client-identity.service.js";
 import type { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
 import type {
+  CustomerAvatarService,
+  CustomerAvatarUpload,
+} from "../customer-avatar/customer-avatar.service.js";
+import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
+import type {
   RegistrationPortal,
   RegistrationSessionDocument,
 } from "../registration-session/registration-session.model.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
-import { professionalRoles, type UserRole } from "../user/user.types.js";
+import {
+  professionalRoles,
+  resolveNotificationPreferences,
+  type UserRole,
+} from "../user/user.types.js";
 import type { EmailOtpProvider } from "../verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../verification/phone-otp.provider.js";
 import { AuthError } from "./auth.errors.js";
@@ -89,6 +98,14 @@ export class AuthService {
     private readonly staffRepository: StaffRepository,
     private readonly clientIdentityService: ClientIdentityService,
     private readonly contactChangeChallengeRepository: ContactChangeChallengeRepository,
+    // Stage D mailing — optional + trailing (same pattern as the booking services). Enqueues
+    // the INTERNAL "new business registration" notification from completeBusinessOwner's
+    // post-commit tail. Absent in the auth test/integration construction sites — a safe no-op.
+    private readonly businessRegisteredNotifier?: BusinessRegisteredNotificationPort,
+    // Customer avatar (PUT /auth/me/avatar + the avatarUrl in getMe). Optional + trailing so
+    // the existing auth test/integration construction sites keep working unchanged; when it is
+    // absent, getMe simply omits avatarUrl and updateMyAvatar is unreachable (route not wired).
+    private readonly customerAvatarService?: CustomerAvatarService,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -468,7 +485,51 @@ export class AuthService {
       throw new Error("Business owner completion failed");
     }
 
+    // Stage D mailing — enqueue the INTERNAL "new business registration" notification strictly
+    // AFTER the registration transaction has committed. Best-effort: never throws, so a
+    // notification problem cannot undo a successfully registered business.
+    await this.dispatchBusinessRegisteredNotification({
+      businessId: authResult.business.id,
+      status: authResult.business.status,
+      businessName: businessDetails.businessName,
+      ownerFirstName: session.personalProfile?.firstName,
+      ownerLastName: session.personalProfile?.lastName,
+      ownerEmail: session.normalizedEmail,
+      phone: (session.phone ?? businessDetails.phone)?.e164,
+      category: categorySelection.category,
+      city: businessDetails.city,
+    });
+
     return authResult;
+  }
+
+  private async dispatchBusinessRegisteredNotification(input: {
+    businessId: string;
+    status: string;
+    businessName: string;
+    ownerFirstName?: string | undefined;
+    ownerLastName?: string | undefined;
+    ownerEmail: string;
+    phone?: string | undefined;
+    category?: string | undefined;
+    city?: string | undefined;
+  }): Promise<void> {
+    if (!this.businessRegisteredNotifier) {
+      return;
+    }
+    const ownerName =
+      [input.ownerFirstName, input.ownerLastName].filter(Boolean).join(" ") || input.ownerEmail;
+    await this.businessRegisteredNotifier.notifyBusinessRegistered({
+      businessId: input.businessId,
+      businessName: input.businessName,
+      ownerName,
+      ownerEmail: input.ownerEmail,
+      phone: input.phone,
+      category: input.category,
+      city: input.city,
+      status: input.status,
+      registeredAt: new Date(),
+    });
   }
 
   public async refresh(refreshToken: string): Promise<AuthResult> {
@@ -534,6 +595,11 @@ export class AuthService {
       user.role === "CUSTOMER"
         ? await this.userRepository.findCustomerProfileByUserId(user._id)
         : null;
+    // Ready-to-render URL for the Customer's uploaded avatar (undefined when none / when the
+    // avatar service is not wired). Storage stays the source of truth; nothing is cached here.
+    const avatarUrl = customerProfile
+      ? await this.customerAvatarService?.resolveAvatarUrl(customerProfile)
+      : undefined;
 
     return {
       user: {
@@ -553,8 +619,12 @@ export class AuthService {
             phone: profile.phone,
             // Profiles created before this field existed read back as "EN" rather than undefined.
             defaultLanguage: profile.defaultLanguage ?? "EN",
+            // Always fully populated: an absent stored sub-doc / sub-field resolves to the
+            // product default here, so the frontend never has to know about "absent".
+            notifications: resolveNotificationPreferences(profile.notifications),
             address: customerProfile?.address,
             dateOfBirth: customerProfile?.dateOfBirth,
+            avatarUrl,
           }
         : null,
       business: business
@@ -592,19 +662,22 @@ export class AuthService {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
-    const { firstName, lastName, gender, defaultLanguage, address, dateOfBirth } = input;
+    const { firstName, lastName, gender, defaultLanguage, address, dateOfBirth, notifications } =
+      input;
 
     if (
       firstName !== undefined ||
       lastName !== undefined ||
       gender !== undefined ||
-      defaultLanguage !== undefined
+      defaultLanguage !== undefined ||
+      notifications !== undefined
     ) {
       await this.userRepository.updateProfile(profile._id, {
         ...(firstName !== undefined ? { firstName } : {}),
         ...(lastName !== undefined ? { lastName } : {}),
         ...(gender !== undefined ? { gender } : {}),
         ...(defaultLanguage !== undefined ? { defaultLanguage } : {}),
+        ...(notifications !== undefined ? { notifications } : {}),
       });
     }
 
@@ -614,6 +687,32 @@ export class AuthService {
         ...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
       });
     }
+
+    return this.getMe(userId);
+  }
+
+  /**
+   * Customer self-service avatar upload/replace. The acting user is always the authenticated
+   * session user (`userId` from request.auth) — never a client-supplied id. All storage,
+   * validation and write-new-then-retire-old logic lives in CustomerAvatarService; this method
+   * only delegates and then returns the same full getMe payload the profile mutations return,
+   * so the frontend gets the persisted avatarUrl without a second request.
+   */
+  public async updateMyAvatar(
+    userId: string,
+    file: CustomerAvatarUpload | undefined,
+  ): Promise<Awaited<ReturnType<AuthService["getMe"]>>> {
+    if (!this.customerAvatarService) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    const user = await this.userRepository.findById(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    await this.customerAvatarService.uploadOrReplaceAvatar(userId, file);
 
     return this.getMe(userId);
   }

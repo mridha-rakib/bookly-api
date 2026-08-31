@@ -1,7 +1,15 @@
-import { Router } from "express";
+import {
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  Router,
+} from "express";
+import multer from "multer";
 
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
+import { env } from "../../config/env.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
@@ -15,6 +23,17 @@ import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessLifecycleService } from "../business/business-lifecycle.service.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { BlogError } from "../content/blog.errors.js";
+import { BlogPostRepository } from "../content/blog.repository.js";
+import {
+  blogMediaIdParamsSchema,
+  blogPostIdParamsSchema,
+  createBlogBodySchema,
+  listAdminBlogQuerySchema,
+  updateBlogBodySchema,
+} from "../content/blog.schema.js";
+import { BlogService } from "../content/blog.service.js";
+import { BlogMediaRepository } from "../content/blog-media.repository.js";
 import { FaqRepository } from "../content/faq.repository.js";
 import {
   createFaqBodySchema,
@@ -24,6 +43,12 @@ import {
   updateFaqBodySchema,
 } from "../content/faq.schema.js";
 import { FaqService } from "../content/faq.service.js";
+import { StaticPageRepository } from "../content/static-page.repository.js";
+import {
+  staticPageKeyParamsSchema,
+  updateStaticPageBodySchema,
+} from "../content/static-page.schema.js";
+import { StaticPageService } from "../content/static-page.service.js";
 import { BusinessPayoutRepository } from "../finance/business-payout.repository.js";
 import { BusinessPayoutService } from "../finance/business-payout.service.js";
 import {
@@ -35,6 +60,10 @@ import {
   platformTransactionsQuerySchema,
 } from "../finance/finance.schema.js";
 import { FinanceService } from "../finance/finance.service.js";
+import { PlatformSettingsController } from "../platform-settings/platform-settings.controller.js";
+import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
+import { updatePlatformSettingsBodySchema } from "../platform-settings/platform-settings.schema.js";
+import { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import { PromoRepository } from "../promo/promo.repository.js";
 import {
   createPromoBodySchema,
@@ -56,6 +85,7 @@ import { ReviewService } from "../review/review.service.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
+import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import {
   changeSupportTicketStatusBodySchema,
   listAdminSupportTicketsQuerySchema,
@@ -105,6 +135,31 @@ import { SuperAdminReviewService } from "./super-admin-review.service.js";
 import { SuperAdminServiceAnalyticsService } from "./super-admin-service-analytics.service.js";
 import { SuperAdminSupportController } from "./super-admin-support.controller.js";
 import { SuperAdminSupportService } from "./super-admin-support.service.js";
+
+/** Single in-memory image upload for the Blog media endpoint — same multer config as
+ * business-media.route.ts (memory storage, one file, env-driven size cap). */
+const blogMediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: env.BUSINESS_MEDIA_MAX_UPLOAD_BYTES, files: 1 },
+});
+
+const uploadBlogImage: RequestHandler = (
+  request: Request,
+  response: Response,
+  next: NextFunction,
+): void => {
+  blogMediaUpload.single("file")(request, response, (error: unknown) => {
+    if (!error) {
+      next();
+      return;
+    }
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      next(new BlogError("BLOG_MEDIA_TOO_LARGE", 413));
+      return;
+    }
+    next(error);
+  });
+};
 
 /**
  * Batch 8 — the first real Super Admin backend surface in this codebase (confirmed by
@@ -207,7 +262,16 @@ export const createSuperAdminRoute = (): Router => {
     ),
   );
 
-  const contentController = new SuperAdminContentController(new FaqService(new FaqRepository()));
+  const contentController = new SuperAdminContentController(
+    new FaqService(new FaqRepository()),
+    new BlogService(
+      new BlogPostRepository(),
+      new BlogMediaRepository(),
+      createDeferredStorageServiceFromEnv(),
+      { maxUploadBytes: env.BUSINESS_MEDIA_MAX_UPLOAD_BYTES },
+    ),
+    new StaticPageService(new StaticPageRepository()),
+  );
 
   const supportController = new SuperAdminSupportController(
     new SuperAdminSupportService(
@@ -226,7 +290,19 @@ export const createSuperAdminRoute = (): Router => {
     ),
   );
 
+  const platformSettingsController = new PlatformSettingsController(
+    new PlatformSettingsService(new PlatformSettingsRepository()),
+  );
+
   router.use(authenticate, requireActiveUser(), requireRoles(["SUPER_ADMIN"]));
+
+  // --- Platform Settings ---
+  router.get("/settings/platform", asyncHandler(platformSettingsController.get));
+  router.patch(
+    "/settings/platform",
+    validateRequest({ body: updatePlatformSettingsBodySchema }),
+    asyncHandler(platformSettingsController.update),
+  );
 
   // --- Businesses ---
   router.get(
@@ -407,6 +483,62 @@ export const createSuperAdminRoute = (): Router => {
     "/content/faqs/:faqId",
     validateRequest({ params: faqIdParamsSchema }),
     asyncHandler(contentController.deleteFaq),
+  );
+
+  // --- Content Manager: Blog (Phase 2) ---
+  // SUPER_ADMIN-only via the router-wide gate. Public PUBLISHED-only reads live on the anonymous
+  // `/content` router (content.route.ts). Media routes are registered before `/:postId` so
+  // `DELETE /content/blog/media/:mediaId` is never captured by `DELETE /content/blog/:postId`.
+  router.post(
+    "/content/blog/media",
+    uploadBlogImage,
+    asyncHandler(contentController.uploadBlogMedia),
+  );
+  router.delete(
+    "/content/blog/media/:mediaId",
+    validateRequest({ params: blogMediaIdParamsSchema }),
+    asyncHandler(contentController.deleteBlogMedia),
+  );
+  router.get(
+    "/content/blog",
+    validateRequest({ query: listAdminBlogQuerySchema }),
+    asyncHandler(contentController.listBlog),
+  );
+  router.post(
+    "/content/blog",
+    validateRequest({ body: createBlogBodySchema }),
+    asyncHandler(contentController.createBlog),
+  );
+  router.get(
+    "/content/blog/:postId",
+    validateRequest({ params: blogPostIdParamsSchema }),
+    asyncHandler(contentController.getBlog),
+  );
+  router.patch(
+    "/content/blog/:postId",
+    validateRequest({ params: blogPostIdParamsSchema, body: updateBlogBodySchema }),
+    asyncHandler(contentController.updateBlog),
+  );
+  router.delete(
+    "/content/blog/:postId",
+    validateRequest({ params: blogPostIdParamsSchema }),
+    asyncHandler(contentController.deleteBlog),
+  );
+
+  // --- Content Manager: Static Pages (Phase 3) ---
+  // Fixed set of 4 legal pages — list + read + update only (no create/delete). Always-live
+  // (no status). Public PUBLISHED-safe reads live on the anonymous `/content/pages/:pageKey`
+  // router (content.route.ts).
+  router.get("/content/pages", asyncHandler(contentController.listStaticPages));
+  router.get(
+    "/content/pages/:pageKey",
+    validateRequest({ params: staticPageKeyParamsSchema }),
+    asyncHandler(contentController.getStaticPage),
+  );
+  router.patch(
+    "/content/pages/:pageKey",
+    validateRequest({ params: staticPageKeyParamsSchema, body: updateStaticPageBodySchema }),
+    asyncHandler(contentController.updateStaticPage),
   );
 
   // --- Support Tickets (Batch 15B) ---

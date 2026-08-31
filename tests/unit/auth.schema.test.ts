@@ -40,6 +40,44 @@ describe("updateMyProfileBodySchema", () => {
     expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "FR" }).success).toBe(false);
     expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "en" }).success).toBe(false);
   });
+
+  describe("notifications (appointment reminder preferences)", () => {
+    it("accepts a single-channel partial update", () => {
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { appointmentReminderEmail: false } })
+          .success,
+      ).toBe(true);
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { appointmentReminderSms: true } })
+          .success,
+      ).toBe(true);
+    });
+
+    it("accepts both channels together", () => {
+      expect(
+        updateMyProfileBodySchema.safeParse({
+          notifications: { appointmentReminderEmail: true, appointmentReminderSms: false },
+        }).success,
+      ).toBe(true);
+    });
+
+    it("rejects an empty notifications object (no-op request)", () => {
+      expect(updateMyProfileBodySchema.safeParse({ notifications: {} }).success).toBe(false);
+    });
+
+    it("rejects a non-boolean channel value", () => {
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { appointmentReminderEmail: "yes" } })
+          .success,
+      ).toBe(false);
+    });
+
+    it("rejects an unknown nested channel key (mass-assignment guard)", () => {
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: true } }).success,
+      ).toBe(false);
+    });
+  });
 });
 
 describe("Batch 18 contact-change schemas", () => {

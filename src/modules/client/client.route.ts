@@ -10,6 +10,8 @@ import {
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
+import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import { ClientCreatedNotifier } from "../notification/client-created.notifier.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { UserRepository } from "../user/user.repository.js";
@@ -44,12 +46,14 @@ export const createClientRoute = (): Router => {
   const staffRepository = new StaffRepository();
   const clientRepository = new ClientRepository();
   const clientIdentityService = new ClientIdentityService(userRepository, clientRepository);
+  const clientCreatedNotifier = new ClientCreatedNotifier(new EmailOutboxService());
   const service = new ClientService(
     clientRepository,
     businessRepository,
     staffRepository,
     userRepository,
     clientIdentityService,
+    clientCreatedNotifier,
   );
   const controller = new ClientController(service);
 
