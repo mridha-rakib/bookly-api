@@ -22,6 +22,8 @@ import "../modules/business-travel-settings/business-travel-settings.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
 import "../modules/client/client.model.js";
 import "../modules/email-outbox/email-outbox.model.js";
+import "../modules/marketing/marketing-campaign.model.js";
+import "../modules/marketing/marketing-campaign-recipient.model.js";
 import "../modules/payment/customer-payment-profile.model.js";
 import "../modules/registration-session/registration-session.model.js";
 import "../modules/services/service-category.model.js";

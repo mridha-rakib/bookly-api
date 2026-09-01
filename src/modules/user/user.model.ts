@@ -2,6 +2,8 @@ import { model, Schema, type Types } from "mongoose";
 
 import {
   genders,
+  type MarketingEmailConsent,
+  marketingEmailConsentSources,
   type NotificationPreferences,
   type UserLanguage,
   type UserRole,
@@ -66,11 +68,15 @@ export type UserProfileDocument = {
   /** Account UI language preference. Optional: rows created before this field default to "EN"
    * at read time (see AuthService.getMe). */
   defaultLanguage?: UserLanguage | undefined;
-  /** Customer-configurable OPTIONAL notification channels (24h appointment reminder only).
-   * Absent — or an absent sub-field — means "product default" (see resolveNotificationPreferences
-   * / NOTIFICATION_PREFERENCE_DEFAULTS); no migration needed. Never suppresses mandatory
-   * transactional or security mail. */
+  /** Customer-configurable OPTIONAL notification channels (24h appointment reminder + marketing-
+   * email opt-in, Stage M1). Absent — or an absent sub-field — means "product default" (see
+   * resolveNotificationPreferences / NOTIFICATION_PREFERENCE_DEFAULTS); no migration needed.
+   * Never suppresses mandatory transactional or security mail. */
   notifications?: NotificationPreferences | undefined;
+  /** Provenance of the current `notifications.marketingEmail` value (Stage M3A) — audit only,
+   * eligibility never reads it. Absent on legacy rows (no backfill); written on the next
+   * preference mutation. */
+  marketingEmailConsent?: MarketingEmailConsent | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   createdAt: Date;
@@ -96,6 +102,22 @@ const userProfileSchema = new Schema<UserProfileDocument>(
       type: {
         appointmentReminderEmail: { type: Boolean },
         appointmentReminderSms: { type: Boolean },
+        // Marketing-email opt-in (Stage M1 — preference foundation only). Same style as the
+        // reminder channels: plain optional Boolean, no default, no index. Absent resolves to
+        // `false` (see resolveNotificationPreferences). Nothing sends marketing email yet.
+        marketingEmail: { type: Boolean },
+      },
+      required: false,
+      _id: false,
+      default: undefined,
+    },
+    // Stage M3A — audit provenance for `notifications.marketingEmail`. Optional, no `_id`,
+    // `default: undefined`; the whole sub-doc is replaced on each write (its two fields have no
+    // siblings to protect). Never read by eligibility.
+    marketingEmailConsent: {
+      type: {
+        updatedAt: { type: Date, required: true },
+        source: { type: String, enum: marketingEmailConsentSources, required: true },
       },
       required: false,
       _id: false,
@@ -108,6 +130,14 @@ const userProfileSchema = new Schema<UserProfileDocument>(
 );
 
 userProfileSchema.index({ "phone.e164": 1 });
+// Stage M3A — marketing campaign audience materialization scans exactly
+// `{ "notifications.marketingEmail": true }`. Partial so it only indexes opted-in profiles (a
+// small minority, since the product default is OFF) — never a generic index over every
+// notification sub-field.
+userProfileSchema.index(
+  { "notifications.marketingEmail": 1 },
+  { partialFilterExpression: { "notifications.marketingEmail": true } },
+);
 
 export const UserProfileModel = model<UserProfileDocument>("UserProfile", userProfileSchema);
 

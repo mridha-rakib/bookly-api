@@ -200,3 +200,65 @@ describe("central email transport", () => {
     expect(serialised).not.toContain("leaked-secret-detail");
   });
 });
+
+describe("generic MIME header forwarding (Marketing Email Stage M2)", () => {
+  const LIST_UNSUB_HEADERS = {
+    "List-Unsubscribe": "<https://api.bookly.cy/api/v1/marketing/unsubscribe?token=abc>",
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    RESET_ENV();
+  });
+
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it("SendGrid: forwards `headers` verbatim, and omits the key entirely when unset", async () => {
+    const send = vi.fn().mockResolvedValue([{ headers: {} }, {}]);
+    const { SendGridEmailTransport } = await loadSendGridTransport();
+    const transport = new SendGridEmailTransport(() => ({ send }));
+
+    await transport.send(buildInput({ headers: LIST_UNSUB_HEADERS }));
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ headers: LIST_UNSUB_HEADERS });
+
+    await transport.send(buildInput());
+    expect(send.mock.calls[1]?.[0]).not.toHaveProperty("headers");
+  });
+
+  it("Resend: forwards `headers` verbatim, and omits the key entirely when unset", async () => {
+    vi.resetModules();
+    RESET_ENV();
+    process.env["EMAIL_PROVIDER"] = "resend";
+    process.env["RESEND_API_KEY"] = "re_test_key";
+    process.env["RESEND_FROM_EMAIL"] = "noreply@example.com";
+    process.env["RESEND_FROM_NAME"] = "Bookly";
+    const { ResendEmailTransport } = await import(
+      "../../src/modules/email/resend-email-transport.js"
+    );
+    const send = vi.fn().mockResolvedValue({ data: { id: "re-1" } });
+    const transport = new ResendEmailTransport(() => ({ emails: { send } }));
+
+    await transport.send(buildInput({ headers: LIST_UNSUB_HEADERS }));
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ headers: LIST_UNSUB_HEADERS });
+
+    await transport.send(buildInput());
+    expect(send.mock.calls[1]?.[0]).not.toHaveProperty("headers");
+  });
+
+  it("SMTP: forwards `headers` verbatim, and omits the key entirely when unset", async () => {
+    vi.resetModules();
+    RESET_ENV();
+    const { SmtpEmailTransport } = await import("../../src/modules/email/smtp-email-transport.js");
+    const sendMail = vi.fn().mockResolvedValue({ messageId: "smtp-1" });
+    const transport = new SmtpEmailTransport(() => ({ sendMail }));
+
+    await transport.send(buildInput({ headers: LIST_UNSUB_HEADERS }));
+    expect(sendMail.mock.calls[0]?.[0]).toMatchObject({ headers: LIST_UNSUB_HEADERS });
+
+    await transport.send(buildInput());
+    expect(sendMail.mock.calls[1]?.[0]).not.toHaveProperty("headers");
+  });
+});

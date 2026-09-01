@@ -60,6 +60,18 @@ import {
   platformTransactionsQuerySchema,
 } from "../finance/finance.schema.js";
 import { FinanceService } from "../finance/finance.service.js";
+import { MarketingAudienceService } from "../marketing/marketing-audience.service.js";
+import { MarketingCampaignController } from "../marketing/marketing-campaign.controller.js";
+import { MarketingCampaignRepository } from "../marketing/marketing-campaign.repository.js";
+import {
+  createMarketingCampaignBodySchema,
+  listMarketingCampaignsQuerySchema,
+  marketingCampaignIdParamsSchema,
+  scheduleMarketingCampaignBodySchema,
+} from "../marketing/marketing-campaign.schema.js";
+import { MarketingCampaignService } from "../marketing/marketing-campaign.service.js";
+import { MarketingCampaignRecipientRepository } from "../marketing/marketing-campaign-recipient.repository.js";
+import { MarketingCampaignSourceService } from "../marketing/marketing-campaign-source.service.js";
 import { PlatformSettingsController } from "../platform-settings/platform-settings.controller.js";
 import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
 import { updatePlatformSettingsBodySchema } from "../platform-settings/platform-settings.schema.js";
@@ -294,6 +306,19 @@ export const createSuperAdminRoute = (): Router => {
     new PlatformSettingsService(new PlatformSettingsRepository()),
   );
 
+  // Marketing Email M3A/M3B — campaign domain + audience + cancel. The actual delivery worker
+  // runs out-of-process (scripts/run-marketing-campaign-worker.ts); this API never sends.
+  // SUPER_ADMIN only.
+  const marketingCampaignRecipientRepository = new MarketingCampaignRecipientRepository();
+  const marketingCampaignController = new MarketingCampaignController(
+    new MarketingCampaignService(
+      new MarketingCampaignRepository(),
+      new MarketingCampaignSourceService(new BlogPostRepository(), new PromoRepository()),
+      new MarketingAudienceService(userRepository, marketingCampaignRecipientRepository),
+      marketingCampaignRecipientRepository,
+    ),
+  );
+
   router.use(authenticate, requireActiveUser(), requireRoles(["SUPER_ADMIN"]));
 
   // --- Platform Settings ---
@@ -302,6 +327,41 @@ export const createSuperAdminRoute = (): Router => {
     "/settings/platform",
     validateRequest({ body: updatePlatformSettingsBodySchema }),
     asyncHandler(platformSettingsController.update),
+  );
+
+  // --- Marketing Email campaigns (Stage M3A — domain + audience only, NO send endpoint) ---
+  router.post(
+    "/marketing/campaigns",
+    validateRequest({ body: createMarketingCampaignBodySchema }),
+    asyncHandler(marketingCampaignController.create),
+  );
+  router.get(
+    "/marketing/campaigns",
+    validateRequest({ query: listMarketingCampaignsQuerySchema }),
+    asyncHandler(marketingCampaignController.list),
+  );
+  router.get(
+    "/marketing/campaigns/:campaignId",
+    validateRequest({ params: marketingCampaignIdParamsSchema }),
+    asyncHandler(marketingCampaignController.getById),
+  );
+  router.post(
+    "/marketing/campaigns/:campaignId/schedule",
+    validateRequest({
+      params: marketingCampaignIdParamsSchema,
+      body: scheduleMarketingCampaignBodySchema,
+    }),
+    asyncHandler(marketingCampaignController.schedule),
+  );
+  router.post(
+    "/marketing/campaigns/:campaignId/materialize",
+    validateRequest({ params: marketingCampaignIdParamsSchema }),
+    asyncHandler(marketingCampaignController.materialize),
+  );
+  router.post(
+    "/marketing/campaigns/:campaignId/cancel",
+    validateRequest({ params: marketingCampaignIdParamsSchema }),
+    asyncHandler(marketingCampaignController.cancel),
   );
 
   // --- Businesses ---

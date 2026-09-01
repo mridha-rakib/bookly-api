@@ -10,7 +10,13 @@ import {
   type UserProfileDocument,
   UserProfileModel,
 } from "./user.model.js";
-import type { NotificationPreferences, UserLanguage, UserRole, UserStatus } from "./user.types.js";
+import type {
+  MarketingEmailConsent,
+  NotificationPreferences,
+  UserLanguage,
+  UserRole,
+  UserStatus,
+} from "./user.types.js";
 
 type CreateUserInput = {
   normalizedEmail: string;
@@ -70,6 +76,27 @@ export class UserRepository {
     }
 
     return UserProfileModel.find({ userId: { $in: userIds } }).exec();
+  }
+
+  /**
+   * Stage M3A — one page of the marketing-campaign audience scan: UserProfile rows with
+   * `notifications.marketingEmail === true`, ordered by `_id`, strictly after `afterId`. Uses
+   * the partial index on `notifications.marketingEmail` (see user.model.ts). Returns only the
+   * two fields the audience service needs. `_id`-cursor pagination — never `skip`/`offset`.
+   */
+  public async findMarketingOptedInProfilePage(
+    afterId: Types.ObjectId | null,
+    limit: number,
+  ): Promise<Array<Pick<UserProfileDocument, "_id" | "userId">>> {
+    const query: Record<string, unknown> = { "notifications.marketingEmail": true };
+    if (afterId) {
+      query["_id"] = { $gt: afterId };
+    }
+    return UserProfileModel.find(query, { _id: 1, userId: 1 })
+      .sort({ _id: 1 })
+      .limit(limit)
+      .lean<Array<Pick<UserProfileDocument, "_id" | "userId">>>()
+      .exec();
   }
 
   /** Batch 11 — Super Admin global Customer list: bounded, server-side paginated, filtered by
@@ -195,9 +222,13 @@ export class UserRepository {
        * never clobbers the sibling. A dot-path set also auto-creates the sub-doc on a row that
        * never had one. */
       notifications?: NotificationPreferences;
+      /** Stage M3A — audit provenance for a marketing-email preference change. Pass ONLY when
+       * `notifications.marketingEmail` is also being written in the same call; the whole sub-doc
+       * is replaced. */
+      marketingEmailConsent?: MarketingEmailConsent;
     },
   ): Promise<void> {
-    const { phone, notifications, ...rest } = update;
+    const { phone, notifications, marketingEmailConsent, ...rest } = update;
     const setFields: Record<string, unknown> = { ...rest };
     const unsetFields: Record<string, unknown> = {};
 
@@ -215,6 +246,10 @@ export class UserRepository {
           setFields[`notifications.${channel}`] = value;
         }
       }
+    }
+
+    if (marketingEmailConsent) {
+      setFields["marketingEmailConsent"] = marketingEmailConsent;
     }
 
     await UserProfileModel.updateOne(

@@ -17,10 +17,11 @@ export type VerifiedCustomerPhone = { e164: string } | undefined;
  * (plus, for SMS, an already-resolved verified phone) and answers per channel. It performs no
  * I/O, so it can be called cheaply once per reminder event with data the caller already holds.
  *
- * SCOPE GUARD (structural): this type only knows about the 24h appointment reminder. It has no
- * method for — and is never imported by — booking confirmation / cancellation / completion /
- * no-show / CLIENT_CREATED notifiers or the OTP / email-changed security paths. Those remain
- * unconditional. A future optional channel adds a method here; mandatory mail never does.
+ * SCOPE GUARD (structural): this type only knows about OPTIONAL customer channels — the 24h
+ * appointment reminder and the marketing-email opt-in. It has no method for — and is never
+ * imported by — booking confirmation / cancellation / completion / no-show / CLIENT_CREATED
+ * notifiers or the OTP / email-changed security paths. Those remain unconditional. A future
+ * optional channel adds a method here; mandatory mail never does.
  *
  * Call this BEFORE enqueuing an optional channel — never from inside a template, an outbox
  * repository/worker, or a provider transport.
@@ -31,6 +32,20 @@ export class CustomerNotificationPolicy {
     preferences: NotificationPreferences | undefined,
   ): boolean {
     return resolveNotificationPreferences(preferences).appointmentReminderEmail;
+  }
+
+  /**
+   * Marketing-email opt-in (Stage M1). Answers ONE question: has this linked customer explicitly
+   * opted into marketing email? Product default is OFF, so `undefined` / an absent field / an
+   * explicit `false` all return `false`.
+   *
+   * Deliberately does NOT check the email address, `emailVerifiedAt`, `User.status`, SendGrid
+   * suppression state, campaign context, or any business/promo/content eligibility — those are
+   * future M3 campaign-eligibility concerns. Nothing in the codebase sends marketing email yet;
+   * this method exists so M1 ships a single, testable consent gate.
+   */
+  public mayReceiveMarketingEmail(preferences: NotificationPreferences | undefined): boolean {
+    return resolveNotificationPreferences(preferences).marketingEmail === true;
   }
 
   /**

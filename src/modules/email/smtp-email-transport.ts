@@ -63,6 +63,9 @@ export class SmtpEmailTransport implements EmailTransport {
     if (input.attachments && input.attachments.length > 0) {
       payload["attachments"] = input.attachments.map(toNodemailerAttachment);
     }
+    if (input.headers && Object.keys(input.headers).length > 0) {
+      payload["headers"] = input.headers;
+    }
 
     try {
       const info = (await this.transporterFactory().sendMail(payload)) as { messageId?: unknown };

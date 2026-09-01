@@ -33,6 +33,8 @@
     "worker:reminder:once": "tsx src/scripts/run-appointment-reminder-worker.ts --once",
     "worker:sms": "tsx src/scripts/run-sms-worker.ts",
     "worker:sms:once": "tsx src/scripts/run-sms-worker.ts --once",
+    "worker:marketing": "tsx src/scripts/run-marketing-campaign-worker.ts",
+    "worker:marketing:once": "tsx src/scripts/run-marketing-campaign-worker.ts --once",
     "prepare": "node scripts/prepare-husky.mjs"
   },
   "lint-staged": {

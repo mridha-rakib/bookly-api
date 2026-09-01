@@ -60,6 +60,9 @@ export class ResendEmailTransport implements EmailTransport {
     if (input.attachments && input.attachments.length > 0) {
       payload["attachments"] = input.attachments.map(toResendAttachment);
     }
+    if (input.headers && Object.keys(input.headers).length > 0) {
+      payload["headers"] = input.headers;
+    }
 
     try {
       const response = (await this.clientFactory(env.RESEND_API_KEY).emails.send(payload)) as {

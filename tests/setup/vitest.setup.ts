@@ -10,6 +10,9 @@ process.env["TRUST_PROXY"] = "false";
 process.env["SHUTDOWN_TIMEOUT_MS"] = "1000";
 process.env["EMAIL_PROVIDER"] = "smtp";
 process.env["EMAIL_FROM"] = "noreply@example.com";
+// Marketing M3B — configured by default so the campaign worker's one-click guard passes; the
+// envelope/one-click tests delete it + re-import to cover the unconfigured path.
+process.env["PUBLIC_API_BASE_URL"] = "https://api.test.local/api/v1";
 process.env["EMAIL_FROM_NAME"] = "Bookly";
 process.env["SMTP_HOST"] = "smtp.example.com";
 process.env["SMTP_PORT"] = "587";

@@ -672,12 +672,20 @@ export class AuthService {
       defaultLanguage !== undefined ||
       notifications !== undefined
     ) {
+      // Stage M3A — record consent provenance ONLY when the marketing-email preference itself is
+      // part of this mutation. An unrelated profile edit, or a reminder-only notifications
+      // update, never touches `marketingEmailConsent`.
+      const writesMarketingEmail = notifications?.marketingEmail !== undefined;
+
       await this.userRepository.updateProfile(profile._id, {
         ...(firstName !== undefined ? { firstName } : {}),
         ...(lastName !== undefined ? { lastName } : {}),
         ...(gender !== undefined ? { gender } : {}),
         ...(defaultLanguage !== undefined ? { defaultLanguage } : {}),
         ...(notifications !== undefined ? { notifications } : {}),
+        ...(writesMarketingEmail
+          ? { marketingEmailConsent: { updatedAt: new Date(), source: "settings" as const } }
+          : {}),
       });
     }
 

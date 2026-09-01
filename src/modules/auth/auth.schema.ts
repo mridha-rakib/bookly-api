@@ -128,13 +128,16 @@ export const updateMyProfileBodySchema = z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, "Date of birth must be in YYYY-MM-DD format")
       .optional(),
-    // Optional 24h appointment-reminder channels. Partial nested update: send only the
-    // channel(s) being changed. `.strict()` blocks any other nested key (mass-assignment
-    // guard); the inner refine rejects an empty object so a no-op request is a 400.
+    // Optional customer notification channels — 24h appointment-reminder email/SMS and the
+    // marketing-email opt-in (Stage M1). Partial nested update: send only the channel(s) being
+    // changed. `.strict()` blocks any other nested key (mass-assignment guard); the inner refine
+    // rejects an empty object so a no-op request is a 400. `marketingEmail` is accepted and
+    // persisted here, but no marketing email is sent anywhere yet (M1 = preference only).
     notifications: z
       .object({
         appointmentReminderEmail: z.boolean().optional(),
         appointmentReminderSms: z.boolean().optional(),
+        marketingEmail: z.boolean().optional(),
       })
       .strict()
       .refine((value) => Object.keys(value).length > 0, {

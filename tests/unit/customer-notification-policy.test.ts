@@ -12,6 +12,7 @@ describe("resolveNotificationPreferences", () => {
     expect(NOTIFICATION_PREFERENCE_DEFAULTS).toEqual({
       appointmentReminderEmail: true,
       appointmentReminderSms: false,
+      marketingEmail: false,
     });
   });
 
@@ -19,11 +20,23 @@ describe("resolveNotificationPreferences", () => {
     expect(resolveNotificationPreferences({ appointmentReminderEmail: false })).toEqual({
       appointmentReminderEmail: false,
       appointmentReminderSms: false,
+      marketingEmail: false,
     });
     expect(resolveNotificationPreferences({ appointmentReminderSms: true })).toEqual({
       appointmentReminderEmail: true,
       appointmentReminderSms: true,
+      marketingEmail: false,
     });
+  });
+
+  it("defaults marketingEmail to false and echoes an explicit opt-in without touching reminders", () => {
+    expect(resolveNotificationPreferences({}).marketingEmail).toBe(false);
+    expect(resolveNotificationPreferences({ marketingEmail: true })).toEqual({
+      appointmentReminderEmail: true,
+      appointmentReminderSms: false,
+      marketingEmail: true,
+    });
+    expect(resolveNotificationPreferences({ marketingEmail: false }).marketingEmail).toBe(false);
   });
 });
 
@@ -39,6 +52,41 @@ describe("CustomerNotificationPolicy", () => {
       expect(policy.mayReceiveAppointmentReminderEmail({ appointmentReminderEmail: false })).toBe(
         false,
       );
+    });
+
+    it("is unaffected by the marketingEmail preference", () => {
+      expect(policy.mayReceiveAppointmentReminderEmail({ marketingEmail: true })).toBe(true);
+      expect(
+        policy.mayReceiveAppointmentReminderEmail({
+          appointmentReminderEmail: false,
+          marketingEmail: true,
+        }),
+      ).toBe(false);
+    });
+  });
+
+  describe("mayReceiveMarketingEmail", () => {
+    it("is false unless the customer has explicitly opted in", () => {
+      expect(policy.mayReceiveMarketingEmail(undefined)).toBe(false);
+      expect(policy.mayReceiveMarketingEmail({})).toBe(false);
+      expect(policy.mayReceiveMarketingEmail({ marketingEmail: false })).toBe(false);
+      expect(policy.mayReceiveMarketingEmail({ marketingEmail: true })).toBe(true);
+    });
+
+    it("is independent of the appointment-reminder preferences", () => {
+      expect(
+        policy.mayReceiveMarketingEmail({
+          appointmentReminderEmail: false,
+          appointmentReminderSms: true,
+          marketingEmail: true,
+        }),
+      ).toBe(true);
+      expect(
+        policy.mayReceiveMarketingEmail({
+          appointmentReminderEmail: true,
+          appointmentReminderSms: true,
+        }),
+      ).toBe(false);
     });
   });
 
