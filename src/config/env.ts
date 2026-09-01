@@ -379,6 +379,45 @@ export const env = createEnv({
           });
         }
       }),
+    // Marketing Email M2/M3B — the backend's OWN public https base URL (including the
+    // `/api/<version>` prefix), e.g. https://api.bookly.cy/api/v1. Needed ONLY to build the
+    // RFC 8058 one-click `List-Unsubscribe` header target, which mail providers POST to directly
+    // with no browser (so it must resolve to the API, not the web app). No existing "our own base
+    // URL" env var exists to derive this from — same situation, and same "configured directly"
+    // resolution, as GOOGLE_CALENDAR_REDIRECT_URI / S3_PUBLIC_BASE_URL. Optional in
+    // development/test (envelope omits the one-click headers + logs); **REQUIRED in production**
+    // as of M3B — the marketing campaign worker refuses to send without a working one-click
+    // unsubscribe (assertMarketingOneClickConfigured), and the API will not boot in production
+    // without it.
+    PUBLIC_API_BASE_URL: z
+      .string()
+      .url()
+      .optional()
+      .transform((value) => value?.replace(/\/+$/, ""))
+      .superRefine((value, context) => {
+        if (rawNodeEnv === "production" && !value) {
+          context.addIssue({
+            code: "custom",
+            message:
+              "PUBLIC_API_BASE_URL is required in production (marketing one-click unsubscribe target)",
+          });
+        }
+      }),
+    // Marketing Email Stage M2 — public unsubscribe endpoint abuse guard. Mirrors
+    // CONTACT_RATE_LIMIT_MAX (another genuinely-anonymous public POST): per-IP, 15-minute window.
+    MARKETING_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
+    // Marketing Email Stage M3B — the campaign delivery worker (scripts/run-marketing-campaign-
+    // worker.ts, `pnpm worker:marketing`). Mirrors the EMAIL_WORKER_* / APPOINTMENT_REMINDER_
+    // WORKER_* convention. Concurrency is deliberately LOWER than transactional email — a bulk
+    // marketing blast should not hammer the provider. The worker is entirely separate from the
+    // transactional EmailOutbox worker; MarketingCampaignRecipient is its own queue.
+    MARKETING_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
+    MARKETING_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+    MARKETING_WORKER_CONCURRENCY: z.coerce.number().int().positive().default(3),
+    MARKETING_WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(4),
+    MARKETING_WORKER_RETRY_BASE_MS: z.coerce.number().int().positive().default(60_000),
+    MARKETING_WORKER_CLAIM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+    MARKETING_WORKER_PROMOTE_BATCH_SIZE: z.coerce.number().int().positive().default(5),
     // Async transactional-email delivery (EmailOutbox + worker, see
     // scripts/run-email-worker.ts). OTP stays synchronous and is never queued. Mirrors the
     // NO_SHOW_WORKER_* convention above.

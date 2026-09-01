@@ -41,7 +41,7 @@ describe("updateMyProfileBodySchema", () => {
     expect(updateMyProfileBodySchema.safeParse({ defaultLanguage: "en" }).success).toBe(false);
   });
 
-  describe("notifications (appointment reminder preferences)", () => {
+  describe("notifications (appointment reminder + marketing-email preferences)", () => {
     it("accepts a single-channel partial update", () => {
       expect(
         updateMyProfileBodySchema.safeParse({ notifications: { appointmentReminderEmail: false } })
@@ -61,6 +61,15 @@ describe("updateMyProfileBodySchema", () => {
       ).toBe(true);
     });
 
+    it("accepts a marketingEmail-only partial update (Stage M1)", () => {
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: true } }).success,
+      ).toBe(true);
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: false } }).success,
+      ).toBe(true);
+    });
+
     it("rejects an empty notifications object (no-op request)", () => {
       expect(updateMyProfileBodySchema.safeParse({ notifications: {} }).success).toBe(false);
     });
@@ -70,11 +79,22 @@ describe("updateMyProfileBodySchema", () => {
         updateMyProfileBodySchema.safeParse({ notifications: { appointmentReminderEmail: "yes" } })
           .success,
       ).toBe(false);
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: "true" } }).success,
+      ).toBe(false);
+      expect(
+        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: null } }).success,
+      ).toBe(false);
     });
 
     it("rejects an unknown nested channel key (mass-assignment guard)", () => {
       expect(
-        updateMyProfileBodySchema.safeParse({ notifications: { marketingEmail: true } }).success,
+        updateMyProfileBodySchema.safeParse({ notifications: { newsletter: true } }).success,
+      ).toBe(false);
+      expect(
+        updateMyProfileBodySchema.safeParse({
+          notifications: { marketingEmail: true, bogus: 1 },
+        }).success,
       ).toBe(false);
     });
   });

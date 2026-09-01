@@ -19,6 +19,7 @@ import { HealthRepository } from "../modules/health/health.repository.js";
 import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createGoogleCalendarCallbackRoute } from "../modules/integration/integration.route.js";
+import { createMarketingRoute } from "../modules/marketing/marketing.route.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
 import { createPlatformConfigRoute } from "../modules/platform-settings/platform-settings.route.js";
 import {
@@ -96,6 +97,11 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // prefix — same anonymous-route precedent as createContactRoute()/createDiscoveryRoute().
   // Super Admin FAQ mutations live under `/super-admin/content` (SUPER_ADMIN-gated), never here.
   router.use("/content", createPublicContentRoute());
+  // Marketing Email Stage M2 — public unsubscribe. Genuinely anonymous, its own top-level prefix
+  // (same precedent as createContactRoute()/createDiscoveryRoute()/createPublicContentRoute()).
+  // No marketing email is sent yet; this only lets a FUTURE marketing send carry a working
+  // one-click unsubscribe. Distinct `/marketing` prefix — no ordering dependency.
+  router.use("/marketing", createMarketingRoute());
   // Batch 16 — Favorites, same "/me" prefix/rationale as "My Bookings"/"My Reviews"/"My Tickets"
   // above (own-resource-scoped, CUSTOMER-only, cross-Business).
   router.use("/me", createFavoriteRoute());

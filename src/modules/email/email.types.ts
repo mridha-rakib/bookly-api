@@ -45,6 +45,13 @@ export type EmailTransportSendInput = {
   attachments?: EmailAttachment[];
   /** Safe, non-secret key/value tags for provider-side searchability (templateKey, eventKey). */
   metadata?: Record<string, string>;
+  /**
+   * Provider-neutral extra MIME headers. Only populated by callers that genuinely need them —
+   * today that is the marketing-email path adding `List-Unsubscribe` / `List-Unsubscribe-Post`
+   * (Stage M2). Transactional/OTP sends never set this, so their on-the-wire headers are
+   * unchanged. Never put secrets here — every adapter forwards the map verbatim.
+   */
+  headers?: Record<string, string>;
 };
 
 export type EmailTransportSendResult = {

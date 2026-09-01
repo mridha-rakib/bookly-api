@@ -50,6 +50,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     findById: vi.fn(),
     findManyByIds: vi.fn().mockResolvedValue([]),
     findProfilesByUserIds: vi.fn().mockResolvedValue([]),
+    findMarketingOptedInProfilePage: vi.fn().mockResolvedValue([]),
     updateLastLogin: vi.fn(),
     updateRole: vi.fn(),
     updateEmail: vi.fn(),
@@ -450,6 +451,107 @@ describe("AuthService.updateMyProfile", () => {
     });
     expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
   });
+
+  it("forwards a marketingEmail-only change to UserProfile without touching reminder siblings or CustomerProfile (Stage M1)", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: profileId,
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+          notifications: { appointmentReminderEmail: true, appointmentReminderSms: false },
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+
+    await service.updateMyProfile(userId.toHexString(), {
+      notifications: { marketingEmail: true },
+    });
+
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(
+      profileId,
+      expect.objectContaining({ notifications: { marketingEmail: true } }),
+    );
+    expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
+  });
+
+  it("records marketingEmailConsent {source:'settings'} whenever the marketingEmail preference is part of the mutation (Stage M3A)", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const mk = () =>
+      createAuthService({
+        userRepository: {
+          findById: vi.fn().mockResolvedValue({
+            _id: userId,
+            normalizedEmail: "customer@example.com",
+            role: "CUSTOMER",
+            status: "ACTIVE",
+          }),
+          findProfileByUserId: vi.fn().mockResolvedValue({
+            _id: profileId,
+            firstName: "Jane",
+            lastName: "Doe",
+            gender: "female",
+          }),
+          findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+        },
+      });
+
+    for (const value of [true, false]) {
+      const { service, userRepository } = mk();
+      await service.updateMyProfile(userId.toHexString(), {
+        notifications: { marketingEmail: value },
+      });
+      expect(userRepository.updateProfile).toHaveBeenCalledWith(
+        profileId,
+        expect.objectContaining({
+          notifications: { marketingEmail: value },
+          marketingEmailConsent: expect.objectContaining({ source: "settings" }),
+        }),
+      );
+    }
+  });
+
+  it("does NOT touch marketingEmailConsent for an unrelated profile field or a reminder-only notifications update (Stage M3A)", async () => {
+    const userId = new Types.ObjectId();
+    const profileId = new Types.ObjectId();
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: profileId,
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+
+    await service.updateMyProfile(userId.toHexString(), { firstName: "Janet" });
+    await service.updateMyProfile(userId.toHexString(), {
+      notifications: { appointmentReminderSms: true },
+    });
+
+    for (const call of userRepository.updateProfile.mock.calls) {
+      expect(call[1]).not.toHaveProperty("marketingEmailConsent");
+    }
+  });
 });
 
 describe("AuthService.getMe", () => {
@@ -565,7 +667,15 @@ describe("AuthService.getMe", () => {
       },
     });
     await expect(legacy.service.getMe(userId.toHexString())).resolves.toMatchObject({
-      profile: { notifications: { appointmentReminderEmail: true, appointmentReminderSms: false } },
+      profile: {
+        notifications: {
+          appointmentReminderEmail: true,
+          appointmentReminderSms: false,
+          // Stage M1 — a legacy profile with no stored notifications resolves marketingEmail
+          // to false at read time (no backfill, no migration).
+          marketingEmail: false,
+        },
+      },
     });
 
     const configured = createAuthService({
@@ -581,14 +691,48 @@ describe("AuthService.getMe", () => {
           firstName: "Jane",
           lastName: "Doe",
           gender: "female",
-          notifications: { appointmentReminderEmail: false, appointmentReminderSms: true },
+          notifications: {
+            appointmentReminderEmail: false,
+            appointmentReminderSms: true,
+            marketingEmail: true,
+          },
         }),
         findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
       },
     });
     await expect(configured.service.getMe(userId.toHexString())).resolves.toMatchObject({
-      profile: { notifications: { appointmentReminderEmail: false, appointmentReminderSms: true } },
+      profile: {
+        notifications: {
+          appointmentReminderEmail: false,
+          appointmentReminderSms: true,
+          marketingEmail: true,
+        },
+      },
     });
+  });
+
+  it("resolves marketingEmail to false when only reminder channels are stored (Stage M1)", async () => {
+    const userId = new Types.ObjectId();
+    const { service } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          normalizedEmail: "customer@example.com",
+          role: "CUSTOMER",
+          status: "ACTIVE",
+        }),
+        findProfileByUserId: vi.fn().mockResolvedValue({
+          _id: new Types.ObjectId(),
+          firstName: "Jane",
+          lastName: "Doe",
+          gender: "female",
+          notifications: { appointmentReminderEmail: true },
+        }),
+        findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+      },
+    });
+    const result = await service.getMe(userId.toHexString());
+    expect(result.profile?.notifications.marketingEmail).toBe(false);
   });
 });
 

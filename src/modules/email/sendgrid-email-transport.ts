@@ -80,6 +80,9 @@ export class SendGridEmailTransport implements EmailTransport {
     if (input.metadata && Object.keys(input.metadata).length > 0) {
       payload["customArgs"] = input.metadata;
     }
+    if (input.headers && Object.keys(input.headers).length > 0) {
+      payload["headers"] = input.headers;
+    }
 
     try {
       const response = await this.clientFactory(env.SENDGRID_API_KEY).send(payload);

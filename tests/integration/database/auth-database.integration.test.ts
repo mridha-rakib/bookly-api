@@ -1401,6 +1401,62 @@ describe("database-backed authentication integration", () => {
       expect(after?.phoneVerifiedAt?.getTime()).toBe(before?.phoneVerifiedAt?.getTime());
     });
   });
+
+  describe("Marketing Email — Stage M1 preference persistence", () => {
+    it("defaults marketingEmail to false for a fresh profile with no backfilled write", async () => {
+      const parts = await completeCustomer("marketing-default@example.com");
+      const userId = parts.result.user.id;
+
+      const me = await parts.authService.getMe(userId);
+      expect(me.profile?.notifications).toMatchObject({
+        appointmentReminderEmail: true,
+        appointmentReminderSms: false,
+        marketingEmail: false,
+      });
+
+      // Read-time default only — nothing is persisted just because getMe resolved it.
+      const profile = await UserProfileModel.findOne({ userId }).lean().exec();
+      expect(profile?.notifications?.marketingEmail).toBeUndefined();
+    });
+
+    it("persists marketingEmail via the generic profile PATCH path without clobbering reminder siblings", async () => {
+      const parts = await completeCustomer("marketing-persist@example.com");
+      const userId = parts.result.user.id;
+      const profileId = (await UserProfileModel.findOne({ userId }).orFail().exec())._id;
+
+      // Seed a stored reminder sibling first so a whole-subdoc replacement would be visible.
+      await parts.userRepository.updateProfile(profileId, {
+        notifications: { appointmentReminderSms: true },
+      });
+
+      await parts.userRepository.updateProfile(profileId, {
+        notifications: { marketingEmail: true },
+      });
+
+      const afterOptIn = (await UserProfileModel.findById(profileId).lean().exec())?.notifications;
+      expect(afterOptIn).toMatchObject({ appointmentReminderSms: true, marketingEmail: true });
+      expect(afterOptIn?.appointmentReminderEmail).toBeUndefined();
+
+      const meOptIn = await parts.authService.getMe(userId);
+      expect(meOptIn.profile?.notifications).toEqual({
+        appointmentReminderEmail: true,
+        appointmentReminderSms: true,
+        marketingEmail: true,
+      });
+
+      // Opting back out persists as an explicit false and still leaves siblings intact.
+      await parts.userRepository.updateProfile(profileId, {
+        notifications: { marketingEmail: false },
+      });
+
+      const afterOptOut = (await UserProfileModel.findById(profileId).lean().exec())?.notifications;
+      expect(afterOptOut).toMatchObject({ appointmentReminderSms: true, marketingEmail: false });
+
+      const meOptOut = await parts.authService.getMe(userId);
+      expect(meOptOut.profile?.notifications.marketingEmail).toBe(false);
+      expect(meOptOut.profile?.notifications.appointmentReminderSms).toBe(true);
+    });
+  });
 });
 
 const prepareBusinessOwnerForCompletion = async (
