@@ -2,18 +2,25 @@ import mongoose, { Types } from "mongoose";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { env } from "../../src/config/env.js";
+import type { AppointmentReminderRepository } from "../../src/modules/appointment-reminder/appointment-reminder.repository.js";
 import { AuthService } from "../../src/modules/auth/auth.service.js";
 import { sha256 } from "../../src/modules/auth/auth.utils.js";
 import type { PasswordHasher } from "../../src/modules/auth/password-hasher.js";
 import type { TokenService } from "../../src/modules/auth/token.service.js";
+import type { BookingRepository } from "../../src/modules/booking/booking.repository.js";
 import type { BusinessRepository } from "../../src/modules/business/business.repository.js";
 import type { BusinessService } from "../../src/modules/business/business.service.js";
 import type { BusinessOnboardingRepository } from "../../src/modules/business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../../src/modules/business-onboarding/business-onboarding.service.js";
+import type { ClientRepository } from "../../src/modules/client/client.repository.js";
 import type { ClientIdentityService } from "../../src/modules/client/client-identity.service.js";
 import type { ContactChangeChallengeRepository } from "../../src/modules/contact-change/contact-change-challenge.repository.js";
 import type { CustomerAvatarService } from "../../src/modules/customer-avatar/customer-avatar.service.js";
+import type { EmailOutboxService } from "../../src/modules/email-outbox/email-outbox.service.js";
+import type { FavoriteRepository } from "../../src/modules/favorite/favorite.repository.js";
+import type { CustomerPaymentProfileRepository } from "../../src/modules/payment/customer-payment-profile.repository.js";
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
+import type { ReviewRepository } from "../../src/modules/review/review.repository.js";
 import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../src/modules/verification/phone-otp.provider.js";
@@ -67,6 +74,9 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     upsertCustomerProfile: vi.fn(),
     setCustomerAvatar: vi.fn(),
     updatePasswordHash: vi.fn(),
+    softDeleteCustomer: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+    anonymizeUserProfileForDeletion: vi.fn(),
+    anonymizeCustomerProfileForDeletion: vi.fn(),
     commitEmailChange: vi.fn(),
     updatePhoneVerifiedAt: vi.fn(),
     findProfileByUserId: vi.fn(),
@@ -127,6 +137,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     upsertPhoneChallenge: vi.fn(),
     incrementAttempts: vi.fn(),
     claimAndDelete: vi.fn(),
+    deleteAllForUser: vi.fn().mockResolvedValue(0),
     ...(overrides["contactChangeChallengeRepository"] as object | undefined),
   };
 
@@ -154,7 +165,39 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
         ? `https://signed.example/${profile.avatar.storageKey}`
         : undefined,
     ),
+    deleteAvatarObject: vi.fn().mockResolvedValue(undefined),
     ...(overrides["customerAvatarService"] as object | undefined),
+  };
+
+  // Account-closure collaborators (DELETE /auth/me).
+  const bookingRepository = {
+    hasUpcomingActiveBookingsForCustomer: vi.fn().mockResolvedValue(false),
+    anonymizeCustomerSnapshotForDeletion: vi.fn().mockResolvedValue(0),
+    ...(overrides["bookingRepository"] as object | undefined),
+  };
+  const reviewRepository = {
+    anonymizeReviewerForDeletion: vi.fn().mockResolvedValue(0),
+    ...(overrides["reviewRepository"] as object | undefined),
+  };
+  const favoriteRepository = {
+    deleteAllForCustomer: vi.fn().mockResolvedValue(0),
+    ...(overrides["favoriteRepository"] as object | undefined),
+  };
+  const appointmentReminderRepository = {
+    retireActiveForCustomer: vi.fn().mockResolvedValue(0),
+    ...(overrides["appointmentReminderRepository"] as object | undefined),
+  };
+  const clientRepository = {
+    unlinkAndAnonymizeForUserDeletion: vi.fn().mockResolvedValue(0),
+    ...(overrides["clientRepository"] as object | undefined),
+  };
+  const customerPaymentProfileRepository = {
+    clearSensitiveReferencesForDeletion: vi.fn().mockResolvedValue(undefined),
+    ...(overrides["customerPaymentProfileRepository"] as object | undefined),
+  };
+  const emailOutboxService = {
+    enqueue: vi.fn().mockResolvedValue({ created: true }),
+    ...(overrides["emailOutboxService"] as object | undefined),
   };
 
   const service = new AuthService(
@@ -177,6 +220,13 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     contactChangeChallengeRepository as unknown as ContactChangeChallengeRepository,
     undefined,
     customerAvatarService as unknown as CustomerAvatarService,
+    bookingRepository as unknown as BookingRepository,
+    reviewRepository as unknown as ReviewRepository,
+    favoriteRepository as unknown as FavoriteRepository,
+    appointmentReminderRepository as unknown as AppointmentReminderRepository,
+    clientRepository as unknown as ClientRepository,
+    customerPaymentProfileRepository as unknown as CustomerPaymentProfileRepository,
+    emailOutboxService as unknown as EmailOutboxService,
   );
 
   return {
@@ -192,6 +242,13 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     emailOtpProvider,
     phoneOtpProvider,
     customerAvatarService,
+    bookingRepository,
+    reviewRepository,
+    favoriteRepository,
+    appointmentReminderRepository,
+    clientRepository,
+    customerPaymentProfileRepository,
+    emailOutboxService,
   };
 };
 
@@ -1161,5 +1218,224 @@ describe("AuthService.verifyPhoneChange", () => {
     await expect(
       service.verifyPhoneChange(userId.toHexString(), { code: "1234" }),
     ).rejects.toMatchObject({ details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }] });
+  });
+});
+
+describe("AuthService.deleteMyAccount", () => {
+  const userId = new Types.ObjectId();
+  const baseUser = {
+    _id: userId,
+    role: "CUSTOMER" as const,
+    status: "ACTIVE" as const,
+    normalizedEmail: "closing@example.com",
+    passwordHash: "hashed-password",
+  };
+  const expectedTombstoneEmail = `deleted+${userId.toHexString()}@account.invalid`;
+  const expectedTombstonePhone = `deleted-${userId.toHexString()}`;
+  const validInput = { currentPassword: "secret", confirmationText: "DELETE" as const };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const withActiveTransaction = () => {
+    vi.spyOn(mongoose, "startSession").mockResolvedValue(createDbSession() as unknown as never);
+  };
+
+  const deletableOverrides = (extra: Record<string, unknown> = {}) => ({
+    userRepository: {
+      findByIdWithPassword: vi.fn().mockResolvedValue({ ...baseUser }),
+      findById: vi.fn().mockResolvedValue({ ...baseUser }),
+      findProfileByUserId: vi.fn().mockResolvedValue({ firstName: "Casey", lastName: "Doe" }),
+      findCustomerProfileByUserId: vi
+        .fn()
+        .mockResolvedValue({ avatar: { storageKey: "users/x/avatar/a.jpg" } }),
+      softDeleteCustomer: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+      anonymizeUserProfileForDeletion: vi.fn(),
+      anonymizeCustomerProfileForDeletion: vi.fn(),
+    },
+    ...extra,
+  });
+
+  it("closes the account: transactional anonymization + full best-effort cleanup + email", async () => {
+    withActiveTransaction();
+    const parts = createAuthService(deletableOverrides());
+
+    await parts.service.deleteMyAccount(userId.toHexString(), { ...validInput });
+
+    expect(parts.userRepository.softDeleteCustomer).toHaveBeenCalledWith(
+      userId,
+      expect.objectContaining({
+        tombstoneEmail: expectedTombstoneEmail,
+        deletedBy: { actorUserId: userId, actorRole: "CUSTOMER" },
+      }),
+      expect.anything(),
+    );
+    expect(parts.userRepository.anonymizeUserProfileForDeletion).toHaveBeenCalled();
+    expect(parts.userRepository.anonymizeCustomerProfileForDeletion).toHaveBeenCalled();
+    expect(parts.tokenService.revokeAllSessionsForUser).toHaveBeenCalledWith(userId);
+    expect(parts.bookingRepository.anonymizeCustomerSnapshotForDeletion).toHaveBeenCalledWith(
+      userId,
+      expectedTombstoneEmail,
+    );
+    expect(parts.reviewRepository.anonymizeReviewerForDeletion).toHaveBeenCalledWith(userId);
+    expect(parts.clientRepository.unlinkAndAnonymizeForUserDeletion).toHaveBeenCalledWith(userId, {
+      normalizedEmail: expectedTombstoneEmail,
+      phoneE164: expectedTombstonePhone,
+    });
+    expect(
+      parts.customerPaymentProfileRepository.clearSensitiveReferencesForDeletion,
+    ).toHaveBeenCalledWith(userId);
+    expect(parts.favoriteRepository.deleteAllForCustomer).toHaveBeenCalledWith(userId);
+    expect(parts.contactChangeChallengeRepository.deleteAllForUser).toHaveBeenCalledWith(userId);
+    expect(parts.appointmentReminderRepository.retireActiveForCustomer).toHaveBeenCalledWith(
+      userId,
+      "ACCOUNT_DELETED",
+      expect.anything(),
+    );
+    expect(parts.customerAvatarService.deleteAvatarObject).toHaveBeenCalledWith(
+      "users/x/avatar/a.jpg",
+    );
+    expect(parts.emailOutboxService.enqueue).toHaveBeenCalledWith({
+      eventKey: `ACCOUNT_DELETED:${userId.toHexString()}`,
+      templateKey: "ACCOUNT_CLOSED",
+      recipient: "closing@example.com",
+      payload: { firstName: "Casey" },
+    });
+  });
+
+  it("rejects a wrong current password and writes nothing", async () => {
+    withActiveTransaction();
+    const parts = createAuthService(
+      deletableOverrides({ passwordHasher: { verify: vi.fn().mockResolvedValue(false) } }),
+    );
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).rejects.toMatchObject({ details: [{ code: "INVALID_CURRENT_PASSWORD" }] });
+
+    expect(parts.userRepository.softDeleteCustomer).not.toHaveBeenCalled();
+    expect(parts.emailOutboxService.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects a confirmationText that is not exactly DELETE (defence-in-depth)", async () => {
+    const parts = createAuthService(deletableOverrides());
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), {
+        currentPassword: "secret",
+        confirmationText: "delete" as unknown as "DELETE",
+      }),
+    ).rejects.toMatchObject({ details: [{ code: "DELETE_CONFIRMATION_INVALID" }] });
+
+    expect(parts.userRepository.softDeleteCustomer).not.toHaveBeenCalled();
+  });
+
+  it("blocks closure while an upcoming active booking exists", async () => {
+    const parts = createAuthService(
+      deletableOverrides({
+        bookingRepository: {
+          hasUpcomingActiveBookingsForCustomer: vi.fn().mockResolvedValue(true),
+        },
+      }),
+    );
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).rejects.toMatchObject({ details: [{ code: "ACCOUNT_HAS_ACTIVE_BOOKINGS" }] });
+
+    expect(parts.userRepository.softDeleteCustomer).not.toHaveBeenCalled();
+    expect(parts.emailOutboxService.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent for an already-closed account: revokes sessions, no re-anonymization, no email", async () => {
+    const parts = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({ ...baseUser, status: "DELETED" }),
+        softDeleteCustomer: vi.fn(),
+        anonymizeUserProfileForDeletion: vi.fn(),
+        anonymizeCustomerProfileForDeletion: vi.fn(),
+      },
+    });
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).resolves.toBeUndefined();
+
+    expect(parts.tokenService.revokeAllSessionsForUser).toHaveBeenCalledWith(userId);
+    expect(parts.userRepository.softDeleteCustomer).not.toHaveBeenCalled();
+    expect(parts.emailOutboxService.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("maps an unsupported-transaction failure to 503 and runs no post-commit cleanup", async () => {
+    vi.spyOn(mongoose, "startSession").mockResolvedValue({
+      withTransaction: vi.fn(async () => {
+        throw new Error("Transaction numbers are only allowed on a replica set member or mongos");
+      }),
+      endSession: vi.fn(),
+    } as unknown as never);
+    const parts = createAuthService(deletableOverrides());
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).rejects.toMatchObject({ details: [{ code: "TRANSACTION_UNAVAILABLE" }] });
+
+    expect(parts.emailOutboxService.enqueue).not.toHaveBeenCalled();
+    expect(parts.bookingRepository.anonymizeCustomerSnapshotForDeletion).not.toHaveBeenCalled();
+  });
+
+  it("still resolves when a post-commit cleanup step throws (best-effort, non-fatal)", async () => {
+    withActiveTransaction();
+    const parts = createAuthService(
+      deletableOverrides({
+        bookingRepository: {
+          hasUpcomingActiveBookingsForCustomer: vi.fn().mockResolvedValue(false),
+          anonymizeCustomerSnapshotForDeletion: vi.fn().mockRejectedValue(new Error("mongo blip")),
+        },
+      }),
+    );
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).resolves.toBeUndefined();
+
+    // A later step still runs despite the earlier failure.
+    expect(parts.emailOutboxService.enqueue).toHaveBeenCalled();
+  });
+
+  it("on a lost CAS race, skips anonymization + email but still revokes sessions", async () => {
+    withActiveTransaction();
+    const parts = createAuthService(
+      deletableOverrides({
+        userRepository: {
+          findByIdWithPassword: vi.fn().mockResolvedValue({ ...baseUser }),
+          findProfileByUserId: vi.fn().mockResolvedValue({ firstName: "Casey" }),
+          findCustomerProfileByUserId: vi.fn().mockResolvedValue(null),
+          softDeleteCustomer: vi.fn().mockResolvedValue({ matchedCount: 0 }),
+          anonymizeUserProfileForDeletion: vi.fn(),
+          anonymizeCustomerProfileForDeletion: vi.fn(),
+        },
+      }),
+    );
+
+    await expect(
+      parts.service.deleteMyAccount(userId.toHexString(), { ...validInput }),
+    ).resolves.toBeUndefined();
+
+    expect(parts.userRepository.anonymizeUserProfileForDeletion).not.toHaveBeenCalled();
+    expect(parts.emailOutboxService.enqueue).not.toHaveBeenCalled();
+    expect(parts.tokenService.revokeAllSessionsForUser).toHaveBeenCalledWith(userId);
+  });
+
+  it("derives a deterministic tombstone email from the user id", async () => {
+    withActiveTransaction();
+    const parts = createAuthService(deletableOverrides());
+
+    await parts.service.deleteMyAccount(userId.toHexString(), { ...validInput });
+    const call = parts.userRepository.softDeleteCustomer.mock.calls[0]?.[1] as {
+      tombstoneEmail: string;
+    };
+
+    expect(call.tombstoneEmail).toBe(expectedTombstoneEmail);
   });
 });

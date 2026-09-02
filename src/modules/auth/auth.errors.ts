@@ -30,6 +30,10 @@ const defaultMessages: Record<string, string> = {
   CONTACT_UNCHANGED: "That's already your current email or phone number",
   CONTACT_CHANGE_NOT_FOUND:
     "No pending change request was found. Please request a new verification code",
+  DELETE_CONFIRMATION_INVALID: "Type DELETE to confirm account closure",
+  ACCOUNT_HAS_ACTIVE_BOOKINGS:
+    "You have upcoming bookings that must be completed or cancelled before your account can be closed",
+  ACCOUNT_DELETED: "This account has been closed",
 };
 
 export class AuthError extends AppError {

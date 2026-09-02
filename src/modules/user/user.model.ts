@@ -25,6 +25,15 @@ export type UserDocument = {
     passwordUpdatedAt: Date;
     lastLoginAt?: Date | undefined;
   };
+  /**
+   * Account-closure audit metadata (soft delete). Written once, together with
+   * `status: "DELETED"`, by AuthService.deleteMyAccount. `deletedBy` records who performed the
+   * closure — for customer self-service that is the customer themselves (`actorRole: "CUSTOMER"`).
+   * `deletionReason` is optional free-text (schema supports it; the v1 UI never sends one).
+   */
+  deletedAt?: Date | undefined;
+  deletedBy?: { actorUserId: Types.ObjectId; actorRole: UserRole } | undefined;
+  deletionReason?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -41,6 +50,20 @@ const userSchema = new Schema<UserDocument>(
       passwordUpdatedAt: { type: Date, required: true },
       lastLoginAt: { type: Date },
     },
+    // Soft-delete audit metadata — optional sub-doc, `_id: false`, `default: undefined` (mirrors
+    // the `marketingEmailConsent` sub-doc convention below). Set once by
+    // AuthService.deleteMyAccount alongside `status: "DELETED"`.
+    deletedAt: { type: Date },
+    deletedBy: {
+      type: {
+        actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+        actorRole: { type: String, enum: userRoles, required: true },
+      },
+      required: false,
+      _id: false,
+      default: undefined,
+    },
+    deletionReason: { type: String, trim: true, maxlength: 500 },
   },
   { timestamps: true },
 );

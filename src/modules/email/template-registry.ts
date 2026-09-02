@@ -1,5 +1,9 @@
 import type { RenderedEmail } from "./email.types.js";
 import {
+  type AccountClosedPayload,
+  renderAccountClosedEmail,
+} from "./templates/account/account-closed.template.js";
+import {
   type BusinessRegisteredEmailData,
   renderBusinessRegisteredEmail,
 } from "./templates/admin/business-registered.template.js";
@@ -69,6 +73,8 @@ import {
  * renderer TODAY. Stage C/D add the rest — no placeholder bodies are registered now.
  */
 export type EmailTemplateKey =
+  // Customer account lifecycle
+  | "ACCOUNT_CLOSED"
   | "OTP_VERIFICATION"
   // Stage B — client + booking creation
   | "CLIENT_CREATED"
@@ -112,6 +118,7 @@ const asRenderer = <P>(fn: (payload: P) => RenderedEmail): EmailTemplateRenderer
   fn as EmailTemplateRenderer<never>;
 
 const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> = {
+  ACCOUNT_CLOSED: asRenderer<AccountClosedPayload>(renderAccountClosedEmail),
   OTP_VERIFICATION: asRenderer<OtpVerificationPayload>(renderOtpVerificationEmail),
   CLIENT_CREATED: asRenderer<ClientCreatedEmailData>(renderClientCreatedEmail),
   BOOKING_CUSTOMER_CONFIRMED: asRenderer<BookingEmailData>(renderBookingCustomerConfirmedEmail),

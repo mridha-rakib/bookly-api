@@ -31,6 +31,13 @@ export class FavoriteRepository {
     await FavoriteModel.deleteOne({ customerUserId, businessId }).exec();
   }
 
+  /** Account-closure cleanup — remove every one of this customer's favorites. Idempotent
+   * (removing nothing is a no-op). Returns how many rows were removed. */
+  public async deleteAllForCustomer(customerUserId: Types.ObjectId | string): Promise<number> {
+    const result = await FavoriteModel.deleteMany({ customerUserId }).exec();
+    return result.deletedCount ?? 0;
+  }
+
   public async isFavorite(
     customerUserId: Types.ObjectId,
     businessId: Types.ObjectId,

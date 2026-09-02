@@ -19,6 +19,13 @@ const professionalEntryOpenApiSchema = entryOpenApiSchema
   .extend({ visitType: visitTypeOpenApiSchema.optional() })
   .strict();
 const loginOpenApiSchema = z.object({ email: emailSchema, password: z.string().min(1) }).strict();
+const deleteMyAccountOpenApiSchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    confirmationText: z.literal("DELETE"),
+    deletionReason: z.string().min(1).max(500).optional(),
+  })
+  .strict();
 const sessionOpenApiSchema = z.object({ sessionId: sessionIdSchema }).strict();
 const verifyOtpOpenApiSchema = sessionOpenApiSchema.extend({ code: otpCodeSchema }).strict();
 const profileOpenApiSchema = sessionOpenApiSchema
@@ -163,7 +170,7 @@ const meResponseSchema = z.object({
 });
 
 type AuthPath = {
-  method: "get" | "post";
+  method: "get" | "post" | "delete";
   path: string;
   summary: string;
   description?: string;
@@ -369,6 +376,15 @@ const authPaths: AuthPath[] = [
     path: "/auth/me",
     summary: "Get the current authenticated user",
     response: meResponseSchema,
+  },
+  {
+    method: "delete",
+    path: "/auth/me",
+    summary: "Close (soft-delete) the current customer account",
+    description:
+      'CUSTOMER only. Requires the current password and the literal typed confirmation "DELETE". Anonymizes profile PII, frees the email, revokes all sessions and clears the refresh cookie. Blocked (409) while an upcoming active booking exists.',
+    body: deleteMyAccountOpenApiSchema,
+    response: z.object({}).strict(),
   },
 ];
 

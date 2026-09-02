@@ -150,6 +150,33 @@ export class AppointmentReminderRepository {
   }
 
   /**
+   * Account-closure cleanup — retire every still-active reminder for this customer, across any
+   * booking. Same authoritative-override semantics as `retireActiveForBooking` (no claim-token
+   * guard; `COMPLETED` / `SKIPPED` / already-`CANCELLED` rows are left untouched). Normally a
+   * defensive no-op, since account closure is blocked while upcoming bookings exist. Returns how
+   * many rows were retired.
+   */
+  public async retireActiveForCustomer(
+    customerUserId: Types.ObjectId | string,
+    reasonCategory: string,
+    options: { now: Date } = { now: new Date() },
+  ): Promise<number> {
+    const result = await AppointmentReminderModel.updateMany(
+      { customerUserId, status: { $in: ["PENDING", "PROCESSING"] } },
+      {
+        $set: {
+          status: "CANCELLED",
+          processedAt: options.now,
+          lastErrorCategory: reasonCategory,
+        },
+        $unset: { claimedAt: "", claimedBy: "" },
+      },
+    ).exec();
+
+    return result.modifiedCount ?? 0;
+  }
+
+  /**
    * Atomically move ONE due reminder to PROCESSING and return it (`null` when none). Eligible =
    * PENDING and due, OR PROCESSING with a stale claim — in both cases only while attempts remain.
    * `attemptCount` is incremented in the same write, so a crash mid-process still burns one.

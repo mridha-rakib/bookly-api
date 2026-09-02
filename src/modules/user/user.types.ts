@@ -10,7 +10,11 @@ export type UserRole = (typeof userRoles)[number];
 
 export const professionalRoles: UserRole[] = ["BUSINESS_OWNER", "SUPERVISOR", "STAFF"];
 
-export const userStatuses = ["ACTIVE", "DORMANT", "SUSPENDED"] as const;
+// ACTIVE: normal account. DORMANT: existing inactive state. SUSPENDED: admin/platform
+// restriction. DELETED: customer-requested account closure (soft delete + anonymization via
+// DELETE /auth/me) — a terminal state; login/refresh/`requireActiveUser` all reject it and the
+// row's PII has been anonymized (see AuthService.deleteMyAccount).
+export const userStatuses = ["ACTIVE", "DORMANT", "SUSPENDED", "DELETED"] as const;
 
 export type UserStatus = (typeof userStatuses)[number];
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  deleteMyAccountBodySchema,
   requestEmailChangeBodySchema,
   requestPhoneChangeBodySchema,
   updateMyProfileBodySchema,
@@ -142,5 +143,61 @@ describe("Batch 18 contact-change schemas", () => {
   it("verifyPhoneChangeBodySchema requires exactly a 4-digit code", () => {
     expect(verifyPhoneChangeBodySchema.safeParse({ code: "5678" }).success).toBe(true);
     expect(verifyPhoneChangeBodySchema.safeParse({ code: "abcd" }).success).toBe(false);
+  });
+});
+
+describe("deleteMyAccountBodySchema", () => {
+  it("accepts currentPassword + the literal DELETE confirmation", () => {
+    expect(
+      deleteMyAccountBodySchema.safeParse({
+        currentPassword: "secret",
+        confirmationText: "DELETE",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("accepts an optional deletionReason", () => {
+    const result = deleteMyAccountBodySchema.safeParse({
+      currentPassword: "secret",
+      confirmationText: "DELETE",
+      deletionReason: "Moving away",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects any confirmationText other than the exact word DELETE", () => {
+    expect(
+      deleteMyAccountBodySchema.safeParse({ currentPassword: "secret", confirmationText: "delete" })
+        .success,
+    ).toBe(false);
+    expect(
+      deleteMyAccountBodySchema.safeParse({ currentPassword: "secret", confirmationText: "" })
+        .success,
+    ).toBe(false);
+    expect(deleteMyAccountBodySchema.safeParse({ currentPassword: "secret" }).success).toBe(false);
+  });
+
+  it("requires a non-empty currentPassword", () => {
+    expect(
+      deleteMyAccountBodySchema.safeParse({ currentPassword: "", confirmationText: "DELETE" })
+        .success,
+    ).toBe(false);
+  });
+
+  it("rejects unknown fields (mass-assignment guard) and an over-long reason", () => {
+    expect(
+      deleteMyAccountBodySchema.safeParse({
+        currentPassword: "secret",
+        confirmationText: "DELETE",
+        status: "ACTIVE",
+      }).success,
+    ).toBe(false);
+    expect(
+      deleteMyAccountBodySchema.safeParse({
+        currentPassword: "secret",
+        confirmationText: "DELETE",
+        deletionReason: "x".repeat(501),
+      }).success,
+    ).toBe(false);
   });
 });
