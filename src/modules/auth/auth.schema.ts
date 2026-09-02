@@ -157,6 +157,18 @@ export const changeMyPasswordBodySchema = z
   })
   .strict();
 
+// Customer account closure (DELETE /auth/me). Re-verifies the current password (same precedent
+// as the contact-change flows) and requires the literal typed confirmation "DELETE". `.strict()`
+// rejects any other field. `deletionReason` is optional free-text kept for audit; the v1 UI
+// never sends it.
+export const deleteMyAccountBodySchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    confirmationText: z.literal("DELETE"),
+    deletionReason: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
 // Batch 18 — Customer email/phone self-service change. Requesting a change re-verifies the
 // Customer's current password first (no established precedent existed for this — confirmed via
 // AskUserQuestion) before an OTP is ever sent to the NEW contact; the existing verified contact
@@ -211,6 +223,7 @@ export type BusinessDetailsBody = z.infer<typeof businessDetailsBodySchema>;
 export type CategorySelectionBody = z.infer<typeof categorySelectionBodySchema>;
 export type UpdateMyProfileBody = z.infer<typeof updateMyProfileBodySchema>;
 export type ChangeMyPasswordBody = z.infer<typeof changeMyPasswordBodySchema>;
+export type DeleteMyAccountBody = z.infer<typeof deleteMyAccountBodySchema>;
 export type RequestEmailChangeBody = z.infer<typeof requestEmailChangeBodySchema>;
 export type VerifyEmailChangeBody = z.infer<typeof verifyEmailChangeBodySchema>;
 export type RequestPhoneChangeBody = z.infer<typeof requestPhoneChangeBodySchema>;

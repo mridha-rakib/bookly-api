@@ -63,4 +63,26 @@ export class CustomerPaymentProfileRepository {
   ): Promise<CustomerPaymentProfileDocument | null> {
     return CustomerPaymentProfileModel.findOne({ stripeCustomerId }).exec();
   }
+
+  /**
+   * Account-closure cleanup — strip stored payment-instrument references (the payment-method id
+   * and card display metadata) from this customer's profile. Deliberately keeps `userId` and
+   * `stripeCustomerId`: the Stripe Customer is retained so historical charges/refunds stay
+   * reconcilable (financial records are never deleted), and this feature adds no Stripe
+   * API/gateway deletion call. Idempotent — a no-op when the row is absent or already stripped.
+   */
+  public async clearSensitiveReferencesForDeletion(userId: Types.ObjectId | string): Promise<void> {
+    await CustomerPaymentProfileModel.updateOne(
+      { userId },
+      {
+        $unset: {
+          defaultPaymentMethodId: "",
+          cardBrand: "",
+          cardLast4: "",
+          cardExpMonth: "",
+          cardExpYear: "",
+        },
+      },
+    ).exec();
+  }
 }

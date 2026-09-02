@@ -11,6 +11,7 @@ import type {
   BusinessDetailsBody,
   CategorySelectionBody,
   ChangeMyPasswordBody,
+  DeleteMyAccountBody,
   EntryBody,
   LoginBody,
   ProfessionalEntryBody,
@@ -212,6 +213,18 @@ export class AuthController {
       request.validated?.body as ChangeMyPasswordBody,
     );
     sendSuccess(response, 200, "Password changed");
+  };
+
+  public deleteMe = async (request: Request, response: Response): Promise<void> => {
+    const userId = request.auth?.userId;
+
+    if (!userId) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    await this.authService.deleteMyAccount(userId, request.validated?.body as DeleteMyAccountBody);
+    clearRefreshCookie(response);
+    sendSuccess(response, 200, "Account closed");
   };
 
   public updateMyAvatar = async (request: Request, response: Response): Promise<void> => {

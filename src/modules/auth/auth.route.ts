@@ -7,6 +7,8 @@ import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
+import { AppointmentReminderRepository } from "../appointment-reminder/appointment-reminder.repository.js";
+import { BookingRepository } from "../booking/booking.repository.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessService } from "../business/business.service.js";
 import { BusinessAccessRepository } from "../business/business-access.repository.js";
@@ -19,8 +21,11 @@ import { ContactChangeChallengeRepository } from "../contact-change/contact-chan
 import { CustomerAvatarError } from "../customer-avatar/customer-avatar.errors.js";
 import { CustomerAvatarService } from "../customer-avatar/customer-avatar.service.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import { FavoriteRepository } from "../favorite/favorite.repository.js";
 import { BusinessRegisteredNotifier } from "../notification/business-registered.notifier.js";
+import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
+import { ReviewRepository } from "../review/review.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
@@ -37,6 +42,7 @@ import {
   businessDetailsBodySchema,
   categorySelectionBodySchema,
   changeMyPasswordBodySchema,
+  deleteMyAccountBodySchema,
   entryBodySchema,
   loginBodySchema,
   professionalEntryBodySchema,
@@ -114,13 +120,22 @@ export const createAuthRoute = (): Router => {
   const sessionRepository = new SessionRepository();
   const tokenService = new TokenService(sessionRepository);
   const staffRepository = new StaffRepository();
-  const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
+  const clientRepository = new ClientRepository();
+  const clientIdentityService = new ClientIdentityService(userRepository, clientRepository);
   const contactChangeChallengeRepository = new ContactChangeChallengeRepository();
+  const emailOutboxService = new EmailOutboxService();
   const customerAvatarService = new CustomerAvatarService(
     userRepository,
     createDeferredStorageServiceFromEnv(),
     { maxUploadBytes: env.CUSTOMER_AVATAR_MAX_UPLOAD_BYTES },
   );
+  // Account-closure collaborators (DELETE /auth/me). Passed as trailing optional args to
+  // AuthService — see its constructor.
+  const bookingRepository = new BookingRepository();
+  const reviewRepository = new ReviewRepository();
+  const favoriteRepository = new FavoriteRepository();
+  const appointmentReminderRepository = new AppointmentReminderRepository();
+  const customerPaymentProfileRepository = new CustomerPaymentProfileRepository();
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
@@ -135,8 +150,15 @@ export const createAuthRoute = (): Router => {
     staffRepository,
     clientIdentityService,
     contactChangeChallengeRepository,
-    new BusinessRegisteredNotifier(new EmailOutboxService()),
+    new BusinessRegisteredNotifier(emailOutboxService),
     customerAvatarService,
+    bookingRepository,
+    reviewRepository,
+    favoriteRepository,
+    appointmentReminderRepository,
+    clientRepository,
+    customerPaymentProfileRepository,
+    emailOutboxService,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
@@ -316,6 +338,19 @@ export const createAuthRoute = (): Router => {
     loginLimiter,
     validateRequest({ body: changeMyPasswordBodySchema }),
     asyncHandler(controller.changeMyPassword),
+  );
+
+  // Customer account closure (soft delete + anonymization). CUSTOMER-only; acts on
+  // request.auth.userId only. `loginLimiter` caps password brute-forcing through this route,
+  // matching /me/password.
+  router.delete(
+    "/me",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    loginLimiter,
+    validateRequest({ body: deleteMyAccountBodySchema }),
+    asyncHandler(controller.deleteMe),
   );
 
   // Customer self-service avatar. CUSTOMER-only (SUPER_ADMIN excluded — no Super Admin avatar

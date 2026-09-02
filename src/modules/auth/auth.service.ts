@@ -1,23 +1,30 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
+import type { AppointmentReminderRepository } from "../appointment-reminder/appointment-reminder.repository.js";
+import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessService } from "../business/business.service.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
+import type { ClientRepository } from "../client/client.repository.js";
 import type { ClientIdentityService } from "../client/client-identity.service.js";
 import type { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
 import type {
   CustomerAvatarService,
   CustomerAvatarUpload,
 } from "../customer-avatar/customer-avatar.service.js";
+import type { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import type { FavoriteRepository } from "../favorite/favorite.repository.js";
 import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
+import type { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import type {
   RegistrationPortal,
   RegistrationSessionDocument,
 } from "../registration-session/registration-session.model.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
+import type { ReviewRepository } from "../review/review.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import {
@@ -32,6 +39,7 @@ import type {
   BusinessDetailsBody,
   CategorySelectionBody,
   ChangeMyPasswordBody,
+  DeleteMyAccountBody,
   EntryBody,
   LoginBody,
   ProfessionalEntryBody,
@@ -48,6 +56,7 @@ import type {
 import {
   addMinutes,
   assertOtpResendAllowed,
+  createOpaqueToken,
   generateNumericOtp,
   normalizeEmail,
   normalizePhoneNumber,
@@ -106,6 +115,16 @@ export class AuthService {
     // the existing auth test/integration construction sites keep working unchanged; when it is
     // absent, getMe simply omits avatarUrl and updateMyAvatar is unreachable (route not wired).
     private readonly customerAvatarService?: CustomerAvatarService,
+    // Customer account closure (DELETE /auth/me). Optional + trailing, same rationale as the two
+    // above: the real route (auth.route.ts) wires every one of these; construction sites that
+    // never exercise deleteMyAccount omit them. `deleteMyAccount` guards on the ones it needs.
+    private readonly bookingRepository?: BookingRepository,
+    private readonly reviewRepository?: ReviewRepository,
+    private readonly favoriteRepository?: FavoriteRepository,
+    private readonly appointmentReminderRepository?: AppointmentReminderRepository,
+    private readonly clientRepository?: ClientRepository,
+    private readonly customerPaymentProfileRepository?: CustomerPaymentProfileRepository,
+    private readonly emailOutboxService?: EmailOutboxService,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -140,6 +159,12 @@ export class AuthService {
 
     if (!this.roleMatchesPortal(user.role, portal)) {
       throw new AuthError("PORTAL_MISMATCH", 409);
+    }
+
+    if (user.status === "DELETED") {
+      // Closed account. The email is tombstoned so this branch is normally unreachable; keep it
+      // as defence-in-depth and never reveal the closure — behave exactly like "no such user".
+      throw new AuthError("INVALID_CREDENTIALS", 401);
     }
 
     const passwordValid = await this.passwordHasher.verify(user.passwordHash, input.password);
@@ -547,6 +572,11 @@ export class AuthService {
         throw new AuthError("USER_SUSPENDED", 403);
       }
 
+      if (user.status === "DELETED") {
+        await this.tokenService.revokeRefreshToken(rotated.refreshToken);
+        throw new AuthError("ACCOUNT_DELETED", 401);
+      }
+
       const accessToken = await this.tokenService.createAccessToken({
         userId: user._id,
         role: user.role,
@@ -587,6 +617,10 @@ export class AuthService {
 
     if (!user) {
       throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    if (user.status === "DELETED") {
+      throw new AuthError("ACCOUNT_DELETED", 401);
     }
 
     const profile = await this.userRepository.findProfileByUserId(user._id);
@@ -740,6 +774,250 @@ export class AuthService {
 
     const passwordHash = await this.passwordHasher.hash(input.newPassword);
     await this.userRepository.updatePasswordHash(user._id, passwordHash);
+  }
+
+  /**
+   * Customer account closure — soft delete + PII anonymization (DELETE /auth/me). Approved model:
+   *
+   *  1. Validate: typed "DELETE" confirmation, current password, CUSTOMER role, and no upcoming
+   *     active booking (UPCOMING / PENDING, future-dated) — that last one blocks with 409.
+   *  2. Atomic core (one transaction): User → `status: "DELETED"` + freed email tombstone +
+   *     unusable password + `deletedAt` / `deletedBy` / `deletionReason`; UserProfile and
+   *     CustomerProfile PII anonymized. A CAS on `status !== "DELETED"` makes a concurrent /
+   *     replayed request a no-op.
+   *  3. Best-effort, idempotent, post-commit tail (never rethrows): revoke every session;
+   *     anonymize the booking contact snapshots + review reviewer identity; unlink + anonymize
+   *     the linked Business CRM rows; strip stored payment references; drop favorites and any
+   *     contact-change challenge; retire active reminders; delete the avatar object; enqueue the
+   *     ACCOUNT_CLOSED email to the original address.
+   *
+   * Overall idempotent: a replay (`status` already `"DELETED"`) returns after making sure the
+   * caller's sessions are revoked, without re-running anonymization or re-sending the email.
+   */
+  public async deleteMyAccount(userId: string, input: DeleteMyAccountBody): Promise<void> {
+    if (input.confirmationText !== "DELETE") {
+      throw new AuthError("DELETE_CONFIRMATION_INVALID", 400);
+    }
+
+    const user = await this.userRepository.findByIdWithPassword(userId);
+
+    if (!user) {
+      throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    if (user.role !== "CUSTOMER") {
+      // The route already restricts this to CUSTOMER; defence-in-depth service invariant.
+      throw new AuthError("PORTAL_MISMATCH", 403);
+    }
+
+    if (user.status === "DELETED") {
+      await this.revokeSessionsQuietly(user._id, userId);
+      return;
+    }
+
+    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
+      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+    }
+
+    const bookingRepository = this.requireDeletionDependency(
+      this.bookingRepository,
+      "bookingRepository",
+    );
+
+    if (await bookingRepository.hasUpcomingActiveBookingsForCustomer(user._id, new Date())) {
+      throw new AuthError("ACCOUNT_HAS_ACTIVE_BOOKINGS", 409);
+    }
+
+    // Everything the post-commit tail needs, captured BEFORE the row is anonymized.
+    const originalEmail = user.normalizedEmail;
+    const profile = await this.userRepository.findProfileByUserId(user._id);
+    const customerProfile = await this.userRepository.findCustomerProfileByUserId(user._id);
+    const firstNameForEmail = profile?.firstName?.trim() || "there";
+    const avatarStorageKey = customerProfile?.avatar?.storageKey;
+
+    const tombstoneEmail = this.buildDeletionTombstoneEmail(user._id);
+    const tombstonePhoneE164 = this.buildDeletionTombstonePhoneE164(user._id);
+    const now = new Date();
+    // Argon2 is CPU-heavy — hash outside the transaction so no lock is held during it.
+    const unusablePasswordHash = await this.passwordHasher.hash(createOpaqueToken());
+
+    const dbSession = await mongoose.startSession();
+    let closedByThisRequest = false;
+
+    try {
+      await dbSession.withTransaction(async () => {
+        const { matchedCount } = await this.userRepository.softDeleteCustomer(
+          user._id,
+          {
+            tombstoneEmail,
+            unusablePasswordHash,
+            deletedAt: now,
+            deletedBy: { actorUserId: user._id, actorRole: "CUSTOMER" },
+            ...(input.deletionReason ? { deletionReason: input.deletionReason } : {}),
+          },
+          dbSession,
+        );
+
+        if (matchedCount === 0) {
+          // Lost a concurrent race — another request already closed the account and owns the
+          // post-commit tail. Leave `closedByThisRequest` false.
+          return;
+        }
+
+        await this.userRepository.anonymizeUserProfileForDeletion(user._id, dbSession);
+        await this.userRepository.anonymizeCustomerProfileForDeletion(user._id, dbSession);
+        closedByThisRequest = true;
+      });
+    } catch (error) {
+      if (this.isTransactionUnsupported(error)) {
+        throw new AuthError("DATABASE_TRANSACTION_UNAVAILABLE", 503, [
+          {
+            message:
+              "MongoDB transactions are not available; use a replica set or retry with transaction support enabled.",
+            code: "TRANSACTION_UNAVAILABLE",
+          },
+        ]);
+      }
+      throw error;
+    } finally {
+      await dbSession.endSession();
+    }
+
+    if (!closedByThisRequest) {
+      // The CAS lost the race — the winning request runs the cleanup + email. Still make sure
+      // this caller's sessions are dead.
+      await this.revokeSessionsQuietly(user._id, userId);
+      return;
+    }
+
+    await this.runPostDeletionCleanup(user._id, {
+      originalEmail,
+      firstNameForEmail,
+      tombstoneEmail,
+      tombstonePhoneE164,
+      avatarStorageKey,
+      now,
+    });
+  }
+
+  /**
+   * Best-effort, idempotent side effects that run AFTER the account-closure transaction commits.
+   * Each step is isolated in its own try/catch — a failure is logged and never rethrown, so one
+   * failing cleanup can never make the closure look failed to the caller. Every operation here is
+   * safe to re-run (constant writes / deletes matched on immutable ids).
+   */
+  private async runPostDeletionCleanup(
+    userId: Types.ObjectId,
+    data: {
+      originalEmail: string;
+      firstNameForEmail: string;
+      tombstoneEmail: string;
+      tombstonePhoneE164: string;
+      avatarStorageKey?: string | undefined;
+      now: Date;
+    },
+  ): Promise<void> {
+    const id = String(userId);
+    const step = async (name: string, run: () => Promise<unknown>): Promise<void> => {
+      try {
+        await run();
+      } catch (error) {
+        logger.error({ err: error, userId: id, step: name }, "Post-deletion cleanup step failed");
+      }
+    };
+
+    await step("revokeSessions", () => this.tokenService.revokeAllSessionsForUser(userId));
+
+    await step("anonymizeBookingSnapshots", async () => {
+      await this.bookingRepository?.anonymizeCustomerSnapshotForDeletion(
+        userId,
+        data.tombstoneEmail,
+      );
+    });
+
+    await step("anonymizeReviews", async () => {
+      await this.reviewRepository?.anonymizeReviewerForDeletion(userId);
+    });
+
+    await step("unlinkBusinessClients", async () => {
+      await this.clientRepository?.unlinkAndAnonymizeForUserDeletion(userId, {
+        normalizedEmail: data.tombstoneEmail,
+        phoneE164: data.tombstonePhoneE164,
+      });
+    });
+
+    await step("clearPaymentReferences", async () => {
+      await this.customerPaymentProfileRepository?.clearSensitiveReferencesForDeletion(userId);
+    });
+
+    await step("deleteFavorites", async () => {
+      await this.favoriteRepository?.deleteAllForCustomer(userId);
+    });
+
+    await step("deleteContactChangeChallenges", async () => {
+      await this.contactChangeChallengeRepository.deleteAllForUser(userId);
+    });
+
+    await step("retireReminders", async () => {
+      await this.appointmentReminderRepository?.retireActiveForCustomer(userId, "ACCOUNT_DELETED", {
+        now: data.now,
+      });
+    });
+
+    if (data.avatarStorageKey) {
+      await step("deleteAvatarObject", () =>
+        this.deleteAvatarObjectQuietly(data.avatarStorageKey as string),
+      );
+    }
+
+    await step("enqueueClosureEmail", async () => {
+      await this.emailOutboxService?.enqueue({
+        eventKey: `ACCOUNT_DELETED:${id}`,
+        templateKey: "ACCOUNT_CLOSED",
+        recipient: data.originalEmail,
+        payload: { firstName: data.firstNameForEmail },
+      });
+    });
+  }
+
+  private async revokeSessionsQuietly(userObjectId: Types.ObjectId, userId: string): Promise<void> {
+    try {
+      await this.tokenService.revokeAllSessionsForUser(userObjectId);
+    } catch (error) {
+      logger.error({ err: error, userId }, "Session revoke during account closure failed");
+    }
+  }
+
+  private async deleteAvatarObjectQuietly(storageKey: string): Promise<void> {
+    if (!this.customerAvatarService) {
+      return;
+    }
+    await this.customerAvatarService.deleteAvatarObject(storageKey);
+  }
+
+  private requireDeletionDependency<T>(dependency: T | undefined, name: string): T {
+    if (!dependency) {
+      throw new Error(`AuthService.deleteMyAccount is missing required dependency "${name}"`);
+    }
+    return dependency;
+  }
+
+  /**
+   * Deterministic, collision-safe (per userId), non-routable tombstone that frees the customer's
+   * real email on closure. `.invalid` is reserved by RFC 2606 — it can never receive mail or
+   * collide with a real registration.
+   */
+  private buildDeletionTombstoneEmail(userId: Types.ObjectId): string {
+    return `deleted+${String(userId)}@account.invalid`;
+  }
+
+  /**
+   * Deterministic, per-user, non-routable phone tombstone. BusinessClient carries a per-Business
+   * unique index on `phone.e164`, so a blank value could collide across different deleted
+   * customers in one Business — this keeps every anonymized row unique.
+   */
+  private buildDeletionTombstonePhoneE164(userId: Types.ObjectId): string {
+    return `deleted-${String(userId)}`;
   }
 
   /**

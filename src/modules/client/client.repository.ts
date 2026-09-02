@@ -221,6 +221,45 @@ export class ClientRepository {
   }
 
   /**
+   * Account-closure cleanup — for every Business CRM row linked to this now-deleted Customer,
+   * unlink the relationship and anonymize the locally-stored personal contact snapshot. Called
+   * best-effort, post-commit, from AuthService.deleteMyAccount (a single `updateMany`, matching
+   * this repository's one-write-per-call posture). `normalizedEmail` and `phone.e164` are set to
+   * the caller-supplied per-user deterministic, non-routable tombstones so the per-Business
+   * unique indexes on those two fields can never collide across different deleted customers.
+   * Business-owned, non-personal state (activation history, `businessId`, `createdByUserId`,
+   * `archivedAt`) is left untouched. Returns how many rows were updated.
+   */
+  public async unlinkAndAnonymizeForUserDeletion(
+    userId: Types.ObjectId | string,
+    tombstones: { normalizedEmail: string; phoneE164: string },
+  ): Promise<number> {
+    const result = await BusinessClientModel.updateMany(
+      { linkedUserId: userId },
+      {
+        $set: {
+          linkState: "UNLINKED",
+          firstName: "Deleted",
+          lastName: "User",
+          normalizedEmail: tombstones.normalizedEmail,
+          "phone.countryCode": "",
+          "phone.nationalNumber": "",
+          "phone.e164": tombstones.phoneE164,
+        },
+        $unset: {
+          linkedUserId: "",
+          dateOfBirth: "",
+          gender: "",
+          address: "",
+          notes: "",
+          tag: "",
+        },
+      },
+    ).exec();
+    return result.modifiedCount ?? 0;
+  }
+
+  /**
    * Cross-business lookups used only by post customer-registration identity matching — never
    * scoped to a single Business, and deliberately does not filter by archivedAt (an archived
    * Client may still link; see client-identity.service.ts).

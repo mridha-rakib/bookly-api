@@ -16,7 +16,7 @@ const createRequest = (authorization?: string): Request =>
     headers: authorization ? { authorization } : {},
   }) as Request;
 
-const createUser = (status: "ACTIVE" | "SUSPENDED" = "ACTIVE"): UserDocument =>
+const createUser = (status: "ACTIVE" | "SUSPENDED" | "DELETED" = "ACTIVE"): UserDocument =>
   ({
     _id: new Types.ObjectId(),
     role: "CUSTOMER",
@@ -92,6 +92,20 @@ describe("auth middleware", () => {
     expect(next.mock.calls[0]?.[0]).toMatchObject({
       statusCode: 403,
       details: [{ code: "USER_SUSPENDED" }],
+    });
+  });
+
+  it("rejects closed (DELETED) accounts in active-user middleware with a 401", () => {
+    const request = {
+      auth: { userId: "u1", role: "CUSTOMER", status: "DELETED" },
+    } as Request;
+    const next = vi.fn();
+
+    requireActiveUser()(request, {} as Response, next as NextFunction);
+
+    expect(next.mock.calls[0]?.[0]).toMatchObject({
+      statusCode: 401,
+      details: [{ code: "ACCOUNT_DELETED" }],
     });
   });
 });

@@ -81,6 +81,11 @@ export const requireActiveUser = (): RequestHandler => (request, _response, next
     return;
   }
 
+  if (request.auth?.status === "DELETED") {
+    next(new AuthError("ACCOUNT_DELETED", 401));
+    return;
+  }
+
   next();
 };
 

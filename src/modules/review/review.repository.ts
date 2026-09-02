@@ -140,6 +140,23 @@ export class ReviewRepository {
     return { reviews, total };
   }
 
+  /**
+   * Account-closure cleanup — anonymize this customer's reviewer identity across every review
+   * they authored. Best-effort and idempotent: sets the snapshot display name to a constant,
+   * matched on the immutable `customerUserId`. Rating, comment, status and moderation history
+   * are untouched, and `customerUserId` itself is retained for integrity. Returns how many
+   * reviews were updated.
+   */
+  public async anonymizeReviewerForDeletion(
+    customerUserId: Types.ObjectId | string,
+  ): Promise<number> {
+    const result = await ReviewModel.updateMany(
+      { customerUserId },
+      { $set: { reviewerDisplayName: "Deleted User" } },
+    ).exec();
+    return result.modifiedCount ?? 0;
+  }
+
   private isDuplicateKeyError(error: unknown): boolean {
     return (
       typeof error === "object" &&

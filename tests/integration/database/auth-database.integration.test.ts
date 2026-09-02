@@ -4,6 +4,7 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
+import { AppointmentReminderRepository } from "../../../src/modules/appointment-reminder/appointment-reminder.repository.js";
 import { AuthError } from "../../../src/modules/auth/auth.errors.js";
 import {
   businessDetailsBodySchema,
@@ -17,6 +18,8 @@ import { AuthService } from "../../../src/modules/auth/auth.service.js";
 import { sha256 } from "../../../src/modules/auth/auth.utils.js";
 import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
+import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessService } from "../../../src/modules/business/business.service.js";
@@ -24,15 +27,24 @@ import { BusinessAccessRepository } from "../../../src/modules/business/business
 import { BusinessLinkVerificationRepository } from "../../../src/modules/business/business-link-verification.repository.js";
 import { BusinessOnboardingRepository } from "../../../src/modules/business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
+import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
 import { ContactChangeChallengeModel } from "../../../src/modules/contact-change/contact-change-challenge.model.js";
 import { ContactChangeChallengeRepository } from "../../../src/modules/contact-change/contact-change-challenge.repository.js";
+import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
+import { FavoriteModel } from "../../../src/modules/favorite/favorite.model.js";
+import { FavoriteRepository } from "../../../src/modules/favorite/favorite.repository.js";
+import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
+import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import {
   type RegistrationPortal,
   RegistrationSessionModel,
 } from "../../../src/modules/registration-session/registration-session.model.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
+import { ReviewModel } from "../../../src/modules/review/review.model.js";
+import { ReviewRepository } from "../../../src/modules/review/review.repository.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -66,6 +78,7 @@ type AuthServiceParts = {
   phoneProvider: TestPhoneOtpProvider;
   userRepository: UserRepository;
   sessionRepository: SessionRepository;
+  tokenService: TokenService;
 };
 
 const context = { userAgent: "vitest", ipAddress: "127.0.0.1" };
@@ -140,7 +153,10 @@ const createAuthService = (
     emailProvider,
   );
   const staffRepository = new StaffRepository();
-  const clientIdentityService = new ClientIdentityService(userRepository, new ClientRepository());
+  const clientRepository = new ClientRepository();
+  const clientIdentityService = new ClientIdentityService(userRepository, clientRepository);
+  const tokenService = new TokenService(sessionRepository);
+  const emailOutboxService = new EmailOutboxService();
 
   return {
     authService: new AuthService(
@@ -152,16 +168,26 @@ const createAuthService = (
       new Argon2PasswordHasher(),
       emailProvider,
       phoneProvider,
-      new TokenService(sessionRepository),
+      tokenService,
       businessService,
       staffRepository,
       clientIdentityService,
       new ContactChangeChallengeRepository(),
+      undefined,
+      undefined,
+      new BookingRepository(),
+      new ReviewRepository(),
+      new FavoriteRepository(),
+      new AppointmentReminderRepository(),
+      clientRepository,
+      new CustomerPaymentProfileRepository(),
+      emailOutboxService,
     ),
     emailProvider,
     phoneProvider,
     userRepository,
     sessionRepository,
+    tokenService,
   };
 };
 
@@ -1455,6 +1481,190 @@ describe("database-backed authentication integration", () => {
       const meOptOut = await parts.authService.getMe(userId);
       expect(meOptOut.profile?.notifications.marketingEmail).toBe(false);
       expect(meOptOut.profile?.notifications.appointmentReminderSms).toBe(true);
+    });
+  });
+
+  describe("account closure (DELETE /auth/me)", () => {
+    const closeInput = { currentPassword: testPassword, confirmationText: "DELETE" as const };
+
+    const seedCustomer = async (email: string) => {
+      const parts = createAuthService();
+      const { result } = await completeCustomer(email, parts);
+      return { parts, userId: result.user.id, refreshToken: result.refreshToken };
+    };
+
+    it("soft-deletes the account, anonymizes PII, revokes sessions and enqueues the closure email", async () => {
+      const { parts, userId } = await seedCustomer("close-me@example.com");
+      const userObjectId = new mongoose.Types.ObjectId(userId);
+      const business = new mongoose.Types.ObjectId();
+      const tombstone = `deleted+${userId}@account.invalid`;
+
+      await FavoriteModel.create({ customerUserId: userObjectId, businessId: business });
+      await ReviewModel.create({
+        bookingId: new mongoose.Types.ObjectId(),
+        businessId: business,
+        customerUserId: userObjectId,
+        reviewerDisplayName: "Jane C.",
+        rating: 5,
+      });
+      await BusinessClientModel.create({
+        businessId: business,
+        createdByUserId: userObjectId,
+        firstName: "Jane",
+        lastName: "Customer",
+        normalizedEmail: "close-me@example.com",
+        phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+        linkState: "LINKED",
+        linkedUserId: userObjectId,
+        notes: "prefers mornings",
+        tag: "VIP",
+      });
+      await CustomerPaymentProfileModel.create({
+        userId: userObjectId,
+        stripeCustomerId: `cus_${userId}`,
+        defaultPaymentMethodId: "pm_123",
+        cardBrand: "visa",
+        cardLast4: "4242",
+        cardExpMonth: 12,
+        cardExpYear: 2031,
+      });
+      const pastBookingId = new mongoose.Types.ObjectId();
+      await BookingModel.collection.insertOne({
+        _id: pastBookingId,
+        status: "COMPLETED",
+        schedule: { startAt: new Date(Date.now() - 7 * 24 * 3600_000) },
+        customer: {
+          customerUserId: userObjectId,
+          contact: {
+            firstName: "Jane",
+            lastName: "Customer",
+            normalizedEmail: "close-me@example.com",
+            phone: { countryCode: "+357", nationalNumber: "99112233", e164: "+35799112233" },
+          },
+        },
+      });
+
+      await parts.authService.deleteMyAccount(userId, { ...closeInput });
+
+      const user = await UserModel.findById(userId).lean().exec();
+      expect(user?.status).toBe("DELETED");
+      expect(user?.normalizedEmail).toBe(tombstone);
+      expect(user?.deletedAt).toBeInstanceOf(Date);
+      expect(user?.deletedBy?.actorRole).toBe("CUSTOMER");
+      expect(String(user?.deletedBy?.actorUserId)).toBe(userId);
+
+      const profile = await UserProfileModel.findOne({ userId: userObjectId }).lean().exec();
+      expect(profile?.firstName).toBe("Deleted");
+      expect(profile?.lastName).toBe("User");
+      expect(profile?.phone).toBeUndefined();
+
+      const sessions = await SessionModel.find({ userId: userObjectId }).lean().exec();
+      expect(sessions.length).toBeGreaterThan(0);
+      expect(sessions.every((s) => s.revokedAt)).toBe(true);
+
+      expect(await FavoriteModel.countDocuments({ customerUserId: userObjectId })).toBe(0);
+
+      const review = await ReviewModel.findOne({ customerUserId: userObjectId }).lean().exec();
+      expect(review?.reviewerDisplayName).toBe("Deleted User");
+      expect(review?.rating).toBe(5);
+
+      const client = await BusinessClientModel.findOne({ businessId: business }).lean().exec();
+      expect(client?.linkState).toBe("UNLINKED");
+      expect(client?.linkedUserId).toBeUndefined();
+      expect(client?.firstName).toBe("Deleted");
+      expect(client?.normalizedEmail).toBe(tombstone);
+      expect(client?.phone.e164).toBe(`deleted-${userId}`);
+      expect(client?.notes).toBeUndefined();
+      expect(client?.tag).toBeUndefined();
+
+      const payment = await CustomerPaymentProfileModel.findOne({ userId: userObjectId })
+        .lean()
+        .exec();
+      expect(payment?.stripeCustomerId).toBe(`cus_${userId}`);
+      expect(payment?.defaultPaymentMethodId).toBeUndefined();
+      expect(payment?.cardLast4).toBeUndefined();
+
+      const booking = await BookingModel.collection.findOne({ _id: pastBookingId });
+      expect(booking?.["customer"]).toMatchObject({
+        contact: {
+          firstName: "Deleted",
+          lastName: "User",
+          normalizedEmail: tombstone,
+          phone: { countryCode: "", nationalNumber: "", e164: "" },
+        },
+      });
+
+      const outbox = await EmailOutboxModel.findOne({ eventKey: `ACCOUNT_DELETED:${userId}` })
+        .lean()
+        .exec();
+      expect(outbox?.templateKey).toBe("ACCOUNT_CLOSED");
+      expect(outbox?.recipient).toBe("close-me@example.com");
+    });
+
+    it("frees the email and blocks login/refresh/getMe; the address can re-register", async () => {
+      const { parts, userId, refreshToken } = await seedCustomer("reuse@example.com");
+
+      await parts.authService.deleteMyAccount(userId, { ...closeInput });
+
+      await expect(
+        parts.authService.login(
+          "CUSTOMER",
+          { email: "reuse@example.com", password: testPassword },
+          context,
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "INVALID_CREDENTIALS" }] });
+
+      await expect(parts.authService.refresh(refreshToken)).rejects.toBeInstanceOf(AuthError);
+      await expect(parts.authService.getMe(userId)).rejects.toMatchObject({
+        details: [{ code: "ACCOUNT_DELETED" }],
+      });
+
+      const { result: fresh } = await completeCustomer("reuse@example.com");
+      expect(fresh.user.id).not.toBe(userId);
+    });
+
+    it("blocks closure while an upcoming active booking exists and mutates nothing", async () => {
+      const { parts, userId } = await seedCustomer("has-booking@example.com");
+      const userObjectId = new mongoose.Types.ObjectId(userId);
+
+      await BookingModel.collection.insertOne({
+        _id: new mongoose.Types.ObjectId(),
+        status: "UPCOMING",
+        schedule: { startAt: new Date(Date.now() + 3 * 24 * 3600_000) },
+        customer: {
+          customerUserId: userObjectId,
+          contact: {
+            firstName: "Sam",
+            normalizedEmail: "has-booking@example.com",
+            phone: { countryCode: "+357", nationalNumber: "99000111", e164: "+35799000111" },
+          },
+        },
+      });
+
+      await expect(
+        parts.authService.deleteMyAccount(userId, { ...closeInput }),
+      ).rejects.toMatchObject({ details: [{ code: "ACCOUNT_HAS_ACTIVE_BOOKINGS" }] });
+
+      const user = await UserModel.findById(userId).lean().exec();
+      expect(user?.status).toBe("ACTIVE");
+      expect(user?.deletedAt).toBeUndefined();
+    });
+
+    it("is idempotent: a second closure call is a no-op that still resolves", async () => {
+      const { parts, userId } = await seedCustomer("twice@example.com");
+
+      await parts.authService.deleteMyAccount(userId, { ...closeInput });
+      const firstCount = await EmailOutboxModel.countDocuments({
+        eventKey: `ACCOUNT_DELETED:${userId}`,
+      });
+
+      await expect(
+        parts.authService.deleteMyAccount(userId, { ...closeInput }),
+      ).resolves.toBeUndefined();
+
+      expect(await EmailOutboxModel.countDocuments({ eventKey: `ACCOUNT_DELETED:${userId}` })).toBe(
+        firstCount,
+      );
     });
   });
 });

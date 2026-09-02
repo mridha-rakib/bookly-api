@@ -75,4 +75,11 @@ export class ContactChangeChallengeRepository {
   public async claimAndDelete(id: Types.ObjectId): Promise<ContactChangeChallengeDocument | null> {
     return ContactChangeChallengeModel.findOneAndDelete({ _id: id }).exec();
   }
+
+  /** Account-closure cleanup — drop any pending email/phone change challenge slots for this
+   * user. Idempotent. Returns how many rows were removed. */
+  public async deleteAllForUser(userId: Types.ObjectId | string): Promise<number> {
+    const result = await ContactChangeChallengeModel.deleteMany({ userId }).exec();
+    return result.deletedCount ?? 0;
+  }
 }

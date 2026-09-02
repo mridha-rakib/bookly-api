@@ -386,6 +386,49 @@ export class BookingRepository {
     return this.runPaginatedQuery(query, pagination);
   }
 
+  /**
+   * Account-closure guard — does this Customer have any still-active booking dated in the
+   * future? "Active" = UPCOMING or PENDING (the non-terminal statuses); COMPLETED / NO_SHOW_* /
+   * CANCELLED_* / LATE_CANCELLATION never block. Served by the sparse
+   * `{customer.customerUserId, schedule.startAt}` index; `exists` short-circuits at the first hit.
+   */
+  public async hasUpcomingActiveBookingsForCustomer(
+    customerUserId: Types.ObjectId | string,
+    now: Date,
+  ): Promise<boolean> {
+    const found = await BookingModel.exists({
+      "customer.customerUserId": customerUserId,
+      status: { $in: ["UPCOMING", "PENDING"] },
+      "schedule.startAt": { $gt: now },
+    }).exec();
+    return found !== null;
+  }
+
+  /**
+   * Account-closure cleanup — anonymize the denormalized customer contact snapshot on every one
+   * of this Customer's historical bookings. Best-effort and idempotent: writes constant
+   * placeholders, matched on the immutable `customer.customerUserId`. Never touches the booking
+   * id, schedule, service lines, `businessId`, financial links, or `customer.customerUserId`
+   * itself. Returns how many bookings were updated.
+   */
+  public async anonymizeCustomerSnapshotForDeletion(
+    customerUserId: Types.ObjectId | string,
+    tombstoneEmail: string,
+  ): Promise<number> {
+    const result = await BookingModel.updateMany(
+      { "customer.customerUserId": customerUserId },
+      {
+        $set: {
+          "customer.contact.firstName": "Deleted",
+          "customer.contact.lastName": "User",
+          "customer.contact.normalizedEmail": tombstoneEmail,
+          "customer.contact.phone": { countryCode: "", nationalNumber: "", e164: "" },
+        },
+      },
+    ).exec();
+    return result.modifiedCount ?? 0;
+  }
+
   /** Batch 11 — Super Admin global Bookings list: `businessId` is OPTIONAL here (unlike
    * `listForBusiness`, where it's mandatory) — omitted means every Business, matching the
    * explicit cross-business Super Admin surface this batch's own instructions require rather

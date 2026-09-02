@@ -343,6 +343,78 @@ export class UserRepository {
   }
 
   /**
+   * Account closure (soft delete). CAS-guarded on `status` not already being `"DELETED"`, so a
+   * concurrent or replayed deletion matches zero documents (`matchedCount === 0`) and the caller
+   * treats it as "already closed" — never a second anonymization. Frees `normalizedEmail` by
+   * overwriting it with the caller-supplied deterministic, non-routable tombstone and replaces
+   * `passwordHash` with an unusable value. Runs inside the deletion transaction via `session`.
+   */
+  public async softDeleteCustomer(
+    userId: Types.ObjectId | string,
+    input: {
+      tombstoneEmail: string;
+      unusablePasswordHash: string;
+      deletedAt: Date;
+      deletedBy: { actorUserId: Types.ObjectId; actorRole: UserRole };
+      deletionReason?: string | undefined;
+    },
+    session?: ClientSession,
+  ): Promise<{ matchedCount: number }> {
+    const result = await UserModel.updateOne(
+      { _id: userId, status: { $ne: "DELETED" } },
+      {
+        $set: {
+          status: "DELETED",
+          normalizedEmail: input.tombstoneEmail,
+          passwordHash: input.unusablePasswordHash,
+          "security.passwordUpdatedAt": input.deletedAt,
+          deletedAt: input.deletedAt,
+          deletedBy: input.deletedBy,
+          ...(input.deletionReason ? { deletionReason: input.deletionReason } : {}),
+        },
+      },
+      session ? { session } : undefined,
+    );
+
+    return { matchedCount: result.matchedCount ?? 0 };
+  }
+
+  /**
+   * Anonymize the customer's UserProfile PII on account closure. `firstName`/`lastName`/`gender`
+   * are required fields → overwritten with placeholders; the optional contact / preference
+   * fields are removed. Runs inside the deletion transaction via `session`.
+   */
+  public async anonymizeUserProfileForDeletion(
+    userId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<void> {
+    await UserProfileModel.updateOne(
+      { userId },
+      {
+        $set: { firstName: "Deleted", lastName: "User", gender: "other" },
+        $unset: { phone: "", notifications: "", marketingEmailConsent: "" },
+      },
+      session ? { session } : undefined,
+    );
+  }
+
+  /**
+   * Anonymize the customer's CustomerProfile PII on account closure. Every field here is
+   * optional, so all are simply unset (the row itself may not exist — a no-op `updateOne` is
+   * fine). The avatar object bytes are deleted from storage separately, post-commit.
+   */
+  public async anonymizeCustomerProfileForDeletion(
+    userId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<void> {
+    await CustomerProfileModel.updateOne(
+      { userId },
+      { $unset: { address: "", dateOfBirth: "", avatar: "" } },
+      session ? { session } : undefined,
+    );
+  }
+
+  /**
    * Client identity-linking building blocks (see client-identity.service.ts). "Verified" here
    * means the User row itself has emailVerifiedAt/phoneVerifiedAt set — Bookly's customer
    * signup flow requires both OTP steps before a CUSTOMER account exists, so every CUSTOMER is

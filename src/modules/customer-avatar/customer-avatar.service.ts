@@ -116,6 +116,24 @@ export class CustomerAvatarService {
     return this.storageService.getObjectUrl({ key: storageKey });
   }
 
+  /**
+   * Account-closure cleanup — delete one avatar object from storage by its key. The
+   * CustomerProfile `avatar` reference is removed separately, inside the account-deletion
+   * transaction, so this only touches the object store. Best-effort: a missing object or a
+   * transient storage error is logged and swallowed (same posture as the stale-object cleanup
+   * in `uploadOrReplaceAvatar`).
+   */
+  public async deleteAvatarObject(storageKey: string): Promise<void> {
+    try {
+      await this.storageService.deleteObject({ key: storageKey });
+    } catch (error) {
+      logger.warn(
+        { storageKey, error },
+        "Failed to delete customer avatar object during account closure",
+      );
+    }
+  }
+
   private requireValidImage(file: CustomerAvatarUpload | undefined): ValidCustomerAvatarUpload {
     if (!file || file.size < 1) {
       throw new CustomerAvatarError("CUSTOMER_AVATAR_FILE_REQUIRED", 400);
