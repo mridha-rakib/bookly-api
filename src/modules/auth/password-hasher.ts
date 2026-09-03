@@ -4,7 +4,10 @@ import { env } from "../../config/env.js";
 
 export interface PasswordHasher {
   hash(password: string): Promise<string>;
-  verify(hash: string, password: string): Promise<boolean>;
+  /** `hash` is nullable so callers need no guard for a passwordless (Google-only) account: an
+   * absent hash can never match, so this resolves to `false` — the same outcome a wrong password
+   * produces. Every pre-Phase-2A account has a hash, so that path is currently unreachable. */
+  verify(hash: string | undefined, password: string): Promise<boolean>;
 }
 
 export class Argon2PasswordHasher implements PasswordHasher {
@@ -17,7 +20,11 @@ export class Argon2PasswordHasher implements PasswordHasher {
     });
   }
 
-  public async verify(hash: string, password: string): Promise<boolean> {
+  public async verify(hash: string | undefined, password: string): Promise<boolean> {
+    if (!hash) {
+      return false;
+    }
+
     return argon2.verify(hash, password);
   }
 }

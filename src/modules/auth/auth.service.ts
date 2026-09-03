@@ -17,6 +17,8 @@ import type {
 } from "../customer-avatar/customer-avatar.service.js";
 import type { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import type { FavoriteRepository } from "../favorite/favorite.repository.js";
+import type { LinkedAccountRepository } from "../linked-account/linked-account.repository.js";
+import type { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
 import type { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import type {
@@ -29,6 +31,7 @@ import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import {
   professionalRoles,
+  resolveAuthProviders,
   resolveNotificationPreferences,
   type UserRole,
 } from "../user/user.types.js";
@@ -125,6 +128,11 @@ export class AuthService {
     private readonly clientRepository?: ClientRepository,
     private readonly customerPaymentProfileRepository?: CustomerPaymentProfileRepository,
     private readonly emailOutboxService?: EmailOutboxService,
+    // Phase 1 — Customer → Google account linking. Optional + trailing, same rationale as the
+    // collaborators above: auth.route.ts wires both; other construction sites omit them and
+    // `getMe` then returns `linkedAccounts: []` while the deletion cleanup step is a no-op.
+    private readonly linkedAccountService?: LinkedAccountService,
+    private readonly linkedAccountRepository?: LinkedAccountRepository,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -411,6 +419,7 @@ export class AuthService {
           {
             normalizedEmail: session.normalizedEmail,
             passwordHash: session.passwordHash ?? "",
+            authProviders: ["PASSWORD"],
             role: "BUSINESS_OWNER",
             status: "ACTIVE",
             ...(session.emailVerification.verifiedAt
@@ -635,6 +644,14 @@ export class AuthService {
       ? await this.customerAvatarService?.resolveAvatarUrl(customerProfile)
       : undefined;
 
+    // Phase 1 — Customer → Google account links. Only Customers can hold one; every other role
+    // (and any construction site that didn't wire the service) resolves to an empty array so the
+    // frontend never has to branch on "absent".
+    const linkedAccounts =
+      user.role === "CUSTOMER" && this.linkedAccountService
+        ? await this.linkedAccountService.listForUser(String(user._id))
+        : [];
+
     return {
       user: {
         id: String(user._id),
@@ -669,6 +686,7 @@ export class AuthService {
             visitType: normalizeBusinessVisitType(business.visitType),
           }
         : null,
+      linkedAccounts,
     };
   }
 
@@ -958,6 +976,10 @@ export class AuthService {
       await this.contactChangeChallengeRepository.deleteAllForUser(userId);
     });
 
+    await step("deleteLinkedAccounts", async () => {
+      await this.linkedAccountRepository?.deleteAllForUser(userId);
+    });
+
     await step("retireReminders", async () => {
       await this.appointmentReminderRepository?.retireActiveForCustomer(userId, "ACCOUNT_DELETED", {
         now: data.now,
@@ -1185,8 +1207,18 @@ export class AuthService {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
-    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
-      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+    // Phase 2B — a Google-only Customer (authProviders = ["GOOGLE"], no passwordHash) reaches this
+    // exact endpoint to set their FIRST phone as the required post-signup completion step. Such a
+    // user has no current password to prove, so the check is skipped for accounts without a
+    // PASSWORD provider. For every password account the behaviour is byte-identical to before —
+    // `currentPassword` is still required and still verified.
+    if (resolveAuthProviders(user.authProviders).includes("PASSWORD")) {
+      if (
+        !input.currentPassword ||
+        !(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))
+      ) {
+        throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
+      }
     }
 
     const profile = await this.userRepository.findProfileByUserId(user._id);
@@ -1495,6 +1527,7 @@ export class AuthService {
           {
             normalizedEmail: session.normalizedEmail,
             passwordHash: session.passwordHash ?? "",
+            authProviders: ["PASSWORD"],
             role: "CUSTOMER",
             status: "ACTIVE",
             ...(session.emailVerification.verifiedAt

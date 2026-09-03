@@ -126,7 +126,7 @@ describe("Batch 18 contact-change schemas", () => {
     expect(verifyEmailChangeBodySchema.safeParse({}).success).toBe(false);
   });
 
-  it("requestPhoneChangeBodySchema requires currentPassword + countryCode + nationalNumber", () => {
+  it("requestPhoneChangeBodySchema requires countryCode + nationalNumber; currentPassword is optional (Phase 2B)", () => {
     expect(
       requestPhoneChangeBodySchema.safeParse({
         currentPassword: "secret",
@@ -134,10 +134,22 @@ describe("Batch 18 contact-change schemas", () => {
         nationalNumber: "12345678",
       }).success,
     ).toBe(true);
+    // Google-only Customers setting their first phone send no currentPassword.
     expect(
       requestPhoneChangeBodySchema.safeParse({ countryCode: "+357", nationalNumber: "12345678" })
         .success,
+    ).toBe(true);
+    // …but an empty-string currentPassword is still rejected, and the phone fields stay required.
+    expect(
+      requestPhoneChangeBodySchema.safeParse({
+        currentPassword: "",
+        countryCode: "+357",
+        nationalNumber: "12345678",
+      }).success,
     ).toBe(false);
+    expect(requestPhoneChangeBodySchema.safeParse({ currentPassword: "secret" }).success).toBe(
+      false,
+    );
   });
 
   it("verifyPhoneChangeBodySchema requires exactly a 4-digit code", () => {

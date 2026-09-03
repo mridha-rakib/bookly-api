@@ -10,17 +10,23 @@ import {
   type UserProfileDocument,
   UserProfileModel,
 } from "./user.model.js";
-import type {
-  MarketingEmailConsent,
-  NotificationPreferences,
-  UserLanguage,
-  UserRole,
-  UserStatus,
+import {
+  type AuthProvider,
+  assertUserAuthProvidersConsistent,
+  type MarketingEmailConsent,
+  type NotificationPreferences,
+  type UserLanguage,
+  type UserRole,
+  type UserStatus,
 } from "./user.types.js";
 
 type CreateUserInput = {
   normalizedEmail: string;
-  passwordHash: string;
+  /** Optional as of Phase 2A — omit for a Google-only account. When omitted, `authProviders`
+   * must not contain `"PASSWORD"` (enforced by assertUserAuthProvidersConsistent). */
+  passwordHash?: string | undefined;
+  /** Defaults to `["PASSWORD"]` when omitted. */
+  authProviders?: AuthProvider[] | undefined;
   role: UserRole;
   status: UserStatus;
   emailVerifiedAt?: Date | undefined;
@@ -262,8 +268,12 @@ export class UserRepository {
   }
 
   public async create(input: CreateUserInput, session?: ClientSession): Promise<UserDocument> {
+    const authProviders = input.authProviders ?? ["PASSWORD"];
+    assertUserAuthProvidersConsistent({ passwordHash: input.passwordHash, authProviders });
+
     return new UserModel({
       ...input,
+      authProviders,
       security: {
         passwordUpdatedAt: new Date(),
       },

@@ -1,6 +1,8 @@
 import { model, Schema, type Types } from "mongoose";
 
 import {
+  type AuthProvider,
+  authProviders,
   genders,
   type MarketingEmailConsent,
   marketingEmailConsentSources,
@@ -16,7 +18,19 @@ import {
 export type UserDocument = {
   _id: Types.ObjectId;
   normalizedEmail: string;
-  passwordHash: string;
+  /**
+   * Argon2 hash for email/password login. Optional as of Phase 2A: a Google-only account has
+   * none. Every account that existed before Phase 2A has one, so no data migration is needed —
+   * {@link assertUserAuthProvidersConsistent} keeps this in lockstep with `authProviders`. Still
+   * `select:false`; never returned unless explicitly `.select("+passwordHash")`.
+   */
+  passwordHash?: string | undefined;
+  /**
+   * Which mechanisms this User can authenticate with (see {@link AuthProvider}). Always contains
+   * at least one entry. Legacy rows written before this field read back absent on `.lean()`
+   * paths — go through {@link resolveAuthProviders}.
+   */
+  authProviders: AuthProvider[];
   role: UserRole;
   status: UserStatus;
   emailVerifiedAt?: Date | undefined;
@@ -41,7 +55,16 @@ export type UserDocument = {
 const userSchema = new Schema<UserDocument>(
   {
     normalizedEmail: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true, select: false },
+    passwordHash: { type: String, required: false, select: false },
+    // Non-empty by construction (repository default + assertUserAuthProvidersConsistent). The
+    // schema `default` self-heals a hydrated read of a legacy row; `.lean()` callers use
+    // resolveAuthProviders. No index — nothing queries by it yet.
+    authProviders: {
+      type: [String],
+      enum: authProviders,
+      required: true,
+      default: ["PASSWORD"],
+    },
     role: { type: String, enum: userRoles, required: true },
     status: { type: String, enum: userStatuses, required: true, default: "ACTIVE" },
     emailVerifiedAt: { type: Date },

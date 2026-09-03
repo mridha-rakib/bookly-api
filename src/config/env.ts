@@ -493,6 +493,19 @@ export const env = createEnv({
     // No existing "our own base URL" env var exists in this codebase to derive this from (see
     // S3_PUBLIC_BASE_URL for the closest precedent), so it is configured directly.
     GOOGLE_CALENDAR_REDIRECT_URI: z.string().url().optional(),
+    // The backend's callback URL for Customer → Google account linking (linked-account module),
+    // registered as a second "Authorized redirect URI" on the SAME OAuth client above (e.g.
+    // http://localhost:3000/api/v1/auth/oauth/google/callback for local dev). Plain-optional like
+    // GOOGLE_CALENDAR_REDIRECT_URI — isGoogleAccountLinkConfigured() gates the feature at runtime.
+    GOOGLE_ACCOUNT_LINK_REDIRECT_URI: z.string().url().optional(),
+    // The backend's callback URL for the Customer "Continue with Google" sign-up / sign-in flow
+    // (customer-google-auth module), a further "Authorized redirect URI" on the same OAuth client
+    // (e.g. http://localhost:3000/api/v1/auth/customer/oauth/google/callback for local dev).
+    // Plain-optional — isCustomerGoogleAuthConfigured() gates the feature at runtime.
+    GOOGLE_CUSTOMER_OAUTH_REDIRECT_URI: z.string().url().optional(),
+    // Reserved for the future Business-Owner "Continue with Google" flow — NOT read by any code
+    // yet. Plain-optional, same convention as the URIs above.
+    GOOGLE_PROFESSIONAL_OAUTH_REDIRECT_URI: z.string().url().optional(),
     // 32-byte AES-256-GCM key, hex-encoded (64 hex chars) — encrypts Google OAuth
     // access/refresh tokens at rest. Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
     GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY: z
