@@ -8,6 +8,7 @@ import type {
   PutStaffScheduleBody,
   StaffBusinessParams,
   StaffIdParams,
+  StaffInvitationParams,
   StaffTimeOffParams,
   UpdateStaffBody,
 } from "./staff.schema.js";
@@ -28,7 +29,25 @@ export class StaffController {
     const params = request.validated?.params as StaffBusinessParams;
     const body = request.validated?.body as CreateStaffBody;
     const result = await this.staffService.createStaff(userId, params.businessId, body);
-    sendSuccess(response, 201, "Staff member created", result);
+    sendSuccess(response, 201, "Staff invitation sent", result);
+  };
+
+  public resendInvitation = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as StaffInvitationParams;
+    const result = await this.staffService.resendInvitation(
+      userId,
+      params.businessId,
+      params.invitationId,
+    );
+    sendSuccess(response, 200, "Staff invitation resent", result);
+  };
+
+  public revokeInvitation = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as StaffInvitationParams;
+    await this.staffService.revokeInvitation(userId, params.businessId, params.invitationId);
+    sendSuccess(response, 200, "Staff invitation revoked");
   };
 
   public update = async (request: Request, response: Response): Promise<void> => {

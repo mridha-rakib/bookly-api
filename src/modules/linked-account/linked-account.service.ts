@@ -60,7 +60,16 @@ export class LinkedAccountService {
 
     const user = await this.userRepository.findById(userId);
 
-    if (!user || user.status === "DELETED" || user.role !== "CUSTOMER") {
+    // Google linking is available to CUSTOMER, BUSINESS_OWNER (Phase 2C) and SUPERVISOR / STAFF
+    // (Phase 2D) — never SUPER_ADMIN. The signed state named this user, but they must still be
+    // linkable now.
+    const linkableRole =
+      user?.role === "CUSTOMER" ||
+      user?.role === "BUSINESS_OWNER" ||
+      user?.role === "SUPERVISOR" ||
+      user?.role === "STAFF";
+
+    if (!user || user.status === "DELETED" || !linkableRole) {
       // A valid signature over a user that can no longer be linked — treat as a stale request.
       throw new LinkedAccountError("LINKED_ACCOUNT_INVALID_STATE", 400);
     }

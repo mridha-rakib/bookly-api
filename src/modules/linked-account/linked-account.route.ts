@@ -20,9 +20,12 @@ type LinkedAccountRouteDeps = {
 
 /**
  * Mounted with `router.use(...)` inside createAuthRoute() so its paths sit under `/auth`. The two
- * customer endpoints are gated authenticate + requireActiveUser + requireRoles(["CUSTOMER"]); the
- * OAuth callback is deliberately public — Google redirects the browser to it with no
- * Authorization header, and its security comes from the signed `state` param instead (see
+ * account endpoints are gated authenticate + requireActiveUser + requireRoles(["CUSTOMER",
+ * "BUSINESS_OWNER", "SUPERVISOR", "STAFF"]) — SUPER_ADMIN is excluded (no admin Google-link
+ * surface); Phase 2D added SUPERVISOR / STAFF so a staff member who joined with a password can
+ * add Google from settings later. The OAuth callback is deliberately public — Google redirects
+ * the browser to it with no Authorization header, and its security comes from the signed `state`
+ * param instead (see
  * LinkedAccountService.linkGoogleFromCallback). createAuthRoute() applies no router-wide auth
  * gate, so no special mount ordering is needed (unlike the Calendar callback under `/businesses`).
  */
@@ -34,7 +37,7 @@ export const createLinkedAccountRoute = (deps: LinkedAccountRouteDeps): Router =
     "/me/linked-accounts/google/authorize-url",
     authenticate,
     requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
+    requireRoles(["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"]),
     authorizeUrlLimiter,
     asyncHandler(controller.getGoogleAuthorizeUrl),
   );
@@ -43,7 +46,7 @@ export const createLinkedAccountRoute = (deps: LinkedAccountRouteDeps): Router =
     "/me/linked-accounts/google",
     authenticate,
     requireActiveUser(),
-    requireRoles(["CUSTOMER"]),
+    requireRoles(["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"]),
     unlinkLimiter,
     validateRequest({ body: unlinkGoogleAccountBodySchema }),
     asyncHandler(controller.unlinkGoogle),

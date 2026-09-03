@@ -8,7 +8,10 @@ const nodeEnvSchema = z.enum(["development", "test", "production"]).default("dev
 const rawNodeEnv = nodeEnvSchema.parse(process.env["NODE_ENV"] ?? "development");
 const emailProviderSchema = z
   .enum(["smtp", "resend", "sendgrid"])
-  .default(rawNodeEnv === "production" ? "resend" : "smtp");
+  // Production default is SendGrid — the provider this project actually uses. A prod deploy that
+  // forgets to set EMAIL_PROVIDER then still fails fast on a missing SENDGRID_API_KEY / EMAIL_FROM
+  // rather than silently selecting an unconfigured transport.
+  .default(rawNodeEnv === "production" ? "sendgrid" : "smtp");
 const rawEmailProvider = emailProviderSchema.parse(process.env["EMAIL_PROVIDER"] || undefined);
 const phoneOtpProviderSchema = z
   .enum(["dummy", "twilio"])
@@ -28,6 +31,14 @@ const optionalBooleanString = z
   .enum(["true", "false", "1", "0"])
   .optional()
   .transform((value) => value === "true" || value === "1");
+
+// Resolved the same way the AUTH_COOKIE_SECURE schema does (explicit value wins, otherwise
+// defaults to "production"). Needed at module scope so AUTH_COOKIE_SAME_SITE can cross-validate
+// against it — browsers reject `SameSite=None` unless the cookie is also `Secure`.
+const rawAuthCookieSecure =
+  process.env["AUTH_COOKIE_SECURE"] !== undefined
+    ? ["true", "1"].includes(process.env["AUTH_COOKIE_SECURE"])
+    : rawNodeEnv === "production";
 
 const docsEnabledSchema = z
   .enum(["true", "false", "1", "0"])
@@ -98,6 +109,33 @@ const optionalProductionRequiredString = (name: string) =>
     .string()
     .optional()
     .superRefine((value, context) => {
+      if (rawNodeEnv === "production" && !value) {
+        context.addIssue({
+          code: "custom",
+          message: `${name} is required in production`,
+        });
+      }
+    });
+
+/**
+ * A URL env var that is OPTIONAL in development / test but REQUIRED (and still a valid URL) in
+ * production. Used for the backend's own OAuth callback URLs — GOOGLE_CLIENT_ID/SECRET are
+ * already production-required, so a Google OAuth client always exists in production and every
+ * flow's redirect URI must be configured too; without this a flow silently 302s the browser
+ * back with `status=error` and nothing signals the misconfiguration at boot.
+ */
+const optionalProductionRequiredUrl = (name: string) =>
+  z
+    .string()
+    .optional()
+    .superRefine((value, context) => {
+      if (value !== undefined) {
+        try {
+          new URL(value);
+        } catch {
+          context.addIssue({ code: "custom", message: `${name} must be a valid URL` });
+        }
+      }
       if (rawNodeEnv === "production" && !value) {
         context.addIssue({
           code: "custom",
@@ -222,10 +260,40 @@ export const env = createEnv({
     JWT_ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
     REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
     AUTH_COOKIE_NAME: z.string().min(1).default("bookly_refresh_token"),
-    AUTH_COOKIE_DOMAIN: z.string().optional(),
+    // A cookie `Domain` attribute is a BARE host — no scheme, port, path or spaces. e.g.
+    // "bookly.cy" (host-only) or ".bookly.cy" (shared across subdomains). Leave blank for a
+    // host-only cookie (correct for local dev). A URL here (e.g. "http://localhost:3001") makes
+    // res.cookie() throw at request time → every auth endpoint 500s; reject it up front instead.
+    AUTH_COOKIE_DOMAIN: z
+      .string()
+      .optional()
+      .superRefine((value, context) => {
+        if (value && !/^\.?(?:[a-z0-9-]+\.)*[a-z0-9-]+$/i.test(value)) {
+          context.addIssue({
+            code: "custom",
+            message:
+              'AUTH_COOKIE_DOMAIN must be a bare hostname (e.g. "bookly.cy" or ".bookly.cy"), not a URL — leave it blank for a host-only cookie',
+          });
+        }
+      }),
     AUTH_COOKIE_PATH: z.string().min(1).default("/api/v1/auth"),
     AUTH_COOKIE_SECURE: optionalBooleanString.default(rawNodeEnv === "production"),
-    AUTH_COOKIE_SAME_SITE: z.enum(["lax", "strict", "none"]).default("lax"),
+    // "lax" is the correct default: the refresh + OAuth nonce cookies must ride along on the
+    // top-level GET redirect Google makes back to the callback, which "strict" would drop.
+    // Use "none" only for a genuinely cross-site frontend/backend split — and then the cookie
+    // MUST also be Secure, or every browser silently refuses to store it.
+    AUTH_COOKIE_SAME_SITE: z
+      .enum(["lax", "strict", "none"])
+      .default("lax")
+      .superRefine((value, context) => {
+        if (value === "none" && !rawAuthCookieSecure) {
+          context.addIssue({
+            code: "custom",
+            message:
+              "AUTH_COOKIE_SAME_SITE=none requires AUTH_COOKIE_SECURE=true (browsers reject SameSite=None without Secure)",
+          });
+        }
+      }),
     OTP_LENGTH: z.coerce.number().int().min(4).max(4).default(4),
     OTP_EXPIRY_MINUTES: z.coerce.number().int().positive().default(10),
     OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
@@ -481,31 +549,33 @@ export const env = createEnv({
     // env var just for this narrow purpose.
     SUPPORT_CONTACT_INBOX_EMAIL: z.string().email().optional(),
     CONTACT_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
-    // Google Calendar (one-way Bookly -> Google booking sync): required in production, optional
-    // in development/test — same provider-optionality convention as Stripe above. No real Google
-    // Cloud OAuth client exists in this environment yet; the integration throws a clear
-    // GOOGLE_CALENDAR_NOT_CONFIGURED domain error at connect-time rather than failing app boot.
+    // Google OAuth client — required in production (the whole Google auth surface depends on it),
+    // optional in development/test where the feature gates (`is*Configured()`) keep the app
+    // booting and each flow returns a clear NOT_CONFIGURED error / status=error redirect instead.
     GOOGLE_CLIENT_ID: optionalProductionRequiredString("GOOGLE_CLIENT_ID"),
     GOOGLE_CLIENT_SECRET: optionalProductionRequiredString("GOOGLE_CLIENT_SECRET"),
-    // The backend's own callback URL registered in Google Cloud Console (e.g.
-    // https://api.bookly.cy/businesses/integrations/google-calendar/callback for production,
-    // http://localhost:4000/businesses/integrations/google-calendar/callback for local dev).
-    // No existing "our own base URL" env var exists in this codebase to derive this from (see
-    // S3_PUBLIC_BASE_URL for the closest precedent), so it is configured directly.
-    GOOGLE_CALENDAR_REDIRECT_URI: z.string().url().optional(),
-    // The backend's callback URL for Customer → Google account linking (linked-account module),
-    // registered as a second "Authorized redirect URI" on the SAME OAuth client above (e.g.
-    // http://localhost:3000/api/v1/auth/oauth/google/callback for local dev). Plain-optional like
-    // GOOGLE_CALENDAR_REDIRECT_URI — isGoogleAccountLinkConfigured() gates the feature at runtime.
-    GOOGLE_ACCOUNT_LINK_REDIRECT_URI: z.string().url().optional(),
-    // The backend's callback URL for the Customer "Continue with Google" sign-up / sign-in flow
-    // (customer-google-auth module), a further "Authorized redirect URI" on the same OAuth client
-    // (e.g. http://localhost:3000/api/v1/auth/customer/oauth/google/callback for local dev).
-    // Plain-optional — isCustomerGoogleAuthConfigured() gates the feature at runtime.
-    GOOGLE_CUSTOMER_OAUTH_REDIRECT_URI: z.string().url().optional(),
-    // Reserved for the future Business-Owner "Continue with Google" flow — NOT read by any code
-    // yet. Plain-optional, same convention as the URIs above.
-    GOOGLE_PROFESSIONAL_OAUTH_REDIRECT_URI: z.string().url().optional(),
+    // Every backend OAuth callback URL below is one "Authorized redirect URI" on the SAME Google
+    // Cloud OAuth client. All are REQUIRED in production (GOOGLE_CLIENT_ID/SECRET already are, so
+    // a client always exists in prod and every flow must have its callback configured) and
+    // optional in dev/test. Each must also be registered verbatim in the Google Cloud Console.
+    // e.g. https://api.bookly.cy/api/v1/businesses/integrations/google-calendar/callback
+    GOOGLE_CALENDAR_REDIRECT_URI: optionalProductionRequiredUrl("GOOGLE_CALENDAR_REDIRECT_URI"),
+    // e.g. https://api.bookly.cy/api/v1/auth/oauth/google/callback  (Customer → Google linking)
+    GOOGLE_ACCOUNT_LINK_REDIRECT_URI: optionalProductionRequiredUrl(
+      "GOOGLE_ACCOUNT_LINK_REDIRECT_URI",
+    ),
+    // e.g. https://api.bookly.cy/api/v1/auth/customer/oauth/google/callback
+    GOOGLE_CUSTOMER_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "GOOGLE_CUSTOMER_OAUTH_REDIRECT_URI",
+    ),
+    // e.g. https://api.bookly.cy/api/v1/auth/professional/oauth/google/callback
+    GOOGLE_PROFESSIONAL_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "GOOGLE_PROFESSIONAL_OAUTH_REDIRECT_URI",
+    ),
+    // e.g. https://api.bookly.cy/api/v1/auth/staff/invitation/oauth/google/callback
+    GOOGLE_STAFF_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "GOOGLE_STAFF_OAUTH_REDIRECT_URI",
+    ),
     // 32-byte AES-256-GCM key, hex-encoded (64 hex chars) — encrypts Google OAuth
     // access/refresh tokens at rest. Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
     GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY: z

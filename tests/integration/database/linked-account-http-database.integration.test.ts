@@ -75,7 +75,9 @@ describe("HTTP-level Customer → Google account linking", () => {
     return app;
   };
 
-  const createUser = async (role: "CUSTOMER" | "BUSINESS_OWNER", password?: string) =>
+  type TestRole = "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN";
+
+  const createUser = async (role: TestRole, password?: string) =>
     userRepository.create({
       normalizedEmail: `user-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: password ? await passwordHasher.hash(password) : "unusable-hash",
@@ -83,7 +85,7 @@ describe("HTTP-level Customer → Google account linking", () => {
       status: "ACTIVE",
     });
 
-  const bearerFor = (userId: Types.ObjectId | string, role: "CUSTOMER" | "BUSINESS_OWNER") =>
+  const bearerFor = (userId: Types.ObjectId | string, role: TestRole) =>
     tokenService.createAccessToken({ userId, role }).then((token) => `Bearer ${token}`);
 
   const AUTHORIZE_URL = "/api/v1/auth/me/linked-accounts/google/authorize-url";
@@ -144,12 +146,21 @@ describe("HTTP-level Customer → Google account linking", () => {
       expect(response.status).toBe(401);
     });
 
-    it("rejects a non-CUSTOMER caller (403)", async () => {
-      const owner = await createUser("BUSINESS_OWNER");
-      const response = await request(buildApp())
+    it("allows CUSTOMER, BUSINESS_OWNER, SUPERVISOR and STAFF callers (Phase 2C/2D); SUPER_ADMIN is 403", async () => {
+      for (const role of ["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const) {
+        const user = await createUser(role);
+        const response = await request(buildApp())
+          .get(AUTHORIZE_URL)
+          .set("Authorization", await bearerFor(user._id, role));
+        expect(response.status).toBe(200);
+        expect(response.body.data.authUrl).toContain("accounts.google.com");
+      }
+
+      const admin = await createUser("SUPER_ADMIN");
+      const denied = await request(buildApp())
         .get(AUTHORIZE_URL)
-        .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
-      expect(response.status).toBe(403);
+        .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"));
+      expect(denied.status).toBe(403);
     });
 
     it("returns 503 when linking is not configured on the server", async () => {

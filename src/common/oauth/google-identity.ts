@@ -37,6 +37,43 @@ export class GoogleIdentityError extends Error {
 }
 
 /**
+ * Splits a Google identity into non-empty first/last names (UserProfile requires both). Prefers
+ * the dedicated `given_name` / `family_name`; for a single-token display name, duplicates it into
+ * both fields — the same "no invented placeholder" approach as staff.utils.splitStaffName. The
+ * user can edit either field afterwards. Shared by the Customer and Business-Owner Google flows.
+ */
+export const splitGoogleName = (identity: {
+  firstName?: string;
+  lastName?: string;
+  displayName?: string;
+}): { firstName: string; lastName: string } => {
+  const given = identity.firstName?.trim();
+  const family = identity.lastName?.trim();
+
+  if (given && family) {
+    return { firstName: given, lastName: family };
+  }
+
+  const display = (identity.displayName ?? "").trim().replace(/\s+/g, " ");
+  const firstSpace = display.indexOf(" ");
+  const displayFirst = firstSpace === -1 ? display : display.slice(0, firstSpace);
+  const displayLast = firstSpace === -1 ? display : display.slice(firstSpace + 1);
+
+  if (given || family) {
+    return {
+      firstName: given || displayFirst || (family as string),
+      lastName: family || displayLast || (given as string),
+    };
+  }
+
+  if (!display) {
+    return { firstName: "Google", lastName: "User" };
+  }
+
+  return { firstName: displayFirst, lastName: displayLast || displayFirst };
+};
+
+/**
  * Exchanges an authorization `code` for an `id_token` and verifies it against Google's keys
  * (signature / `aud` === our client id / `iss` / `exp`, all handled by `verifyIdToken`), then
  * returns only the identity fields. The token set itself is never returned or stored. Any failure

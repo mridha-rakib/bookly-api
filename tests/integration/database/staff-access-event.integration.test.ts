@@ -1,6 +1,4 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-
-import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
@@ -14,10 +12,13 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { StaffAvatarRepository } from "../../../src/modules/staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../../../src/modules/staff-avatar/staff-avatar.service.js";
+import { StaffInvitationRepository } from "../../../src/modules/staff-invitation/staff-invitation.repository.js";
+import { StaffInvitationService } from "../../../src/modules/staff-invitation/staff-invitation.service.js";
 import { createDeferredStorageServiceFromEnv } from "../../../src/modules/storage/storage.service.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { EmailOtpProvider } from "../../../src/modules/verification/email-otp.provider.js";
+import { seedStaffMember } from "../../helpers/seed-staff.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -69,7 +70,7 @@ describe("StaffAccessEvent + access-change email integration", () => {
       staffRepository,
       businessRepository,
       userRepository,
-      new Argon2PasswordHasher(),
+      new StaffInvitationService(new StaffInvitationRepository(), userRepository),
       noopOtpProvider,
       new StaffScheduleRepository(),
       new StaffTimeOffRepository(),
@@ -102,7 +103,7 @@ describe("StaffAccessEvent + access-change email integration", () => {
       category: "Wellness",
       subcategories: ["Barber"],
     } as never);
-    const staff = await staffService.createStaff(String(owner._id), String(business._id), {
+    const staff = await seedStaffMember(userRepository, staffRepository, owner._id, business._id, {
       name: "Sam Cutter",
       email: "sam@example.com",
       role: "STAFF",
@@ -285,7 +286,7 @@ describe("StaffAccessEvent + access-change email integration", () => {
       staffRepository,
       businessRepository,
       userRepository,
-      new Argon2PasswordHasher(),
+      new StaffInvitationService(new StaffInvitationRepository(), userRepository),
       noopOtpProvider,
       new StaffScheduleRepository(),
       new StaffTimeOffRepository(),

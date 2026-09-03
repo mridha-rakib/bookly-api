@@ -23,6 +23,7 @@ import { BusinessOnboardingService } from "../../../src/modules/business-onboard
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
 import { ContactChangeChallengeRepository } from "../../../src/modules/contact-change/contact-change-challenge.repository.js";
+import { LinkedAccountRepository } from "../../../src/modules/linked-account/linked-account.repository.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
@@ -35,6 +36,10 @@ import { StaffTimeOffModel } from "../../../src/modules/staff/staff-time-off.mod
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { StaffAvatarRepository } from "../../../src/modules/staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../../../src/modules/staff-avatar/staff-avatar.service.js";
+import { StaffInvitationModel } from "../../../src/modules/staff-invitation/staff-invitation.model.js";
+import { StaffInvitationRepository } from "../../../src/modules/staff-invitation/staff-invitation.repository.js";
+import { StaffInvitationService } from "../../../src/modules/staff-invitation/staff-invitation.service.js";
+import { StaffInvitationAcceptService } from "../../../src/modules/staff-invitation/staff-invitation-accept.service.js";
 import { createDeferredStorageServiceFromEnv } from "../../../src/modules/storage/storage.service.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
@@ -42,6 +47,7 @@ import type {
   EmailOtpProvider,
   EmailOtpPurpose,
 } from "../../../src/modules/verification/email-otp.provider.js";
+import { seedStaffMember } from "../../helpers/seed-staff.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -77,6 +83,11 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
   public lastPurpose: EmailOtpPurpose | undefined;
   public sentCount = 0;
   public shouldFail = false;
+  // Phase 2D — the invitation link email goes through `sendNotice`.
+  public lastNoticeTo = "";
+  public lastNoticeSubject = "";
+  public lastNoticeText = "";
+  public noticeCount = 0;
 
   public async sendOtp(input: {
     to: string;
@@ -93,7 +104,15 @@ class CapturingEmailOtpProvider implements EmailOtpProvider {
     this.sentCount += 1;
   }
 
-  public async sendNotice(): Promise<void> {}
+  public async sendNotice(input: { to: string; subject: string; text: string }): Promise<void> {
+    if (this.shouldFail) {
+      throw new Error("simulated delivery failure");
+    }
+    this.lastNoticeTo = input.to;
+    this.lastNoticeSubject = input.subject;
+    this.lastNoticeText = input.text;
+    this.noticeCount += 1;
+  }
 }
 
 describe("database-backed StaffMembership integration", () => {
@@ -134,7 +153,7 @@ describe("database-backed StaffMembership integration", () => {
       staffRepository,
       businessRepository,
       userRepository,
-      new Argon2PasswordHasher(),
+      new StaffInvitationService(new StaffInvitationRepository(), userRepository),
       emailProvider,
       staffScheduleRepository,
       staffTimeOffRepository,
@@ -202,11 +221,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const created = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Vivi M",
-      email: "vivi@example.com",
-      role: "SUPERVISOR",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Vivi M",
+        email: "vivi@example.com",
+        role: "SUPERVISOR",
+      },
+    );
 
     const explanation = (await StaffMembershipModel.findOne({
       userId: created.userId,
@@ -237,7 +262,7 @@ describe("database-backed StaffMembership integration", () => {
 
   // --- Creation: owned-Business-only authorization ------------------------
 
-  it("allows the owner to create SUPERVISOR and STAFF for their own Business", async () => {
+  it("issues a PENDING invitation (no User, no StaffMembership) for SUPERVISOR and STAFF, and emails a link", async () => {
     const { user: owner, business } = await createBusinessOwner(
       "owner-a@example.com",
       "Business A",
@@ -254,16 +279,21 @@ describe("database-backed StaffMembership integration", () => {
       role: "STAFF",
     });
 
-    expect(supervisor.role).toBe("SUPERVISOR");
-    expect(staff.role).toBe("STAFF");
-    expect(await StaffMembershipModel.countDocuments({ businessId: business._id })).toBe(2);
+    expect(supervisor).toMatchObject({ role: "SUPERVISOR", status: "PENDING" });
+    expect(staff).toMatchObject({ role: "STAFF", status: "PENDING" });
+    expect(supervisor.invitationId).toMatch(/^[a-f\d]{24}$/);
 
-    const created = await UserModel.findOne({ normalizedEmail: "vivi@example.com" })
-      .select("+passwordHash")
-      .orFail();
-    expect(created.role).toBe("SUPERVISOR");
-    expect(created.status).toBe("ACTIVE");
-    expect(created.passwordHash).toMatch(/^\$argon2id\$/);
+    // Option B — nothing is provisioned until the invitee accepts.
+    expect(await UserModel.countDocuments({})).toBe(1); // just the owner
+    expect(await StaffMembershipModel.countDocuments({ businessId: business._id })).toBe(0);
+    expect(
+      await StaffInvitationModel.countDocuments({ businessId: business._id, status: "PENDING" }),
+    ).toBe(2);
+
+    // The invitation link email — never a password / code.
+    expect(emailProvider.noticeCount).toBe(2);
+    expect(emailProvider.lastNoticeTo).toBe("rania@example.com");
+    expect(emailProvider.lastNoticeText).toContain("/staff/invite/accept?token=");
   });
 
   it("denies staff creation for a Business the actor only has a BusinessAccess link to — the original owner can still manage it", async () => {
@@ -286,11 +316,17 @@ describe("database-backed StaffMembership integration", () => {
     expect(await StaffMembershipModel.countDocuments({ businessId: businessB._id })).toBe(0);
 
     // Business B's real owner is unaffected and can still create/manage its Staff normally.
-    const created = await staffService.createStaff(String(ownerB._id), String(businessB._id), {
-      name: "Nikos K",
-      email: "nikos@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      ownerB._id,
+      businessB._id,
+      {
+        name: "Nikos K",
+        email: "nikos@example.com",
+        role: "STAFF",
+      },
+    );
     const listForOwnerB = await staffService.listStaff(String(ownerB._id), String(businessB._id));
     expect(listForOwnerB.members.some((member) => member.email === "nikos@example.com")).toBe(true);
     expect(created.businessId).toBe(String(businessB._id));
@@ -365,11 +401,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const supervisor = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Vivi M",
-      email: "vivi@example.com",
-      role: "SUPERVISOR",
-    });
+    const supervisor = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Vivi M",
+        email: "vivi@example.com",
+        role: "SUPERVISOR",
+      },
+    );
 
     const app = buildStaffApp();
     const supervisorToken = await bearerFor(supervisor.userId, "SUPERVISOR");
@@ -419,11 +461,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const created = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Gone Soon",
-      email: "gone@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Gone Soon",
+        email: "gone@example.com",
+        role: "STAFF",
+      },
+    );
 
     await staffService.removeStaff(
       String(owner._id),
@@ -448,11 +496,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const created = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Vivi M",
-      email: "vivi@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Vivi M",
+        email: "vivi@example.com",
+        role: "STAFF",
+      },
+    );
 
     const promoted = await staffService.updateStaff(
       String(owner._id),
@@ -480,11 +534,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const created = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Rollback Test",
-      email: "rollback@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Rollback Test",
+        email: "rollback@example.com",
+        role: "STAFF",
+      },
+    );
 
     const updateRoleSpy = vi
       .spyOn(userRepository, "updateRole")
@@ -516,11 +576,17 @@ describe("database-backed StaffMembership integration", () => {
     );
     const { business: businessB } = await createBusinessOwner("owner-b@example.com", "Business B");
 
-    const created = await staffService.createStaff(String(owner._id), String(businessA._id), {
-      name: "One Business Only",
-      email: "one-business@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      businessA._id,
+      {
+        name: "One Business Only",
+        email: "one-business@example.com",
+        role: "STAFF",
+      },
+    );
 
     // Directly attempting a second active membership for the same userId at the repository
     // level must fail the partial-unique index — this is the DB-level backstop, independent
@@ -542,11 +608,17 @@ describe("database-backed StaffMembership integration", () => {
       "owner-a@example.com",
       "Business A",
     );
-    const created = await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Rania A",
-      email: "rania@example.com",
-      role: "STAFF",
-    });
+    const created = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      {
+        name: "Rania A",
+        email: "rania@example.com",
+        role: "STAFF",
+      },
+    );
 
     const deactivated = await staffService.updateStaff(
       String(owner._id),
@@ -619,7 +691,7 @@ describe("database-backed StaffMembership integration", () => {
       "Business A",
     );
     for (let index = 0; index < 5; index += 1) {
-      await staffService.createStaff(String(owner._id), String(business._id), {
+      await seedStaffMember(userRepository, staffRepository, owner._id, business._id, {
         name: `Staff ${index}`,
         email: `staff${index}@example.com`,
         role: "STAFF",
@@ -672,9 +744,9 @@ describe("database-backed StaffMembership integration", () => {
     ).rejects.toMatchObject({ statusCode: 404 });
   });
 
-  // --- Temporary password -----------------------------------------------------------
+  // --- Invitation issuance (Phase 2D) ---------------------------------------------------
 
-  it("emails a random temporary password, hashes it (never plaintext), and never returns it from the API", async () => {
+  it("createStaff issues a PENDING invitation, stores only a token hash, and creates no User/membership", async () => {
     const { user: owner, business } = await createBusinessOwner(
       "owner-a@example.com",
       "Business A",
@@ -687,35 +759,59 @@ describe("database-backed StaffMembership integration", () => {
     });
 
     expect(created).not.toHaveProperty("password");
-    expect(created).not.toHaveProperty("tempPassword");
-    expect(JSON.stringify(created)).not.toContain(emailProvider.lastCode);
+    expect(created).not.toHaveProperty("userId");
+    expect(created).not.toHaveProperty("membershipId");
+    expect(JSON.stringify(created)).not.toContain("token");
 
-    expect(emailProvider.lastPurpose).toBe("STAFF_TEMP_PASSWORD");
-    expect(emailProvider.lastTo).toBe("fresh-hire@example.com");
-    expect(emailProvider.lastCode).not.toBe("123456");
-    expect(emailProvider.lastCode.length).toBeGreaterThanOrEqual(12);
-
-    const storedUser = await UserModel.findOne({ normalizedEmail: "fresh-hire@example.com" })
-      .select("+passwordHash")
+    const invitation = await StaffInvitationModel.findById(created.invitationId)
+      .select("+tokenHash")
       .orFail();
-    expect(storedUser.passwordHash).toMatch(/^\$argon2id\$/);
-    expect(storedUser.passwordHash).not.toBe(emailProvider.lastCode);
+    expect(invitation.status).toBe("PENDING");
+    expect(invitation.tokenHash).toMatch(/^[a-f\d]{64}$/); // sha256 hex, never the raw token
 
-    const hasher = new Argon2PasswordHasher();
-    expect(await hasher.verify(storedUser.passwordHash, emailProvider.lastCode)).toBe(true);
+    expect(await UserModel.countDocuments({ normalizedEmail: "fresh-hire@example.com" })).toBe(0);
+    expect(await StaffMembershipModel.countDocuments()).toBe(0);
+
+    // The emailed link carries the RAW token (which is never persisted).
+    const linkMatch = emailProvider.lastNoticeText.match(/accept\?token=([^\s]+)/);
+    expect(linkMatch).not.toBeNull();
   });
 
-  it("logs in through the existing professional login using the emailed temporary password", async () => {
+  it("a STAFF who accepted their invitation with a password logs in through the existing professional login", async () => {
     const { user: owner, business } = await createBusinessOwner(
       "owner-a@example.com",
       "Business A",
     );
-    await staffService.createStaff(String(owner._id), String(business._id), {
-      name: "Fresh Hire",
+
+    const invitationRepository = new StaffInvitationRepository();
+    const invitationService = new StaffInvitationService(invitationRepository, userRepository);
+    const acceptService = new StaffInvitationAcceptService(
+      invitationService,
+      invitationRepository,
+      userRepository,
+      staffRepository,
+      new LinkedAccountRepository(),
+      new Argon2PasswordHasher(),
+      new TokenService(new SessionRepository()),
+    );
+
+    const { token } = await invitationService.issue({
+      businessId: business._id,
+      invitedByUserId: owner._id,
       email: "fresh-hire@example.com",
       role: "STAFF",
     });
-    const tempPassword = emailProvider.lastCode;
+
+    await acceptService.acceptWithPassword(
+      {
+        token,
+        password: "s3cret-pass",
+        firstName: "Fresh",
+        lastName: "Hire",
+        agreeTerms: true,
+      },
+      { userAgent: "vitest", ipAddress: "127.0.0.1" },
+    );
 
     const registrationSessionRepository = new RegistrationSessionRepository();
     const businessOnboardingRepository = new BusinessOnboardingRepository();
@@ -745,15 +841,16 @@ describe("database-backed StaffMembership integration", () => {
 
     const result = await authService.login(
       "PROFESSIONAL",
-      { email: "fresh-hire@example.com", password: tempPassword },
+      { email: "fresh-hire@example.com", password: "s3cret-pass" },
       { userAgent: "vitest", ipAddress: "127.0.0.1" },
     );
 
     expect(result.user.role).toBe("STAFF");
     expect(result.accessToken).toEqual(expect.any(String));
+    expect(await StaffMembershipModel.countDocuments({ businessId: business._id })).toBe(1);
   });
 
-  it("documents (does not silently hide) that account creation persists even if the welcome email fails to send", async () => {
+  it("surfaces STAFF_INVITATION_EMAIL_FAILED when the link email cannot be sent (the invitation still exists)", async () => {
     const { user: owner, business } = await createBusinessOwner(
       "owner-a@example.com",
       "Business A",
@@ -768,11 +865,15 @@ describe("database-backed StaffMembership integration", () => {
       }),
     ).rejects.toMatchObject({ statusCode: 502 });
 
-    // The account and membership were already committed before the email attempt — this is
-    // the documented tradeoff (see staff.service.ts createStaff), matching the existing
-    // business-link-verification precedent of not rolling back on post-write email failure.
-    expect(await UserModel.countDocuments({ normalizedEmail: "email-fails@example.com" })).toBe(1);
-    expect(await StaffMembershipModel.countDocuments()).toBe(1);
+    // No User (Option B) — but the invitation row persisted, so the owner can "resend".
+    expect(await UserModel.countDocuments({ normalizedEmail: "email-fails@example.com" })).toBe(0);
+    expect(await StaffMembershipModel.countDocuments()).toBe(0);
+    expect(
+      await StaffInvitationModel.countDocuments({
+        email: "email-fails@example.com",
+        status: "PENDING",
+      }),
+    ).toBe(1);
   });
 
   // ================================================================================
@@ -789,7 +890,7 @@ describe("database-backed StaffMembership integration", () => {
       const { business: unrelated } = await createBusinessOwner("owner-c@example.com", "Unrelated");
       await businessAccessRepository.create({ userId: owner._id, businessId: linkedA._id });
 
-      await staffService.createStaff(String(owner._id), String(primary._id), {
+      await seedStaffMember(userRepository, staffRepository, owner._id, primary._id, {
         name: "Primary Staff",
         email: "primary-staff@example.com",
         role: "STAFF",
@@ -841,11 +942,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const created = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Sup Ervisor",
-        email: "supervisor@example.com",
-        role: "SUPERVISOR",
-      });
+      const created = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Sup Ervisor",
+          email: "supervisor@example.com",
+          role: "SUPERVISOR",
+        },
+      );
 
       const updated = await staffService.updateStaff(
         String(owner._id),
@@ -877,16 +984,28 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staffA = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "staff-a@example.com",
-        role: "STAFF",
-      });
-      const staffB = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff B",
-        email: "staff-b@example.com",
-        role: "STAFF",
-      });
+      const staffA = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "staff-a@example.com",
+          role: "STAFF",
+        },
+      );
+      const staffB = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff B",
+          email: "staff-b@example.com",
+          role: "STAFF",
+        },
+      );
 
       await staffService.putSchedule(
         String(owner._id),
@@ -926,11 +1045,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "staff-a@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "staff-a@example.com",
+          role: "STAFF",
+        },
+      );
 
       // Bypasses the schema's duplicate-day rejection to prove the service itself also
       // never persists two shifts for the same day (defense in depth).
@@ -958,11 +1083,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "staff-a@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "staff-a@example.com",
+          role: "STAFF",
+        },
+      );
 
       await staffService.putSchedule(
         String(owner._id),
@@ -987,11 +1118,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "staff-a@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "staff-a@example.com",
+          role: "STAFF",
+        },
+      );
       const app = buildStaffApp();
       const token = await bearerFor(owner._id, "BUSINESS_OWNER");
 
@@ -1035,9 +1172,11 @@ describe("database-backed StaffMembership integration", () => {
       );
       await businessAccessRepository.create({ userId: ownerA._id, businessId: businessB._id });
 
-      const removedStaff = await staffService.createStaff(
-        String(ownerA._id),
-        String(businessA._id),
+      const removedStaff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        ownerA._id,
+        businessA._id,
         { name: "Gone", email: "gone-schedule@example.com", role: "STAFF" },
       );
       await staffService.removeStaff(
@@ -1057,9 +1196,11 @@ describe("database-backed StaffMembership integration", () => {
 
       // ownerA's BusinessAccess link to Business B grants no schedule-management rights —
       // its real owner (ownerB) still can.
-      const linkedStaff = await staffService.createStaff(
-        String(ownerB._id),
-        String(businessB._id),
+      const linkedStaff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        ownerB._id,
+        businessB._id,
         { name: "B's Staffer", email: "b-schedule@example.com", role: "STAFF" },
       );
       await expect(
@@ -1089,11 +1230,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-b@example.com",
         "Business B",
       );
-      const staff = await staffService.createStaff(String(ownerA._id), String(businessA._id), {
-        name: "Staff A",
-        email: "cross-business@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        ownerA._id,
+        businessA._id,
+        {
+          name: "Staff A",
+          email: "cross-business@example.com",
+          role: "STAFF",
+        },
+      );
 
       await expect(
         staffService.putSchedule(
@@ -1112,11 +1259,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "list-schedule@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "list-schedule@example.com",
+          role: "STAFF",
+        },
+      );
       await staffService.putSchedule(
         String(owner._id),
         String(business._id),
@@ -1143,11 +1296,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-single@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-single@example.com",
+          role: "STAFF",
+        },
+      );
 
       const entry = await staffService.createTimeOff(
         String(owner._id),
@@ -1165,11 +1324,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-range@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-range@example.com",
+          role: "STAFF",
+        },
+      );
 
       const entry = await staffService.createTimeOff(
         String(owner._id),
@@ -1194,11 +1359,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-overlap@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-overlap@example.com",
+          role: "STAFF",
+        },
+      );
 
       await staffService.createTimeOff(
         String(owner._id),
@@ -1232,11 +1403,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-reversed@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-reversed@example.com",
+          role: "STAFF",
+        },
+      );
       const app = buildStaffApp();
       const token = await bearerFor(owner._id, "BUSINESS_OWNER");
 
@@ -1258,16 +1435,28 @@ describe("database-backed StaffMembership integration", () => {
       );
       await businessAccessRepository.create({ userId: owner._id, businessId: businessB._id });
 
-      const staffA = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-a@example.com",
-        role: "STAFF",
-      });
-      const staffB = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff B",
-        email: "timeoff-b@example.com",
-        role: "STAFF",
-      });
+      const staffA = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-a@example.com",
+          role: "STAFF",
+        },
+      );
+      const staffB = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff B",
+          email: "timeoff-b@example.com",
+          role: "STAFF",
+        },
+      );
 
       // owner's BusinessAccess link to Business B grants no Time Off rights — creating Staff
       // there at all is denied.
@@ -1319,11 +1508,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Staff A",
-        email: "timeoff-remove@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Staff A",
+          email: "timeoff-remove@example.com",
+          role: "STAFF",
+        },
+      );
       const entry = await staffService.createTimeOff(
         String(owner._id),
         String(business._id),
@@ -1356,11 +1551,17 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      const staff = await staffService.createStaff(String(owner._id), String(business._id), {
-        name: "Gone",
-        email: "timeoff-removed-staff@example.com",
-        role: "STAFF",
-      });
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Gone",
+          email: "timeoff-removed-staff@example.com",
+          role: "STAFF",
+        },
+      );
       await staffService.removeStaff(
         String(owner._id),
         String(business._id),
@@ -1385,7 +1586,7 @@ describe("database-backed StaffMembership integration", () => {
         "owner-a@example.com",
         "Business A",
       );
-      await staffService.createStaff(String(owner._id), String(business._id), {
+      await seedStaffMember(userRepository, staffRepository, owner._id, business._id, {
         name: "Fresh Staff",
         email: "timeoff-fresh@example.com",
         role: "STAFF",
