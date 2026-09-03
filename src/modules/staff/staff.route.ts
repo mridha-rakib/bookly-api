@@ -3,12 +3,13 @@ import { Router } from "express";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
-import { Argon2PasswordHasher } from "../auth/password-hasher.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { StaffAccessNotifier } from "../notification/staff-access.notifier.js";
 import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
+import { StaffInvitationRepository } from "../staff-invitation/staff-invitation.repository.js";
+import { StaffInvitationService } from "../staff-invitation/staff-invitation.service.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
@@ -20,6 +21,7 @@ import {
   putStaffScheduleBodySchema,
   staffBusinessParamsSchema,
   staffIdParamsSchema,
+  staffInvitationParamsSchema,
   staffTimeOffParamsSchema,
   updateStaffBodySchema,
 } from "./staff.schema.js";
@@ -39,7 +41,10 @@ export const createStaffRoute = (): Router => {
   const staffRepository = new StaffRepository();
   const businessRepository = new BusinessRepository();
   const userRepository = new UserRepository();
-  const passwordHasher = new Argon2PasswordHasher();
+  const staffInvitationService = new StaffInvitationService(
+    new StaffInvitationRepository(),
+    userRepository,
+  );
   const emailOtpProvider = createEmailOtpProvider();
   const staffScheduleRepository = new StaffScheduleRepository();
   const staffTimeOffRepository = new StaffTimeOffRepository();
@@ -57,7 +62,7 @@ export const createStaffRoute = (): Router => {
     staffRepository,
     businessRepository,
     userRepository,
-    passwordHasher,
+    staffInvitationService,
     emailOtpProvider,
     staffScheduleRepository,
     staffTimeOffRepository,
@@ -76,6 +81,17 @@ export const createStaffRoute = (): Router => {
     "/:businessId/staff",
     validateRequest({ params: staffBusinessParamsSchema, body: createStaffBodySchema }),
     asyncHandler(controller.create),
+  );
+  // Phase 2D — pending-invitation management (owner-only, same gate as the rest of this router).
+  router.post(
+    "/:businessId/staff/invitations/:invitationId/resend",
+    validateRequest({ params: staffInvitationParamsSchema }),
+    asyncHandler(controller.resendInvitation),
+  );
+  router.delete(
+    "/:businessId/staff/invitations/:invitationId",
+    validateRequest({ params: staffInvitationParamsSchema }),
+    asyncHandler(controller.revokeInvitation),
   );
   router.patch(
     "/:businessId/staff/:staffId",

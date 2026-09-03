@@ -27,6 +27,13 @@ export const staffTimeOffParamsSchema = z
   })
   .strict();
 
+export const staffInvitationParamsSchema = z
+  .object({
+    businessId: objectIdSchema,
+    invitationId: objectIdSchema,
+  })
+  .strict();
+
 // Strict role allowlist — BUSINESS_OWNER/SUPER_ADMIN/CUSTOMER are not valid values here at
 // all, so a client sending role=BUSINESS_OWNER (or any other role) fails schema validation
 // before it ever reaches the service/repository layer.
@@ -131,6 +138,7 @@ export const createStaffTimeOffBodySchema = z
 export type StaffBusinessParams = z.infer<typeof staffBusinessParamsSchema>;
 export type StaffIdParams = z.infer<typeof staffIdParamsSchema>;
 export type StaffTimeOffParams = z.infer<typeof staffTimeOffParamsSchema>;
+export type StaffInvitationParams = z.infer<typeof staffInvitationParamsSchema>;
 export type CreateStaffBody = z.infer<typeof createStaffBodySchema>;
 export type UpdateStaffBody = z.infer<typeof updateStaffBodySchema>;
 export type PutStaffScheduleBody = z.infer<typeof putStaffScheduleBodySchema>;

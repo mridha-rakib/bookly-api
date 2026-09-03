@@ -1,7 +1,10 @@
 import type { ClientSession, Types } from "mongoose";
 
 import { type StaffInvitationDocument, StaffInvitationModel } from "./staff-invitation.model.js";
-import type { StaffInvitationStatus } from "./staff-invitation.types.js";
+import type {
+  StaffInvitationAuthProvider,
+  StaffInvitationStatus,
+} from "./staff-invitation.types.js";
 
 export type CreateStaffInvitationInput = {
   businessId: Types.ObjectId;
@@ -11,6 +14,8 @@ export type CreateStaffInvitationInput = {
   tokenHash: string;
   expiresAt: Date;
   resendTimestamps: Date[];
+  firstName?: string | undefined;
+  lastName?: string | undefined;
 };
 
 /**
@@ -68,6 +73,46 @@ export class StaffInvitationRepository {
       { _id: id, status: "PENDING" },
       { $set: { status: "ACCEPTED", acceptedUserId, acceptedAt } },
       { returnDocument: "after", ...(session ? { session } : {}) },
+    ).exec();
+  }
+
+  /**
+   * Owner "resend": rotate to a fresh token hash + expiry, CAS-guarded on `status: "PENDING"`.
+   * Returns the updated doc, or `null` if the invitation was no longer pending.
+   */
+  public async refreshToken(
+    id: Types.ObjectId,
+    input: { tokenHash: string; expiresAt: Date; resendTimestamps: Date[] },
+  ): Promise<StaffInvitationDocument | null> {
+    return StaffInvitationModel.findOneAndUpdate(
+      { _id: id, status: "PENDING" },
+      { $set: input },
+      { returnDocument: "after" },
+    )
+      .select("+tokenHash")
+      .exec();
+  }
+
+  /**
+   * Records HOW the invitation was accepted (audit only) inside the acceptance transaction —
+   * called right after {@link markAccepted}, so it does not re-guard on status.
+   */
+  public async setAcceptanceMeta(
+    id: Types.ObjectId,
+    meta: { authProvider: StaffInvitationAuthProvider; googleProviderAccountId?: string },
+    session?: ClientSession,
+  ): Promise<void> {
+    await StaffInvitationModel.updateOne(
+      { _id: id },
+      {
+        $set: {
+          authProvider: meta.authProvider,
+          ...(meta.googleProviderAccountId
+            ? { googleProviderAccountId: meta.googleProviderAccountId }
+            : {}),
+        },
+      },
+      session ? { session } : undefined,
     ).exec();
   }
 

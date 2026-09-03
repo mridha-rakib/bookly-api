@@ -1,5 +1,6 @@
 import type { ClientSession, Types } from "mongoose";
 
+import type { BusinessVisitType } from "../business/business.types.js";
 import {
   type RegistrationPortal,
   type RegistrationSessionDocument,
@@ -12,6 +13,16 @@ type CreateSessionInput = {
   intendedRole: "CUSTOMER" | "BUSINESS_OWNER";
   normalizedEmail: string;
   currentStep: RegistrationStep;
+  expiresAt: Date;
+};
+
+type CreateGoogleProfessionalSessionInput = {
+  normalizedEmail: string;
+  googleProviderAccountId: string;
+  firstName: string;
+  lastName: string;
+  businessVisitType: BusinessVisitType;
+  emailVerifiedAt: Date;
   expiresAt: Date;
 };
 
@@ -72,6 +83,46 @@ export class RegistrationSessionRepository {
 
       throw error;
     }
+  }
+
+  /**
+   * Phase 2C — starts a fresh PROFESSIONAL / BUSINESS_OWNER session already past email
+   * verification, seeded from a Google-verified identity. Any earlier active PROFESSIONAL session
+   * for the same email (an abandoned email/password attempt, or a stale Google one) is retired
+   * first so `createOrReuseActive` can never hand back a session with the wrong `authProvider` or
+   * a leftover `passwordHash`. The caller still creates the BusinessOnboardingDraft + links its
+   * id onto `businessOnboardingDraftId`.
+   */
+  public async createGoogleProfessionalSession(
+    input: CreateGoogleProfessionalSessionInput,
+  ): Promise<RegistrationSessionDocument> {
+    await RegistrationSessionModel.updateMany(
+      { normalizedEmail: input.normalizedEmail, portal: "PROFESSIONAL", isActive: true },
+      { $set: { isActive: false } },
+    );
+
+    return RegistrationSessionModel.create({
+      portal: "PROFESSIONAL",
+      intendedRole: "BUSINESS_OWNER",
+      normalizedEmail: input.normalizedEmail,
+      isActive: true,
+      currentStep: "EMAIL_VERIFIED",
+      authProvider: "GOOGLE",
+      googleProviderAccountId: input.googleProviderAccountId,
+      emailVerification: {
+        verifiedAt: input.emailVerifiedAt,
+        attempts: 0,
+        resendTimestamps: [],
+      },
+      phoneVerification: { attempts: 0, resendTimestamps: [] },
+      personalProfile: {
+        firstName: input.firstName,
+        lastName: input.lastName,
+        gender: "other",
+      },
+      businessVisitType: input.businessVisitType,
+      expiresAt: input.expiresAt,
+    });
   }
 
   public async findActiveById(

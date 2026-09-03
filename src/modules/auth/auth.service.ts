@@ -21,15 +21,17 @@ import type { LinkedAccountRepository } from "../linked-account/linked-account.r
 import type { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
 import type { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
-import type {
-  RegistrationPortal,
-  RegistrationSessionDocument,
+import {
+  type RegistrationPortal,
+  type RegistrationSessionDocument,
+  resolveRegistrationAuthProvider,
 } from "../registration-session/registration-session.model.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import type { ReviewRepository } from "../review/review.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import {
+  type AuthProvider,
   professionalRoles,
   resolveAuthProviders,
   resolveNotificationPreferences,
@@ -67,25 +69,9 @@ import {
   safeCompare,
   sha256,
 } from "./auth.utils.js";
+import { type AuthResult, issueAuthSession, type RequestContext } from "./auth-session.js";
 import type { PasswordHasher } from "./password-hasher.js";
 import type { TokenService } from "./token.service.js";
-
-type RequestContext = {
-  userAgent?: string | undefined;
-  ipAddress?: string | undefined;
-};
-
-type AuthResult = {
-  accessToken: string;
-  accessTokenExpiresAt: string;
-  user: {
-    id: string;
-    email: string;
-    role: UserRole;
-    status: string;
-  };
-  refreshToken: string;
-};
 
 const nextStepValues = {
   PASSWORD_LOGIN: "PASSWORD_LOGIN",
@@ -257,7 +243,19 @@ export class AuthService {
       gender: input.gender,
     };
     session.phone = normalizePhoneNumber(input.countryCode, nationalNumber);
-    session.passwordHash = await this.passwordHasher.hash(input.password);
+
+    // Phase 2C — a GOOGLE PROFESSIONAL session has no password: Google verified the identity and
+    // `completeBusinessOwner` will create the User with `authProviders:["GOOGLE"]`. For every
+    // PASSWORD session `password` is still required and still hashed here — byte-identical.
+    if (resolveRegistrationAuthProvider(session.authProvider) !== "GOOGLE") {
+      if (!input.password) {
+        throw new AuthError("INVALID_REGISTRATION_STEP", 400, [
+          { path: "password", message: "Password is required", code: "required" },
+        ]);
+      }
+      session.passwordHash = await this.passwordHasher.hash(input.password);
+    }
+
     if (input.agreeTerms !== false) {
       session.termsAcceptedAt = new Date();
     }
@@ -410,6 +408,21 @@ export class AuthService {
       throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
     }
 
+    // Phase 2C — a GOOGLE session creates a passwordless BUSINESS_OWNER + a LinkedAccount, in the
+    // SAME transaction as the Business. `ensureFinalCommonData` already guaranteed the Google
+    // `sub` is present. A PASSWORD session is byte-identical to before.
+    const isGoogleSession = resolveRegistrationAuthProvider(session.authProvider) === "GOOGLE";
+    const userProviderFields: { authProviders: AuthProvider[]; passwordHash?: string } =
+      isGoogleSession
+        ? { authProviders: ["GOOGLE"] }
+        : { authProviders: ["PASSWORD"], passwordHash: session.passwordHash ?? "" };
+
+    if (isGoogleSession && !this.linkedAccountRepository) {
+      throw new Error(
+        "completeBusinessOwner: linkedAccountRepository is required for a Google session",
+      );
+    }
+
     const dbSession = await mongoose.startSession();
     let authResult: (AuthResult & { business: { id: string; status: string } }) | undefined;
 
@@ -418,8 +431,7 @@ export class AuthService {
         const user = await this.userRepository.create(
           {
             normalizedEmail: session.normalizedEmail,
-            passwordHash: session.passwordHash ?? "",
-            authProviders: ["PASSWORD"],
+            ...userProviderFields,
             role: "BUSINESS_OWNER",
             status: "ACTIVE",
             ...(session.emailVerification.verifiedAt
@@ -431,6 +443,21 @@ export class AuthService {
           },
           dbSession,
         );
+
+        if (isGoogleSession) {
+          await this.linkedAccountRepository?.create(
+            {
+              userId: user._id,
+              provider: "GOOGLE",
+              providerAccountId: session.googleProviderAccountId as string,
+              email: session.normalizedEmail,
+              emailVerified: true,
+              linkedAt: new Date(),
+            },
+            dbSession,
+          );
+        }
+
         await this.userRepository.createProfile(
           {
             userId: user._id,
@@ -644,11 +671,12 @@ export class AuthService {
       ? await this.customerAvatarService?.resolveAvatarUrl(customerProfile)
       : undefined;
 
-    // Phase 1 — Customer → Google account links. Only Customers can hold one; every other role
-    // (and any construction site that didn't wire the service) resolves to an empty array so the
-    // frontend never has to branch on "absent".
+    // Google account links are held by CUSTOMER (Phase 1), BUSINESS_OWNER (Phase 2C) and
+    // SUPERVISOR / STAFF (Phase 2D — a staff member who accepted their invitation with Google,
+    // or linked it afterwards). SUPER_ADMIN never links; any construction site that didn't wire
+    // the service also resolves to an empty array, so the frontend never branches on "absent".
     const linkedAccounts =
-      user.role === "CUSTOMER" && this.linkedAccountService
+      user.role !== "SUPER_ADMIN" && this.linkedAccountService
         ? await this.linkedAccountService.listForUser(String(user._id))
         : [];
 
@@ -1589,6 +1617,12 @@ export class AuthService {
     return authResult;
   }
 
+  /**
+   * Thin adapter over the shared {@link issueAuthSession} (auth-session.ts) — the one place
+   * access-token + rotating-refresh-session issuance is assembled, reused by password login, OTP
+   * registration completion, and both Google flows. Kept as a method so the many existing call
+   * sites in this file stay unchanged.
+   */
   private async issueAuthResult(
     userId: Types.ObjectId,
     email: string,
@@ -1597,25 +1631,7 @@ export class AuthService {
     context: RequestContext,
     session?: ClientSession,
   ): Promise<AuthResult> {
-    const accessToken = await this.tokenService.createAccessToken({ userId, role });
-    const refreshInput = {
-      userId,
-      ...(context.userAgent ? { userAgent: context.userAgent } : {}),
-      ...(context.ipAddress ? { ipAddress: context.ipAddress } : {}),
-    };
-    const refreshSession = await this.tokenService.createRefreshSession(refreshInput, session);
-
-    return {
-      accessToken,
-      accessTokenExpiresAt: this.tokenService.getAccessTokenExpiresAt().toISOString(),
-      refreshToken: refreshSession.refreshToken,
-      user: {
-        id: String(userId),
-        email,
-        role,
-        status,
-      },
-    };
+    return issueAuthSession(this.tokenService, { userId, email, role, status }, context, session);
   }
 
   private async getRegistrationSession(sessionId: string): Promise<RegistrationSessionDocument> {
@@ -1669,7 +1685,19 @@ export class AuthService {
       throw new AuthError("PHONE_NOT_VERIFIED", 400);
     }
 
-    if (!session.personalProfile || !session.phone || !session.passwordHash) {
+    const isGoogleSession = resolveRegistrationAuthProvider(session.authProvider) === "GOOGLE";
+
+    if (!session.personalProfile || !session.phone) {
+      throw new AuthError("INVALID_REGISTRATION_STEP", 409);
+    }
+
+    // A GOOGLE session legitimately has no `passwordHash` (and must carry the Google `sub`
+    // instead); a PASSWORD session must have the hash.
+    if (isGoogleSession) {
+      if (!session.googleProviderAccountId) {
+        throw new AuthError("INVALID_REGISTRATION_STEP", 409);
+      }
+    } else if (!session.passwordHash) {
       throw new AuthError("INVALID_REGISTRATION_STEP", 409);
     }
   }

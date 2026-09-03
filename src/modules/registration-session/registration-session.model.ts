@@ -6,6 +6,19 @@ import type { Gender, PhoneNumber } from "../user/user.types.js";
 export const registrationPortals = ["CUSTOMER", "PROFESSIONAL"] as const;
 export type RegistrationPortal = (typeof registrationPortals)[number];
 
+/**
+ * How the registration is being completed. Phase 2C — a `"GOOGLE"` PROFESSIONAL session carries a
+ * Google-verified identity + email and never collects a password; `"PASSWORD"` is the classic
+ * email + password + OTP flow. Absent on rows written before Phase 2C — resolve via
+ * {@link resolveRegistrationAuthProvider}.
+ */
+export const registrationAuthProviders = ["PASSWORD", "GOOGLE"] as const;
+export type RegistrationAuthProvider = (typeof registrationAuthProviders)[number];
+
+export const resolveRegistrationAuthProvider = (
+  value: RegistrationAuthProvider | undefined,
+): RegistrationAuthProvider => value ?? "PASSWORD";
+
 export const registrationSteps = [
   "EMAIL_ENTRY",
   "VISIT_TYPE_SELECTED",
@@ -49,6 +62,12 @@ export type RegistrationSession = {
     providerVerificationId?: string | undefined;
   };
   passwordHash?: string | undefined;
+  /** Phase 2C — absent means "PASSWORD" (see resolveRegistrationAuthProvider). */
+  authProvider?: RegistrationAuthProvider | undefined;
+  /** GOOGLE sessions only — the Google OIDC `sub`, threaded through to completeBusinessOwner so
+   * the LinkedAccount is created in the SAME transaction as the User + Business. Not a
+   * credential (an opaque stable id), so not `select:false` — mirrors LinkedAccount.providerAccountId. */
+  googleProviderAccountId?: string | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   businessVisitType?: BusinessVisitType | undefined;
@@ -95,6 +114,8 @@ const registrationSessionSchema = new Schema<RegistrationSession>(
       providerVerificationId: { type: String, select: false },
     },
     passwordHash: { type: String, select: false },
+    authProvider: { type: String, enum: registrationAuthProviders },
+    googleProviderAccountId: { type: String, trim: true },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
     businessVisitType: {

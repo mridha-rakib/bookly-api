@@ -1,6 +1,9 @@
 import mongoose, { type Types } from "mongoose";
 
-import type { GoogleVerifiedIdentity } from "../../common/oauth/google-identity.js";
+import {
+  type GoogleVerifiedIdentity,
+  splitGoogleName,
+} from "../../common/oauth/google-identity.js";
 import { logger } from "../../config/logger.js";
 import { createOpaqueToken, normalizeEmail, safeCompare } from "../auth/auth.utils.js";
 import { type AuthResult, issueAuthSession, type RequestContext } from "../auth/auth-session.js";
@@ -28,44 +31,8 @@ export type CustomerGoogleCallbackResult =
   | { type: "ACCOUNT_EXISTS" }
   | { type: "ERROR" };
 
-type GoogleSignupName = { firstName: string; lastName: string };
-
-/**
- * Splits a Google identity into non-empty first/last names (UserProfile requires both). Prefers
- * the dedicated `given_name` / `family_name`; for a single-token display name, duplicates it into
- * both fields — the same "no invented placeholder" approach as staff.utils.splitStaffName. The
- * Customer can edit either field afterwards from Profile.
- */
-export const splitGoogleName = (identity: {
-  firstName?: string;
-  lastName?: string;
-  displayName?: string;
-}): GoogleSignupName => {
-  const given = identity.firstName?.trim();
-  const family = identity.lastName?.trim();
-
-  if (given && family) {
-    return { firstName: given, lastName: family };
-  }
-
-  const display = (identity.displayName ?? "").trim().replace(/\s+/g, " ");
-  const firstSpace = display.indexOf(" ");
-  const displayFirst = firstSpace === -1 ? display : display.slice(0, firstSpace);
-  const displayLast = firstSpace === -1 ? display : display.slice(firstSpace + 1);
-
-  if (given || family) {
-    return {
-      firstName: given || displayFirst || (family as string),
-      lastName: family || displayLast || (given as string),
-    };
-  }
-
-  if (!display) {
-    return { firstName: "Google", lastName: "User" };
-  }
-
-  return { firstName: displayFirst, lastName: displayLast || displayFirst };
-};
+// Re-exported for existing importers (tests) — the implementation now lives in common/oauth.
+export { splitGoogleName };
 
 /**
  * Customer "Continue with Google" — sign-up and sign-in in one callback. HOLDS NO HTTP concerns:

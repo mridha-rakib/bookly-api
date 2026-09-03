@@ -1,12 +1,15 @@
 import mongoose from "mongoose";
 
+import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { normalizeEmail } from "../auth/auth.utils.js";
-import type { PasswordHasher } from "../auth/password-hasher.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
+import { StaffInvitationNotifier } from "../notification/staff-invitation.notifier.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
+import type { StaffInvitationDocument } from "../staff-invitation/staff-invitation.model.js";
+import type { StaffInvitationService } from "../staff-invitation/staff-invitation.service.js";
 import type { UserDocument, UserProfileDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { EmailOtpProvider } from "../verification/email-otp.provider.js";
@@ -14,12 +17,7 @@ import { StaffError } from "./staff.errors.js";
 import type { StaffMembershipDocument } from "./staff.model.js";
 import type { StaffRepository } from "./staff.repository.js";
 import type { StaffCreatableRole, StaffDisplayRole } from "./staff.types.js";
-import {
-  generateTempPassword,
-  joinStaffName,
-  parseFreeTextPhone,
-  splitStaffName,
-} from "./staff.utils.js";
+import { joinStaffName, parseFreeTextPhone, splitStaffName } from "./staff.utils.js";
 import type { StaffAccessEventDocument } from "./staff-access-event.model.js";
 import type { StaffAccessEventRepository } from "./staff-access-event.repository.js";
 import type { StaffScheduleDayDocument, StaffScheduleDocument } from "./staff-schedule.model.js";
@@ -54,9 +52,24 @@ export type StaffMemberDto = {
   avatarUrl: string | undefined;
 };
 
+/** A still-PENDING invitation shown alongside real members on the Staff screen (Phase 2D). No
+ * User / StaffMembership exists yet — the person has not accepted. */
+export type PendingStaffInvitationDto = {
+  invitationId: string;
+  businessId: string;
+  email: string;
+  name: string;
+  role: StaffCreatableRole;
+  status: "PENDING";
+  invitedAt: string;
+  expiresAt: string;
+};
+
 export type StaffListDto = {
   businessId: string;
   members: StaffMemberDto[];
+  /** PENDING invitations (Phase 2D). Empty until someone is invited but has not yet accepted. */
+  invitations: PendingStaffInvitationDto[];
 };
 
 export type CreateStaffInput = {
@@ -89,7 +102,11 @@ export class StaffService {
     private readonly staffRepository: StaffRepository,
     private readonly businessRepository: BusinessRepository,
     private readonly userRepository: UserRepository,
-    private readonly passwordHasher: PasswordHasher,
+    // Phase 2D — "Add staff" now issues an invitation instead of creating a temp-password User.
+    // This service no longer hashes passwords (acceptance does, in staff-invitation).
+    private readonly staffInvitationService: StaffInvitationService,
+    // Still used for the invitation link email (branded plain-notice transport — same one the
+    // former temp-password email used), via a lazily-built StaffInvitationNotifier.
     private readonly emailOtpProvider: EmailOtpProvider,
     private readonly staffScheduleRepository: StaffScheduleRepository,
     private readonly staffTimeOffRepository: StaffTimeOffRepository,
@@ -105,7 +122,10 @@ export class StaffService {
 
   public async listStaff(actorUserId: string, businessId: string): Promise<StaffListDto> {
     const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
-    const memberships = await this.staffRepository.listActiveByBusinessId(businessId);
+    const [memberships, pendingInvitations] = await Promise.all([
+      this.staffRepository.listActiveByBusinessId(businessId),
+      this.staffInvitationService.listPendingForBusiness(business._id),
+    ]);
     const membershipIds = memberships.map((membership) => membership._id);
 
     const userIds = [business.ownerUserId, ...memberships.map((membership) => membership.userId)];
@@ -157,121 +177,132 @@ export class StaffService {
     return {
       businessId: String(business._id),
       members: [ownerRow, ...staffRows],
+      invitations: pendingInvitations.map((invitation) => this.toPendingInvitationDto(invitation)),
     };
   }
 
+  /**
+   * Phase 2D — "Add staff" no longer creates a User. It issues a PENDING {@link StaffInvitation}
+   * and emails the invitee a one-time link; the User + UserProfile + StaffMembership are created
+   * later, in one transaction, when they accept (password or Google) — see
+   * StaffInvitationAcceptService. Returns a pending-invitation DTO, never a member row.
+   */
   public async createStaff(
     actorUserId: string,
     businessId: string,
     input: CreateStaffInput,
-  ): Promise<StaffMemberDto> {
+  ): Promise<PendingStaffInvitationDto> {
     const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
 
     const normalizedEmail = normalizeEmail(input.email);
 
-    if (await this.userRepository.findByEmail(normalizedEmail)) {
-      throw new StaffError("STAFF_EMAIL_ALREADY_EXISTS", 409);
-    }
-
-    let phone: ReturnType<typeof parseFreeTextPhone>;
+    // Early feedback for a garbled phone even though the invitation itself stores no phone —
+    // the invitee supplies their own at acceptance.
     try {
-      phone = parseFreeTextPhone(input.phone);
+      parseFreeTextPhone(input.phone);
     } catch {
       throw new StaffError("STAFF_PHONE_INVALID", 400);
     }
 
     const { firstName, lastName } = splitStaffName(input.name);
-    const tempPassword = generateTempPassword();
-    const passwordHash = await this.passwordHasher.hash(tempPassword);
 
-    const dbSession = await mongoose.startSession();
-    let created: { user: UserDocument; membership: StaffMembershipDocument } | undefined;
+    // Issue rejects an email already on a User (STAFF_INVITATION_EMAIL_IN_USE) or an already-
+    // pending invitation for this (business, email) — both surface as their own 409s.
+    const { invitation, token } = await this.staffInvitationService.issue({
+      businessId: business._id,
+      invitedByUserId: new mongoose.Types.ObjectId(actorUserId),
+      email: normalizedEmail,
+      role: input.role,
+      firstName,
+      lastName,
+    });
 
+    // Link email delivery — mirrors the former temp-password send: after the row is persisted,
+    // and a failure surfaces as STAFF_INVITATION_EMAIL_FAILED (the invitation still exists and
+    // the owner can "resend").
     try {
-      await dbSession.withTransaction(async () => {
-        const user = await this.userRepository.create(
-          {
-            normalizedEmail,
-            passwordHash,
-            authProviders: ["PASSWORD"],
-            role: input.role,
-            status: "ACTIVE",
-          },
-          dbSession,
-        );
-
-        await this.userRepository.createProfile(
-          {
-            userId: user._id,
-            firstName,
-            lastName,
-            gender: "other", // Add Staff form has no gender field in this phase; see report.
-            ...(phone ? { phone } : {}),
-          },
-          dbSession,
-        );
-
-        const membership = await this.staffRepository.create(
-          {
-            userId: user._id,
-            businessId: business._id,
-            role: input.role,
-            createdByUserId: new mongoose.Types.ObjectId(actorUserId),
-          },
-          dbSession,
-        );
-
-        created = { user, membership };
-      });
-    } catch (error) {
-      if (this.isTransactionUnsupported(error)) {
-        throw new StaffError("STAFF_TRANSACTION_UNAVAILABLE", 503);
-      }
-
-      if (this.isDuplicateKeyError(error)) {
-        throw new StaffError("STAFF_EMAIL_ALREADY_EXISTS", 409);
-      }
-
-      throw error;
-    } finally {
-      await dbSession.endSession();
-    }
-
-    if (!created) {
-      throw new Error("Staff creation failed");
-    }
-
-    // Email delivery happens after the transaction has committed — never inside it (no
-    // network calls inside a Mongo transaction). If this throws, the account still exists
-    // (documented behavior, matching the existing business-link-verification precedent);
-    // the caller sees STAFF_TEMP_PASSWORD_EMAIL_FAILED and can advise the owner accordingly.
-    try {
-      await this.emailOtpProvider.sendOtp({
+      await this.invitationNotifier().send({
         to: normalizedEmail,
-        code: tempPassword,
-        purpose: "STAFF_TEMP_PASSWORD",
+        businessName: business.name,
+        role: invitation.role,
+        acceptUrl: this.buildAcceptUrl(token),
+        expiresInText: this.expiresInText(invitation.expiresAt),
       });
     } catch {
-      throw new StaffError("STAFF_TEMP_PASSWORD_EMAIL_FAILED", 502);
+      throw new StaffError("STAFF_INVITATION_EMAIL_FAILED", 502);
     }
 
+    return this.toPendingInvitationDto(invitation);
+  }
+
+  /** Owner re-sends a still-pending invitation with a fresh link + reset expiry. */
+  public async resendInvitation(
+    actorUserId: string,
+    businessId: string,
+    invitationId: string,
+  ): Promise<PendingStaffInvitationDto> {
+    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+
+    const { invitation, token } = await this.staffInvitationService.resend({
+      invitationId,
+      businessId: business._id,
+    });
+
+    try {
+      await this.invitationNotifier().send({
+        to: invitation.email,
+        businessName: business.name,
+        role: invitation.role,
+        acceptUrl: this.buildAcceptUrl(token),
+        expiresInText: this.expiresInText(invitation.expiresAt),
+      });
+    } catch {
+      throw new StaffError("STAFF_INVITATION_EMAIL_FAILED", 502);
+    }
+
+    return this.toPendingInvitationDto(invitation);
+  }
+
+  /** Owner cancels a still-pending invitation. */
+  public async revokeInvitation(
+    actorUserId: string,
+    businessId: string,
+    invitationId: string,
+  ): Promise<void> {
+    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    await this.staffInvitationService.revoke({ invitationId, businessId: business._id });
+  }
+
+  private invitationNotifier(): StaffInvitationNotifier {
+    return new StaffInvitationNotifier(this.emailOtpProvider);
+  }
+
+  private buildAcceptUrl(token: string): string {
+    return `${env.FRONTEND_BASE_URL}/staff/invite/accept?token=${encodeURIComponent(token)}`;
+  }
+
+  private expiresInText(expiresAt: Date): string {
+    const hours = Math.round((expiresAt.getTime() - Date.now()) / (60 * 60 * 1000));
+    if (hours >= 24) {
+      const days = Math.round(hours / 24);
+      return `in ${days} day${days === 1 ? "" : "s"}`;
+    }
+    return `in ${Math.max(hours, 1)} hour${hours === 1 ? "" : "s"}`;
+  }
+
+  private toPendingInvitationDto(invitation: StaffInvitationDocument): PendingStaffInvitationDto {
     return {
-      membershipId: String(created.membership._id),
-      userId: String(created.user._id),
-      businessId: String(created.membership.businessId),
-      name: joinStaffName(firstName, lastName),
-      email: normalizedEmail,
-      phone,
-      role: created.membership.role,
-      employmentActive: created.membership.employmentActive,
-      isOwner: false,
-      createdAt: created.membership.createdAt.toISOString(),
-      schedule: [],
-      timeOff: [],
-      // Avatar upload is a separate follow-up call the frontend makes only after this
-      // create succeeds (mirrors the OTP-email-after-commit precedent above) — never
-      // undefined here to imply failure, simply not-yet-uploaded.
-      avatarUrl: undefined,
+      invitationId: String(invitation._id),
+      businessId: String(invitation.businessId),
+      email: invitation.email,
+      name: joinStaffName(
+        invitation.firstName ?? invitation.email,
+        invitation.lastName ?? invitation.email,
+      ),
+      role: invitation.role,
+      status: "PENDING",
+      invitedAt: invitation.createdAt.toISOString(),
+      expiresAt: invitation.expiresAt.toISOString(),
     };
   }
 

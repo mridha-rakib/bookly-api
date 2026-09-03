@@ -1,6 +1,11 @@
 import { Types } from "mongoose";
 
-import { createOpaqueToken, normalizeEmail, sha256 } from "../auth/auth.utils.js";
+import {
+  assertOtpResendAllowed,
+  createOpaqueToken,
+  normalizeEmail,
+  sha256,
+} from "../auth/auth.utils.js";
 import type { StaffCreatableRole } from "../staff/staff.types.js";
 import type { UserRepository } from "../user/user.repository.js";
 import { StaffInvitationError } from "./staff-invitation.errors.js";
@@ -15,6 +20,8 @@ export type IssueStaffInvitationInput = {
   invitedByUserId: Types.ObjectId | string;
   email: string;
   role: StaffCreatableRole;
+  firstName?: string | undefined;
+  lastName?: string | undefined;
   /** Overrides {@link STAFF_INVITATION_TTL_HOURS} for this one invitation. */
   ttlHours?: number | undefined;
 };
@@ -26,16 +33,12 @@ export type IssuedStaffInvitation = {
 };
 
 /**
- * Phase 2A foundation — issue / inspect / revoke staff invitations.
- *
- * Deliberately NOT called by StaffService yet; the existing temp-password staff-creation path is
- * untouched. A later phase wires {@link issue} into the owner's "add staff" action and adds an
- * accept flow that consumes the token via {@link redeemToken} + StaffInvitationRepository.
- * markAccepted (in the same transaction that provisions the User + StaffMembership).
+ * Issue / inspect / resend / revoke staff invitations (Phase 2D).
  *
  * Holds no HTTP concerns and no direct Mongo access. Reuses the auth module's helpers
- * (createOpaqueToken / sha256 / normalizeEmail) exactly as LinkedAccountService and StaffService
- * already do.
+ * (createOpaqueToken / sha256 / normalizeEmail / assertOtpResendAllowed) exactly as
+ * LinkedAccountService and StaffService already do. The account-provisioning half of the flow
+ * lives in {@link StaffInvitationAcceptService}.
  */
 export class StaffInvitationService {
   public constructor(
@@ -74,6 +77,8 @@ export class StaffInvitationService {
         tokenHash: sha256(token),
         expiresAt: new Date(now.getTime() + ttlHours * MS_PER_HOUR),
         resendTimestamps: [now],
+        ...(input.firstName ? { firstName: input.firstName } : {}),
+        ...(input.lastName ? { lastName: input.lastName } : {}),
       });
 
       return { invitation, token };
@@ -84,6 +89,50 @@ export class StaffInvitationService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Owner re-sends a still-pending invitation: mints a FRESH token (invalidating the previous
+   * link), resets the 72h expiry, and appends a resend timestamp. Enforces the same
+   * resend-cooldown the OTP flow uses (assertOtpResendAllowed) so this can't be used to
+   * email-bomb an address.
+   */
+  public async resend(input: {
+    invitationId: Types.ObjectId | string;
+    businessId: Types.ObjectId | string;
+    ttlHours?: number | undefined;
+  }): Promise<IssuedStaffInvitation> {
+    const invitation = await this.staffInvitationRepository.findById(input.invitationId);
+
+    if (!invitation || String(invitation.businessId) !== String(input.businessId)) {
+      throw new StaffInvitationError("STAFF_INVITATION_NOT_FOUND", 404);
+    }
+
+    if (invitation.status !== "PENDING") {
+      throw new StaffInvitationError("STAFF_INVITATION_NOT_PENDING", 409);
+    }
+
+    try {
+      assertOtpResendAllowed(invitation.resendTimestamps);
+    } catch {
+      throw new StaffInvitationError("STAFF_INVITATION_RESEND_TOO_SOON", 429);
+    }
+
+    const token = createOpaqueToken();
+    const now = new Date();
+    const ttlHours = input.ttlHours ?? STAFF_INVITATION_TTL_HOURS;
+
+    const updated = await this.staffInvitationRepository.refreshToken(invitation._id, {
+      tokenHash: sha256(token),
+      expiresAt: new Date(now.getTime() + ttlHours * MS_PER_HOUR),
+      resendTimestamps: [...invitation.resendTimestamps, now],
+    });
+
+    if (!updated) {
+      throw new StaffInvitationError("STAFF_INVITATION_NOT_PENDING", 409);
+    }
+
+    return { invitation: updated, token };
   }
 
   /**
@@ -134,6 +183,12 @@ export class StaffInvitationService {
     businessId: Types.ObjectId | string,
   ): Promise<StaffInvitationDocument[]> {
     return this.staffInvitationRepository.listByBusinessId(businessId);
+  }
+
+  public async listPendingForBusiness(
+    businessId: Types.ObjectId | string,
+  ): Promise<StaffInvitationDocument[]> {
+    return this.staffInvitationRepository.listByBusinessId(businessId, { status: "PENDING" });
   }
 
   private isDuplicateKeyError(error: unknown): boolean {

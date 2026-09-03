@@ -31,10 +31,18 @@ import { createLinkedAccountRoute } from "../linked-account/linked-account.route
 import { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import { BusinessRegisteredNotifier } from "../notification/business-registered.notifier.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
+import { ProfessionalGoogleAuthController } from "../professional-google-auth/professional-google-auth.controller.js";
+import { createProfessionalGoogleAuthRoute } from "../professional-google-auth/professional-google-auth.route.js";
+import { ProfessionalGoogleAuthService } from "../professional-google-auth/professional-google-auth.service.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import { ReviewRepository } from "../review/review.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
+import { StaffInvitationController } from "../staff-invitation/staff-invitation.controller.js";
+import { StaffInvitationRepository } from "../staff-invitation/staff-invitation.repository.js";
+import { createStaffInvitationRoute } from "../staff-invitation/staff-invitation.route.js";
+import { StaffInvitationService } from "../staff-invitation/staff-invitation.service.js";
+import { StaffInvitationAcceptService } from "../staff-invitation/staff-invitation-accept.service.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
@@ -162,6 +170,42 @@ export const createAuthRoute = (): Router => {
     tokenService,
   );
   const customerGoogleAuthController = new CustomerGoogleAuthController(customerGoogleAuthService);
+  // Phase 2C — Business Owner "Continue with Google". Google verification only ever seeds a
+  // PROFESSIONAL RegistrationSession here; the User + LinkedAccount + Business are still created
+  // together by AuthService.completeBusinessOwner at the end of onboarding.
+  const professionalGoogleAuthService = new ProfessionalGoogleAuthService(
+    userRepository,
+    linkedAccountRepository,
+    registrationSessionRepository,
+    businessOnboardingService,
+    tokenService,
+  );
+  const professionalGoogleAuthController = new ProfessionalGoogleAuthController(
+    professionalGoogleAuthService,
+  );
+  // Phase 2D — Staff/Supervisor invitation acceptance (password OR Continue with Google). The
+  // invitation is the only account-creation path for these roles; accepting it creates the
+  // User + UserProfile + StaffMembership (+ LinkedAccount for Google) in one transaction. Reuses
+  // the shared userRepository / linkedAccountRepository / tokenService / passwordHasher.
+  const staffInvitationRepository = new StaffInvitationRepository();
+  const staffInvitationService = new StaffInvitationService(
+    staffInvitationRepository,
+    userRepository,
+  );
+  const staffInvitationAcceptService = new StaffInvitationAcceptService(
+    staffInvitationService,
+    staffInvitationRepository,
+    userRepository,
+    staffRepository,
+    linkedAccountRepository,
+    passwordHasher,
+    tokenService,
+  );
+  const staffInvitationController = new StaffInvitationController(
+    staffInvitationService,
+    staffInvitationAcceptService,
+    businessRepository,
+  );
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
@@ -456,6 +500,31 @@ export const createAuthRoute = (): Router => {
       controller: customerGoogleAuthController,
       startLimiter: loginLimiter,
       callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Phase 2C — public Business Owner Google auth: GET /auth/professional/oauth/google/start
+  // (validates + signs the required `visitType`) and GET /auth/professional/oauth/google/callback.
+  // Public — security is the signed state + the professional nonce cookie.
+  router.use(
+    createProfessionalGoogleAuthRoute({
+      controller: professionalGoogleAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Phase 2D — public Staff/Supervisor invitation acceptance:
+  //   GET  /auth/staff/invitation?token=            (render accept screen)
+  //   POST /auth/staff/invitation/accept/password
+  //   GET  /auth/staff/invitation/oauth/google/start?token=
+  //   GET  /auth/staff/invitation/oauth/google/callback
+  // Public — security is the opaque invitation token + signed state + staff nonce cookie.
+  router.use(
+    createStaffInvitationRoute({
+      controller: staffInvitationController,
+      readLimiter: loginLimiter,
+      acceptLimiter: loginLimiter,
     }),
   );
 

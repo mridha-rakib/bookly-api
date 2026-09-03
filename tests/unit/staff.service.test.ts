@@ -9,6 +9,7 @@ import { StaffService } from "../../src/modules/staff/staff.service.js";
 import type { StaffScheduleRepository } from "../../src/modules/staff/staff-schedule.repository.js";
 import type { StaffTimeOffRepository } from "../../src/modules/staff/staff-time-off.repository.js";
 import type { StaffAvatarService } from "../../src/modules/staff-avatar/staff-avatar.service.js";
+import type { StaffInvitationService } from "../../src/modules/staff-invitation/staff-invitation.service.js";
 import type { UserDocument, UserProfileDocument } from "../../src/modules/user/user.model.js";
 import type { UserRepository } from "../../src/modules/user/user.repository.js";
 
@@ -95,11 +96,15 @@ describe("StaffService.listStaff — avatar integration", () => {
       getAvatarUrlsByUserIds,
     } as unknown as StaffAvatarService;
 
+    const staffInvitationService = {
+      listPendingForBusiness: vi.fn().mockResolvedValue([]),
+    } as unknown as StaffInvitationService;
+
     const service = new StaffService(
       staffRepository,
       businessRepository,
       userRepository,
-      {} as never,
+      staffInvitationService,
       {} as never,
       staffScheduleRepository,
       staffTimeOffRepository,

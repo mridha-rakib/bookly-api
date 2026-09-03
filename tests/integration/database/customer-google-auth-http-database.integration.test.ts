@@ -88,7 +88,7 @@ describe("HTTP-level Customer Google auth (start + callback)", () => {
 
     expect(res.status).toBe(302);
     expect(res.headers["location"]).toContain("accounts.google.com");
-    expect(String(res.headers["set-cookie"])).toMatch(/bookly_refresh_token_oauth_nonce=/);
+    expect(String(res.headers["set-cookie"])).toMatch(/bookly_refresh_token_oauth_nonce_customer=/);
     expect(String(res.headers["set-cookie"])).toMatch(/HttpOnly/i);
   });
 

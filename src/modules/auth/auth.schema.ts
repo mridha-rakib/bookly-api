@@ -51,7 +51,9 @@ export const profileBodySchema = sessionBodySchema
     countryCode: countryCodeSchema,
     nationalNumber: nationalNumberSchema.optional(),
     phone: nationalNumberSchema.optional(),
-    password: passwordSchema,
+    // Optional as of Phase 2C: a Google-originated PROFESSIONAL session sets no password. The
+    // service still requires + hashes it for every PASSWORD session (see AuthService.submitProfile).
+    password: passwordSchema.optional(),
     agreeTerms: z.boolean().optional(),
     termsVersion: z.string().trim().min(1).optional(),
   })
