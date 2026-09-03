@@ -103,6 +103,7 @@ export const seedDemoCustomer = async (
   const user = await dependencies.userRepository.create({
     normalizedEmail,
     passwordHash,
+    authProviders: ["PASSWORD"],
     role: "CUSTOMER",
     status: "ACTIVE",
     emailVerifiedAt: new Date(),

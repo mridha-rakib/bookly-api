@@ -193,6 +193,7 @@ export class StaffService {
           {
             normalizedEmail,
             passwordHash,
+            authProviders: ["PASSWORD"],
             role: input.role,
             status: "ACTIVE",
           },

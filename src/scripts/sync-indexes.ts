@@ -22,6 +22,7 @@ import "../modules/business-travel-settings/business-travel-settings.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
 import "../modules/client/client.model.js";
 import "../modules/email-outbox/email-outbox.model.js";
+import "../modules/linked-account/linked-account.model.js";
 import "../modules/marketing/marketing-campaign.model.js";
 import "../modules/marketing/marketing-campaign-recipient.model.js";
 import "../modules/payment/customer-payment-profile.model.js";
@@ -34,6 +35,7 @@ import "../modules/staff/staff-access-event.model.js";
 import "../modules/staff/staff-schedule.model.js";
 import "../modules/staff/staff-time-off.model.js";
 import "../modules/staff-avatar/staff-avatar.model.js";
+import "../modules/staff-invitation/staff-invitation.model.js";
 import "../modules/stripe-webhook/stripe-webhook-event.model.js";
 import "../modules/user/user.model.js";
 

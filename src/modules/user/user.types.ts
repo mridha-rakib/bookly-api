@@ -10,6 +10,53 @@ export type UserRole = (typeof userRoles)[number];
 
 export const professionalRoles: UserRole[] = ["BUSINESS_OWNER", "SUPERVISOR", "STAFF"];
 
+/**
+ * How a User can authenticate. `PASSWORD` — a usable `passwordHash` is set (email/password
+ * login). `GOOGLE` — a verified Google identity is linked (see LinkedAccount). Every User carries
+ * at least one. `authProviders` is the single source of truth for "can this account sign in
+ * without a password"; the value is kept in lockstep with `passwordHash` presence by
+ * {@link assertUserAuthProvidersConsistent}.
+ */
+export const authProviders = ["PASSWORD", "GOOGLE"] as const;
+
+export type AuthProvider = (typeof authProviders)[number];
+
+/**
+ * Resolves a possibly-absent stored `authProviders` to a concrete list. User rows written before
+ * this field existed read back without it on `.lean()` / aggregation paths (a hydrated `find`
+ * self-heals via the schema default, a lean read does not); those are password accounts by
+ * construction, so absent/empty resolves to `["PASSWORD"]`. Single home for the "absent means
+ * password" rule — mirrors {@link resolveNotificationPreferences} below.
+ */
+export const resolveAuthProviders = (stored: AuthProvider[] | undefined): AuthProvider[] =>
+  stored && stored.length > 0 ? stored : ["PASSWORD"];
+
+/**
+ * Domain invariant checked on every User write (see UserRepository.create): `authProviders` is
+ * non-empty and its `PASSWORD` membership matches whether a `passwordHash` is present. Blocks
+ * both a passwordless row that still claims `PASSWORD` and a Google-only row that forgot to drop
+ * it. Throws a plain Error — a programmer invariant, never a user-facing condition.
+ */
+export const assertUserAuthProvidersConsistent = (input: {
+  passwordHash?: string | null | undefined;
+  authProviders: AuthProvider[];
+}): void => {
+  if (input.authProviders.length === 0) {
+    throw new Error("authProviders must contain at least one provider");
+  }
+
+  const declaresPassword = input.authProviders.includes("PASSWORD");
+  const hasPasswordHash = input.passwordHash !== undefined && input.passwordHash !== null;
+
+  if (declaresPassword !== hasPasswordHash) {
+    throw new Error(
+      `authProviders/passwordHash mismatch: PASSWORD ${
+        declaresPassword ? "declared" : "not declared"
+      } but passwordHash ${hasPasswordHash ? "present" : "absent"}`,
+    );
+  }
+};
+
 // ACTIVE: normal account. DORMANT: existing inactive state. SUSPENDED: admin/platform
 // restriction. DELETED: customer-requested account closure (soft delete + anonymization via
 // DELETE /auth/me) — a terminal state; login/refresh/`requireActiveUser` all reject it and the

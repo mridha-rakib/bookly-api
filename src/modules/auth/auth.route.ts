@@ -20,8 +20,15 @@ import { ClientIdentityService } from "../client/client-identity.service.js";
 import { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
 import { CustomerAvatarError } from "../customer-avatar/customer-avatar.errors.js";
 import { CustomerAvatarService } from "../customer-avatar/customer-avatar.service.js";
+import { CustomerGoogleAuthController } from "../customer-google-auth/customer-google-auth.controller.js";
+import { createCustomerGoogleAuthRoute } from "../customer-google-auth/customer-google-auth.route.js";
+import { CustomerGoogleAuthService } from "../customer-google-auth/customer-google-auth.service.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { FavoriteRepository } from "../favorite/favorite.repository.js";
+import { LinkedAccountController } from "../linked-account/linked-account.controller.js";
+import { LinkedAccountRepository } from "../linked-account/linked-account.repository.js";
+import { createLinkedAccountRoute } from "../linked-account/linked-account.route.js";
+import { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import { BusinessRegisteredNotifier } from "../notification/business-registered.notifier.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
@@ -124,6 +131,9 @@ export const createAuthRoute = (): Router => {
   const clientIdentityService = new ClientIdentityService(userRepository, clientRepository);
   const contactChangeChallengeRepository = new ContactChangeChallengeRepository();
   const emailOutboxService = new EmailOutboxService();
+  // Single shared instance — reused by AuthService, LinkedAccountService and the customer Google
+  // auth path; never construct a second hasher.
+  const passwordHasher = new Argon2PasswordHasher();
   const customerAvatarService = new CustomerAvatarService(
     userRepository,
     createDeferredStorageServiceFromEnv(),
@@ -136,13 +146,29 @@ export const createAuthRoute = (): Router => {
   const favoriteRepository = new FavoriteRepository();
   const appointmentReminderRepository = new AppointmentReminderRepository();
   const customerPaymentProfileRepository = new CustomerPaymentProfileRepository();
+  // Phase 1 — Customer → Google account linking.
+  const linkedAccountRepository = new LinkedAccountRepository();
+  const linkedAccountService = new LinkedAccountService(
+    linkedAccountRepository,
+    passwordHasher,
+    userRepository,
+  );
+  const linkedAccountController = new LinkedAccountController(linkedAccountService);
+  // Phase 2B — Customer "Continue with Google" sign-up / sign-in. Reuses the shared
+  // userRepository / linkedAccountRepository / tokenService instances above.
+  const customerGoogleAuthService = new CustomerGoogleAuthService(
+    userRepository,
+    linkedAccountRepository,
+    tokenService,
+  );
+  const customerGoogleAuthController = new CustomerGoogleAuthController(customerGoogleAuthService);
   const authService = new AuthService(
     userRepository,
     registrationSessionRepository,
     businessOnboardingRepository,
     businessOnboardingService,
     businessRepository,
-    new Argon2PasswordHasher(),
+    passwordHasher,
     createEmailOtpProvider(),
     createPhoneOtpProvider(),
     tokenService,
@@ -159,6 +185,8 @@ export const createAuthRoute = (): Router => {
     clientRepository,
     customerPaymentProfileRepository,
     emailOutboxService,
+    linkedAccountService,
+    linkedAccountRepository,
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
@@ -405,6 +433,30 @@ export const createAuthRoute = (): Router => {
     otpVerifyLimiter,
     validateRequest({ body: verifyPhoneChangeBodySchema }),
     asyncHandler(controller.verifyPhoneChange),
+  );
+
+  // Phase 1 — Customer → Google account linking. GET /auth/me/linked-accounts/google/authorize-url
+  // + DELETE /auth/me/linked-accounts/google (both CUSTOMER-gated), and the public
+  // GET /auth/oauth/google/callback. No router-wide auth gate here, so the public callback needs
+  // no special mount order.
+  router.use(
+    createLinkedAccountRoute({
+      authenticate,
+      controller: linkedAccountController,
+      authorizeUrlLimiter: loginLimiter,
+      unlinkLimiter: loginLimiter,
+    }),
+  );
+
+  // Phase 2B — public Customer Google auth: GET /auth/customer/oauth/google/start and
+  // GET /auth/customer/oauth/google/callback. No `authenticate` — security is the signed state +
+  // nonce cookie. Reuses the `loginLimiter` instance (same per-IP budget as password login).
+  router.use(
+    createCustomerGoogleAuthRoute({
+      controller: customerGoogleAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
   );
 
   return router;

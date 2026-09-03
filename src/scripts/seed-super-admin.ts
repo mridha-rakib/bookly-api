@@ -57,6 +57,7 @@ export const seedSuperAdmin = async (
   const user = await dependencies.userRepository.create({
     normalizedEmail,
     passwordHash,
+    authProviders: ["PASSWORD"],
     role: "SUPER_ADMIN",
     status: "ACTIVE",
     emailVerifiedAt: new Date(),

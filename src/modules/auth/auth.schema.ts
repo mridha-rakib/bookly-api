@@ -188,7 +188,9 @@ export const verifyEmailChangeBodySchema = z
 
 export const requestPhoneChangeBodySchema = z
   .object({
-    currentPassword: z.string().min(1),
+    // Optional as of Phase 2B: a Google-only Customer setting their first phone has no current
+    // password to send. The service still requires + verifies it for every password account.
+    currentPassword: z.string().min(1).optional(),
     countryCode: countryCodeSchema,
     nationalNumber: nationalNumberSchema,
   })
