@@ -61,6 +61,52 @@ export const createManualBookingBodySchema = createBookingBodyBase
 
 export const createCustomerBookingPreviewBodySchema = createBookingBodyBase.strict();
 
+/**
+ * Package purchase (preview + finalize) — reuses createBookingBodyBase's full shape (same
+ * fields a normal Customer booking preview/finalize already sends: startAt, travelAddress,
+ * customerCity, notes, idempotencyKey) but requires EXACTLY one service line, since a Package
+ * purchase is always for one Package Deal Service (Type 1 — see package-progress.model.ts's own
+ * doc comment). Whether that one line's Service actually IS a Package Deal is a database fact
+ * the schema layer cannot see — enforced in BookingCreationService.finalizePackagePurchase.
+ * Deliberately omits `promoCode` — Promo Code support for Package purchases is not built in
+ * this phase (see the Package Deal audit's own "deferred" list).
+ */
+export const packagePurchaseBodySchema = createBookingBodyBase
+  .omit({ promoCode: true })
+  .extend({ serviceLines: z.array(serviceLineBodySchema).length(1) })
+  .strict();
+
+/**
+ * Redeem one remaining session of an already-purchased Package — no service-line pricing input
+ * at all (the base Service, price, and duration are already fixed by the entitlement itself;
+ * see PackageProgressRepository.claimSession), just the appointment specifics a normal booking
+ * needs: who provides it, when, (for a TRAVEL_TO_CUSTOMER business) where, and which valid
+ * Add-ons to attach (approved rule: the Package base is $0, but Add-ons and any real travel fee
+ * remain separately payable via the existing deposit/balance machinery — see
+ * BookingCreationService.redeemPackageSession's own doc comment).
+ */
+export const redeemPackageSessionBodySchema = z
+  .object({
+    staffMembershipId: objectIdSchema,
+    startAt: isoDateTimeSchema,
+    addonIds: z.array(objectIdSchema).max(50).default([]),
+    travelAddress: travelAddressBodySchema.optional(),
+    customerCity: z.enum(businessCities).optional(),
+    notes: z.string().trim().max(2000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(200),
+  })
+  .strict();
+
+/**
+ * Whole-Package refund/void (approved rule) — the only body field is an optional customer-
+ * supplied reason, passed through unmodified to the SAME cancellation path a normal
+ * cancelBookingBodySchema request already uses (see BookingLifecycleService.voidUnusedPackage,
+ * which reuses cancelByCustomer verbatim for the origin session when it is still UPCOMING).
+ */
+export const voidPackageBodySchema = z
+  .object({ reason: z.string().trim().max(500).optional() })
+  .strict();
+
 export const rescheduleBookingBodySchema = z.object({ startAt: isoDateTimeSchema }).strict();
 
 export const cancelBookingBodySchema = z
@@ -191,6 +237,9 @@ export type CreateManualBookingBody = z.infer<typeof createManualBookingBodySche
 export type CreateCustomerBookingPreviewBody = z.infer<
   typeof createCustomerBookingPreviewBodySchema
 >;
+export type PackagePurchaseBody = z.infer<typeof packagePurchaseBodySchema>;
+export type RedeemPackageSessionBody = z.infer<typeof redeemPackageSessionBodySchema>;
+export type VoidPackageBody = z.infer<typeof voidPackageBodySchema>;
 export type RescheduleBookingBody = z.infer<typeof rescheduleBookingBodySchema>;
 export type CancelBookingBody = z.infer<typeof cancelBookingBodySchema>;
 export type WaiveFeeBody = z.infer<typeof waiveFeeBodySchema>;

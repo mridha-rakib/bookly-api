@@ -4,6 +4,11 @@ import express, { type Express } from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 
+/**
+ * The ExpressApplication class is responsible for configuring and initializing the Express application.
+ * It sets up middleware, routes, and error handling for the application.
+ */
+
 import { buildErrorResponse } from "../common/http/responses.js";
 import { createErrorHandler } from "../common/middleware/error-handler.js";
 import { httpLoggerMiddleware } from "../common/middleware/http-logger.js";

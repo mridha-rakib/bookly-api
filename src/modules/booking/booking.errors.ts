@@ -30,7 +30,9 @@ const defaultMessages: Record<string, string> = {
   BOOKING_INVALID_VENUE_PAYMENT_AMOUNT:
     "A partial venue payment must be a whole-cent amount greater than 0 and less than the remaining balance",
   BOOKING_PACKAGE_SERVICE_NOT_SUPPORTED_YET:
-    "Booking a package service is not yet supported — package remaining-session tracking is not built yet",
+    "Booking a package service is not yet supported through the normal booking flow — purchase it from its own Package flow instead",
+  BOOKING_PACKAGE_PURCHASE_INVALID_LINES:
+    "A Package purchase must contain exactly one service line for a Package Deal service",
   BOOKING_PRICING_INPUT_INVALID: "The booked quantity for this service line is invalid",
   BOOKING_SCHEDULE_INVALID: "The requested booking time is invalid",
   BOOKING_CLIENT_CROSS_BUSINESS: "This client does not belong to the selected business",

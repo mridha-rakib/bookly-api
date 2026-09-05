@@ -5,6 +5,7 @@ import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
@@ -55,6 +56,7 @@ export const createServicesRoute = (): Router => {
     staffRepository,
     new UserRepository(),
     staffAvatarService,
+    new PackageProgressRepository(),
   );
   const controller = new ServiceController(service);
 

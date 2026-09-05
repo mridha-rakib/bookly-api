@@ -15,6 +15,8 @@ const defaultMessages: Record<string, string> = {
   STAFF_REMOVED_CANNOT_EDIT: "This staff member has been removed and can no longer be edited",
   STAFF_TIME_OFF_NOT_FOUND: "That time off entry was not found",
   STAFF_TIME_OFF_OVERLAP: "This time off overlaps with an existing entry for this staff member",
+  STAFF_REMOVAL_BLOCKED_BY_PACKAGE_ENTITLEMENTS:
+    "This is the last eligible staff member for a Package Deal service with customers who still have unused purchased sessions — assign another eligible staff member to that service before removing or deactivating this one",
 };
 
 export class StaffError extends AppError {

@@ -14,6 +14,8 @@ const defaultMessages: Record<string, string> = {
   SERVICE_CITY_NOT_SERVED: "One or more selected cities are not enabled in Travel Settings",
   SERVICE_CITIES_NOT_APPLICABLE:
     "This business does not travel to customers, so cities served cannot be set",
+  SERVICE_ARCHIVE_BLOCKED_BY_PACKAGE_ENTITLEMENTS:
+    "This Package Deal has customers with unused purchased sessions — it cannot be archived until those entitlements are fully used or refunded/voided",
 };
 
 export class ServiceError extends AppError {

@@ -2,6 +2,11 @@ import type { Types } from "mongoose";
 
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import {
+  isPackageLinkedBooking,
+  packageSessionOutcomeForBookingStatus,
+} from "../package-progress/package-progress.rules.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { BookingDocument, BookingEventHistoryEntry } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
@@ -62,7 +67,28 @@ export class NoShowResolutionService {
     // Stage D mailing — same optional-trailing pattern as elsewhere. Absent in the integration
     // suites that construct this service directly.
     private readonly noShowNotifier?: NoShowResolutionNotificationPort,
+    // Package Deal no-show resolution hook (optional + trailing, same rationale as
+    // BookingLifecycleService's identical dependency) — a genuinely resolved no-show
+    // (NO_SHOW_CHARGED or NO_SHOW_WAIVED) forfeits the Package session; see
+    // package-progress.rules.ts for the single source of truth this decision comes from.
+    private readonly packageProgressRepository?: Pick<
+      PackageProgressRepository,
+      "resolveSessionOnTerminalStatus"
+    >,
   ) {}
+
+  /** Best-effort, non-transactional (matching this worker's own existing write style — see
+   * transitionViaOwner's own bare casUpdate) — no-op for a Booking with no Package-linked line. */
+  private async syncPackageSessionOnResolvedNoShow(booking: BookingDocument): Promise<void> {
+    if (!this.packageProgressRepository || !isPackageLinkedBooking(booking)) {
+      return;
+    }
+    const outcome = packageSessionOutcomeForBookingStatus(booking.status);
+    if (outcome === "NONE") {
+      return;
+    }
+    await this.packageProgressRepository.resolveSessionOnTerminalStatus(booking._id, outcome);
+  }
 
   /**
    * Processes one overdue Booking. Concurrency-safe across multiple worker instances via TWO
@@ -91,7 +117,14 @@ export class NoShowResolutionService {
       return "skipped_already_resolved";
     }
 
-    const noShowPercentage = booking.cancellationPolicySnapshot?.noShowPercentage;
+    // Package rule (confirmed): "the lost session IS the penalty" — a Package-linked no-show
+    // (the purchase session OR a redeemed session) never carries an additional base-service
+    // percentage fee. Forcing `noShowPercentage` to undefined here reuses the EXISTING
+    // "nothing chargeable" branch below verbatim (no new code path, no Stripe call ever
+    // attempted) rather than inventing a second no-show outcome.
+    const noShowPercentage = isPackageLinkedBooking(booking)
+      ? undefined
+      : booking.cancellationPolicySnapshot?.noShowPercentage;
     const grossFeeCents = noShowPercentage
       ? Math.round((booking.financials.eligiblePlatformFeeBasisCents * noShowPercentage) / 100)
       : 0;
@@ -118,14 +151,20 @@ export class NoShowResolutionService {
       !booking.customer.customerUserId
     ) {
       const waived = await this.transitionViaOwner(booking, "NO_SHOW_WAIVED", {
-        note: !noShowPercentage
-          ? "Auto-resolved: no cancellation/no-show policy was configured for this business at booking time"
-          : "Auto-resolved: no chargeable amount or payment method available",
+        note: isPackageLinkedBooking(booking)
+          ? "Auto-resolved: Package base-service no-show — the forfeited session is the only penalty, no additional fee applies"
+          : !noShowPercentage
+            ? "Auto-resolved: no cancellation/no-show policy was configured for this business at booking time"
+            : "Auto-resolved: no chargeable amount or payment method available",
       });
+      if (waived) {
+        await this.syncPackageSessionOnResolvedNoShow(waived);
+      }
       // Only notify the customer of a "fee waived" outcome when there genuinely WAS a no-show
       // fee to waive: a policy existed, it is a real online customer, and it is not a MANUAL
       // booking (i.e. the ONLY reason we reached this branch is amountCents <= 0 — the deposit
-      // already covered the fee). No email for "no policy was ever configured" / MANUAL.
+      // already covered the fee). No email for "no policy was ever configured" / MANUAL / a
+      // Package (which never had a real fee at stake in the first place).
       const feeCoveredByDeposit =
         Boolean(noShowPercentage) &&
         booking.source !== "MANUAL" &&
@@ -193,6 +232,9 @@ export class NoShowResolutionService {
     const charged = await this.transitionViaOwner(booking, "NO_SHOW_CHARGED", {
       note: providerReference ? `Charged via ${providerReference}` : undefined,
     });
+    if (charged) {
+      await this.syncPackageSessionOnResolvedNoShow(charged);
+    }
 
     // Stage D — the customer NO_SHOW_CHARGED email, only after the charge SUCCEEDED and the
     // status transition won its CAS. Amounts are this method's OWN already-computed domain

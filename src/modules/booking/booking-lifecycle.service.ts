@@ -1,4 +1,4 @@
-import mongoose, { Types } from "mongoose";
+import mongoose, { type ClientSession, Types } from "mongoose";
 
 import { logger } from "../../config/logger.js";
 import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
@@ -11,6 +11,13 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import type { IntegrationService } from "../integration/integration.service.js";
 import type { BookingRescheduledCustomerNotificationPort } from "../notification/booking-rescheduled-customer.notifier.js";
 import type { StaffBookingNotificationPort } from "../notification/staff-booking.notifier.js";
+import { PackageProgressError } from "../package-progress/package-progress.errors.js";
+import type { PackageProgressDocument } from "../package-progress/package-progress.model.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import {
+  isPackageLinkedBooking,
+  packageSessionOutcomeForBookingStatus,
+} from "../package-progress/package-progress.rules.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
@@ -124,7 +131,63 @@ export class BookingLifecycleService {
     // any reminder-preference gate. Absent in the integration suites that construct this service
     // directly — a safe no-op there.
     private readonly bookingRescheduledCustomerNotifier?: BookingRescheduledCustomerNotificationPort,
+    // Package Deal session lifecycle hooks (optional + trailing, same rationale as every other
+    // dep above). completeBooking marks a redeemed session COMPLETED (informational only); every
+    // terminal-status transition that can result from cancellation/waive-fee/no-show-resolution
+    // resolves the Package session as RESTORE or FORFEIT per package-progress.rules.ts's own
+    // single source of truth (Phase 4B correction — see that file's doc comment for the full
+    // confirmed mapping). Every hook is a best-effort no-op for a Booking that carries no
+    // packageProgressId at all (every normal, non-Package booking) and absent entirely in suites
+    // that construct this service directly without exercising Package Deals.
+    private readonly packageProgressRepository?: Pick<
+      PackageProgressRepository,
+      | "resolveSessionOnTerminalStatus"
+      | "markSessionCompleted"
+      | "findByIdForCustomerAndBusiness"
+      | "voidPackage"
+    >,
   ) {}
+
+  /** Best-effort — no-op for a Booking with no Package-linked line (every normal booking).
+   * Never throws: PackageProgressRepository's own hooks are already idempotent filter-guarded
+   * updates, and a missing/absent repository is itself a valid, supported configuration. */
+  private async syncPackageSessionOnCompletion(
+    booking: BookingDocument,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!this.packageProgressRepository || !isPackageLinkedBooking(booking)) {
+      return;
+    }
+    await this.packageProgressRepository.markSessionCompleted(booking._id, session);
+  }
+
+  /**
+   * Resolves the Package session's fate for ANY terminal status a Booking can reach via
+   * cancellation, fee-waiver, or no-show resolution — the ONE place that decision is applied
+   * (package-progress.rules.ts's packageSessionOutcomeForBookingStatus is the ONE place it is
+   * DECIDED). Called from every code path that can produce one of the six statuses that function
+   * maps: performCancellationTransaction (CANCELLED_BY_CUSTOMER/CANCELLED_BY_BUSINESS/
+   * LATE_CANCELLATION), waiveFee's three internal branches and resolveNoShowByBusiness
+   * (NO_SHOW_WAIVED/NO_SHOW_CANCELLED), and NoShowResolutionService.autoResolve
+   * (NO_SHOW_CHARGED/NO_SHOW_WAIVED, called from that separate class via the same repository).
+   */
+  private async syncPackageSessionOnTerminalStatus(
+    booking: BookingDocument,
+    session?: ClientSession,
+  ): Promise<void> {
+    if (!this.packageProgressRepository || !isPackageLinkedBooking(booking)) {
+      return;
+    }
+    const outcome = packageSessionOutcomeForBookingStatus(booking.status);
+    if (outcome === "NONE") {
+      return;
+    }
+    await this.packageProgressRepository.resolveSessionOnTerminalStatus(
+      booking._id,
+      outcome,
+      session,
+    );
+  }
 
   /** Post-commit tail — retire the 24h reminder for a booking leaving UPCOMING. Best-effort,
    * never throws (the scheduler swallows its own errors). No-op when no scheduler was injected. */
@@ -267,6 +330,8 @@ export class BookingLifecycleService {
           throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
         }
 
+        await this.syncPackageSessionOnCompletion(updated, dbSession);
+
         if (venueAmountCents > 0) {
           await this.financialTransactionService.record(
             {
@@ -345,15 +410,36 @@ export class BookingLifecycleService {
     const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
       booking._id,
     );
-    const outcome = buildCancellationOutcome({
+    const classifiedOutcome = buildCancellationOutcome({
       scheduledStartAt: booking.schedule.startAt,
       now,
       policySnapshot: booking.cancellationPolicySnapshot,
       eligiblePlatformFeeBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
       depositAlreadyPaidCents: upfrontPayment?.amountCents ?? 0,
     });
+    // The STATUS classification (on-time vs late) is always derived from the real, unmodified
+    // classification above — reused exactly as-is, never a new cutoff (confirmed Package rule).
     const nextStatus: BookingStatus =
-      outcome.feeMode === "PERCENTAGE" ? "LATE_CANCELLATION" : "CANCELLED_BY_CUSTOMER";
+      classifiedOutcome.feeMode === "PERCENTAGE" ? "LATE_CANCELLATION" : "CANCELLED_BY_CUSTOMER";
+
+    // Package rule (confirmed): "the lost session IS the penalty" — a late-cancelled
+    // Package-linked Booking (the purchase session OR a redeemed session) is FORFEITED
+    // (see syncPackageSessionOnTerminalStatus) but must NEVER also carry an additional
+    // percentage-based cancellation fee on top. The fee-bearing fields are zeroed for
+    // PERSISTENCE and for the charge-decision below; `nextStatus` above already used the real
+    // classification, so the LATE_CANCELLATION status itself is untouched — only the money is
+    // suppressed. A $0 redeemed session already produces a $0 fee here regardless (its
+    // `eligiblePlatformFeeBasisCents` is 0), so this only has a real effect for the Package
+    // purchase Booking (session 1), which carries the genuine bundle-price basis.
+    const outcome: BookingCancellationOutcome = isPackageLinkedBooking(booking)
+      ? {
+          ...classifiedOutcome,
+          cancellationFeeCents: 0,
+          depositAppliedCents: 0,
+          additionalChargeCents: 0,
+          settlementStatus: "NOT_APPLICABLE",
+        }
+      : classifiedOutcome;
 
     const event: BookingEventHistoryEntry = {
       type: "STATUS_CHANGED",
@@ -463,6 +549,110 @@ export class BookingLifecycleService {
     await this.dispatchCancellationNotifications(refunded, "BUSINESS", business);
     await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
     return refunded;
+  }
+
+  /**
+   * Whole-Package refund/void (confirmed rule): allowed ONLY for a Package that is genuinely
+   * "completely unused" — no session (including the purchase session itself) has ever reached
+   * COMPLETED or FORFEITED (late-cancelled/no-showed), and no session OTHER than the one this
+   * call itself may cancel is still SCHEDULED/unresolved (confirmed rule: an unresolved
+   * scheduled session must never let a Package look "unused"). A future session that was
+   * successfully cancelled ON TIME and restored does NOT by itself disqualify this — it leaves
+   * no COMPLETED/FORFEITED trace behind.
+   *
+   * Reuses, never reimplements:
+   *  - `cancelByCustomer` (unmodified) to resolve the origin Booking if it is still UPCOMING —
+   *    its own existing on-time/late classification decides the outcome exactly as it always
+   *    has; a LATE cancellation here FORFEITS the session (via the existing hook), which then
+   *    correctly fails this method's own "never used" check below — no separate cutoff invented.
+   *  - `executeBusinessCancellationRefund` (unmodified) for the actual Stripe refund + REFUND
+   *    ledger entry — refunds EXACTLY the amount `findSucceededUpfrontPayment` proves was really
+   *    collected (the deposit, e.g. EUR 35 of a EUR 200 bundle), never the full bundle price.
+   *
+   * The "off-platform/venue balance already recorded as paid" sub-case this rule's own audit
+   * flagged as needing infrastructure verification PROVABLY CANNOT ARISE here: recording a venue
+   * payment is only ever possible via `completeBooking`, which requires the Booking to already
+   * be COMPLETED — and a COMPLETED origin session is already excluded by the "never used" check
+   * below. So a Package that passes this method's eligibility check can only ever have an
+   * online-collected deposit at stake, never an off-platform amount — no missing infrastructure,
+   * no invented reversal mechanism.
+   */
+  public async voidUnusedPackage(
+    customerUserId: string,
+    businessId: string,
+    packageProgressId: string,
+    reason: string | undefined,
+  ): Promise<PackageProgressDocument> {
+    if (!this.packageProgressRepository) {
+      throw new Error("PackageProgressRepository must be injected to void a Package");
+    }
+
+    let progress = await this.packageProgressRepository.findByIdForCustomerAndBusiness(
+      packageProgressId,
+      businessId,
+      customerUserId,
+    );
+    if (!progress) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+    if (progress.voidedAt) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
+    }
+
+    const originBooking = await this.bookingRepository.findByIdForCustomer(
+      progress.originBookingId,
+      customerUserId,
+    );
+    if (!originBooking) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+
+    // If the purchase session is still upcoming, resolve it through the SAME cancellation path
+    // any customer-initiated cancellation already goes through — its own on-time/late
+    // classification (unchanged) decides whether the session restores or forfeits, and the
+    // eligibility check below reads whatever that decision actually produced.
+    if (originBooking.status === "UPCOMING") {
+      await this.cancelByCustomer(customerUserId, String(originBooking._id), reason);
+      const refreshed = await this.packageProgressRepository.findByIdForCustomerAndBusiness(
+        packageProgressId,
+        businessId,
+        customerUserId,
+      );
+      if (refreshed) {
+        progress = refreshed;
+      }
+    }
+
+    const everUsed = progress.sessions.some(
+      (entry) => entry.status === "COMPLETED" || entry.status === "FORFEITED",
+    );
+    if (everUsed) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
+    }
+
+    const hasUnresolvedSession = progress.sessions.some((entry) => entry.status === "SCHEDULED");
+    if (hasUnresolvedSession) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
+    }
+
+    const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
+      progress.originBookingId,
+    );
+    if (upfrontPayment && upfrontPayment.amountCents > 0) {
+      const currentOrigin = await this.bookingRepository.findByIdForCustomer(
+        progress.originBookingId,
+        customerUserId,
+      );
+      if (currentOrigin) {
+        await this.executeBusinessCancellationRefund(currentOrigin, upfrontPayment);
+      }
+    }
+
+    const voided = await this.packageProgressRepository.voidPackage(progress._id);
+    if (!voided) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
+    }
+    return voided;
   }
 
   /**
@@ -782,6 +972,8 @@ export class BookingLifecycleService {
         if (!updated) {
           throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
         }
+
+        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
@@ -963,6 +1155,7 @@ export class BookingLifecycleService {
       if (!updated) {
         throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
       }
+      await this.syncPackageSessionOnTerminalStatus(updated);
       await this.dispatchNoShowWaivedNotification(updated, business.name);
       return updated;
     }
@@ -995,7 +1188,13 @@ export class BookingLifecycleService {
     nextStatus?: BookingStatus;
   } | null> {
     if (booking.status === "PENDING") {
-      const noShowPercentage = booking.cancellationPolicySnapshot?.noShowPercentage;
+      // Package rule (confirmed): "the lost session IS the penalty" — a Package-linked no-show
+      // never carries an additional base-service percentage fee, matching autoResolve's own
+      // suppression in NoShowResolutionService (the two paths must agree, so a manual waive and
+      // the worker's own auto-resolution never disagree on what was ever owed).
+      const noShowPercentage = isPackageLinkedBooking(booking)
+        ? undefined
+        : booking.cancellationPolicySnapshot?.noShowPercentage;
       const grossFee = noShowPercentage
         ? Math.round((booking.financials.eligiblePlatformFeeBasisCents * noShowPercentage) / 100)
         : 0;
@@ -1085,6 +1284,8 @@ export class BookingLifecycleService {
         if (!updated) {
           throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
         }
+
+        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
       });
     } catch (error) {
       if (duplicateKey) {
@@ -1170,6 +1371,8 @@ export class BookingLifecycleService {
         if (!updated) {
           throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
         }
+
+        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
       });
     } finally {
       await dbSession.endSession();
@@ -1239,6 +1442,8 @@ export class BookingLifecycleService {
     if (!updated) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
+
+    await this.syncPackageSessionOnTerminalStatus(updated);
 
     // Stage D — customer notification for the terminal no-show outcome. Best-effort.
     if (this.noShowNotifier) {

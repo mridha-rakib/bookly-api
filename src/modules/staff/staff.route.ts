@@ -12,6 +12,7 @@ import { TokenService } from "../auth/token.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { StaffAccessNotifier } from "../notification/staff-access.notifier.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
@@ -78,6 +79,7 @@ const buildStaffService = (): StaffService => {
     new StaffAccessNotifier(new EmailOutboxService(), userRepository),
     staffAccessEventRepository,
     new ServiceRepository(),
+    new PackageProgressRepository(),
   );
 };
 
