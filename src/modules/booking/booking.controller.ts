@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
+import type { PackageProgressBusinessParams } from "../package-progress/package-progress.schema.js";
 import type { UserRole } from "../user/user.types.js";
 import {
   toBookingCalendarEntryDto,
@@ -20,7 +21,10 @@ import type {
   ListBusinessBookingsQuery,
   ListCustomerBookingsQuery,
   MarkNoShowBody,
+  PackagePurchaseBody,
+  RedeemPackageSessionBody,
   RescheduleBookingBody,
+  VoidPackageBody,
   WaiveFeeBody,
 } from "./booking.schema.js";
 import type { BookingService } from "./booking.service.js";
@@ -251,6 +255,99 @@ export class BookingController {
     }
 
     sendSuccess(response, 201, "Booking confirmed", toBookingDetailDto(result.booking));
+  };
+
+  // --- Customer-side: Package purchase / session redemption ----------------------------------
+
+  public previewPackagePurchase = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as BookingBusinessParams;
+    const body = request.validated?.body as PackagePurchaseBody;
+
+    const preview = await this.creationService.previewPackagePurchase(userId, params.businessId, {
+      serviceLines: body.serviceLines,
+      startAt: body.startAt,
+      travelAddress: body.travelAddress,
+      customerCity: body.customerCity,
+      notes: body.notes,
+      idempotencyKey: body.idempotencyKey,
+    });
+
+    sendSuccess(response, 200, "Package purchase preview", preview);
+  };
+
+  public finalizePackagePurchase = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as BookingBusinessParams;
+    const body = request.validated?.body as PackagePurchaseBody;
+
+    const result = await this.creationService.finalizePackagePurchase(userId, params.businessId, {
+      serviceLines: body.serviceLines,
+      startAt: body.startAt,
+      travelAddress: body.travelAddress,
+      customerCity: body.customerCity,
+      notes: body.notes,
+      idempotencyKey: body.idempotencyKey,
+    });
+
+    if (result.status === "requires_action") {
+      sendSuccess(response, 200, "Payment requires additional authentication", result);
+      return;
+    }
+
+    sendSuccess(response, 201, "Package purchased", toBookingDetailDto(result.booking));
+  };
+
+  public redeemPackageSession = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    const body = request.validated?.body as RedeemPackageSessionBody;
+
+    const result = await this.creationService.redeemPackageSession(
+      userId,
+      params.businessId,
+      params.packageProgressId,
+      {
+        staffMembershipId: body.staffMembershipId,
+        startAt: body.startAt,
+        addonIds: body.addonIds,
+        travelAddress: body.travelAddress,
+        customerCity: body.customerCity,
+        notes: body.notes,
+        idempotencyKey: body.idempotencyKey,
+      },
+    );
+
+    if (result.status === "requires_action") {
+      sendSuccess(response, 200, "Payment requires additional authentication", result);
+      return;
+    }
+
+    sendSuccess(response, 201, "Session booked", toBookingDetailDto(result.booking));
+  };
+
+  /** Whole-Package refund/void (approved rule) — see BookingLifecycleService.voidUnusedPackage's
+   * own doc comment for the full eligibility rule. Returns just the entitlement's own updated
+   * fields (never a Booking DTO — voiding may resolve zero, one, or leave several Bookings
+   * untouched depending on what was actually scheduled). */
+  public voidPackage = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    const body = request.validated?.body as VoidPackageBody;
+
+    const voided = await this.lifecycleService.voidUnusedPackage(
+      userId,
+      params.businessId,
+      params.packageProgressId,
+      body.reason,
+    );
+
+    sendSuccess(response, 200, "Package refunded and voided", {
+      packageProgressId: String(voided._id),
+      voidedAt: voided.voidedAt?.toISOString(),
+      remainingSessions: voided.remainingSessions,
+      totalSessions: voided.totalSessions,
+    });
   };
 
   public getDetailForCustomer = async (request: Request, response: Response): Promise<void> => {

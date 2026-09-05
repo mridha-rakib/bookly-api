@@ -7,6 +7,7 @@ import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
 import { StaffInvitationNotifier } from "../notification/staff-invitation.notifier.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import type { StaffInvitationDocument } from "../staff-invitation/staff-invitation.model.js";
@@ -136,7 +137,69 @@ export class StaffService {
       ServiceRepository,
       "listActiveByAssignedStaffMembershipId"
     >,
+    // Optional + trailing, same rationale: only needed to enforce the approved Package Deal
+    // staff-removal protection below. Absent in unit suites that don't exercise it.
+    private readonly packageProgressRepository?: Pick<
+      PackageProgressRepository,
+      "hasOutstandingEntitlementsForService"
+    >,
   ) {}
+
+  /**
+   * Approved rule: removing (soft-remove) or deactivating (employmentActive -> false) the FINAL
+   * eligible staff member for a Package Deal Service that still has outstanding (unused,
+   * unvoided) Package entitlements is blocked outright — it would leave paying customers with no
+   * usable professional to redeem their remaining sessions against. "Eligible" mirrors
+   * AvailabilityService.resolveEligibleStaff's own definition exactly: assigned to the Service
+   * AND `employmentActive && !removedAt` — reused here rather than re-derived. Never
+   * auto-reassigns or invents a substitute — the caller must assign another eligible staff
+   * member (or wait for the entitlement to be used/voided) before this action is allowed.
+   * A no-op when either optional dependency is absent (matches every other optional-dependency
+   * feature in this class) or the membership is assigned to no Package Deal service.
+   */
+  private async assertPackageStaffRemovalSafe(
+    business: BusinessDocument,
+    membershipId: string,
+  ): Promise<void> {
+    if (!this.serviceRepository || !this.packageProgressRepository) {
+      return;
+    }
+
+    const assignedServices = await this.serviceRepository.listActiveByAssignedStaffMembershipId(
+      business._id,
+      membershipId,
+    );
+
+    for (const service of assignedServices) {
+      if (!service.isPackageDeal) {
+        continue;
+      }
+
+      const hasOutstanding =
+        await this.packageProgressRepository.hasOutstandingEntitlementsForService(
+          business._id,
+          service._id,
+        );
+      if (!hasOutstanding) {
+        continue;
+      }
+
+      const otherAssignedIds = service.assignedStaffMembershipIds.filter(
+        (id) => String(id) !== String(membershipId),
+      );
+      const otherMemberships =
+        otherAssignedIds.length > 0
+          ? await this.staffRepository.findManyByIdsForBusiness(business._id, otherAssignedIds)
+          : [];
+      const otherEligible = otherMemberships.filter(
+        (membership) => membership.employmentActive && !membership.removedAt,
+      );
+
+      if (otherEligible.length === 0) {
+        throw new StaffError("STAFF_REMOVAL_BLOCKED_BY_PACKAGE_ENTITLEMENTS", 409);
+      }
+    }
+  }
 
   public async listStaff(actorUserId: string, businessId: string): Promise<StaffListDto> {
     const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
@@ -367,6 +430,10 @@ export class StaffService {
       if (roleEvent) {
         accessEvents.push(roleEvent);
       }
+    }
+
+    if (input.employmentActive === false && membership.employmentActive) {
+      await this.assertPackageStaffRemovalSafe(business, staffId);
     }
 
     if (input.employmentActive !== undefined) {
@@ -620,6 +687,7 @@ export class StaffService {
     staffId: string,
   ): Promise<void> {
     const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    await this.assertPackageStaffRemovalSafe(business, staffId);
     const removed = await this.staffRepository.softRemoveById(business._id, staffId);
 
     if (!removed) {

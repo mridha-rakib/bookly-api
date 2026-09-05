@@ -13,6 +13,8 @@ import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessAccessRepository } from "../../../src/modules/business/business-access.repository.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
+import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { createServicesRoute } from "../../../src/modules/services/service.route.js";
@@ -94,6 +96,7 @@ describe("database-backed Service integration", () => {
       staffRepository,
       userRepository,
       staffAvatarService,
+      new PackageProgressRepository(),
     );
     tokenService = new TokenService(new SessionRepository());
   });
@@ -459,6 +462,62 @@ describe("database-backed Service integration", () => {
       await expect(
         serviceService.archiveService(String(user._id), String(business._id), service.id),
       ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("blocks archiving a Package Deal Service with outstanding (unused, unvoided) Package entitlements", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+      const service = await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({
+          serviceCategoryId: category.id,
+          isPackageDeal: true,
+          pricingMode: undefined,
+          fixedPricing: undefined,
+          packageServicesName: "Deep Tissue Massage",
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 5,
+            bundlePriceCents: 45_000,
+            discountPercent: 10,
+          },
+        }),
+      );
+
+      const entitlement = await PackageProgressModel.create({
+        _id: new mongoose.Types.ObjectId(),
+        businessId: business._id,
+        customerUserId: new mongoose.Types.ObjectId(),
+        businessClientId: new mongoose.Types.ObjectId(),
+        serviceId: service.id,
+        totalSessions: 5,
+        remainingSessions: 4,
+        completedSessions: 0,
+        sessions: [],
+        originBookingId: new mongoose.Types.ObjectId(),
+        purchaseSnapshot: {
+          name: service.name,
+          packageServicesName: "Deep Tissue Massage",
+          bundlePriceCents: 45_000,
+          durationMin: 60,
+          sessionsInPackage: 5,
+          discountPercent: 10,
+        },
+      });
+
+      await expect(
+        serviceService.archiveService(String(user._id), String(business._id), service.id),
+      ).rejects.toMatchObject({ statusCode: 409 });
+
+      // Once the entitlement is fully depleted, archiving is no longer blocked.
+      await PackageProgressModel.updateOne(
+        { _id: entitlement._id },
+        { $set: { remainingSessions: 0 } },
+      ).exec();
+      await serviceService.archiveService(String(user._id), String(business._id), service.id);
+      const archived = await ServiceModel.findById(service.id).orFail().exec();
+      expect(archived.status).toBe("ARCHIVED");
     });
   });
 

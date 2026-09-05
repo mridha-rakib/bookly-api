@@ -15,6 +15,9 @@ import type { BusinessTravelSettingsRepository } from "../business-travel-settin
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
 import type { IntegrationService } from "../integration/integration.service.js";
+import { PackageProgressError } from "../package-progress/package-progress.errors.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import { computePackageBalanceSettlement } from "../package-progress/package-progress.rules.js";
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
@@ -189,6 +192,11 @@ export class BookingCreationService {
     // row from the post-commit tail. Best-effort, never throws — a reminder problem can never
     // roll back a committed booking. Absent in suites that construct this service directly.
     private readonly appointmentReminderScheduler?: AppointmentReminderSchedulingPort,
+    // Optional trailing dep (same rationale) — required only by the three Package-purchase/
+    // redemption methods below (previewPackagePurchase/finalizePackagePurchase/
+    // redeemPackageSession). Absent in every pre-existing suite that constructs this service
+    // directly without exercising Package Deals.
+    private readonly packageProgressRepository?: PackageProgressRepository,
   ) {}
 
   /**
@@ -611,6 +619,756 @@ export class BookingCreationService {
       }
       throw error;
     }
+  }
+
+  // --- Customer: Package purchase / session redemption --------------------------------------
+  //
+  // Package Deal audit (see the Phase A report): a Package is multiple sessions of the SAME
+  // Service — never a bundle of distinct Services (packagePricing has exactly one durationMin/
+  // bundlePriceCents for the whole package, structurally ruling that out). The Booking schema
+  // has exactly one root {timezone, startAt, endAt} shared by every line, so a multi-session
+  // Package can never be ONE Booking — each session is its own, normal Booking, linked back to
+  // a small PackageProgress entitlement via the packageProgressId/sessionIndex fields
+  // booking.model.ts already reserved for this ("confirmed rule K").
+  //
+  // CONFIRMED PRODUCT ANSWERS this implementation is built on (Phase 4B approved-rules
+  // corrections supersede the original Phase 2 clarification round where they differ):
+  //  - Payment: deposit-now/balance-at-venue at purchase (KEPT — never a full Stripe charge;
+  //    see PackagePricing's own comment for why). Sessions 2..N never redeem until that ORIGIN
+  //    Booking's own venue balance is recorded settled (computePackageBalanceSettlement,
+  //    package-progress.rules.ts) — no second payment-status system. The Package base session
+  //    itself is ALWAYS $0 once unlocked — never re-run through calculateBookingDepositCents
+  //    for the base price, which floors at DEPOSIT_MIN_CENTS even for a €0 basis (the exact
+  //    double-charge landmine the Phase 3 audit found). A redemption's Add-ons/travel fee ARE
+  //    real, separately payable money and DO go through the normal deposit formula.
+  //  - Scheduling: incremental — purchasing books ONLY session 1; sessions 2..N are booked
+  //    later, one at a time, via redeemPackageSession.
+  //  - Cancellation/no-show: on-time cancellation returns the session to the balance, no
+  //    penalty; LATE cancellation or a genuine NO_SHOW FORFEITS the session (the lost session
+  //    IS the penalty — no additional percentage fee on the package base). Wired via
+  //    BookingLifecycleService/NoShowResolutionService's own sync hooks — see
+  //    package-progress.rules.ts's packageSessionOutcomeForBookingStatus.
+  //  - Expiry: none (no field, no rule).
+  //  - Whole-package refund/void: allowed only while completely unused (no session ever
+  //    COMPLETED/FORFEITED, no unresolved SCHEDULED session) — see voidUnusedPackage in
+  //    BookingLifecycleService. No partial/prorated refunds.
+  //
+  // Deliberately still deferred (not silently invented):
+  //  - Owner/Supervisor manual Package purchase or redemption on a Customer's behalf.
+  //  - Promo Code support on a Package purchase.
+
+  /** Read-only Package purchase quote — mirrors previewCustomerBooking exactly (same shared
+   * private helpers, same shape), scoped to exactly one Package Deal service line. Never
+   * reserves or persists anything. */
+  public async previewPackagePurchase(
+    customerUserId: string,
+    businessId: string,
+    input: CreateBookingInput,
+  ): Promise<BookingCreationPreview> {
+    this.requirePackagePurchaseShape(input);
+    const business = await this.requireBusiness(businessId);
+
+    const startAt = this.parseStartAt(input.startAt);
+    const lines = await this.resolveServiceLines(business, startAt, input, { allowPackage: true });
+    this.requirePackageServiceLine(lines[0] as ResolvedServiceLine);
+    const fulfilment = await this.resolveFulfilment(business, input);
+    this.bookingService.validateFulfilmentSnapshot(business, fulfilment);
+    const travelFeeCents = await this.requireTravelEligibilityAndFee(
+      business,
+      lines,
+      input.customerCity,
+    );
+
+    const existingClient = await this.clientRepository.findByBusinessIdAndLinkedUserId(
+      business._id,
+      customerUserId,
+    );
+    const isFirstBooking = !existingClient?.activatedAt;
+    const financials = this.assembleFinancials(
+      "BOOKLY_MANAGED",
+      lines,
+      travelFeeCents,
+      isFirstBooking,
+    );
+    const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
+    const line = lines[0] as ResolvedServiceLine;
+
+    return {
+      finalizable: true,
+      isFirstBooking,
+      business: { id: String(business._id), name: business.name, timezone: business.timezone },
+      schedule: {
+        timezone: business.timezone,
+        startAt: startAt.toISOString(),
+        endAt: line.endAt.toISOString(),
+      },
+      fulfilment,
+      serviceLines: [
+        {
+          serviceId: String(line.service._id),
+          staffMembershipId: String(line.staffMembership._id),
+          serviceSnapshot: line.serviceSnapshot,
+          staffSnapshot: line.staffSnapshot,
+          addons: line.addons,
+          amountCents: line.amountCents,
+        },
+      ],
+      financials,
+      amountDueNowCents: financials.depositCents,
+      requiresSavedCard: true,
+      hasSavedCard: cardStatus.hasSavedCard,
+    };
+  }
+
+  /**
+   * The real Package purchase: books and pays for session 1 exactly like
+   * finalizeCustomerBooking (same idempotency-claim/payment/activation/ledger machinery,
+   * reused via persistCustomerBooking, completely unmodified), then creates the linked
+   * PackageProgress entitlement with `remainingSessions = sessionsInPackage - 1`. The
+   * entitlement is written BEFORE persistCustomerBooking (both keyed off pre-generated ids,
+   * the same "pre-generate then link" pattern this class already uses for bookingId) so a
+   * failure in the Booking write can be cleanly compensated by deleting the just-created,
+   * not-yet-referenced-by-anything-else entitlement row — never leaving a paid Booking with
+   * no entitlement, and never leaving an entitlement with no origin Booking.
+   */
+  public async finalizePackagePurchase(
+    customerUserId: string,
+    businessId: string,
+    input: CreateBookingInput,
+  ): Promise<FinalizeBookingResult> {
+    this.requirePackageProgressRepository();
+    this.requirePackagePurchaseShape(input);
+    this.requireIdempotencyKey(input.idempotencyKey);
+    const business = await this.requireBusiness(businessId);
+
+    const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
+    if (existingClaim) {
+      const booking = await this.awaitIdempotentBooking(
+        { business, idempotencyKey: input.idempotencyKey },
+        existingClaim.bookingId,
+      );
+      return { status: "confirmed", booking };
+    }
+
+    const startAt = this.parseStartAt(input.startAt);
+    const lines = await this.resolveServiceLines(business, startAt, input, { allowPackage: true });
+    const line = this.requirePackageServiceLine(lines[0] as ResolvedServiceLine);
+    const packagePricing = line.service.packagePricing as NonNullable<
+      ServiceDocument["packagePricing"]
+    >;
+
+    const fulfilment = await this.resolveFulfilment(business, input);
+    this.bookingService.validateFulfilmentSnapshot(business, fulfilment);
+    const travelFeeCents = await this.requireTravelEligibilityAndFee(
+      business,
+      lines,
+      input.customerCity,
+    );
+
+    const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
+    const isFirstBooking = !client.activatedAt;
+    const financials = this.assembleFinancials(
+      "BOOKLY_MANAGED",
+      lines,
+      travelFeeCents,
+      isFirstBooking,
+    );
+
+    const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
+    if (!cardStatus.hasSavedCard) {
+      throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
+    }
+
+    const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
+    const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
+    const customer = this.buildCustomerSnapshot(client);
+    const createdBy: BookingActor = {
+      actorUserId: new Types.ObjectId(customerUserId),
+      actorRole: "CUSTOMER",
+    };
+
+    const bookingId = new Types.ObjectId();
+    const packageProgressId = new Types.ObjectId();
+
+    const claimResult = await this.claimRepository.claim({
+      idempotencyKey: input.idempotencyKey,
+      businessId: business._id,
+      actorUserId: new Types.ObjectId(customerUserId),
+      bookingId,
+    });
+
+    if (!claimResult.isNew) {
+      const booking = await this.awaitIdempotentBooking(
+        { business, idempotencyKey: input.idempotencyKey },
+        claimResult.bookingId,
+      );
+      return { status: "confirmed", booking };
+    }
+
+    // Stamp the entitlement linkage onto the single resolved line now that both ids exist —
+    // resolvePricingAndTiming (called inside resolveServiceLines above) deliberately left this
+    // empty, since it runs before either id is generated.
+    line.pricingInput = {
+      sessionsInPackage: packagePricing.sessionsInPackage,
+      sessionIndex: 1,
+      packageProgressId,
+    };
+
+    const customerChargeNowCents = financials.depositCents;
+    let paymentResult: PaymentIntentResult | undefined;
+
+    if (customerChargeNowCents > 0) {
+      try {
+        paymentResult = await this.paymentService.chargeBookingDeposit({
+          userId: customerUserId,
+          amountCents: customerChargeNowCents,
+          idempotencyKey: input.idempotencyKey,
+          metadata: {
+            bookingId: String(bookingId),
+            businessId: String(business._id),
+            purpose: "PACKAGE_PURCHASE",
+          },
+        });
+      } catch (error) {
+        await this.claimRepository.release(input.idempotencyKey);
+        throw error;
+      }
+
+      if (paymentResult.status === "requires_action") {
+        await this.claimRepository.release(input.idempotencyKey);
+        return {
+          status: "requires_action",
+          clientSecret: paymentResult.clientSecret as string,
+          paymentIntentId: paymentResult.paymentIntentId,
+        };
+      }
+
+      if (paymentResult.status !== "succeeded") {
+        await this.claimRepository.release(input.idempotencyKey);
+        throw new PaymentError(
+          "PAYMENT_FAILED",
+          402,
+          paymentResult.failureMessage
+            ? [{ message: paymentResult.failureMessage, code: "PAYMENT_FAILED" }]
+            : undefined,
+        );
+      }
+    }
+
+    try {
+      await (this.packageProgressRepository as PackageProgressRepository).create({
+        _id: packageProgressId,
+        businessId: business._id,
+        customerUserId: new Types.ObjectId(customerUserId),
+        businessClientId: client._id,
+        serviceId: line.service._id,
+        totalSessions: packagePricing.sessionsInPackage,
+        remainingSessions: packagePricing.sessionsInPackage - 1,
+        completedSessions: 0,
+        sessions: [{ sessionIndex: 1, bookingId, status: "SCHEDULED" }],
+        originBookingId: bookingId,
+        purchaseSnapshot: {
+          name: line.service.name,
+          packageServicesName: line.service.packageServicesName,
+          bundlePriceCents: packagePricing.bundlePriceCents,
+          durationMin: packagePricing.durationMin,
+          sessionsInPackage: packagePricing.sessionsInPackage,
+          discountPercent: packagePricing.discountPercent,
+        },
+      });
+    } catch (error) {
+      await this.claimRepository.release(input.idempotencyKey);
+      if (paymentResult) {
+        await this.compensateFailedBookingAfterPayment(
+          business,
+          bookingId,
+          client,
+          customerChargeNowCents,
+          paymentResult,
+        );
+      }
+      throw error;
+    }
+
+    try {
+      const booking = await this.persistCustomerBooking({
+        bookingId,
+        business,
+        customer,
+        createdBy,
+        fulfilment,
+        lines,
+        financials,
+        cancellationPolicySnapshot,
+        noShowEligibilitySnapshot,
+        startAt,
+        notes: input.notes,
+        idempotencyKey: input.idempotencyKey,
+        client,
+        isFirstBooking,
+        paymentResult,
+        resolvedPromo: undefined,
+        customerChargeNowCents,
+      });
+      return { status: "confirmed", booking };
+    } catch (error) {
+      // The Booking never came into being — the entitlement pointing at it must not survive
+      // either (never called once a session may already have been redeemed against this row,
+      // which cannot happen here since this row was only just created above, in this same call).
+      await (this.packageProgressRepository as PackageProgressRepository)
+        .deleteById(packageProgressId)
+        .catch(() => {});
+      if (paymentResult) {
+        await this.compensateFailedBookingAfterPayment(
+          business,
+          bookingId,
+          client,
+          customerChargeNowCents,
+          paymentResult,
+        );
+      } else {
+        await this.claimRepository.release(input.idempotencyKey);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Redeems ONE remaining session of an already-purchased Package. The base session itself is
+   * ALWAYS $0 (its price was already collected at purchase) — approved rule — but a selected
+   * Add-on or (for a TRAVEL_TO_CUSTOMER business) this visit's real travel fee remain separately
+   * payable via the exact same deposit/3DS/ledger machinery any normal booking already uses.
+   * Blocked entirely (PACKAGE_PROGRESS_BALANCE_NOT_SETTLED) until the ORIGIN purchase Booking's
+   * own venue balance is recorded settled — see computePackageBalanceSettlement's own doc
+   * comment for why this reuses that Booking's existing financial state rather than a second,
+   * separately-tracked payment-status field. Reuses every generic booking-creation primitive
+   * (staff eligibility, availability re-validation, atomic slot reservation, notifications,
+   * Google Calendar sync, appointment reminders) exactly as-is; the only Package-specific step
+   * is the atomic PackageProgressRepository.claimSession guard, which prevents two concurrent
+   * redemption requests from both consuming the SAME last remaining session (see that method's
+   * own doc comment for why a single guarded `findOneAndUpdate` — never a naive
+   * read-then-decrement — makes this safe).
+   */
+  public async redeemPackageSession(
+    customerUserId: string,
+    businessId: string,
+    packageProgressId: string,
+    input: {
+      staffMembershipId: string;
+      startAt: string;
+      addonIds?: string[] | undefined;
+      travelAddress?: CreateBookingInput["travelAddress"];
+      customerCity?: CreateBookingInput["customerCity"];
+      notes?: string | undefined;
+      idempotencyKey: string;
+    },
+  ): Promise<FinalizeBookingResult> {
+    this.requirePackageProgressRepository();
+    this.requireIdempotencyKey(input.idempotencyKey);
+    const business = await this.requireBusiness(businessId);
+
+    const progress = await (
+      this.packageProgressRepository as PackageProgressRepository
+    ).findByIdForCustomerAndBusiness(packageProgressId, business._id, customerUserId);
+    if (!progress) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+    if (progress.voidedAt) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_VOIDED", 409);
+    }
+    if (progress.remainingSessions <= 0) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
+    }
+
+    // Approved payment/unlock model: sessions 2..N never redeem until the origin (purchase)
+    // Booking's own venue balance has been recorded as FULLY settled — reusing that Booking's
+    // OWN authoritative `financials.balanceDueCents`/`completionPayment` (never a second,
+    // separately-tracked payment-status field; see package-progress.rules.ts's own doc comment).
+    // Re-fetched live on every call — client state can never unlock this.
+    const originBooking = await this.bookingRepository.findById(
+      business._id,
+      progress.originBookingId,
+    );
+    if (!originBooking) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+    const settlement = computePackageBalanceSettlement(originBooking);
+    if (!settlement.balanceSettled) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_BALANCE_NOT_SETTLED", 409);
+    }
+
+    const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
+    if (existingClaim) {
+      const booking = await this.awaitIdempotentBooking(
+        { business, idempotencyKey: input.idempotencyKey },
+        existingClaim.bookingId,
+      );
+      return { status: "confirmed", booking };
+    }
+
+    const startAt = this.parseStartAt(input.startAt);
+
+    const { service, staffMembership } = await this.bookingService.validateResponsibleStaff(
+      business,
+      String(progress.serviceId),
+      input.staffMembershipId,
+    );
+    if (!service.isPackageDeal || !service._id.equals(progress.serviceId)) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_SERVICE_MISMATCH", 409);
+    }
+    // Approved Service-status rule: ACTIVE and INACTIVE both still allow redeeming an
+    // ALREADY-purchased session (only new purchases are blocked for INACTIVE — see
+    // ServiceService's own createService/updateService guard); only ARCHIVED blocks it, matching
+    // validateResponsibleStaff's own ARCHIVED-only check above — no stricter gate here anymore.
+    if (service.status === "ARCHIVED") {
+      throw new BookingError("BOOKING_SERVICE_ARCHIVED", 409);
+    }
+    const packagePricing = service.packagePricing;
+    if (!packagePricing) {
+      throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 409);
+    }
+
+    // Snapshot vs live (approved rule): WHAT was purchased — the per-session duration — stays
+    // exactly as it was at purchase time, even if the Owner later edits the Service's live
+    // duration; a later purchase of the SAME (edited) Service gets the new live duration
+    // instead (see finalizePackagePurchase, which always reads the CURRENT packagePricing).
+    // Buffer/processing time are operational scheduling detail, not part of what was
+    // contractually sold, so they stay LIVE like every other operational rule below (staff,
+    // hours, schedule, availability, served city).
+    const durationMin = progress.purchaseSnapshot.durationMin;
+    const endAt = new Date(
+      startAt.getTime() +
+        (durationMin +
+          (packagePricing.bufferAfterMin ?? 0) +
+          (packagePricing.processingTimeMin ?? 0)) *
+          60_000,
+    );
+
+    await this.availabilityService.assertSlotIsBookable({
+      business,
+      service,
+      staffMembership,
+      startAt,
+      endAt,
+      partySize: 1,
+    });
+
+    const fulfilment = await this.resolveFulfilment(business, {
+      serviceLines: [],
+      startAt: input.startAt,
+      travelAddress: input.travelAddress,
+      customerCity: input.customerCity,
+      idempotencyKey: input.idempotencyKey,
+    });
+    this.bookingService.validateFulfilmentSnapshot(business, fulfilment);
+
+    // Approved Add-on rule: the Package base is $0, but a selected Add-on is still real,
+    // separately payable money — reuses resolveAddonSnapshots verbatim (same validation,
+    // pricing, and "must be assigned to this Service" rule any normal booking already enforces).
+    const addons = await this.bookingService.resolveAddonSnapshots(
+      business,
+      String(service._id),
+      input.addonIds ?? [],
+    );
+
+    const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
+    const customer = this.buildCustomerSnapshot(client);
+    const createdBy: BookingActor = {
+      actorUserId: new Types.ObjectId(customerUserId),
+      actorRole: "CUSTOMER",
+    };
+    const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
+    const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
+
+    // Same staffSnapshot convention resolveServiceLines already establishes for a normal
+    // booking (booking.model.ts's own doc comment: snapshots survive a later profile change) —
+    // resolved once here rather than batched, since a redemption is always exactly one line.
+    const staffProfile = await this.userRepository.findProfileByUserId(staffMembership.userId);
+    const staffSnapshot = staffProfile
+      ? { firstName: staffProfile.firstName, lastName: staffProfile.lastName }
+      : undefined;
+
+    const resolvedLine: ResolvedServiceLine = {
+      service,
+      staffMembership,
+      serviceSnapshot: {
+        name: service.name,
+        pricingMode: "PACKAGE",
+        durationMin,
+        ...(progress.purchaseSnapshot.discountPercent !== undefined
+          ? { discountPercent: progress.purchaseSnapshot.discountPercent }
+          : {}),
+      },
+      staffSnapshot,
+      // sessionIndex/packageProgressId are stamped in below, once the atomic claim (inside the
+      // transaction) reveals which numbered session this actually is — mirrors
+      // finalizePackagePurchase's own "stamp after both ids/claims exist" comment.
+      pricingInput: { sessionsInPackage: progress.totalSessions },
+      addons,
+      // The Package base service itself is ALWAYS $0 (already paid for at purchase) —
+      // approved rule — regardless of whether Add-ons/travel are also selected.
+      amountCents: 0,
+      discountCents: 0,
+      capacityMax: 1,
+      partySize: 1,
+      endAt,
+    };
+
+    // Approved travel-fee rule: reuse the EXISTING served-city validation AND the EXISTING
+    // per-city fee lookup verbatim — a Package base session is $0, but a real travel fee for
+    // THIS visit is still owed, exactly like any other TRAVEL_TO_CUSTOMER booking (never a new
+    // formula, never bundled for "all future visits").
+    const travelFeeCents = await this.requireTravelEligibilityAndFee(
+      business,
+      [resolvedLine],
+      input.customerCity,
+    );
+
+    // Base service is always $0; Add-ons and travel fee are real, separately payable money —
+    // reusing the EXACT existing deposit/balance formula (assembleFinancials, unmodified) only
+    // when there is genuinely something to charge. When there is nothing extra (the common
+    // case), financials stay all-zero — deliberately NOT routed through assembleFinancials even
+    // then, since calculateBookingDepositCents floors at DEPOSIT_MIN_CENTS even for a €0 basis
+    // (the exact double-charge the Package Deal audit found and this guard exists to prevent).
+    const addonsSubtotalCents = addons.reduce((sum, addon) => sum + addon.priceCents, 0);
+    const hasPayableExtra = addonsSubtotalCents > 0 || travelFeeCents > 0;
+    // A redeeming customer is by definition already activated (they own an existing purchased
+    // Package) — never re-litigate first-vs-returning here; persistCustomerBooking's own
+    // markActivated call below is idempotent regardless (a no-op "loser" for an already-active
+    // Client), so passing false is simply the correct, already-known answer, not a shortcut.
+    const isFirstBooking = false;
+    const financials: BookingFinancials = hasPayableExtra
+      ? this.assembleFinancials("BOOKLY_MANAGED", [resolvedLine], travelFeeCents, isFirstBooking)
+      : {
+          currency: "EUR",
+          servicesSubtotalCents: 0,
+          addonsSubtotalCents: 0,
+          serviceDiscountCents: 0,
+          travelFeeCents: 0,
+          eligiblePlatformFeeBasisCents: 0,
+          platformFeeCents: 0,
+          depositCents: 0,
+          balanceDueCents: 0,
+          totalCents: 0,
+        };
+
+    if (financials.depositCents > 0) {
+      const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
+      if (!cardStatus.hasSavedCard) {
+        throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
+      }
+    }
+
+    const bookingId = new Types.ObjectId();
+    const claimResult = await this.claimRepository.claim({
+      idempotencyKey: input.idempotencyKey,
+      businessId: business._id,
+      actorUserId: new Types.ObjectId(customerUserId),
+      bookingId,
+    });
+    if (!claimResult.isNew) {
+      const booking = await this.awaitIdempotentBooking(
+        { business, idempotencyKey: input.idempotencyKey },
+        claimResult.bookingId,
+      );
+      return { status: "confirmed", booking };
+    }
+
+    const customerChargeNowCents = financials.depositCents;
+    let paymentResult: PaymentIntentResult | undefined;
+
+    if (customerChargeNowCents > 0) {
+      try {
+        paymentResult = await this.paymentService.chargeBookingDeposit({
+          userId: customerUserId,
+          amountCents: customerChargeNowCents,
+          idempotencyKey: input.idempotencyKey,
+          metadata: {
+            bookingId: String(bookingId),
+            businessId: String(business._id),
+            purpose: "PACKAGE_SESSION_EXTRAS",
+          },
+        });
+      } catch (error) {
+        await this.claimRepository.release(input.idempotencyKey);
+        throw error;
+      }
+
+      if (paymentResult.status === "requires_action") {
+        await this.claimRepository.release(input.idempotencyKey);
+        return {
+          status: "requires_action",
+          clientSecret: paymentResult.clientSecret as string,
+          paymentIntentId: paymentResult.paymentIntentId,
+        };
+      }
+
+      if (paymentResult.status !== "succeeded") {
+        await this.claimRepository.release(input.idempotencyKey);
+        throw new PaymentError(
+          "PAYMENT_FAILED",
+          402,
+          paymentResult.failureMessage
+            ? [{ message: paymentResult.failureMessage, code: "PAYMENT_FAILED" }]
+            : undefined,
+        );
+      }
+    }
+
+    const dbSession = await mongoose.startSession();
+    let created: BookingDocument | undefined;
+
+    try {
+      await dbSession.withTransaction(async () => {
+        const afterClaim = await (
+          this.packageProgressRepository as PackageProgressRepository
+        ).claimSession(progress._id, dbSession);
+        if (!afterClaim) {
+          throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
+        }
+        const claimedSessionIndex = afterClaim.totalSessions - afterClaim.remainingSessions;
+
+        const reservation = await this.reservationService.reserveOrJoin(
+          {
+            businessId: business._id,
+            staffMembershipId: staffMembership._id,
+            serviceId: service._id,
+            timezone: business.timezone,
+            startAt,
+            endAt,
+            capacityMax: 1,
+            partySize: 1,
+            idempotencyKey: `${input.idempotencyKey}:0`,
+          },
+          dbSession,
+        );
+
+        const reference = await this.generateUniqueReference();
+
+        const serviceLine: BookingServiceLine = {
+          serviceId: service._id,
+          serviceSnapshot: resolvedLine.serviceSnapshot,
+          pricingInput: {
+            sessionsInPackage: afterClaim.totalSessions,
+            sessionIndex: claimedSessionIndex,
+            packageProgressId: progress._id,
+          },
+          responsibleStaffMembershipId: staffMembership._id,
+          ...(staffSnapshot ? { staffSnapshot } : {}),
+          addons,
+          amountCents: 0,
+          reservationId: reservation.reservationId,
+        };
+
+        created = await this.bookingRepository.create(
+          {
+            _id: bookingId,
+            businessId: business._id,
+            reference,
+            source: "BOOKLY_MANAGED",
+            status: "UPCOMING",
+            customer,
+            createdBy,
+            fulfilment,
+            serviceLines: [serviceLine],
+            financials,
+            schedule: { timezone: business.timezone, startAt, endAt },
+            customerRescheduleCount: 0,
+            rescheduleHistory: [],
+            eventHistory: [
+              {
+                type: "CREATED",
+                nextStatus: "UPCOMING",
+                actorUserId: createdBy.actorUserId,
+                actorRole: createdBy.actorRole,
+                createdAt: new Date(),
+              },
+            ],
+            ...(cancellationPolicySnapshot ? { cancellationPolicySnapshot } : {}),
+            ...(noShowEligibilitySnapshot ? { noShowEligibilitySnapshot } : {}),
+            ...(input.notes ? { notes: input.notes } : {}),
+          },
+          dbSession,
+        );
+
+        await (this.packageProgressRepository as PackageProgressRepository).recordScheduledSession(
+          progress._id,
+          claimedSessionIndex,
+          bookingId,
+          dbSession,
+        );
+
+        // Real money was actually charged (Add-ons/travel) — ledger it exactly like any other
+        // BOOKLY_MANAGED deposit (never PLATFORM_FEE here: isFirstBooking is always false for a
+        // redemption, matching the confirmed "already activated" reasoning above).
+        if (customerChargeNowCents > 0) {
+          await this.financialTransactionService.record(
+            {
+              businessId: business._id,
+              bookingId,
+              businessClientId: client._id,
+              customerUserId: createdBy.actorUserId,
+              type: "DEPOSIT",
+              direction: "DEBIT",
+              amountCents: customerChargeNowCents,
+              currency: financials.currency,
+              status: "SUCCEEDED",
+              ...(paymentResult ? { providerReference: paymentResult.paymentIntentId } : {}),
+              idempotencyKey: `${input.idempotencyKey}:deposit`,
+            },
+            dbSession,
+          );
+        }
+      });
+    } catch (error) {
+      await this.claimRepository.release(input.idempotencyKey);
+      if (paymentResult) {
+        await this.compensateFailedBookingAfterPayment(
+          business,
+          bookingId,
+          client,
+          customerChargeNowCents,
+          paymentResult,
+        );
+      }
+      if (this.isTransactionUnsupported(error)) {
+        throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+      }
+      throw error;
+    } finally {
+      await dbSession.endSession();
+    }
+
+    if (!created) {
+      throw new Error("Package session booking failed without throwing");
+    }
+
+    await this.syncBookingCreatedToGoogleCalendar(created);
+    await this.dispatchBookingCreatedNotifications(created, business);
+    await this.dispatchAppointmentReminderScheduling(created);
+
+    return { status: "confirmed", booking: created };
+  }
+
+  private requirePackageProgressRepository(): void {
+    if (!this.packageProgressRepository) {
+      throw new Error(
+        "PackageProgressRepository must be injected to use Package purchase/redemption",
+      );
+    }
+  }
+
+  private requirePackagePurchaseShape(input: CreateBookingInput): void {
+    if (input.serviceLines.length !== 1) {
+      throw new BookingError("BOOKING_PACKAGE_PURCHASE_INVALID_LINES", 400);
+    }
+  }
+
+  private requirePackageServiceLine(line: ResolvedServiceLine): ResolvedServiceLine {
+    if (!line.service.isPackageDeal) {
+      throw new BookingError("BOOKING_PACKAGE_PURCHASE_INVALID_LINES", 400);
+    }
+    return line;
   }
 
   /**
@@ -1046,6 +1804,12 @@ export class BookingCreationService {
     business: BusinessDocument,
     startAt: Date,
     input: CreateBookingInput,
+    // Additive, defaults to false for every pre-existing call site (createManualBooking,
+    // previewCustomerBooking, finalizeCustomerBooking) — the BOOKING_PACKAGE_SERVICE_NOT_SUPPORTED_YET
+    // guard below stays fully intact there. Only finalizePackagePurchase/previewPackagePurchase
+    // pass `allowPackage: true`, and only for the one, single-line Package purchase path — never
+    // for a normal multi-service booking mixing a package with anything else.
+    options: { allowPackage?: boolean } = {},
   ): Promise<ResolvedServiceLine[]> {
     if (input.serviceLines.length === 0) {
       throw new BookingError("BOOKING_NO_SERVICE_LINES", 400);
@@ -1064,7 +1828,7 @@ export class BookingCreationService {
         throw new BookingError("BOOKING_SERVICE_ARCHIVED", 409);
       }
 
-      if (service.isPackageDeal) {
+      if (service.isPackageDeal && !options.allowPackage) {
         throw new BookingError("BOOKING_PACKAGE_SERVICE_NOT_SUPPORTED_YET", 409);
       }
 
@@ -1140,6 +1904,42 @@ export class BookingCreationService {
     capacityMax: number;
     partySize: number;
   } {
+    // A Package Deal Service has no `pricingMode` at all (forbidden by service.schema.ts when
+    // isPackageDeal is true) — checked here, before the switch below, exactly the same way
+    // AvailabilityService.resolveServiceConfig already branches on isPackageDeal first (see
+    // availability.service.ts). `pricingInputSnapshot` is intentionally empty here — the real
+    // sessionsInPackage/sessionIndex/packageProgressId are stamped onto the resolved line by
+    // the caller (finalizePackagePurchase) only once the entitlement's ids are known, which
+    // happens after this method returns.
+    if (service.isPackageDeal) {
+      const pricing = service.packagePricing;
+      if (!pricing) {
+        throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 409);
+      }
+      if (pricingInput.hours !== undefined || pricingInput.personCount !== undefined) {
+        throw new BookingError("BOOKING_PRICING_INPUT_INVALID", 400);
+      }
+
+      const amountCents = pricing.bundlePriceCents;
+      const discountCents = pricing.discountPercent
+        ? Math.round((amountCents * pricing.discountPercent) / 100)
+        : 0;
+
+      return {
+        pricingMode: "PACKAGE",
+        pricingInputSnapshot: {},
+        amountCents,
+        discountCents,
+        ...(pricing.discountPercent !== undefined
+          ? { discountPercent: pricing.discountPercent }
+          : {}),
+        occupiedMin:
+          pricing.durationMin + (pricing.bufferAfterMin ?? 0) + (pricing.processingTimeMin ?? 0),
+        capacityMax: 1,
+        partySize: 1,
+      };
+    }
+
     switch (service.pricingMode) {
       case "FIXED": {
         const pricing = service.fixedPricing;

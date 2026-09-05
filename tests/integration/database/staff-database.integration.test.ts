@@ -24,7 +24,11 @@ import { ClientRepository } from "../../../src/modules/client/client.repository.
 import { ClientIdentityService } from "../../../src/modules/client/client-identity.service.js";
 import { ContactChangeChallengeRepository } from "../../../src/modules/contact-change/contact-change-challenge.repository.js";
 import { LinkedAccountRepository } from "../../../src/modules/linked-account/linked-account.repository.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
+import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
+import { ServiceModel } from "../../../src/modules/services/service.model.js";
+import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -161,6 +165,10 @@ describe("database-backed StaffMembership integration", () => {
       staffScheduleRepository,
       staffTimeOffRepository,
       staffAvatarService,
+      undefined, // staffAccessNotifier
+      undefined, // staffAccessEventRepository
+      new ServiceRepository(),
+      new PackageProgressRepository(),
     );
     tokenService = new TokenService(new SessionRepository());
   });
@@ -497,6 +505,205 @@ describe("database-backed StaffMembership integration", () => {
       }),
     ).rejects.toMatchObject({ statusCode: 409 });
     expect(await UserModel.countDocuments({ normalizedEmail: "gone@example.com" })).toBe(1);
+  });
+
+  // --- Package Deal staff-removal protection (approved rule) --------------------------
+
+  describe("Package Deal staff-removal protection", () => {
+    const createPackageService = async (
+      businessId: Types.ObjectId,
+      assignedStaffMembershipIds: Types.ObjectId[],
+    ) =>
+      ServiceModel.create({
+        businessId,
+        status: "ACTIVE",
+        isFeatured: false,
+        isPackageDeal: true,
+        category: "Wellness & Beauty",
+        name: "5 Session Massage Pack",
+        packageServicesName: "Deep Tissue Massage",
+        packagePricing: {
+          durationMin: 60,
+          sessionsInPackage: 5,
+          bundlePriceCents: 45_000,
+          discountPercent: 10,
+        },
+        sessionExpiryAlert: { enabled: false },
+        scheduleMode: "AUTO",
+        manualSchedule: [],
+        servedCities: [],
+        assignedStaffMembershipIds,
+      });
+
+    const createOutstandingEntitlement = async (
+      businessId: Types.ObjectId,
+      serviceId: Types.ObjectId,
+    ) =>
+      PackageProgressModel.create({
+        businessId,
+        customerUserId: new mongoose.Types.ObjectId(),
+        businessClientId: new mongoose.Types.ObjectId(),
+        serviceId,
+        totalSessions: 5,
+        remainingSessions: 4,
+        completedSessions: 0,
+        sessions: [],
+        originBookingId: new mongoose.Types.ObjectId(),
+        purchaseSnapshot: {
+          name: "5 Session Massage Pack",
+          packageServicesName: "Deep Tissue Massage",
+          bundlePriceCents: 45_000,
+          durationMin: 60,
+          sessionsInPackage: 5,
+          discountPercent: 10,
+        },
+      });
+
+    it("rejects removing the FINAL eligible staff member for a Package Deal service with outstanding entitlements", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-pkg-remove@example.com",
+        "Business Pkg",
+      );
+      const staffMember = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Only Therapist",
+          email: "only-therapist@example.com",
+          role: "STAFF",
+        },
+      );
+      const service = await createPackageService(business._id, [
+        new mongoose.Types.ObjectId(requireMembershipId(staffMember)),
+      ]);
+      await createOutstandingEntitlement(business._id, service._id);
+
+      await expect(
+        staffService.removeStaff(
+          String(owner._id),
+          String(business._id),
+          requireMembershipId(staffMember),
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+
+      const untouched = await StaffMembershipModel.findById(
+        requireMembershipId(staffMember),
+      ).exec();
+      expect(untouched?.removedAt).toBeUndefined();
+    });
+
+    it("rejects deactivating (employmentActive: false) the FINAL eligible staff member the same way", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-pkg-deactivate@example.com",
+        "Business Pkg",
+      );
+      const staffMember = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Only Therapist",
+          email: "only-therapist-2@example.com",
+          role: "STAFF",
+        },
+      );
+      const service = await createPackageService(business._id, [
+        new mongoose.Types.ObjectId(requireMembershipId(staffMember)),
+      ]);
+      await createOutstandingEntitlement(business._id, service._id);
+
+      await expect(
+        staffService.updateStaff(
+          String(owner._id),
+          String(business._id),
+          requireMembershipId(staffMember),
+          {
+            employmentActive: false,
+          },
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("allows removal once ANOTHER eligible staff member remains assigned to the same Package Deal service", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-pkg-ok@example.com",
+        "Business Pkg",
+      );
+      const staffA = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Therapist A",
+          email: "therapist-a@example.com",
+          role: "STAFF",
+        },
+      );
+      const staffB = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Therapist B",
+          email: "therapist-b@example.com",
+          role: "STAFF",
+        },
+      );
+      const service = await createPackageService(business._id, [
+        new mongoose.Types.ObjectId(requireMembershipId(staffA)),
+        new mongoose.Types.ObjectId(requireMembershipId(staffB)),
+      ]);
+      await createOutstandingEntitlement(business._id, service._id);
+
+      await staffService.removeStaff(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staffA),
+      );
+
+      const removed = await StaffMembershipModel.findById(requireMembershipId(staffA)).exec();
+      expect(removed?.removedAt).toBeTruthy();
+    });
+
+    it("allows removal once the Package's entitlements are fully depleted (no outstanding sessions)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-pkg-depleted@example.com",
+        "Business Pkg",
+      );
+      const staffMember = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        {
+          name: "Only Therapist",
+          email: "only-therapist-3@example.com",
+          role: "STAFF",
+        },
+      );
+      const service = await createPackageService(business._id, [
+        new mongoose.Types.ObjectId(requireMembershipId(staffMember)),
+      ]);
+      const entitlement = await createOutstandingEntitlement(business._id, service._id);
+      await PackageProgressModel.updateOne(
+        { _id: entitlement._id },
+        { $set: { remainingSessions: 0 } },
+      ).exec();
+
+      await staffService.removeStaff(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staffMember),
+      );
+
+      const removed = await StaffMembershipModel.findById(requireMembershipId(staffMember)).exec();
+      expect(removed?.removedAt).toBeTruthy();
+    });
   });
 
   // --- Role update allowlist ---------------------------------------------------------

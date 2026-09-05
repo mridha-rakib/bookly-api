@@ -34,6 +34,13 @@ import { BookingCreatedNotifier } from "../notification/booking-created.notifier
 import { BookingRescheduledCustomerNotifier } from "../notification/booking-rescheduled-customer.notifier.js";
 import { NoShowNotifier } from "../notification/no-show.notifier.js";
 import { StaffBookingNotifier } from "../notification/staff-booking.notifier.js";
+import { PackageProgressController } from "../package-progress/package-progress.controller.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import {
+  packageProgressBusinessParamsSchema,
+  packageProgressIdOnlyParamsSchema,
+} from "../package-progress/package-progress.schema.js";
+import { PackageProgressService } from "../package-progress/package-progress.service.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../payment/payment.service.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
@@ -66,7 +73,10 @@ import {
   listBusinessBookingsQuerySchema,
   listCustomerBookingsQuerySchema,
   markNoShowBodySchema,
+  packagePurchaseBodySchema,
+  redeemPackageSessionBodySchema,
   rescheduleBookingBodySchema,
+  voidPackageBodySchema,
   waiveFeeBodySchema,
 } from "./booking.schema.js";
 import { BookingService } from "./booking.service.js";
@@ -92,6 +102,7 @@ const buildController = (): BookingController => {
   const reservationRepository = new BookingSlotReservationRepository();
   const reservationService = new BookingSlotReservationService(reservationRepository);
   const claimRepository = new BookingCreationClaimRepository();
+  const packageProgressRepository = new PackageProgressRepository();
   const paymentService = new PaymentService(
     new StripePaymentGateway(),
     new CustomerPaymentProfileRepository(),
@@ -164,6 +175,7 @@ const buildController = (): BookingController => {
     platformSettingsService,
     bookingCreatedNotifier,
     appointmentReminderScheduler,
+    packageProgressRepository,
   );
 
   const lifecycleService = new BookingLifecycleService(
@@ -183,10 +195,16 @@ const buildController = (): BookingController => {
     new StaffBookingNotifier(new EmailOutboxService(), staffRepository, userRepository),
     appointmentReminderScheduler,
     new BookingRescheduledCustomerNotifier(new EmailOutboxService()),
+    packageProgressRepository,
   );
 
   return new BookingController(bookingService, creationService, lifecycleService);
 };
+
+const buildPackageProgressController = (): PackageProgressController =>
+  new PackageProgressController(
+    new PackageProgressService(new PackageProgressRepository(), new BookingRepository()),
+  );
 
 const buildAuthenticate = () => {
   const userRepository = new UserRepository();
@@ -338,6 +356,59 @@ export const createBusinessBookingRoute = (): Router => {
     asyncHandler(controller.finalizeCustomerBooking),
   );
 
+  // --- Package Deal purchase / session redemption (Package Deal audit) ---------------------
+  // Same authorization/gating shape as preview/finalize above — CUSTOMER-only, requires an
+  // APPROVED/WARNING Business. Deliberately its own routes, never folded into the normal
+  // preview/finalize bodies: a Package purchase is always exactly one line, never charged
+  // per-line pricingInput, and a redeemed session is never charged at all (see
+  // BookingCreationService's own "Customer: Package purchase / session redemption" doc comment
+  // for the full, product-confirmed rationale).
+  router.post(
+    "/:businessId/bookings/packages/preview",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+    validateRequest({ params: bookingBusinessParamsSchema, body: packagePurchaseBodySchema }),
+    asyncHandler(controller.previewPackagePurchase),
+  );
+
+  router.post(
+    "/:businessId/bookings/packages/purchase",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+    validateRequest({ params: bookingBusinessParamsSchema, body: packagePurchaseBodySchema }),
+    asyncHandler(controller.finalizePackagePurchase),
+  );
+
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/sessions",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+    validateRequest({
+      params: packageProgressBusinessParamsSchema,
+      body: redeemPackageSessionBodySchema,
+    }),
+    asyncHandler(controller.redeemPackageSession),
+  );
+
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/void",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+    validateRequest({
+      params: packageProgressBusinessParamsSchema,
+      body: voidPackageBodySchema,
+    }),
+    asyncHandler(controller.voidPackage),
+  );
+
   return router;
 };
 
@@ -348,6 +419,7 @@ export const createCustomerBookingRoute = (): Router => {
   const router = Router();
   const authenticate = buildAuthenticate();
   const controller = buildController();
+  const packageProgressController = buildPackageProgressController();
   const bookAgainController = new BookAgainController(
     new BookAgainService(
       new BookingRepository(),
@@ -403,6 +475,27 @@ export const createCustomerBookingRoute = (): Router => {
     requireRoles(["CUSTOMER"]),
     validateRequest({ params: bookingIdOnlyParamsSchema, body: rescheduleBookingBodySchema }),
     asyncHandler(controller.rescheduleByCustomer),
+  );
+
+  // Batch — "My Packages" read surface (Package Deal audit), same cross-business "/me" pattern
+  // as "My Bookings" above. Registered BEFORE "/packages/:packageProgressId" for the same
+  // literal-vs-param ordering reason as "book-again" above, in case a future literal path
+  // segment is ever added here.
+  router.get(
+    "/packages",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    asyncHandler(packageProgressController.listForCustomer),
+  );
+
+  router.get(
+    "/packages/:packageProgressId",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ params: packageProgressIdOnlyParamsSchema }),
+    asyncHandler(packageProgressController.getForCustomer),
   );
 
   return router;

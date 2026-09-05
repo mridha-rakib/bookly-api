@@ -23,6 +23,12 @@ export type BookingServiceLineDto = {
   staffName?: string | undefined;
   addons: Array<{ addonId: string; name: string; priceCents: number }>;
   amountCents: number;
+  /** Present only for a `pricingMode: "PACKAGE"` line — which numbered session of the
+   * purchased Package this Booking represents, and the entitlement it consumed from. Absent
+   * for every other pricingMode. */
+  sessionsInPackage?: number | undefined;
+  sessionIndex?: number | undefined;
+  packageProgressId?: string | undefined;
 };
 
 export type BookingDetailDto = {
@@ -148,6 +154,11 @@ const toServiceLineDto = (
     priceCents: addon.priceCents,
   })),
   amountCents: line.amountCents,
+  sessionsInPackage: line.pricingInput.sessionsInPackage,
+  sessionIndex: line.pricingInput.sessionIndex,
+  packageProgressId: line.pricingInput.packageProgressId
+    ? String(line.pricingInput.packageProgressId)
+    : undefined,
 });
 
 /** Deduped, presence-ordered display names across a Booking's service lines — a list/calendar

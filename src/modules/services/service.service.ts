@@ -4,6 +4,7 @@ import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessCity } from "../business/business.types.js";
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
@@ -89,6 +90,10 @@ export class ServiceService {
     private readonly staffRepository: StaffRepository,
     private readonly userRepository: UserRepository,
     private readonly staffAvatarService: StaffAvatarService,
+    private readonly packageProgressRepository?: Pick<
+      PackageProgressRepository,
+      "hasOutstandingEntitlementsForService"
+    >,
   ) {}
 
   // --- Service Categories -----------------------------------------------------------------
@@ -292,6 +297,22 @@ export class ServiceService {
 
     if (existing.status === "ARCHIVED") {
       throw new ServiceError("SERVICE_ALREADY_ARCHIVED", 409);
+    }
+
+    // Approved rule: ARCHIVED is blocked while outstanding Package entitlements (unused,
+    // unvoided purchased sessions) exist for this Service — archiving must never strand a
+    // customer who already paid for sessions they haven't used yet. INACTIVE already blocks new
+    // purchases (see resolveServiceLines's own ACTIVE-only gate) without this restriction —
+    // existing customers keep redeeming an INACTIVE Package Deal, so only ARCHIVED needs it.
+    if (existing.isPackageDeal && this.packageProgressRepository) {
+      const hasOutstanding =
+        await this.packageProgressRepository.hasOutstandingEntitlementsForService(
+          business._id,
+          serviceId,
+        );
+      if (hasOutstanding) {
+        throw new ServiceError("SERVICE_ARCHIVE_BLOCKED_BY_PACKAGE_ENTITLEMENTS", 409);
+      }
     }
 
     await this.serviceRepository.archiveById(business._id, serviceId);

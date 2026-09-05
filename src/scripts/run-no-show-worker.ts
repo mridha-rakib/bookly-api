@@ -10,6 +10,7 @@ import { BookingFinancialTransactionService } from "../modules/booking-financial
 import { BusinessRepository } from "../modules/business/business.repository.js";
 import { EmailOutboxService } from "../modules/email-outbox/email-outbox.service.js";
 import { NoShowNotifier } from "../modules/notification/no-show.notifier.js";
+import { PackageProgressRepository } from "../modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../modules/payment/payment.service.js";
 import { StripePaymentGateway } from "../modules/payment/stripe-payment-gateway.js";
@@ -49,6 +50,7 @@ const buildService = (): NoShowResolutionService => {
     paymentService,
     financialTransactionService,
     new NoShowNotifier(new EmailOutboxService()),
+    new PackageProgressRepository(),
   );
 };
 
