@@ -15,7 +15,7 @@ const RESET_ENV = () => {
   process.env["SMTP_USER"] = "smtp-user";
   process.env["SMTP_PASS"] = "smtp-pass";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   delete process.env["SENDGRID_API_KEY"];
   delete process.env["RESEND_API_KEY"];
   delete process.env["RESEND_FROM_EMAIL"];

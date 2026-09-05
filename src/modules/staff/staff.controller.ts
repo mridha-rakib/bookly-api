@@ -122,6 +122,20 @@ export class StaffController {
     sendSuccess(response, 200, "Time off removed");
   };
 
+  public getMySchedule = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as StaffBusinessParams;
+    const result = await this.staffService.getMySchedule(userId, params.businessId);
+    sendSuccess(response, 200, "My schedule", result);
+  };
+
+  public listMyAssignedServices = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as StaffBusinessParams;
+    const result = await this.staffService.listMyAssignedServices(userId, params.businessId);
+    sendSuccess(response, 200, "My assigned services", result);
+  };
+
   private requireUserId(request: Request): string {
     const userId = request.auth?.userId;
 

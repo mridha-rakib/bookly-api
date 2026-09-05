@@ -27,6 +27,7 @@ import {
   createCustomerReviewRoute,
   createPublicBusinessReviewRoute,
 } from "../modules/review/review.route.js";
+import { createStaffScheduleRoute } from "../modules/staff/staff.route.js";
 import { createSuperAdminRoute } from "../modules/super-admin/super-admin.route.js";
 import { createContactRoute } from "../modules/support/contact.route.js";
 import { createSupportRoute } from "../modules/support/support.route.js";
@@ -74,6 +75,14 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // createBusinessRoute()'s router-wide BUSINESS_OWNER-only gate, so this MUST be registered
   // before it).
   router.use("/businesses", createDashboardOverviewRoute());
+  // Phase 4A — Staff list read + schedule/time-off (Owner-or-Supervisor) plus Staff/Supervisor
+  // self-service "my schedule"/"my assigned services" (Owner-or-Supervisor-or-Staff). Same
+  // per-route-auth-before-stricter-router-wide-gate rationale as the routers above — Supervisor
+  // has no staff-schedule access at all, and Staff has none of this self-service at all, under
+  // createBusinessRoute()'s router-wide BUSINESS_OWNER-only gate, so this MUST be registered
+  // before it. createStaffRoute() (core staff identity: create/update/remove/invitations) stays
+  // Owner-only and mounted inside createBusinessRoute() as before.
+  router.use("/businesses", createStaffScheduleRoute());
   router.use("/businesses", createBusinessRoute());
   // Customer self-service "My Bookings" surface — cross-business, never nested under
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).

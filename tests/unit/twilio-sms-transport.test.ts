@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  */
 const RESET_ENV = () => {
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   delete process.env["TWILIO_ACCOUNT_SID"];
   delete process.env["TWILIO_AUTH_TOKEN"];
   delete process.env["TWILIO_MESSAGING_SERVICE_SID"];

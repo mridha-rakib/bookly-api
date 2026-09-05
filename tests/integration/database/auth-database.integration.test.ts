@@ -100,7 +100,7 @@ class TestPhoneOtpProvider implements PhoneOtpProvider {
   }
 
   public async verifyOtp(input: { toE164: string; code: string }): Promise<boolean> {
-    return input.code === "1234";
+    return input.code === "123456";
   }
 }
 
@@ -233,7 +233,7 @@ const completeCustomer = async (
   );
   await parts.authService.sendPhoneOtp({ sessionId });
   const result = await parts.authService.verifyCustomerPhoneAndComplete(
-    verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+    verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
     context,
   );
 
@@ -274,7 +274,7 @@ const completeBusinessOwner = async (
   );
   await parts.authService.sendPhoneOtp({ sessionId });
   await parts.authService.verifyProfessionalPhone(
-    verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+    verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
   );
   await parts.authService.saveBusinessDetails(
     businessDetailsBodySchema.parse({
@@ -534,7 +534,7 @@ describe("database-backed authentication integration", () => {
     const { sessionId } = await completeCustomer("customer-repeat@example.com", parts);
 
     await expect(
-      parts.authService.verifyCustomerPhoneAndComplete({ sessionId, code: "1234" }, context),
+      parts.authService.verifyCustomerPhoneAndComplete({ sessionId, code: "123456" }, context),
     ).rejects.toMatchObject({ statusCode: 409 });
     expect(await UserModel.countDocuments()).toBe(1);
     expect(await UserProfileModel.countDocuments()).toBe(1);
@@ -564,11 +564,11 @@ describe("database-backed authentication integration", () => {
 
     const outcomes = await Promise.allSettled([
       race.authService.verifyCustomerPhoneAndComplete(
-        { sessionId: raceSessionId, code: "1234" },
+        { sessionId: raceSessionId, code: "123456" },
         context,
       ),
       race.authService.verifyCustomerPhoneAndComplete(
-        { sessionId: raceSessionId, code: "1234" },
+        { sessionId: raceSessionId, code: "123456" },
         context,
       ),
     ]);
@@ -641,7 +641,7 @@ describe("database-backed authentication integration", () => {
     );
     await parts.authService.sendPhoneOtp({ sessionId });
     await parts.authService.verifyProfessionalPhone(
-      verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
     );
 
     // Simulates a tampered client request (e.g. via DevTools) sending a different owner
@@ -720,7 +720,7 @@ describe("database-backed authentication integration", () => {
 
     await parts.authService.sendPhoneOtp({ sessionId });
     await parts.authService.verifyProfessionalPhone(
-      verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
     );
 
     const afterPhoneVerified = await parts.authService.getProgress(sessionId);
@@ -1270,7 +1270,7 @@ describe("database-backed authentication integration", () => {
 
     await expect(
       parts.authService.verifyCustomerPhoneAndComplete(
-        verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+        verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
         context,
       ),
     ).rejects.toMatchObject({ statusCode: 503 });
@@ -1401,7 +1401,7 @@ describe("database-backed authentication integration", () => {
       });
 
       const before = await UserModel.findById(userId).exec();
-      const me = await parts.authService.verifyPhoneChange(userId, { code: "1234" });
+      const me = await parts.authService.verifyPhoneChange(userId, { code: "123456" });
       expect(me.profile?.phone?.nationalNumber).toBe("98887766");
 
       const after = await UserModel.findById(userId).exec();
@@ -1692,7 +1692,7 @@ const prepareBusinessOwnerForCompletion = async (
   );
   await parts.authService.sendPhoneOtp({ sessionId });
   await parts.authService.verifyProfessionalPhone(
-    verifyPhoneOtpBodySchema.parse({ sessionId, code: "1234" }),
+    verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
   );
   await parts.authService.saveBusinessDetails(
     businessDetailsBodySchema.parse({

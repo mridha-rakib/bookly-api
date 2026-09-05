@@ -69,6 +69,22 @@ export class ServiceRepository {
     return ServiceModel.find(query).sort({ createdAt: -1 }).exec();
   }
 
+  /** Staff self-service "my assigned services" — active (non-archived, non-draft-excluded is
+   * not enforced here since a DRAFT could still list a staff assignment) services on this
+   * Business whose `assignedStaffMembershipIds` contains the given membership. */
+  public async listActiveByAssignedStaffMembershipId(
+    businessId: Types.ObjectId | string,
+    membershipId: Types.ObjectId | string,
+  ): Promise<ServiceDocument[]> {
+    return ServiceModel.find({
+      businessId,
+      assignedStaffMembershipIds: membershipId,
+      status: { $ne: "ARCHIVED" },
+    })
+      .sort({ createdAt: -1 })
+      .exec();
+  }
+
   /** Single grouped query — never one count query per status. */
   public async countByStatus(businessId: Types.ObjectId | string): Promise<ServiceStatusCounts> {
     const businessObjectId =

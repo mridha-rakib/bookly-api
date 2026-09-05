@@ -28,7 +28,10 @@ import { RegistrationSessionRepository } from "../../../src/modules/registration
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
-import { createStaffRoute } from "../../../src/modules/staff/staff.route.js";
+import {
+  createStaffRoute,
+  createStaffScheduleRoute,
+} from "../../../src/modules/staff/staff.route.js";
 import { StaffService } from "../../../src/modules/staff/staff.service.js";
 import { StaffScheduleModel } from "../../../src/modules/staff/staff-schedule.model.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
@@ -177,10 +180,17 @@ describe("database-backed StaffMembership integration", () => {
     return { user, business };
   };
 
-  /** Builds a minimal Express app mirroring business.route.ts's real auth+role gate. */
+  /**
+   * Builds a minimal Express app mirroring api-router.ts's real mounting order: the
+   * Owner-or-Supervisor(-or-Staff) schedule/time-off/list router is registered FIRST with its
+   * own per-route auth (no blanket gate), then the Owner-only core-identity router is
+   * registered behind a blanket Owner-only gate — same order/rationale as
+   * createStaffScheduleRoute() being mounted before createBusinessRoute() in production.
+   */
   const buildStaffApp = () => {
     const app = express();
     app.use(express.json());
+    app.use("/businesses", createStaffScheduleRoute());
     app.use(
       createAuthenticateAccessTokenMiddleware(tokenService, userRepository),
       requireActiveUser(),
@@ -965,6 +975,171 @@ describe("database-backed StaffMembership integration", () => {
       expect(updated.role).toBe("SUPERVISOR");
       const user = await UserModel.findById(created.userId).orFail();
       expect(user.status).toBe("ACTIVE");
+    });
+  });
+
+  describe("Phase 4A — Supervisor schedule/list access + Staff self-service (real HTTP boundary)", () => {
+    it("allows an active SUPERVISOR to list staff and read/write a colleague's schedule", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const supervisor = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Sup Ervisor", email: "supervisor@example.com", role: "SUPERVISOR" },
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "staff-a@example.com", role: "STAFF" },
+      );
+
+      const app = buildStaffApp();
+      const supervisorToken = await bearerFor(supervisor.userId, "SUPERVISOR");
+
+      const listResponse = await request(app)
+        .get(`/businesses/${business._id}/staff`)
+        .set("Authorization", supervisorToken);
+      expect(listResponse.status).toBe(200);
+      expect(
+        listResponse.body.data.members.some(
+          (m: { email: string }) => m.email === "staff-a@example.com",
+        ),
+      ).toBe(true);
+
+      const putResponse = await request(app)
+        .put(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
+        .set("Authorization", supervisorToken)
+        .send({ days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }] });
+      expect(putResponse.status).toBe(200);
+
+      const getResponse = await request(app)
+        .get(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
+        .set("Authorization", supervisorToken);
+      expect(getResponse.status).toBe(200);
+      expect(getResponse.body.data).toEqual([
+        { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" },
+      ]);
+    });
+
+    it("rejects a plain STAFF token from the list/schedule endpoints (Owner-or-Supervisor only)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "staff-a@example.com", role: "STAFF" },
+      );
+      const app = buildStaffApp();
+      const staffToken = await bearerFor(staff.userId, "STAFF");
+
+      const listResponse = await request(app)
+        .get(`/businesses/${business._id}/staff`)
+        .set("Authorization", staffToken);
+      expect(listResponse.status).toBe(403);
+
+      const scheduleResponse = await request(app)
+        .get(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
+        .set("Authorization", staffToken);
+      expect(scheduleResponse.status).toBe(403);
+    });
+
+    it("rejects a SUPERVISOR of a DIFFERENT business — 404, indistinguishable from a nonexistent business", async () => {
+      const { business: businessA } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const { user: ownerB, business: businessB } = await createBusinessOwner(
+        "owner-b@example.com",
+        "Business B",
+      );
+      const supervisorB = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        ownerB._id,
+        businessB._id,
+        { name: "Sup B", email: "sup-b@example.com", role: "SUPERVISOR" },
+      );
+      const app = buildStaffApp();
+      const supervisorBToken = await bearerFor(supervisorB.userId, "SUPERVISOR");
+
+      const response = await request(app)
+        .get(`/businesses/${businessA._id}/staff`)
+        .set("Authorization", supervisorBToken);
+      expect(response.status).toBe(404);
+    });
+
+    it("lets STAFF and SUPERVISOR read their OWN schedule via /staff/me/schedule, but not each other's or the Owner's", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "staff-a@example.com", role: "STAFF" },
+      );
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        {
+          days: [{ dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" }],
+        },
+      );
+
+      const app = buildStaffApp();
+      const staffToken = await bearerFor(staff.userId, "STAFF");
+
+      const myScheduleResponse = await request(app)
+        .get(`/businesses/${business._id}/staff/me/schedule`)
+        .set("Authorization", staffToken);
+      expect(myScheduleResponse.status).toBe(200);
+      expect(myScheduleResponse.body.data).toEqual([
+        { dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" },
+      ]);
+
+      // The Owner has no StaffMembership row at all — /me/schedule 404s rather than
+      // synthesizing an empty schedule for them.
+      const ownerToken = await bearerFor(owner._id, "BUSINESS_OWNER");
+      const ownerMyScheduleResponse = await request(app)
+        .get(`/businesses/${business._id}/staff/me/schedule`)
+        .set("Authorization", ownerToken);
+      expect(ownerMyScheduleResponse.status).toBe(404);
+    });
+
+    it("lets STAFF read their own assigned services via /staff/me/services", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "staff-a@example.com", role: "STAFF" },
+      );
+
+      const app = buildStaffApp();
+      const staffToken = await bearerFor(staff.userId, "STAFF");
+
+      const response = await request(app)
+        .get(`/businesses/${business._id}/staff/me/services`)
+        .set("Authorization", staffToken);
+      expect(response.status).toBe(200);
+      expect(response.body.data).toEqual([]);
     });
   });
 

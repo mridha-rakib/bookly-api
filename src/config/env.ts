@@ -17,6 +17,14 @@ const phoneOtpProviderSchema = z
   .enum(["dummy", "twilio"])
   .default(rawNodeEnv === "production" ? "twilio" : "dummy");
 const rawPhoneOtpProvider = phoneOtpProviderSchema.parse(process.env["OTP_PROVIDER"] || undefined);
+// Digit count of the SMS OTP delivered by Twilio Verify (phone verification / phone change).
+// MUST match the Twilio Verify Service "Code Length" setting. Distinct from OTP_LENGTH, which
+// governs the Bookly-generated EMAIL OTP and is intentionally left unchanged. Resolved at module
+// scope so DUMMY_PHONE_OTP_CODE can validate its own length against it inside createEnv().
+const phoneOtpCodeLengthSchema = z.coerce.number().int().min(4).max(10).default(6);
+const rawPhoneOtpCodeLength = phoneOtpCodeLengthSchema.parse(
+  process.env["PHONE_OTP_CODE_LENGTH"] || undefined,
+);
 const storageProviderSchema = z.enum(["s3"]).default("s3");
 const rawStorageProvider = storageProviderSchema.parse(
   process.env["STORAGE_PROVIDER"] || undefined,
@@ -294,7 +302,11 @@ export const env = createEnv({
           });
         }
       }),
+    // EMAIL / Bookly-generated OTP digit count. Intentionally left at 4 — the phone OTP length
+    // is a separate knob (PHONE_OTP_CODE_LENGTH) so raising it never touches email behaviour.
     OTP_LENGTH: z.coerce.number().int().min(4).max(4).default(4),
+    // SMS OTP (Twilio Verify) digit count — must equal the Twilio Verify Service "Code Length".
+    PHONE_OTP_CODE_LENGTH: phoneOtpCodeLengthSchema,
     OTP_EXPIRY_MINUTES: z.coerce.number().int().positive().default(10),
     OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
     OTP_MAX_VERIFICATION_ATTEMPTS: z.coerce.number().int().positive().default(5),
@@ -350,10 +362,10 @@ export const env = createEnv({
           });
         }
 
-        if (value && !/^\d{4}$/.test(value)) {
+        if (value && !new RegExp(`^\\d{${rawPhoneOtpCodeLength}}$`).test(value)) {
           context.addIssue({
             code: "custom",
-            message: "DUMMY_PHONE_OTP_CODE must be exactly 4 digits",
+            message: `DUMMY_PHONE_OTP_CODE must be exactly ${rawPhoneOtpCodeLength} digits (matches PHONE_OTP_CODE_LENGTH)`,
           });
         }
       }),

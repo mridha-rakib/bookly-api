@@ -285,7 +285,7 @@ describe("AuthService repairs", () => {
       createAuthService();
 
     const result = await service.verifyCustomerPhoneAndComplete(
-      { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+      { sessionId: new Types.ObjectId().toHexString(), code: "123456" },
       {},
     );
 
@@ -304,7 +304,7 @@ describe("AuthService repairs", () => {
     const { service, clientIdentityService } = createAuthService();
 
     await service.verifyCustomerPhoneAndComplete(
-      { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+      { sessionId: new Types.ObjectId().toHexString(), code: "123456" },
       {},
     );
     // The linking call is fire-and-forget (never awaited by the caller) — flush microtasks so
@@ -333,7 +333,7 @@ describe("AuthService repairs", () => {
     // to fail the Customer's own registration.
     await expect(
       service.verifyCustomerPhoneAndComplete(
-        { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+        { sessionId: new Types.ObjectId().toHexString(), code: "123456" },
         {},
       ),
     ).resolves.toMatchObject({ accessToken: "access-token" });
@@ -363,7 +363,7 @@ describe("AuthService repairs", () => {
 
     await expect(
       service.verifyCustomerPhoneAndComplete(
-        { sessionId: new Types.ObjectId().toHexString(), code: "1234" },
+        { sessionId: new Types.ObjectId().toHexString(), code: "123456" },
         {},
       ),
     ).rejects.toMatchObject({ statusCode: 409 });
@@ -1178,11 +1178,11 @@ describe("AuthService.verifyPhoneChange", () => {
       },
     });
 
-    await service.verifyPhoneChange(userId.toHexString(), { code: "1234" });
+    await service.verifyPhoneChange(userId.toHexString(), { code: "123456" });
 
     expect(phoneOtpProvider.verifyOtp).toHaveBeenCalledWith({
       toE164: "+35712345678",
-      code: "1234",
+      code: "123456",
     });
     expect(userRepository.updateProfile).toHaveBeenCalledWith(profile._id, { phone: newPhone });
     expect(userRepository.updatePhoneVerifiedAt).toHaveBeenCalledWith(userId, expect.any(Date));
@@ -1203,7 +1203,7 @@ describe("AuthService.verifyPhoneChange", () => {
     });
 
     await expect(
-      service.verifyPhoneChange(userId.toHexString(), { code: "0000" }),
+      service.verifyPhoneChange(userId.toHexString(), { code: "000000" }),
     ).rejects.toMatchObject({ details: [{ code: "OTP_INVALID" }] });
     expect(contactChangeChallengeRepository.incrementAttempts).toHaveBeenCalledWith(challengeId);
     expect(userRepository.updateProfile).not.toHaveBeenCalled();
@@ -1216,7 +1216,7 @@ describe("AuthService.verifyPhoneChange", () => {
     });
 
     await expect(
-      service.verifyPhoneChange(userId.toHexString(), { code: "1234" }),
+      service.verifyPhoneChange(userId.toHexString(), { code: "123456" }),
     ).rejects.toMatchObject({ details: [{ code: "CONTACT_CHANGE_NOT_FOUND" }] });
   });
 });
