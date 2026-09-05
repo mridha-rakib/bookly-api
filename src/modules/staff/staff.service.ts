@@ -7,6 +7,7 @@ import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
 import { StaffInvitationNotifier } from "../notification/staff-invitation.notifier.js";
+import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import type { StaffInvitationDocument } from "../staff-invitation/staff-invitation.model.js";
 import type { StaffInvitationService } from "../staff-invitation/staff-invitation.service.js";
@@ -32,6 +33,16 @@ export type StaffTimeOffDto = {
   type: StaffTimeOffType;
   startDate: string;
   endDate: string;
+};
+
+/** Staff self-service "my assigned services" — a deliberately minimal read (id/name/category/
+ * status), not the full owner-facing Service shape service.service.ts already returns. */
+export type StaffAssignedServiceDto = {
+  id: string;
+  name: string;
+  category: string;
+  subcategory?: string | undefined;
+  status: string;
 };
 
 export type StaffMemberDto = {
@@ -118,10 +129,17 @@ export class StaffService {
     // / DEACTIVATED / REACTIVATED event is inserted in the SAME transaction as the role /
     // employment write it records, and its `_id` becomes the stable email-dedupe identity.
     private readonly staffAccessEventRepository?: StaffAccessEventRepository,
+    // Optional + trailing, same rationale as the other optional deps above: only needed for
+    // the Staff self-service "my assigned services" read. Absent in unit suites that don't
+    // exercise that path.
+    private readonly serviceRepository?: Pick<
+      ServiceRepository,
+      "listActiveByAssignedStaffMembershipId"
+    >,
   ) {}
 
   public async listStaff(actorUserId: string, businessId: string): Promise<StaffListDto> {
-    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
     const [memberships, pendingInvitations] = await Promise.all([
       this.staffRepository.listActiveByBusinessId(businessId),
       this.staffInvitationService.listPendingForBusiness(business._id),
@@ -651,6 +669,64 @@ export class StaffService {
   }
 
   /**
+   * Staff/Supervisor self-service — read the caller's OWN schedule via their own active
+   * StaffMembership (resolved from `actorUserId`, never from a `staffId` the caller could
+   * substitute). `businessId` is only checked to match the caller's own membership so a
+   * mismatched URL path 404s rather than silently ignoring it — it is never used to look up
+   * someone else's membership. No write path exists here; Owner/Supervisor mutation of a
+   * schedule stays exclusively on {@link putSchedule}.
+   */
+  public async getMySchedule(actorUserId: string, businessId: string): Promise<ScheduleDay[]> {
+    const membership = await this.requireOwnMembershipForBusiness(actorUserId, businessId);
+    const schedule = await this.staffScheduleRepository.findByMembershipId(membership._id);
+    return this.toScheduleDayDtos(schedule ?? undefined);
+  }
+
+  /** Staff/Supervisor self-service — read the Services assigned to the caller's OWN
+   * StaffMembership. See {@link getMySchedule} for the same self-only resolution rule. */
+  public async listMyAssignedServices(
+    actorUserId: string,
+    businessId: string,
+  ): Promise<StaffAssignedServiceDto[]> {
+    const membership = await this.requireOwnMembershipForBusiness(actorUserId, businessId);
+
+    if (!this.serviceRepository) {
+      return [];
+    }
+
+    const services = await this.serviceRepository.listActiveByAssignedStaffMembershipId(
+      membership.businessId,
+      membership._id,
+    );
+
+    return services.map((service) => ({
+      id: String(service._id),
+      name: service.name,
+      category: service.category,
+      subcategory: service.subcategory,
+      status: service.status,
+    }));
+  }
+
+  /** Resolves the caller's own active StaffMembership and confirms it belongs to the requested
+   * `businessId` — the shared authorization step behind every Staff/Supervisor self-service
+   * read (getMySchedule, listMyAssignedServices). 404s (never 403) on any mismatch, matching
+   * the anti-enumeration convention the rest of this service already follows. */
+  private async requireOwnMembershipForBusiness(
+    actorUserId: string,
+    businessId: string,
+  ): Promise<StaffMembershipDocument> {
+    this.requireValidObjectId(businessId);
+    const membership = await this.staffRepository.findActiveByUserId(actorUserId);
+
+    if (!membership?.businessId.equals(businessId)) {
+      throw new StaffError("STAFF_NOT_FOUND", 404);
+    }
+
+    return membership;
+  }
+
+  /**
    * Replaces the whole week in one write. This is what enforces "at most one shift per
    * day" — there is no per-day upsert that could accumulate a second interval — and it is
    * also how the existing single "Save changes" button can update schedule alongside core
@@ -662,7 +738,7 @@ export class StaffService {
     staffId: string,
     input: PutScheduleInput,
   ): Promise<ScheduleDay[]> {
-    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
     const membership = await this.requireActiveMembershipForBusiness(business, staffId);
 
     // Defense in depth beyond the schema's duplicate-day check: dedupe by keeping the last
@@ -700,7 +776,7 @@ export class StaffService {
     staffId: string,
     input: CreateTimeOffInput,
   ): Promise<StaffTimeOffDto> {
-    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
     const membership = await this.requireActiveMembershipForBusiness(business, staffId);
 
     // Single-day leave is startDate === endDate — no separate single/range representation.
@@ -735,7 +811,7 @@ export class StaffService {
     staffId: string,
     timeOffId: string,
   ): Promise<void> {
-    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
     const membership = await this.requireActiveMembershipForBusiness(business, staffId);
 
     const deleted = await this.staffTimeOffRepository.deleteByIdForMembership(
@@ -750,13 +826,19 @@ export class StaffService {
     // Does not touch User, StaffMembership, or employmentActive — pure leave-record removal.
   }
 
-  /** Resolves + authorizes a Business, then resolves an active (not removed) membership on it. */
+  /**
+   * Resolves + authorizes a Business (Owner or Supervisor — see
+   * requireOwnedOrSupervisedStaffBusiness), then resolves an active (not removed) membership
+   * on it. Used only by the two read paths (getSchedule, listTimeOff); the three write paths
+   * (putSchedule, createTimeOff, removeTimeOff) call requireOwnedOrSupervisedStaffBusiness
+   * directly since they also need the resolved `business` for other work.
+   */
   private async requireActiveMembership(
     actorUserId: string,
     businessId: string,
     staffId: string,
   ): Promise<StaffMembershipDocument> {
-    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+    const business = await this.requireOwnedOrSupervisedStaffBusiness(actorUserId, businessId);
     return this.requireActiveMembershipForBusiness(business, staffId);
   }
 
@@ -805,6 +887,43 @@ export class StaffService {
     }
 
     return business;
+  }
+
+  /**
+   * Read/schedule authorization for the surfaces Supervisor is allowed on (staff list read,
+   * schedule read/write, time-off read/write) — Owner keeps full access via
+   * {@link requireOwnedStaffBusiness}'s ownership check; an active SUPERVISOR membership of
+   * this exact Business is additionally allowed. Deliberately NOT used by core staff-identity
+   * methods (create/update/remove staff, invitations) — those stay Owner-only via
+   * requireOwnedStaffBusiness, unchanged. Same 404-not-403 anti-enumeration convention as
+   * requireOwnedStaffBusiness for every rejection path.
+   */
+  private async requireOwnedOrSupervisedStaffBusiness(
+    actorUserId: string,
+    businessId: string,
+  ): Promise<BusinessDocument> {
+    this.requireValidObjectId(businessId);
+    const business = await this.businessRepository.findById(businessId);
+
+    if (!business) {
+      throw new StaffError("STAFF_BUSINESS_NOT_FOUND", 404);
+    }
+
+    if (business.ownerUserId.equals(actorUserId)) {
+      return business;
+    }
+
+    const membership = await this.staffRepository.findActiveByUserId(actorUserId);
+
+    if (
+      membership &&
+      membership.role === "SUPERVISOR" &&
+      membership.businessId.equals(business._id)
+    ) {
+      return business;
+    }
+
+    throw new StaffError("STAFF_BUSINESS_NOT_FOUND", 404);
   }
 
   private toOwnerDto(

@@ -3,9 +3,17 @@ import { Router } from "express";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+  requireRoles,
+} from "../auth/auth.middleware.js";
+import { TokenService } from "../auth/token.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { StaffAccessNotifier } from "../notification/staff-access.notifier.js";
+import { ServiceRepository } from "../services/service.repository.js";
+import { SessionRepository } from "../session/session.repository.js";
 import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
 import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import { StaffInvitationRepository } from "../staff-invitation/staff-invitation.repository.js";
@@ -31,13 +39,12 @@ import { StaffScheduleRepository } from "./staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "./staff-time-off.repository.js";
 
 /**
- * Mounted inside business.route.ts, underneath its existing
- * `requireRoles(["BUSINESS_OWNER"])` gate — staff creation/removal/core-identity editing
- * is BUSINESS_OWNER-only in this phase (Supervisor "manage staff schedules" is a narrower,
- * later-phase permission, not "manage staff accounts").
+ * Both route factories below build their own, independent StaffService instance — same
+ * per-router self-contained wiring convention already used across every other module
+ * (e.g. availability.route.ts, business.route.ts's sub-routers each re-instantiate their own
+ * repositories/services rather than sharing a DI container).
  */
-export const createStaffRoute = (): Router => {
-  const router = Router({ mergeParams: true });
+const buildStaffService = (): StaffService => {
   const staffRepository = new StaffRepository();
   const businessRepository = new BusinessRepository();
   const userRepository = new UserRepository();
@@ -58,7 +65,8 @@ export const createStaffRoute = (): Router => {
     staffAvatarStorageService,
     { maxUploadBytes: env.STAFF_AVATAR_MAX_UPLOAD_BYTES },
   );
-  const service = new StaffService(
+
+  return new StaffService(
     staffRepository,
     businessRepository,
     userRepository,
@@ -69,14 +77,22 @@ export const createStaffRoute = (): Router => {
     staffAvatarService,
     new StaffAccessNotifier(new EmailOutboxService(), userRepository),
     staffAccessEventRepository,
+    new ServiceRepository(),
   );
-  const controller = new StaffController(service);
+};
 
-  router.get(
-    "/:businessId/staff",
-    validateRequest({ params: staffBusinessParamsSchema }),
-    asyncHandler(controller.list),
-  );
+/**
+ * Mounted inside business.route.ts, underneath its existing
+ * `requireRoles(["BUSINESS_OWNER"])` gate — staff account creation/removal/core-identity
+ * editing and invitation management stay BUSINESS_OWNER-only in this phase. Staff list read
+ * and schedule/time-off (Owner-or-Supervisor) live in {@link createStaffScheduleRoute} instead,
+ * mounted as a standalone top-level route the same way client.route.ts/availability.route.ts
+ * are, specifically so Supervisor reaches them before this router's stricter gate would 403.
+ */
+export const createStaffRoute = (): Router => {
+  const router = Router({ mergeParams: true });
+  const controller = new StaffController(buildStaffService());
+
   router.post(
     "/:businessId/staff",
     validateRequest({ params: staffBusinessParamsSchema, body: createStaffBodySchema }),
@@ -104,29 +120,89 @@ export const createStaffRoute = (): Router => {
     asyncHandler(controller.remove),
   );
 
+  return router;
+};
+
+/**
+ * Phase 4A — staff list read + schedule/time-off (Owner-or-Supervisor), plus Staff/Supervisor
+ * self-service "my schedule"/"my assigned services" (Owner-or-Supervisor-or-Staff). A standalone
+ * top-level route, NOT nested under business.route.ts's router-wide
+ * `requireRoles(["BUSINESS_OWNER"])` gate — same rationale and mounting convention as
+ * client.route.ts/availability.route.ts/createBusinessBookingRoute (per-route auth, registered
+ * on "/businesses" before createBusinessRoute() in api-router.ts).
+ *
+ * The `/staff/me/...` routes are registered BEFORE the `/staff/:staffId/...` routes below: with
+ * these mounted on the same "/staff" prefix, Express would otherwise match "me" as a literal
+ * `:staffId` value first (failing staffIdParamsSchema's ObjectId regex) before ever reaching
+ * the dedicated `/me` handlers.
+ */
+export const createStaffScheduleRoute = (): Router => {
+  const router = Router();
+  const userRepository = new UserRepository();
+  const sessionRepository = new SessionRepository();
+  const tokenService = new TokenService(sessionRepository);
+  const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
+  const controller = new StaffController(buildStaffService());
+
+  const ownerOrSupervisor = [
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+  ];
+  const anyStaffRole = [
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR", "STAFF"]),
+  ];
+
+  router.get(
+    "/:businessId/staff/me/schedule",
+    ...anyStaffRole,
+    validateRequest({ params: staffBusinessParamsSchema }),
+    asyncHandler(controller.getMySchedule),
+  );
+  router.get(
+    "/:businessId/staff/me/services",
+    ...anyStaffRole,
+    validateRequest({ params: staffBusinessParamsSchema }),
+    asyncHandler(controller.listMyAssignedServices),
+  );
+
+  router.get(
+    "/:businessId/staff",
+    ...ownerOrSupervisor,
+    validateRequest({ params: staffBusinessParamsSchema }),
+    asyncHandler(controller.list),
+  );
+
   router.get(
     "/:businessId/staff/:staffId/schedule",
+    ...ownerOrSupervisor,
     validateRequest({ params: staffIdParamsSchema }),
     asyncHandler(controller.getSchedule),
   );
   router.put(
     "/:businessId/staff/:staffId/schedule",
+    ...ownerOrSupervisor,
     validateRequest({ params: staffIdParamsSchema, body: putStaffScheduleBodySchema }),
     asyncHandler(controller.putSchedule),
   );
 
   router.get(
     "/:businessId/staff/:staffId/time-off",
+    ...ownerOrSupervisor,
     validateRequest({ params: staffIdParamsSchema }),
     asyncHandler(controller.listTimeOff),
   );
   router.post(
     "/:businessId/staff/:staffId/time-off",
+    ...ownerOrSupervisor,
     validateRequest({ params: staffIdParamsSchema, body: createStaffTimeOffBodySchema }),
     asyncHandler(controller.createTimeOff),
   );
   router.delete(
     "/:businessId/staff/:staffId/time-off/:timeOffId",
+    ...ownerOrSupervisor,
     validateRequest({ params: staffTimeOffParamsSchema }),
     asyncHandler(controller.removeTimeOff),
   );

@@ -1,6 +1,7 @@
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 
+import { env } from "../../config/env.js";
 import {
   businessCities,
   businessVisitTypeAliases,
@@ -9,7 +10,9 @@ import {
 
 const emailSchema = z.string().email();
 const sessionIdSchema = z.string().min(1);
+// Email OTP — 4 digits. Phone OTP (Twilio Verify) — env-driven length (PHONE_OTP_CODE_LENGTH).
 const otpCodeSchema = z.string().regex(/^\d{4}$/);
+const phoneOtpCodeSchema = z.string().regex(new RegExp(`^\\d{${env.PHONE_OTP_CODE_LENGTH}}$`));
 const countryCodeSchema = z.string().regex(/^\+\d{1,4}$/);
 const nationalNumberSchema = z.string().regex(/^\d{4,20}$/);
 const visitTypeOpenApiSchema = z.enum([...businessVisitTypes, ...businessVisitTypeAliases]);
@@ -28,6 +31,9 @@ const deleteMyAccountOpenApiSchema = z
   .strict();
 const sessionOpenApiSchema = z.object({ sessionId: sessionIdSchema }).strict();
 const verifyOtpOpenApiSchema = sessionOpenApiSchema.extend({ code: otpCodeSchema }).strict();
+const verifyPhoneOtpOpenApiSchema = sessionOpenApiSchema
+  .extend({ code: phoneOtpCodeSchema })
+  .strict();
 const profileOpenApiSchema = sessionOpenApiSchema
   .extend({
     firstName: z.string().min(1),
@@ -262,7 +268,7 @@ const authPaths: AuthPath[] = [
     method: "post",
     path: "/auth/customer/register/verify-phone-otp-complete",
     summary: "Verify customer phone OTP and complete account",
-    body: verifyOtpOpenApiSchema,
+    body: verifyPhoneOtpOpenApiSchema,
     response: authResponseSchema,
     status: 201,
   },
@@ -326,7 +332,7 @@ const authPaths: AuthPath[] = [
     method: "post",
     path: "/auth/professional/register/verify-phone-otp",
     summary: "Verify professional phone OTP",
-    body: verifyOtpOpenApiSchema,
+    body: verifyPhoneOtpOpenApiSchema,
     response: sessionStepResponseSchema,
   },
   {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { env } from "../../config/env.js";
 import {
   businessCities,
   businessVisitTypeAliases,
@@ -10,7 +11,16 @@ import { genders, userLanguages } from "../user/user.types.js";
 
 const emailSchema = z.email();
 const sessionIdSchema = z.string().min(1);
+// Bookly-generated OTP (email verification / email change) — fixed 4 digits (OTP_LENGTH).
 const otpCodeSchema = z.string().regex(/^\d{4}$/, "OTP must be 4 digits");
+// Twilio Verify SMS OTP (phone verification / phone change) — length is env-driven and MUST
+// match the Twilio Verify Service "Code Length". Never hardcoded.
+const phoneOtpCodeSchema = z
+  .string()
+  .regex(
+    new RegExp(`^\\d{${env.PHONE_OTP_CODE_LENGTH}}$`),
+    `OTP must be ${env.PHONE_OTP_CODE_LENGTH} digits`,
+  );
 const passwordSchema = z.string().min(6);
 export const countryCodeSchema = z.string().regex(/^\+\d{1,4}$/);
 export const nationalNumberSchema = z.string().regex(/^\d{4,20}$/);
@@ -60,7 +70,7 @@ export const profileBodySchema = sessionBodySchema
   .strict();
 
 export const verifyPhoneOtpBodySchema = sessionBodySchema.extend({
-  code: otpCodeSchema,
+  code: phoneOtpCodeSchema,
 });
 
 export const visitTypeBodySchema = sessionBodySchema
@@ -200,7 +210,7 @@ export const requestPhoneChangeBodySchema = z
 
 export const verifyPhoneChangeBodySchema = z
   .object({
-    code: otpCodeSchema,
+    code: phoneOtpCodeSchema,
   })
   .strict();
 

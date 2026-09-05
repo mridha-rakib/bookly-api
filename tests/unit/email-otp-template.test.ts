@@ -13,7 +13,7 @@ const RESET_ENV = () => {
   process.env["EMAIL_FROM"] = "noreply@example.com";
   process.env["EMAIL_FROM_NAME"] = "Bookly";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   process.env["OTP_EXPIRY_MINUTES"] = "9";
 };
 

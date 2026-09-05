@@ -157,7 +157,7 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
 
     expect((await agent.post(`${REG}/send-phone-otp`).send({ sessionId })).status).toBe(200);
     expect(
-      (await agent.post(`${REG}/verify-phone-otp`).send({ sessionId, code: "1234" })).status,
+      (await agent.post(`${REG}/verify-phone-otp`).send({ sessionId, code: "123456" })).status,
     ).toBe(200);
 
     const details = await agent.post(`${REG}/business-details`).send({

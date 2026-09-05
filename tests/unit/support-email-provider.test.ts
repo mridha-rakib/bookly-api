@@ -7,7 +7,7 @@ const loadSendGridSupportProvider = async () => {
   process.env["EMAIL_FROM"] = "noreply@example.com";
   process.env["EMAIL_FROM_NAME"] = "Bookly";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   return import("../../src/modules/support/support-email.provider.js");
 };
 
@@ -18,7 +18,7 @@ const loadResendSupportProvider = async () => {
   process.env["RESEND_FROM_EMAIL"] = "noreply@example.com";
   process.env["RESEND_FROM_NAME"] = "Bookly";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   return import("../../src/modules/support/support-email.provider.js");
 };
 
@@ -38,7 +38,7 @@ describe("support email provider", () => {
     process.env["SMTP_USER"] = "smtp-user";
     process.env["SMTP_PASS"] = "smtp-pass";
     process.env["OTP_PROVIDER"] = "dummy";
-    process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+    process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
     delete process.env["RESEND_API_KEY"];
     delete process.env["RESEND_FROM_EMAIL"];
     delete process.env["RESEND_FROM_NAME"];

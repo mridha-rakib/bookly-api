@@ -6,7 +6,7 @@ const loadEmailProvider = async () => {
   process.env["RESEND_FROM_EMAIL"] = "noreply@example.com";
   process.env["RESEND_FROM_NAME"] = "Bookly";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   process.env["OTP_EXPIRY_MINUTES"] = "7";
   return import("../../src/modules/verification/email-otp.provider.js");
 };
@@ -18,7 +18,7 @@ const loadSendGridProvider = async () => {
   process.env["EMAIL_FROM"] = "noreply@example.com";
   process.env["EMAIL_FROM_NAME"] = "Bookly";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   process.env["OTP_EXPIRY_MINUTES"] = "7";
   return import("../../src/modules/verification/email-otp.provider.js");
 };
@@ -34,7 +34,7 @@ const loadSmtpProvider = async () => {
   process.env["SMTP_USER"] = "smtp-user";
   process.env["SMTP_PASS"] = "smtp-pass";
   process.env["OTP_PROVIDER"] = "dummy";
-  process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+  process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
   process.env["OTP_EXPIRY_MINUTES"] = "7";
   return import("../../src/modules/verification/email-otp.provider.js");
 };
@@ -60,7 +60,7 @@ describe("verification providers", () => {
     process.env["SMTP_USER"] = "smtp-user";
     process.env["SMTP_PASS"] = "smtp-pass";
     process.env["OTP_PROVIDER"] = "dummy";
-    process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+    process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
     delete process.env["RESEND_API_KEY"];
     delete process.env["RESEND_FROM_EMAIL"];
     delete process.env["RESEND_FROM_NAME"];
@@ -301,7 +301,7 @@ describe("verification providers", () => {
   it("selects dummy phone OTP provider from environment configuration", async () => {
     vi.resetModules();
     process.env["OTP_PROVIDER"] = "dummy";
-    process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+    process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
     const providers = await import("../../src/modules/verification/phone-otp.provider.js");
 
     expect(providers.createPhoneOtpProvider()).toBeInstanceOf(providers.DummyPhoneOtpProvider);
@@ -310,7 +310,7 @@ describe("verification providers", () => {
   it("verifies dummy phone OTP without persisting plaintext OTPs", async () => {
     vi.resetModules();
     process.env["OTP_PROVIDER"] = "dummy";
-    process.env["DUMMY_PHONE_OTP_CODE"] = "1234";
+    process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
     const { DummyPhoneOtpProvider } = await import(
       "../../src/modules/verification/phone-otp.provider.js"
     );
@@ -319,8 +319,12 @@ describe("verification providers", () => {
     await expect(provider.sendOtp({ toE164: "+35712345678" })).resolves.toEqual({
       providerVerificationId: "dummy-phone-otp",
     });
-    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "1234" })).resolves.toBe(true);
-    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "0000" })).resolves.toBe(false);
+    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "123456" })).resolves.toBe(
+      true,
+    );
+    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "000000" })).resolves.toBe(
+      false,
+    );
   });
 
   it("normalizes Twilio delivery and verification failures", async () => {
@@ -339,7 +343,7 @@ describe("verification providers", () => {
       details: [{ code: "PROVIDER_RATE_LIMITED" }],
     });
     await expect(
-      provider.verifyOtp({ toE164: "+35712345678", code: "1234" }),
+      provider.verifyOtp({ toE164: "+35712345678", code: "123456" }),
     ).rejects.toMatchObject({ details: [{ code: "OTP_VERIFICATION_FAILED" }] });
   });
 
@@ -358,6 +362,8 @@ describe("verification providers", () => {
     await expect(provider.sendOtp({ toE164: "+35712345678" })).resolves.toEqual({
       providerVerificationId: "VE123",
     });
-    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "1234" })).resolves.toBe(false);
+    await expect(provider.verifyOtp({ toE164: "+35712345678", code: "123456" })).resolves.toBe(
+      false,
+    );
   });
 });

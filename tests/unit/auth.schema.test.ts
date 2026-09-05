@@ -152,9 +152,10 @@ describe("Batch 18 contact-change schemas", () => {
     );
   });
 
-  it("verifyPhoneChangeBodySchema requires exactly a 4-digit code", () => {
-    expect(verifyPhoneChangeBodySchema.safeParse({ code: "5678" }).success).toBe(true);
-    expect(verifyPhoneChangeBodySchema.safeParse({ code: "abcd" }).success).toBe(false);
+  it("verifyPhoneChangeBodySchema requires exactly a 6-digit code (Twilio Verify)", () => {
+    expect(verifyPhoneChangeBodySchema.safeParse({ code: "567890" }).success).toBe(true);
+    expect(verifyPhoneChangeBodySchema.safeParse({ code: "5678" }).success).toBe(false);
+    expect(verifyPhoneChangeBodySchema.safeParse({ code: "abcdef" }).success).toBe(false);
   });
 });
 
