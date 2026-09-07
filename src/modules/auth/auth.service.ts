@@ -22,6 +22,7 @@ import type { LinkedAccountService } from "../linked-account/linked-account.serv
 import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
 import type { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import {
+  isSocialRegistrationProvider,
   type RegistrationPortal,
   type RegistrationSessionDocument,
   resolveRegistrationAuthProvider,
@@ -244,10 +245,10 @@ export class AuthService {
     };
     session.phone = normalizePhoneNumber(input.countryCode, nationalNumber);
 
-    // Phase 2C — a GOOGLE PROFESSIONAL session has no password: Google verified the identity and
-    // `completeBusinessOwner` will create the User with `authProviders:["GOOGLE"]`. For every
-    // PASSWORD session `password` is still required and still hashed here — byte-identical.
-    if (resolveRegistrationAuthProvider(session.authProvider) !== "GOOGLE") {
+    // A social PROFESSIONAL session (GOOGLE / FACEBOOK) has no password: the provider verified the
+    // identity and `completeBusinessOwner` will create the User with `authProviders:[<provider>]`.
+    // For every PASSWORD session `password` is still required and still hashed here — byte-identical.
+    if (!isSocialRegistrationProvider(session.authProvider)) {
       if (!input.password) {
         throw new AuthError("INVALID_REGISTRATION_STEP", 400, [
           { path: "password", message: "Password is required", code: "required" },
@@ -408,18 +409,34 @@ export class AuthService {
       throw new AuthError("EMAIL_ALREADY_REGISTERED", 409);
     }
 
-    // Phase 2C — a GOOGLE session creates a passwordless BUSINESS_OWNER + a LinkedAccount, in the
-    // SAME transaction as the Business. `ensureFinalCommonData` already guaranteed the Google
-    // `sub` is present. A PASSWORD session is byte-identical to before.
-    const isGoogleSession = resolveRegistrationAuthProvider(session.authProvider) === "GOOGLE";
+    // A social session (GOOGLE / FACEBOOK) creates a passwordless BUSINESS_OWNER + a LinkedAccount,
+    // in the SAME transaction as the Business. `ensureFinalCommonData` already guaranteed the
+    // provider `sub` is present (GOOGLE → googleProviderAccountId, FACEBOOK → oauthProviderAccountId).
+    // A PASSWORD session is byte-identical to before.
+    const regProvider = resolveRegistrationAuthProvider(session.authProvider);
+    const socialProvider: "GOOGLE" | "FACEBOOK" | "APPLE" | null =
+      regProvider === "GOOGLE"
+        ? "GOOGLE"
+        : regProvider === "FACEBOOK"
+          ? "FACEBOOK"
+          : regProvider === "APPLE"
+            ? "APPLE"
+            : null;
+    const isSocialSession = socialProvider !== null;
+    // GOOGLE keeps its own `googleProviderAccountId` column (byte-unchanged); every other social
+    // provider uses the generic `oauthProviderAccountId`.
+    const socialProviderAccountId =
+      socialProvider === "GOOGLE"
+        ? session.googleProviderAccountId
+        : session.oauthProviderAccountId;
     const userProviderFields: { authProviders: AuthProvider[]; passwordHash?: string } =
-      isGoogleSession
-        ? { authProviders: ["GOOGLE"] }
+      socialProvider !== null
+        ? { authProviders: [socialProvider] }
         : { authProviders: ["PASSWORD"], passwordHash: session.passwordHash ?? "" };
 
-    if (isGoogleSession && !this.linkedAccountRepository) {
+    if (isSocialSession && !this.linkedAccountRepository) {
       throw new Error(
-        "completeBusinessOwner: linkedAccountRepository is required for a Google session",
+        "completeBusinessOwner: linkedAccountRepository is required for a social session",
       );
     }
 
@@ -444,12 +461,12 @@ export class AuthService {
           dbSession,
         );
 
-        if (isGoogleSession) {
+        if (socialProvider !== null) {
           await this.linkedAccountRepository?.create(
             {
               userId: user._id,
-              provider: "GOOGLE",
-              providerAccountId: session.googleProviderAccountId as string,
+              provider: socialProvider,
+              providerAccountId: socialProviderAccountId as string,
               email: session.normalizedEmail,
               emailVerified: true,
               linkedAt: new Date(),
@@ -1685,16 +1702,21 @@ export class AuthService {
       throw new AuthError("PHONE_NOT_VERIFIED", 400);
     }
 
-    const isGoogleSession = resolveRegistrationAuthProvider(session.authProvider) === "GOOGLE";
+    const regProvider = resolveRegistrationAuthProvider(session.authProvider);
 
     if (!session.personalProfile || !session.phone) {
       throw new AuthError("INVALID_REGISTRATION_STEP", 409);
     }
 
-    // A GOOGLE session legitimately has no `passwordHash` (and must carry the Google `sub`
-    // instead); a PASSWORD session must have the hash.
-    if (isGoogleSession) {
+    // A social session legitimately has no `passwordHash` (and must carry the provider `sub`
+    // instead — GOOGLE in googleProviderAccountId, FACEBOOK in oauthProviderAccountId); a PASSWORD
+    // session must have the hash.
+    if (regProvider === "GOOGLE") {
       if (!session.googleProviderAccountId) {
+        throw new AuthError("INVALID_REGISTRATION_STEP", 409);
+      }
+    } else if (regProvider === "FACEBOOK" || regProvider === "APPLE") {
+      if (!session.oauthProviderAccountId) {
         throw new AuthError("INVALID_REGISTRATION_STEP", 409);
       }
     } else if (!session.passwordHash) {

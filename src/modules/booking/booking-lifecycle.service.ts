@@ -55,6 +55,13 @@ export type BookingCancelledNotificationPort = {
     booking: BookingDocument,
     business: BusinessDocument,
     cancelledBy: "CUSTOMER" | "BUSINESS",
+    /** The real, authoritative outcome of a refund the caller just executed — see
+     * BookingCancelledNotifier's own doc comment for why this must never be re-derived from the
+     * booking's own persisted `cancellationOutcome`. */
+    refundOutcome?: { succeeded: boolean; amountCents: number },
+    /** See BookingCancelledNotifier's own doc comment — only used when a SECOND, distinct
+     * notification for the same booking must coexist with an already-enqueued plain one. */
+    eventKeyOverride?: string,
   ): Promise<void>;
 };
 export type NoShowNotificationPort = {
@@ -545,8 +552,15 @@ export class BookingLifecycleService {
       return cancelled;
     }
 
-    const refunded = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
-    await this.dispatchCancellationNotifications(refunded, "BUSINESS", business);
+    const {
+      booking: refunded,
+      refundSucceeded,
+      refundedAmountCents,
+    } = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
+    await this.dispatchCancellationNotifications(refunded, "BUSINESS", business, {
+      succeeded: refundSucceeded,
+      amountCents: refundedAmountCents,
+    });
     await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
     return refunded;
   }
@@ -638,13 +652,16 @@ export class BookingLifecycleService {
     const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
       progress.originBookingId,
     );
+    let refundOutcome:
+      | { booking: BookingDocument; refundSucceeded: boolean; refundedAmountCents: number }
+      | undefined;
     if (upfrontPayment && upfrontPayment.amountCents > 0) {
       const currentOrigin = await this.bookingRepository.findByIdForCustomer(
         progress.originBookingId,
         customerUserId,
       );
       if (currentOrigin) {
-        await this.executeBusinessCancellationRefund(currentOrigin, upfrontPayment);
+        refundOutcome = await this.executeBusinessCancellationRefund(currentOrigin, upfrontPayment);
       }
     }
 
@@ -652,6 +669,30 @@ export class BookingLifecycleService {
     if (!voided) {
       throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
     }
+
+    // Phase 4B close-out fix: notify AFTER the refund attempt's authoritative result is known
+    // AND the Package is actually voided — never before, and never claiming success the refund
+    // didn't achieve (dispatchCancellationNotifications/buildCancellationEmailData's own
+    // `refundOverride` only ever describes what `executeBusinessCancellationRefund` actually
+    // did). Only sent when a real refund was actually attempted — nothing to tell the customer
+    // otherwise. Uses a distinct eventKey (never the plain `BOOKING_CANCELLED:` one) so it can
+    // never collide with — and be silently dropped by the outbox's dedupe against — the separate
+    // "booking cancelled" email the `cancelByCustomer` call above may already have enqueued for
+    // this same origin booking (see BookingCancelledNotifier's own doc comment). Best-effort:
+    // never throws, never rolls back the refund/void that already succeeded above.
+    if (refundOutcome) {
+      await this.dispatchCancellationNotifications(
+        refundOutcome.booking,
+        "CUSTOMER",
+        undefined,
+        {
+          succeeded: refundOutcome.refundSucceeded,
+          amountCents: refundOutcome.refundedAmountCents,
+        },
+        `PACKAGE_REFUND:${String(progress.originBookingId)}`,
+      );
+    }
+
     return voided;
   }
 
@@ -665,6 +706,8 @@ export class BookingLifecycleService {
     booking: BookingDocument,
     cancelledBy: "CUSTOMER" | "BUSINESS",
     business?: BusinessDocument,
+    refundOutcome?: { succeeded: boolean; amountCents: number },
+    eventKeyOverride?: string,
   ): Promise<void> {
     if (!this.bookingCancelledNotifier) {
       return;
@@ -678,6 +721,8 @@ export class BookingLifecycleService {
       booking,
       resolvedBusiness,
       cancelledBy,
+      refundOutcome,
+      eventKeyOverride,
     );
   }
 
@@ -887,7 +932,15 @@ export class BookingLifecycleService {
       providerReference?: string | undefined;
       amountCents: number;
     },
-  ): Promise<BookingDocument> {
+  ): Promise<{
+    booking: BookingDocument;
+    /** The real, authoritative outcome of THIS refund attempt — never re-derived afterward from
+     * `booking.cancellationOutcome` (see cancellation-email-data.ts's own doc comment for why
+     * that field only ever records intent, not result). Every caller that notifies about this
+     * refund must pass this straight through as the notifier's `refundOutcome`. */
+    refundSucceeded: boolean;
+    refundedAmountCents: number;
+  }> {
     const idempotencyKey = `business-cancel-refund:${String(booking._id)}`;
     let settlementStatus: "SUCCEEDED" | "FAILED" = "FAILED";
     let refundId: string | undefined;
@@ -931,7 +984,11 @@ export class BookingLifecycleService {
       settlementStatus,
       refundId,
     );
-    return updated ?? booking;
+    return {
+      booking: updated ?? booking,
+      refundSucceeded: settlementStatus === "SUCCEEDED",
+      refundedAmountCents: upfrontPayment.amountCents,
+    };
   }
 
   private async performCancellationTransaction(params: {

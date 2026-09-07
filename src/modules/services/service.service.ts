@@ -27,6 +27,7 @@ import type {
   ServiceStatusCounts,
 } from "./service.repository.js";
 import type { CreateServiceBody, UpdateServiceBody } from "./service.schema.js";
+import { updateServiceBodySchema } from "./service.schema.js";
 import type { ServicePricingMode, ServiceScheduleMode, ServiceStatus } from "./service.types.js";
 import type { ServiceCategoryDocument } from "./service-category.model.js";
 import type { ServiceCategoryRepository } from "./service-category.repository.js";
@@ -239,17 +240,23 @@ export class ServiceService {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
     const existing = await this.serviceRepository.findById(business._id, serviceId);
 
-    if (!existing || existing.status === "ARCHIVED") {
+    if (!existing) {
       throw new ServiceError("SERVICE_NOT_FOUND", 404);
     }
 
     const fields = await this.buildServiceFields(business, body);
-    // status travels in the same full-replace body as everything else now — the Zod layer
-    // already guarantees ACTIVE/INACTIVE only reach here with a fully valid payload (DRAFT
-    // tolerates partial data), so no separate status-transition call is needed.
+    // Bug fix: editing an ARCHIVED Service is a repair flow, never an implicit restore — only
+    // the explicit Restore action (ServiceService.restoreService, which re-runs the full
+    // ACTIVE/INACTIVE publish validation) may unarchive. `body.status` still selects which
+    // completeness rules buildServiceFields/updateServiceBodySchema's own superRefine already
+    // applied above (DRAFT tolerates partial data, letting the Owner save an intermediate
+    // repair; ACTIVE/INACTIVE do not) — it just never becomes the PERSISTED value while the
+    // Service is ARCHIVED. `archivedAt` is untouched either way: it isn't part of
+    // ReplaceServiceFields, so replaceById's $set can never write it.
+    const persistedStatus = existing.status === "ARCHIVED" ? "ARCHIVED" : body.status;
     const replaced = await this.serviceRepository.replaceById(business._id, serviceId, {
       ...fields,
-      status: body.status,
+      status: persistedStatus,
     } as ReplaceServiceFields);
 
     if (!replaced) {
@@ -335,6 +342,15 @@ export class ServiceService {
       throw new ServiceError("SERVICE_NOT_ARCHIVED", 409);
     }
 
+    // Bug fix: restore used to bypass the exact same completeness/publish validation
+    // create/update already enforce for ACTIVE/INACTIVE — an incomplete Service (e.g. archived
+    // while still an incomplete DRAFT, or one whose category/staff/served-city later became
+    // invalid while it sat archived) could be restored straight to ACTIVE. This re-runs that
+    // SAME validation (never a second, independently-invented rule set) against the Service's
+    // current persisted fields before allowing the status change; on failure nothing is written
+    // — the Service stays ARCHIVED exactly as it was.
+    await this.assertRestorableToStatus(business, existing, status);
+
     const restored = await this.serviceRepository.restoreById(business._id, serviceId, status);
 
     if (!restored) {
@@ -343,6 +359,64 @@ export class ServiceService {
 
     const [dto] = await this.toServiceDtos(business, [restored]);
     return dto as ServiceDto;
+  }
+
+  /**
+   * Reuses the EXACT same publish/activation validation create/update already run for
+   * ACTIVE/INACTIVE — never a second, independently-maintained rule set:
+   *  1. `updateServiceBodySchema`'s own presence/consistency `superRefine` (required category,
+   *     subcategory, sessionExpiryAlert, pricing block for the selected mode, Package Deal
+   *     fields, manual-schedule requirements, etc.) — the same schema `updateService`'s route
+   *     validates a request body against, run here against the Service's OWN current persisted
+   *     fields reshaped into that exact body shape.
+   *  2. `buildServiceFields`'s cross-collection checks (category still exists/active, staff
+   *     still belongs to this Business, served cities still enabled) — catches a Service whose
+   *     references went stale WHILE it sat archived (e.g. its category was deactivated
+   *     meanwhile), which the schema alone cannot see.
+   * Throws (never returns a partial result) on the first failure from either layer — the
+   * schema's own generic issue becomes `SERVICE_RESTORE_INCOMPLETE`; buildServiceFields's own
+   * specific errors (SERVICE_CATEGORY_NOT_FOUND, SERVICE_STAFF_INVALID, etc.) propagate verbatim
+   * since they are already more actionable than a generic wrapper.
+   */
+  private async assertRestorableToStatus(
+    business: BusinessDocument,
+    existing: ServiceDocument,
+    status: Extract<ServiceStatus, "ACTIVE" | "INACTIVE">,
+  ): Promise<void> {
+    // `existing` is a live Mongoose document — its embedded objects (sessionExpiryAlert,
+    // fixedPricing, manualSchedule entries, ...) are Mongoose subdocument instances, not plain
+    // objects, and Zod's `.strict()` object check rejects their non-enumerable-looking internal
+    // properties. `.toObject()` is Mongoose's own, already-existing plain-object conversion —
+    // reused here rather than hand-rewriting every nested shape.
+    const plain = (existing as unknown as { toObject: () => ServiceDocument }).toObject();
+
+    const candidateBody: UpdateServiceBody = {
+      status,
+      isFeatured: plain.isFeatured,
+      isPackageDeal: plain.isPackageDeal,
+      serviceCategoryId: plain.serviceCategoryId ? String(plain.serviceCategoryId) : undefined,
+      subcategory: plain.subcategory,
+      name: plain.name,
+      packageServicesName: plain.packageServicesName,
+      description: plain.description,
+      pricingMode: plain.pricingMode,
+      fixedPricing: plain.fixedPricing,
+      hourlyPricing: plain.hourlyPricing,
+      perPersonPricing: plain.perPersonPricing,
+      packagePricing: plain.packagePricing,
+      sessionExpiryAlert: plain.sessionExpiryAlert,
+      scheduleMode: plain.scheduleMode,
+      manualSchedule: plain.manualSchedule,
+      servedCities: plain.servedCities,
+      assignedStaffMembershipIds: plain.assignedStaffMembershipIds.map(String),
+    };
+
+    const parsed = updateServiceBodySchema.safeParse(candidateBody);
+    if (!parsed.success) {
+      throw new ServiceError("SERVICE_RESTORE_INCOMPLETE", 409);
+    }
+
+    await this.buildServiceFields(business, parsed.data);
   }
 
   // --- Validation / field building ----------------------------------------------------------
@@ -435,6 +509,20 @@ export class ServiceService {
       // Covers: unknown id, and a membership id belonging to a different Business —
       // findManyByIdsForBusiness already scopes by businessId, so cross-business
       // assignment is rejected here rather than silently dropped.
+      throw new ServiceError("SERVICE_STAFF_INVALID", 400);
+    }
+
+    // Bug fix: a removed StaffMembership row is never deleted (soft-remove — see
+    // staff.model.ts's own removedAt comment), and removal also sets employmentActive: false
+    // (see StaffRepository.softRemoveById), so findManyByIdsForBusiness above happily "found"
+    // it — this check alone used to treat that as a valid assignment. Every Service update is a
+    // full replace of the whole assignedStaffMembershipIds array (see replaceById's own doc
+    // comment), so simply rejecting any inactive/removed id here is exactly equivalent to
+    // requiring the Owner to actually remove a stale assignment before a save can succeed — an
+    // update that omits it (the Owner unchecked it) still only submits the remaining valid ids
+    // and passes fine. Never touches already-persisted data by itself; this only gates a new
+    // write.
+    if (memberships.some((membership) => !membership.employmentActive || membership.removedAt)) {
       throw new ServiceError("SERVICE_STAFF_INVALID", 400);
     }
   }

@@ -117,4 +117,88 @@ describe("AppointmentReminderScheduler", () => {
     repo.schedule.mockRejectedValueOnce(new Error("db down"));
     await expect(scheduler.onBookingCreated(makeBooking())).resolves.toBeUndefined();
   });
+
+  describe("SESSION_END_REMINDER", () => {
+    const withSnapshot = (
+      enabled: boolean,
+      minutesBeforeSessionEnds?: number,
+    ): Partial<BookingDocument> => ({
+      sessionEndReminderSnapshot: { enabled, minutesBeforeSessionEnds } as never,
+    });
+
+    it("onBookingCreated ALSO schedules SESSION_END_REMINDER, anchored to schedule.endAt, when the snapshot is enabled", async () => {
+      const booking = makeBooking(withSnapshot(true, 15));
+      await scheduler.onBookingCreated(booking);
+
+      expect(repo.schedule).toHaveBeenCalledTimes(2);
+      expect(repo.schedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "SESSION_END_REMINDER",
+          bookingId: booking._id,
+          scheduleStartAt: booking.schedule.endAt,
+          offsetMinutes: 15,
+        }),
+      );
+      // The 24h reminder is completely unaffected by the new kind existing alongside it.
+      expect(repo.schedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "REMINDER_24H",
+          scheduleStartAt: booking.schedule.startAt,
+        }),
+      );
+    });
+
+    it("does NOT schedule SESSION_END_REMINDER when the snapshot is disabled", async () => {
+      const booking = makeBooking(withSnapshot(false));
+      await scheduler.onBookingCreated(booking);
+
+      expect(repo.schedule).toHaveBeenCalledTimes(1);
+      expect(repo.schedule).toHaveBeenCalledWith(expect.objectContaining({ kind: "REMINDER_24H" }));
+    });
+
+    it("does NOT schedule SESSION_END_REMINDER for a legacy booking with no snapshot at all", async () => {
+      const booking = makeBooking(); // no sessionEndReminderSnapshot property
+      await scheduler.onBookingCreated(booking);
+
+      expect(repo.schedule).toHaveBeenCalledTimes(1);
+      expect(repo.schedule).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "SESSION_END_REMINDER" }),
+      );
+    });
+
+    it("does NOT schedule SESSION_END_REMINDER when enabled but minutesBeforeSessionEnds is missing", async () => {
+      const booking = makeBooking(withSnapshot(true, undefined));
+      await scheduler.onBookingCreated(booking);
+
+      expect(repo.schedule).toHaveBeenCalledTimes(1);
+    });
+
+    it("onBookingRescheduled excepts BOTH kinds' current dedupe keys in one retire call", async () => {
+      const booking = makeBooking(withSnapshot(true, 15));
+      await scheduler.onBookingRescheduled(booking);
+
+      expect(repo.retireActiveForBooking).toHaveBeenCalledWith(
+        booking._id,
+        "SUPERSEDED_BY_RESCHEDULE",
+        expect.objectContaining({
+          exceptDedupeKeys: [
+            expect.stringContaining("APPOINTMENT_REMINDER_24H"),
+            expect.stringContaining("SESSION_END_REMINDER"),
+          ],
+        }),
+      );
+      expect(repo.schedule).toHaveBeenCalledTimes(2);
+    });
+
+    it("onBookingRetired still retires everything for the booking with one call, regardless of kind", async () => {
+      const booking = makeBooking({ ...withSnapshot(true, 15), status: "CANCELLED_BY_CUSTOMER" });
+      await scheduler.onBookingRetired(booking, "BOOKING_CANCELLED_BY_CUSTOMER");
+      expect(repo.retireActiveForBooking).toHaveBeenCalledTimes(1);
+      expect(repo.retireActiveForBooking).toHaveBeenCalledWith(
+        booking._id,
+        "BOOKING_CANCELLED_BY_CUSTOMER",
+        expect.objectContaining({ now: expect.any(Date) }),
+      );
+    });
+  });
 });

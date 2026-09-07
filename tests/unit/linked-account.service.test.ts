@@ -11,6 +11,9 @@ const mockEnv = {
   GOOGLE_CLIENT_ID: "test-client-id",
   GOOGLE_CLIENT_SECRET: "test-client-secret",
   GOOGLE_ACCOUNT_LINK_REDIRECT_URI: "http://localhost:3000/api/v1/auth/oauth/google/callback",
+  FACEBOOK_CLIENT_ID: "fb-app-123",
+  FACEBOOK_CLIENT_SECRET: "fb-test-secret",
+  FACEBOOK_ACCOUNT_LINK_REDIRECT_URI: "http://localhost:3000/api/v1/auth/oauth/facebook/callback",
 };
 
 vi.mock("../../src/config/env.js", () => ({ env: mockEnv }));
@@ -27,10 +30,22 @@ vi.mock("../../src/modules/linked-account/google-oauth.client.js", () => ({
   verifyGoogleAccountLinkCallback,
 }));
 
+const isFacebookAccountLinkConfigured = vi.fn(() => true);
+const buildFacebookAccountLinkAuthUrl = vi.fn(
+  (_state: string) => "https://www.facebook.com/v23.0/dialog/oauth?mock=1",
+);
+const verifyFacebookAccountLinkCallback = vi.fn();
+
+vi.mock("../../src/modules/linked-account/facebook-oauth.client.js", () => ({
+  isFacebookAccountLinkConfigured,
+  buildFacebookAccountLinkAuthUrl,
+  verifyFacebookAccountLinkCallback,
+}));
+
 const { LinkedAccountService } = await import(
   "../../src/modules/linked-account/linked-account.service.js"
 );
-const { signGoogleLinkState, verifyGoogleLinkState } = await import(
+const { signGoogleLinkState, verifyGoogleLinkState, signFacebookLinkState } = await import(
   "../../src/modules/linked-account/linked-account.state.js"
 );
 
@@ -349,6 +364,306 @@ describe("LinkedAccountService", () => {
           linkedAt: "2026-09-01T10:00:00.000Z",
         },
       ]);
+    });
+
+    it("maps a FACEBOOK document to the same summary shape", async () => {
+      const { service } = makeService({
+        repo: {
+          findByUserId: vi.fn().mockResolvedValue([
+            buildLinkedAccount({
+              provider: "FACEBOOK",
+              email: "pat@example.com",
+              displayName: "Pat Example",
+              linkedAt: new Date("2026-09-03T09:00:00.000Z"),
+            }),
+          ]),
+        },
+      });
+
+      expect(await service.listForUser("user-1")).toEqual([
+        {
+          provider: "FACEBOOK",
+          email: "pat@example.com",
+          displayName: "Pat Example",
+          linkedAt: "2026-09-03T09:00:00.000Z",
+        },
+      ]);
+    });
+  });
+});
+
+describe("LinkedAccountService — Facebook linking (linking only, never login)", () => {
+  const validIdentity = {
+    providerAccountId: "fb-user-1",
+    email: "Pat@Example.com",
+    emailVerified: true,
+    displayName: "Pat Example",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isFacebookAccountLinkConfigured.mockReturnValue(true);
+    buildFacebookAccountLinkAuthUrl.mockReturnValue(
+      "https://www.facebook.com/v23.0/dialog/oauth?mock=1",
+    );
+  });
+
+  describe("buildFacebookAuthorizeUrl", () => {
+    it("throws LINKED_ACCOUNT_NOT_CONFIGURED (503) when not configured", async () => {
+      isFacebookAccountLinkConfigured.mockReturnValue(false);
+      const { service } = makeService({});
+
+      await expect(service.buildFacebookAuthorizeUrl("user-1")).rejects.toMatchObject({
+        statusCode: 503,
+      });
+    });
+
+    it("signs a Facebook state bound to the caller and returns the consent URL", async () => {
+      const { service } = makeService({});
+      const userId = String(new Types.ObjectId());
+
+      const url = await service.buildFacebookAuthorizeUrl(userId);
+
+      expect(url).toBe("https://www.facebook.com/v23.0/dialog/oauth?mock=1");
+      const state = buildFacebookAccountLinkAuthUrl.mock.calls[0]?.[0] as string;
+      // Signed with the Facebook key context, so only the Facebook verifier accepts it.
+      await expect(verifyGoogleLinkState(state)).rejects.toMatchObject({ statusCode: 400 });
+    });
+  });
+
+  describe("linkFacebookFromCallback", () => {
+    it("rejects an invalid state before any provider call or write", async () => {
+      const { service, repo } = makeService({});
+
+      await expect(service.linkFacebookFromCallback("code", "forged-state")).rejects.toMatchObject({
+        statusCode: 400,
+      });
+      expect(verifyFacebookAccountLinkCallback).not.toHaveBeenCalled();
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects a state whose user is no longer linkable", async () => {
+      const { service } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(buildUser({ status: "DELETED" })) },
+      });
+      const state = await signFacebookLinkState({ userId: String(new Types.ObjectId()) });
+
+      await expect(service.linkFacebookFromCallback("code", state)).rejects.toMatchObject({
+        statusCode: 400,
+      });
+    });
+
+    it("links the verified identity to the state's user — email normalised, never used to look up", async () => {
+      const user = buildUser();
+      const { service, repo } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+      });
+      verifyFacebookAccountLinkCallback.mockResolvedValue(validIdentity);
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await service.linkFacebookFromCallback("auth-code", state);
+
+      expect(repo.findByProviderAccount).toHaveBeenCalledWith("FACEBOOK", "fb-user-1");
+      const createArg = (repo.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+      expect(String(createArg.userId)).toBe(String(user._id));
+      expect(createArg.provider).toBe("FACEBOOK");
+      expect(createArg.providerAccountId).toBe("fb-user-1");
+      expect(createArg.email).toBe("pat@example.com");
+    });
+
+    it("rejects when the Facebook identity already belongs to another user (409)", async () => {
+      const user = buildUser();
+      const { service, repo } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByProviderAccount: vi
+            .fn()
+            .mockResolvedValue(
+              buildLinkedAccount({ provider: "FACEBOOK", userId: new Types.ObjectId() }),
+            ),
+        },
+      });
+      verifyFacebookAccountLinkCallback.mockResolvedValue(validIdentity);
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await expect(service.linkFacebookFromCallback("code", state)).rejects.toMatchObject({
+        statusCode: 409,
+        details: [{ code: "LINKED_ACCOUNT_ALREADY_LINKED_ELSEWHERE" }],
+      });
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it("is idempotent when the same Facebook account is re-linked by the same user", async () => {
+      const user = buildUser();
+      const { service, repo } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByProviderAccount: vi
+            .fn()
+            .mockResolvedValue(buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })),
+        },
+      });
+      verifyFacebookAccountLinkCallback.mockResolvedValue(validIdentity);
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await expect(service.linkFacebookFromCallback("code", state)).resolves.toBeUndefined();
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects when the user already has a different Facebook account linked (409)", async () => {
+      const user = buildUser();
+      const { service } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByProviderAccount: vi.fn().mockResolvedValue(null),
+          findByUserAndProvider: vi.fn().mockResolvedValue(
+            buildLinkedAccount({
+              provider: "FACEBOOK",
+              userId: user._id,
+              providerAccountId: "x",
+            }),
+          ),
+        },
+      });
+      verifyFacebookAccountLinkCallback.mockResolvedValue(validIdentity);
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await expect(service.linkFacebookFromCallback("code", state)).rejects.toMatchObject({
+        statusCode: 409,
+        details: [{ code: "LINKED_ACCOUNT_PROVIDER_ALREADY_LINKED" }],
+      });
+    });
+
+    it("does not switch/merge on an email that matches another user (email never resolves a user)", async () => {
+      const user = buildUser({ normalizedEmail: "real-owner@bookly.test" });
+      const { service, repo } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+      });
+      // Facebook returns an email belonging to a completely different Bookly account.
+      verifyFacebookAccountLinkCallback.mockResolvedValue({
+        ...validIdentity,
+        email: "someone.else@bookly.test",
+      });
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await service.linkFacebookFromCallback("code", state);
+
+      const createArg = (repo.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+      // Linked to the state's user, NOT to whoever owns someone.else@bookly.test.
+      expect(String(createArg.userId)).toBe(String(user._id));
+      // The user repo was only ever asked for the state's user by id — never by email.
+      expect((repo.findByProviderAccount as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toBe(
+        "FACEBOOK",
+      );
+    });
+
+    it("maps a duplicate-key race on create to a stable 409", async () => {
+      const user = buildUser();
+      const duplicateKeyError = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+      const { service } = makeService({
+        users: { findById: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByProviderAccount: vi
+            .fn()
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce(buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })),
+          findByUserAndProvider: vi.fn().mockResolvedValue(null),
+          create: vi.fn().mockRejectedValue(duplicateKeyError),
+        },
+      });
+      verifyFacebookAccountLinkCallback.mockResolvedValue(validIdentity);
+      const state = await signFacebookLinkState({ userId: String(user._id) });
+
+      await expect(service.linkFacebookFromCallback("code", state)).rejects.toMatchObject({
+        statusCode: 409,
+      });
+    });
+  });
+
+  describe("unlinkFacebook", () => {
+    it("rejects a wrong current password with INVALID_CURRENT_PASSWORD (400)", async () => {
+      const { service } = makeService({
+        users: { findByIdWithPassword: vi.fn().mockResolvedValue(buildUser()) },
+        hasher: { verify: vi.fn().mockResolvedValue(false) },
+      });
+
+      await expect(
+        service.unlinkFacebook("user-1", { currentPassword: "wrong" }),
+      ).rejects.toMatchObject({ statusCode: 400, details: [{ code: "INVALID_CURRENT_PASSWORD" }] });
+    });
+
+    it("404s when there is no Facebook link", async () => {
+      const { service } = makeService({
+        users: { findByIdWithPassword: vi.fn().mockResolvedValue(buildUser()) },
+        repo: { findByUserAndProvider: vi.fn().mockResolvedValue(null) },
+      });
+
+      await expect(
+        service.unlinkFacebook("user-1", { currentPassword: "pw" }),
+      ).rejects.toMatchObject({ statusCode: 404, details: [{ code: "LINKED_ACCOUNT_NOT_FOUND" }] });
+    });
+
+    it("unlinks only the FACEBOOK row when the password is correct", async () => {
+      const user = buildUser();
+      const { service, repo } = makeService({
+        users: { findByIdWithPassword: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByUserAndProvider: vi
+            .fn()
+            .mockResolvedValue(buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })),
+          findByUserId: vi
+            .fn()
+            .mockResolvedValue([buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })]),
+        },
+      });
+
+      await service.unlinkFacebook(String(user._id), { currentPassword: "pw" });
+
+      expect(repo.deleteByUserAndProvider).toHaveBeenCalledWith(String(user._id), "FACEBOOK");
+    });
+
+    it("blocks removing the last sign-in method (no password, Facebook is the only provider)", async () => {
+      const user = buildUser({ passwordHash: "" });
+      const { service, repo } = makeService({
+        users: { findByIdWithPassword: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByUserAndProvider: vi
+            .fn()
+            .mockResolvedValue(buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })),
+          findByUserId: vi
+            .fn()
+            .mockResolvedValue([buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })]),
+        },
+      });
+
+      await expect(
+        service.unlinkFacebook(String(user._id), { currentPassword: "pw" }),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        details: [{ code: "LINKED_ACCOUNT_LAST_CREDENTIAL" }],
+      });
+      expect(repo.deleteByUserAndProvider).not.toHaveBeenCalled();
+    });
+
+    it("allows unlinking Facebook when Google remains as another sign-in method", async () => {
+      const user = buildUser({ passwordHash: "" });
+      const { service, repo } = makeService({
+        users: { findByIdWithPassword: vi.fn().mockResolvedValue(user) },
+        repo: {
+          findByUserAndProvider: vi
+            .fn()
+            .mockResolvedValue(buildLinkedAccount({ provider: "FACEBOOK", userId: user._id })),
+          findByUserId: vi
+            .fn()
+            .mockResolvedValue([
+              buildLinkedAccount({ provider: "FACEBOOK", userId: user._id }),
+              buildLinkedAccount({ provider: "GOOGLE", userId: user._id }),
+            ]),
+        },
+      });
+
+      await service.unlinkFacebook(String(user._id), { currentPassword: "pw" });
+      expect(repo.deleteByUserAndProvider).toHaveBeenCalledWith(String(user._id), "FACEBOOK");
     });
   });
 });

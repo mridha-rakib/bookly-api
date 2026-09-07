@@ -346,6 +346,110 @@ describe("database-backed home discovery sections (Batch 17)", () => {
     expect(run2.popular.map((c) => c.id)).toEqual(run1.popular.map((c) => c.id));
   });
 
+  // --- Category filter (the homepage category tile) -----------------------------------
+
+  it("an explicit category context hard-filters ALL three rows to that Business.category", async () => {
+    const { business: tours1 } = await createBusiness({
+      name: "Cyprus Boat Tours",
+      category: "Experience & Tours",
+    });
+    const { business: tours2 } = await createBusiness({
+      name: "Troodos Guided Hikes",
+      category: "Experience & Tours",
+    });
+    // Other categories with strong popularity signal — must never leak past the filter.
+    const { business: barber } = await createBusiness({
+      name: "Downtown Barber",
+      category: "Barber",
+    });
+    await insertBookings(barber._id, "COMPLETED", 10);
+    await favorite(barber._id, 10);
+    await createBusiness({ name: "Zen Spa", category: "Spa" });
+
+    const result = await discoveryService.getHomeSections({
+      limit: 6,
+      contextCategories: ["Experience & Tours"],
+    });
+
+    const allCards = [...result.recommended, ...result.nearYou, ...result.popular];
+    expect(allCards.length).toBeGreaterThan(0);
+    for (const card of allCards) {
+      expect(card.category).toBe("Experience & Tours");
+    }
+    expect(new Set(allCards.map((c) => c.id))).toEqual(
+      new Set([String(tours1._id), String(tours2._id)]),
+    );
+  });
+
+  it("category context filters Recommended even for a personalized Customer (affinity order kept within it)", async () => {
+    const { business: toursNicosia } = await createBusiness({
+      name: "Nicosia Tours",
+      category: "Experience & Tours",
+      city: "Nicosia",
+    });
+    const { business: toursPaphos } = await createBusiness({
+      name: "Paphos Tours",
+      category: "Experience & Tours",
+      city: "Paphos",
+    });
+    // The Customer's real history is a Spa in Nicosia: category affinity ("Spa") must NOT pull
+    // the Spa back in past the "Experience & Tours" filter, but city affinity ("Nicosia") still
+    // orders within the filtered set.
+    const { business: spa } = await createBusiness({
+      name: "Booked Spa Nicosia",
+      category: "Spa",
+      city: "Nicosia",
+    });
+    const customer = await userRepository.create({
+      normalizedEmail: `me-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await insertBookings(spa._id, "COMPLETED", 1, customer._id);
+
+    const result = await discoveryService.getHomeSections({
+      limit: 6,
+      customerUserId: customer._id,
+      contextCategories: ["Experience & Tours"],
+    });
+
+    expect(result.meta.personalized).toBe(true);
+    for (const card of result.recommended) {
+      expect(card.category).toBe("Experience & Tours");
+    }
+    expect(result.recommended.map((c) => c.id)).not.toContain(String(spa._id));
+    expect(result.recommended[0]?.name).toBe("Nicosia Tours"); // city affinity within the filter
+    void toursNicosia;
+    void toursPaphos;
+  });
+
+  it("no category context leaves every row unfiltered (unchanged behavior)", async () => {
+    await createBusiness({ name: "A Tour", category: "Experience & Tours" });
+    await createBusiness({ name: "A Barber", category: "Barber" });
+
+    const result = await discoveryService.getHomeSections({ limit: 6 });
+
+    const categories = new Set(
+      [...result.recommended, ...result.nearYou, ...result.popular].map((c) => c.category),
+    );
+    expect(categories.has("Experience & Tours")).toBe(true);
+    expect(categories.has("Barber")).toBe(true);
+  });
+
+  it("a category context with no eligible business yields empty rows, never a cross-category fallback", async () => {
+    await createBusiness({ name: "Only Barber", category: "Barber" });
+
+    const result = await discoveryService.getHomeSections({
+      limit: 6,
+      contextCategories: ["Experience & Tours"],
+    });
+
+    expect(result.recommended).toEqual([]);
+    expect(result.nearYou).toEqual([]);
+    expect(result.popular).toEqual([]);
+  });
+
   // --- Cross-section de-duplication ----------------------------------------------------
 
   it("with enough inventory the three sections share no Businesses", async () => {

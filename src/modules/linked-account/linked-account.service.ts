@@ -1,9 +1,19 @@
 import { Types } from "mongoose";
-
 import { AuthError } from "../auth/auth.errors.js";
-import { normalizeEmail } from "../auth/auth.utils.js";
+import { createOpaqueToken, normalizeEmail } from "../auth/auth.utils.js";
 import type { PasswordHasher } from "../auth/password-hasher.js";
+import type { UserDocument } from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
+import {
+  buildAppleAccountLinkAuthUrl,
+  isAppleAccountLinkConfigured,
+  verifyAppleAccountLinkCallback,
+} from "./apple-oauth.client.js";
+import {
+  buildFacebookAccountLinkAuthUrl,
+  isFacebookAccountLinkConfigured,
+  verifyFacebookAccountLinkCallback,
+} from "./facebook-oauth.client.js";
 import {
   buildGoogleAccountLinkAuthUrl,
   isGoogleAccountLinkConfigured,
@@ -11,20 +21,52 @@ import {
 } from "./google-oauth.client.js";
 import { LinkedAccountError } from "./linked-account.errors.js";
 import type { LinkedAccountRepository } from "./linked-account.repository.js";
-import type { UnlinkGoogleAccountBody } from "./linked-account.schema.js";
-import { signGoogleLinkState, verifyGoogleLinkState } from "./linked-account.state.js";
-import type { LinkedAccountSummary } from "./linked-account.types.js";
+import type { UnlinkLinkedAccountBody } from "./linked-account.schema.js";
+import {
+  signAppleLinkState,
+  signFacebookLinkState,
+  signGoogleLinkState,
+  verifyAppleLinkState,
+  verifyFacebookLinkState,
+  verifyGoogleLinkState,
+} from "./linked-account.state.js";
+import {
+  type LinkedAccountProvider,
+  type LinkedAccountSummary,
+  linkedAccountProviderLabels,
+} from "./linked-account.types.js";
 
 const GOOGLE_PROVIDER = "GOOGLE" as const;
+const FACEBOOK_PROVIDER = "FACEBOOK" as const;
+const APPLE_PROVIDER = "APPLE" as const;
+
+/** The Apple form_post callback body fields the link flow consumes. */
+export type AppleLinkCallbackInput = {
+  code: string;
+  idToken?: string | undefined;
+  state: string;
+};
+
+/** A verified external identity, provider-independent. */
+type VerifiedIdentity = {
+  providerAccountId: string;
+  email: string;
+  emailVerified: boolean;
+  displayName?: string | undefined;
+};
 
 /**
- * Business logic for Customer → Google account linking (Phase 1). Holds NO HTTP concerns and NO
- * direct Mongo access. Security rules enforced here:
- *  - link is only ever started by an authenticated Customer (route gate) and the target user is
- *    carried in the signed OAuth state, never derived from the Google email;
- *  - the Google identity is verified (id_token) before any write;
- *  - a Google account already linked to a different user is rejected;
- *  - a user may hold at most one Google link;
+ * Business logic for Settings → link an external identity to the authenticated account (Google:
+ * Phase 1; Facebook: this change). Holds NO HTTP concerns and NO direct Mongo access.
+ *
+ * LINKING ≠ LOGIN. Every link is started only by an authenticated, linkable user (route gate);
+ * the target user is carried in the signed OAuth state, NEVER derived from the provider email; no
+ * session is ever created here and the flow can never switch or merge accounts. Security rules,
+ * identical for every provider:
+ *  - the provider identity is verified (Google id_token / Facebook token introspection) before
+ *    any write;
+ *  - a provider identity already linked to a different user is rejected (409);
+ *  - a user may hold at most one link per provider (409);
  *  - unlink requires the current password and can never remove the last sign-in method.
  */
 export class LinkedAccountService {
@@ -33,6 +75,10 @@ export class LinkedAccountService {
     private readonly passwordHasher: PasswordHasher,
     private readonly userRepository: UserRepository,
   ) {}
+
+  // ---------------------------------------------------------------------------
+  // Google (Phase 1) — public API unchanged.
+  // ---------------------------------------------------------------------------
 
   public async buildGoogleAuthorizeUrl(userId: string): Promise<string> {
     if (!isGoogleAccountLinkConfigured()) {
@@ -48,8 +94,7 @@ export class LinkedAccountService {
    * Google redirects the browser here after consent (see linked-account.route.ts — the callback
    * is public because a top-level redirect cannot carry a Bearer token). Trust comes entirely
    * from the signed `state`: it names the user who started the flow, and this method links the
-   * verified Google identity to THAT user only — the provider email is never used to look up or
-   * match an account.
+   * verified Google identity to THAT user only.
    */
   public async linkGoogleFromCallback(code: string, state: string): Promise<void> {
     if (!isGoogleAccountLinkConfigured()) {
@@ -57,12 +102,122 @@ export class LinkedAccountService {
     }
 
     const { userId } = await verifyGoogleLinkState(state);
+    await this.resolveLinkableUser(userId, "Google");
 
+    const identity = await verifyGoogleAccountLinkCallback(code);
+    await this.persistVerifiedIdentity(GOOGLE_PROVIDER, userId, identity);
+  }
+
+  public async unlinkGoogle(userId: string, input: UnlinkLinkedAccountBody): Promise<void> {
+    await this.unlinkProvider(GOOGLE_PROVIDER, userId, input);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Facebook — account LINKING only (never "Continue with Facebook" login).
+  // ---------------------------------------------------------------------------
+
+  public async buildFacebookAuthorizeUrl(userId: string): Promise<string> {
+    if (!isFacebookAccountLinkConfigured()) {
+      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_CONFIGURED", 503, undefined, "Facebook");
+    }
+
+    const state = await signFacebookLinkState({ userId });
+
+    return buildFacebookAccountLinkAuthUrl(state);
+  }
+
+  /**
+   * Facebook redirects the browser here after consent. Public callback — trust is the signed
+   * `state` only. Links the verified Facebook identity to the user named in the state, never to a
+   * user matched by the Facebook email.
+   */
+  public async linkFacebookFromCallback(code: string, state: string): Promise<void> {
+    if (!isFacebookAccountLinkConfigured()) {
+      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_CONFIGURED", 503, undefined, "Facebook");
+    }
+
+    const { userId } = await verifyFacebookLinkState(state);
+    await this.resolveLinkableUser(userId, "Facebook");
+
+    const identity = await verifyFacebookAccountLinkCallback(code);
+    await this.persistVerifiedIdentity(FACEBOOK_PROVIDER, userId, identity);
+  }
+
+  public async unlinkFacebook(userId: string, input: UnlinkLinkedAccountBody): Promise<void> {
+    await this.unlinkProvider(FACEBOOK_PROVIDER, userId, input);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Apple — account LINKING only (never "Continue with Apple" login).
+  // ---------------------------------------------------------------------------
+
+  public async buildAppleAuthorizeUrl(userId: string): Promise<string> {
+    if (!isAppleAccountLinkConfigured()) {
+      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_CONFIGURED", 503, undefined, "Apple");
+    }
+
+    const nonce = createOpaqueToken();
+    const state = await signAppleLinkState({ userId, nonce });
+
+    return buildAppleAccountLinkAuthUrl(state, nonce);
+  }
+
+  /**
+   * Apple POSTs the browser here (form_post) after consent. Public callback — trust is the signed
+   * `state` (carries `userId` + `nonce`) plus the Apple id_token `nonce` claim, which must equal
+   * `state.nonce`. There is no nonce cookie (a SameSite=Lax cookie is not sent on Apple's
+   * cross-site POST). Links the verified Apple identity to `state.userId` only — never a user
+   * matched by the Apple email. A missing Apple email fails the link (LinkedAccount.email
+   * required).
+   */
+  public async linkAppleFromCallback(input: AppleLinkCallbackInput): Promise<void> {
+    if (!isAppleAccountLinkConfigured()) {
+      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_CONFIGURED", 503, undefined, "Apple");
+    }
+
+    const { userId, nonce } = await verifyAppleLinkState(input.state);
+    await this.resolveLinkableUser(userId, "Apple");
+
+    const identity = await verifyAppleAccountLinkCallback({
+      code: input.code,
+      idToken: input.idToken,
+      nonce,
+    });
+    await this.persistVerifiedIdentity(APPLE_PROVIDER, userId, identity);
+  }
+
+  public async unlinkApple(userId: string, input: UnlinkLinkedAccountBody): Promise<void> {
+    await this.unlinkProvider(APPLE_PROVIDER, userId, input);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shared read model.
+  // ---------------------------------------------------------------------------
+
+  public async listForUser(userId: string): Promise<LinkedAccountSummary[]> {
+    const accounts = await this.linkedAccountRepository.findByUserId(userId);
+
+    return accounts.map((account) => ({
+      provider: account.provider,
+      email: account.email,
+      ...(account.displayName ? { displayName: account.displayName } : {}),
+      linkedAt: account.linkedAt.toISOString(),
+    }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Provider-independent core.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The signed state named a user; they must still exist and still be linkable NOW. Linking is
+   * available to CUSTOMER, BUSINESS_OWNER (Phase 2C) and SUPERVISOR / STAFF (Phase 2D) — never
+   * SUPER_ADMIN. A valid signature over a user that can no longer be linked is treated as a stale
+   * request.
+   */
+  private async resolveLinkableUser(userId: string, providerLabel: string): Promise<UserDocument> {
     const user = await this.userRepository.findById(userId);
 
-    // Google linking is available to CUSTOMER, BUSINESS_OWNER (Phase 2C) and SUPERVISOR / STAFF
-    // (Phase 2D) — never SUPER_ADMIN. The signed state named this user, but they must still be
-    // linkable now.
     const linkableRole =
       user?.role === "CUSTOMER" ||
       user?.role === "BUSINESS_OWNER" ||
@@ -70,41 +225,63 @@ export class LinkedAccountService {
       user?.role === "STAFF";
 
     if (!user || user.status === "DELETED" || !linkableRole) {
-      // A valid signature over a user that can no longer be linked — treat as a stale request.
-      throw new LinkedAccountError("LINKED_ACCOUNT_INVALID_STATE", 400);
+      throw new LinkedAccountError("LINKED_ACCOUNT_INVALID_STATE", 400, undefined, providerLabel);
     }
 
-    const identity = await verifyGoogleAccountLinkCallback(code);
+    return user;
+  }
 
-    // Provider-identity uniqueness — this Google account must not already belong to someone else.
+  /**
+   * Conflict detection + persistence, identical for every provider:
+   *  - provider identity already linked to another user   → ALREADY_LINKED_ELSEWHERE (409)
+   *  - provider identity already linked to THIS user      → idempotent no-op
+   *  - this user already has another identity for provider → PROVIDER_ALREADY_LINKED (409)
+   *  - a duplicate-key race on create                     → re-resolved to the same 409s
+   */
+  private async persistVerifiedIdentity(
+    provider: LinkedAccountProvider,
+    userId: string,
+    identity: VerifiedIdentity,
+  ): Promise<void> {
+    const providerLabel = linkedAccountProviderLabels[provider];
+
     const byProviderAccount = await this.linkedAccountRepository.findByProviderAccount(
-      GOOGLE_PROVIDER,
+      provider,
       identity.providerAccountId,
     );
 
     if (byProviderAccount) {
       if (String(byProviderAccount.userId) !== userId) {
-        throw new LinkedAccountError("LINKED_ACCOUNT_ALREADY_LINKED_ELSEWHERE", 409);
+        throw new LinkedAccountError(
+          "LINKED_ACCOUNT_ALREADY_LINKED_ELSEWHERE",
+          409,
+          undefined,
+          providerLabel,
+        );
       }
 
-      // Same Google account, same user — a harmless repeat of an already-completed link.
+      // Same identity, same user — a harmless repeat of an already-completed link.
       return;
     }
 
-    // One Google account per user.
     const existingForUser = await this.linkedAccountRepository.findByUserAndProvider(
       userId,
-      GOOGLE_PROVIDER,
+      provider,
     );
 
     if (existingForUser) {
-      throw new LinkedAccountError("LINKED_ACCOUNT_PROVIDER_ALREADY_LINKED", 409);
+      throw new LinkedAccountError(
+        "LINKED_ACCOUNT_PROVIDER_ALREADY_LINKED",
+        409,
+        undefined,
+        providerLabel,
+      );
     }
 
     try {
       await this.linkedAccountRepository.create({
         userId: new Types.ObjectId(userId),
-        provider: GOOGLE_PROVIDER,
+        provider,
         providerAccountId: identity.providerAccountId,
         email: normalizeEmail(identity.email),
         emailVerified: identity.emailVerified,
@@ -115,22 +292,44 @@ export class LinkedAccountService {
       if (this.isDuplicateKeyError(error)) {
         // Lost a race against a concurrent link. Re-resolve to the stable domain error.
         const raced = await this.linkedAccountRepository.findByProviderAccount(
-          GOOGLE_PROVIDER,
+          provider,
           identity.providerAccountId,
         );
 
         if (raced && String(raced.userId) !== userId) {
-          throw new LinkedAccountError("LINKED_ACCOUNT_ALREADY_LINKED_ELSEWHERE", 409);
+          throw new LinkedAccountError(
+            "LINKED_ACCOUNT_ALREADY_LINKED_ELSEWHERE",
+            409,
+            undefined,
+            providerLabel,
+          );
         }
 
-        throw new LinkedAccountError("LINKED_ACCOUNT_PROVIDER_ALREADY_LINKED", 409);
+        throw new LinkedAccountError(
+          "LINKED_ACCOUNT_PROVIDER_ALREADY_LINKED",
+          409,
+          undefined,
+          providerLabel,
+        );
       }
 
       throw error;
     }
   }
 
-  public async unlinkGoogle(userId: string, input: UnlinkGoogleAccountBody): Promise<void> {
+  /**
+   * Unlink one provider. Requires the current password (same precedent as changeMyPassword) and
+   * the last-credential guard: after this unlink the account must still have at least one way to
+   * sign in — a usable password always counts; otherwise another linked provider must remain. In
+   * practice every User has a real password hash today, so this never blocks — it guards a future
+   * passwordless sign-up path.
+   */
+  private async unlinkProvider(
+    provider: LinkedAccountProvider,
+    userId: string,
+    input: UnlinkLinkedAccountBody,
+  ): Promise<void> {
+    const providerLabel = linkedAccountProviderLabels[provider];
     const user = await this.userRepository.findByIdWithPassword(userId);
 
     if (!user) {
@@ -146,40 +345,22 @@ export class LinkedAccountService {
       throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
     }
 
-    const existing = await this.linkedAccountRepository.findByUserAndProvider(
-      userId,
-      GOOGLE_PROVIDER,
-    );
+    const existing = await this.linkedAccountRepository.findByUserAndProvider(userId, provider);
 
     if (!existing) {
-      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_FOUND", 404);
+      throw new LinkedAccountError("LINKED_ACCOUNT_NOT_FOUND", 404, undefined, providerLabel);
     }
 
-    // Last-credential protection: after this unlink the account must still have at least one way
-    // to sign in. A usable password always counts; otherwise another linked provider must remain.
-    // In Phase 1 every User has a real password hash, so this never blocks today — it guards a
-    // future passwordless (Google-only) sign-up path.
     const hasUsablePassword = Boolean(user.passwordHash);
     const otherProviders = (await this.linkedAccountRepository.findByUserId(userId)).filter(
-      (account) => account.provider !== GOOGLE_PROVIDER,
+      (account) => account.provider !== provider,
     );
 
     if (!hasUsablePassword && otherProviders.length === 0) {
-      throw new LinkedAccountError("LINKED_ACCOUNT_LAST_CREDENTIAL", 409);
+      throw new LinkedAccountError("LINKED_ACCOUNT_LAST_CREDENTIAL", 409, undefined, providerLabel);
     }
 
-    await this.linkedAccountRepository.deleteByUserAndProvider(userId, GOOGLE_PROVIDER);
-  }
-
-  public async listForUser(userId: string): Promise<LinkedAccountSummary[]> {
-    const accounts = await this.linkedAccountRepository.findByUserId(userId);
-
-    return accounts.map((account) => ({
-      provider: account.provider,
-      email: account.email,
-      ...(account.displayName ? { displayName: account.displayName } : {}),
-      linkedAt: account.linkedAt.toISOString(),
-    }));
+    await this.linkedAccountRepository.deleteByUserAndProvider(userId, provider);
   }
 
   private isDuplicateKeyError(error: unknown): boolean {
