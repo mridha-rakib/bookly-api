@@ -35,6 +35,10 @@ import { renderNoShowChargedEmail } from "./templates/booking/no-show-charged.te
 import type { NoShowEmailData } from "./templates/booking/no-show-email-data.js";
 import { renderNoShowWaivedEmail } from "./templates/booking/no-show-waived.template.js";
 import {
+  renderSessionEndReminderEmail,
+  type SessionEndReminderEmailData,
+} from "./templates/booking/session-end-reminder.template.js";
+import {
   type ClientCreatedEmailData,
   renderClientCreatedEmail,
 } from "./templates/client/client-created.template.js";
@@ -86,6 +90,9 @@ export type EmailTemplateKey =
   | "BOOKING_COMPLETED"
   // Appointment reminder (optional, preference-gated — NOT a mandatory booking email)
   | "APPOINTMENT_REMINDER_24H"
+  // Session-end reminder — transactional, NOT preference-gated, Customer-only, distinct from the
+  // 24h reminder above (see appointment-reminder.types.ts's own kind doc comment)
+  | "SESSION_END_REMINDER"
   // Mandatory customer transactional email — appointment schedule changed (customer or business)
   | "BOOKING_RESCHEDULED_CUSTOMER"
   // Stage D — cancellation + no-show + business registration
@@ -131,6 +138,7 @@ const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> 
   APPOINTMENT_REMINDER_24H: asRenderer<AppointmentReminderEmailData>(
     renderAppointmentReminder24hEmail,
   ),
+  SESSION_END_REMINDER: asRenderer<SessionEndReminderEmailData>(renderSessionEndReminderEmail),
   BOOKING_RESCHEDULED_CUSTOMER: asRenderer<BookingRescheduledEmailData>(
     renderBookingRescheduledCustomerEmail,
   ),

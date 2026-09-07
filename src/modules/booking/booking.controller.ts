@@ -13,6 +13,7 @@ import type {
   BookingBusinessParams,
   BookingIdOnlyParams,
   BookingIdParams,
+  BookingServiceParams,
   CalendarQuery,
   CancelBookingBody,
   CompleteBookingBody,
@@ -61,6 +62,39 @@ export class BookingController {
     );
 
     sendSuccess(response, 201, "Booking created", toBookingDetailDto(booking));
+  };
+
+  /** Read-only manual-booking picker data (Owner-or-Supervisor) — see BookingService's own
+   * "Manual-booking read context" doc comment for why this exists instead of reusing the
+   * Owner-only Service-management list. */
+  public listBookableServices = async (request: Request, response: Response): Promise<void> => {
+    const { userId, role } = this.requireBusinessActor(request);
+    const params = request.validated?.params as BookingBusinessParams;
+
+    const services = await this.bookingService.listBookableServices(
+      userId,
+      role,
+      params.businessId,
+    );
+
+    sendSuccess(response, 200, "Bookable services", { services });
+  };
+
+  public listBookableAddonsForService = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const { userId, role } = this.requireBusinessActor(request);
+    const params = request.validated?.params as BookingServiceParams;
+
+    const addons = await this.bookingService.listBookableAddonsForService(
+      userId,
+      role,
+      params.businessId,
+      params.serviceId,
+    );
+
+    sendSuccess(response, 200, "Bookable add-ons", { addons });
   };
 
   public getDetailForBusiness = async (request: Request, response: Response): Promise<void> => {

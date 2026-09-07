@@ -24,6 +24,9 @@ import { BusinessHoursService } from "../../../src/modules/business-hours/busine
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
+import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
@@ -175,7 +178,7 @@ describe("database-backed Package Deal integration", () => {
       financialTransactionService,
       undefined, // integrationService
       undefined, // bookingCompletedNotifier
-      undefined, // bookingCancelledNotifier
+      new BookingCancelledNotifier(new EmailOutboxService(), userRepository),
       undefined, // noShowNotifier
       undefined, // staffBookingNotifier
       undefined, // appointmentReminderScheduler
@@ -1275,6 +1278,140 @@ describe("database-backed Package Deal integration", () => {
           "Second void attempt",
         ),
       ).rejects.toMatchObject({ statusCode: 409 });
+    });
+  });
+
+  // --- Package void/refund notification (Phase 4B close-out fix) -------------------------------
+
+  describe("voidUnusedPackage — Customer + Business Owner notification", () => {
+    it("enqueues a customer + Business Owner email carrying the ACTUAL refunded amount (€35 of a €450 bundle), never the bundle price", async () => {
+      const { owner, business, customer, progress, purchase } = await setUpPurchasedPackage();
+
+      await lifecycleService.voidUnusedPackage(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        "Customer changed their mind",
+      );
+
+      const rows = await EmailOutboxModel.find({
+        eventKey: `PACKAGE_REFUND:${String(purchase._id)}`,
+      }).exec();
+      expect(rows.map((r) => r.templateKey).sort()).toEqual([
+        "BOOKING_CANCELLED_CUSTOMER",
+        "BOOKING_CANCELLED_OWNER",
+      ]);
+      expect(rows.map((r) => r.recipient).sort()).toEqual(
+        [customer.normalizedEmail, owner.normalizedEmail].sort(),
+      );
+      for (const row of rows) {
+        const payload = row.payload as {
+          financialOutcome: {
+            refundFormatted: string;
+            hasRefund: boolean;
+            settlementStatus: string;
+          };
+        };
+        expect(payload.financialOutcome.hasRefund).toBe(true);
+        expect(payload.financialOutcome.refundFormatted).toBe("€35.00");
+        expect(payload.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+      }
+    });
+
+    it("a Stripe refund failure still voids the Package (existing convention, unchanged) but never sends an email falsely claiming the refund succeeded", async () => {
+      const { business, customer, progress, purchase } = await setUpPurchasedPackage();
+      paymentGateway.queueNextRefundOutcome("failed");
+
+      const voided = await lifecycleService.voidUnusedPackage(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        "Refund will fail",
+      );
+      expect(voided.voidedAt).toBeTruthy();
+
+      const ledger = await financialTransactionService.listForBooking(purchase._id);
+      const refund = ledger.find((e) => e.type === "REFUND");
+      expect(refund?.status).toBe("FAILED");
+
+      const rows = await EmailOutboxModel.find({
+        eventKey: `PACKAGE_REFUND:${String(purchase._id)}`,
+      }).exec();
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        const payload = row.payload as { financialOutcome: { settlementStatus: string } };
+        expect(payload.financialOutcome.settlementStatus).toBe("FAILED");
+      }
+      // The customer-facing text is never "has been processed" for a failed refund.
+      expect(JSON.stringify(rows.map((r) => r.payload))).not.toContain("has been processed");
+    });
+
+    it("a retried void after success does not enqueue a duplicate notification (and does not double-refund)", async () => {
+      const { business, customer, progress, purchase } = await setUpPurchasedPackage();
+
+      await lifecycleService.voidUnusedPackage(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        "First void",
+      );
+      await expect(
+        lifecycleService.voidUnusedPackage(
+          String(customer._id),
+          String(business._id),
+          String(progress._id),
+          "Retried void",
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+
+      const rows = await EmailOutboxModel.find({
+        eventKey: `PACKAGE_REFUND:${String(purchase._id)}`,
+      }).exec();
+      expect(rows).toHaveLength(2); // exactly one customer + one owner row, never more
+
+      const ledger = await financialTransactionService.listForBooking(purchase._id);
+      expect(ledger.filter((e) => e.type === "REFUND")).toHaveLength(1);
+    });
+
+    it("a notification/email dependency failure does not roll back an already-successful refund", async () => {
+      const { business, customer, progress, purchase } = await setUpPurchasedPackage();
+      const throwingNotifier = new BookingCancelledNotifier(new EmailOutboxService(), {
+        findManyByIds: async () => {
+          throw new Error("simulated user-lookup failure");
+        },
+      });
+      const isolatedLifecycleService = new BookingLifecycleService(
+        bookingService,
+        bookingRepository,
+        businessRepository,
+        reservationService,
+        availabilityService,
+        serviceRepository,
+        staffRepository,
+        paymentService,
+        financialTransactionService,
+        undefined,
+        undefined,
+        throwingNotifier,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        packageProgressRepository,
+      );
+
+      const voided = await isolatedLifecycleService.voidUnusedPackage(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        "Notifier will throw",
+      );
+      expect(voided.voidedAt).toBeTruthy();
+
+      const ledger = await financialTransactionService.listForBooking(purchase._id);
+      const refund = ledger.find((e) => e.type === "REFUND");
+      expect(refund?.status).toBe("SUCCEEDED");
+      expect(refund?.amountCents).toBe(3_500);
     });
   });
 

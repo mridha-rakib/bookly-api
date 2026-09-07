@@ -16,6 +16,8 @@ const defaultMessages: Record<string, string> = {
     "This business does not travel to customers, so cities served cannot be set",
   SERVICE_ARCHIVE_BLOCKED_BY_PACKAGE_ENTITLEMENTS:
     "This Package Deal has customers with unused purchased sessions — it cannot be archived until those entitlements are fully used or refunded/voided",
+  SERVICE_RESTORE_INCOMPLETE:
+    "This service can't be restored yet. Edit it and complete the required information first.",
 };
 
 export class ServiceError extends AppError {

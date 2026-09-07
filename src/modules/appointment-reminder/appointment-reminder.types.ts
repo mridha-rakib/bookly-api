@@ -9,16 +9,26 @@
  * old one is retired, the new one scheduled.
  */
 
-/** The only reminder offset implemented. A future 1h reminder adds `"REMINDER_1H"` here, a
- * matching `offsetMinutes`, its own template key + a case in `buildAppointmentReminderDedupeKey`
- * / `appointmentReminderEventKeyPrefix` — the model, repository, worker and claim query are
- * already offset-agnostic (they key off `status` + `dueAt`). */
-export const appointmentReminderKinds = ["REMINDER_24H"] as const;
+/** `REMINDER_24H` is anchored to `Booking.schedule.startAt` with a FIXED offset (below).
+ * `SESSION_END_REMINDER` is anchored to `Booking.schedule.endAt` instead, with a PER-BOOKING
+ * offset (`Booking.sessionEndReminderSnapshot.minutesBeforeSessionEnds`, snapshotted from
+ * `Service.sessionExpiryAlert` at creation) — it has no entry in
+ * `APPOINTMENT_REMINDER_OFFSET_MINUTES` and must always be scheduled with an explicit
+ * `ScheduleReminderInput.offsetMinutes`. A future 1h reminder would add `"REMINDER_1H"` here, a
+ * matching fixed `offsetMinutes`, its own template key + a case in
+ * `buildAppointmentReminderDedupeKey` / `appointmentReminderEventKeyPrefix` — the model,
+ * repository, worker and claim query are already offset-agnostic (they key off `status` +
+ * `dueAt`). */
+export const appointmentReminderKinds = ["REMINDER_24H", "SESSION_END_REMINDER"] as const;
 export type AppointmentReminderKind = (typeof appointmentReminderKinds)[number];
 
-export const APPOINTMENT_REMINDER_OFFSET_MINUTES: Record<AppointmentReminderKind, number> = {
-  REMINDER_24H: 24 * 60,
-};
+/** Only kinds with a FIXED, constant-per-kind offset appear here. `SESSION_END_REMINDER` is
+ * intentionally absent — its offset varies per Booking, so the caller (the scheduler) always
+ * supplies it explicitly via `ScheduleReminderInput.offsetMinutes`. */
+export const APPOINTMENT_REMINDER_OFFSET_MINUTES: Partial<Record<AppointmentReminderKind, number>> =
+  {
+    REMINDER_24H: 24 * 60,
+  };
 
 /**
  * Orchestration lifecycle of the reminder row — deliberately SEPARATE from email delivery state
@@ -71,6 +81,11 @@ export type AppointmentReminderStatus = (typeof appointmentReminderStatuses)[num
  *                                      send once config exists; this one is never re-sent.
  *  - SKIPPED_INELIGIBLE            — the booking became ineligible (cancelled / rescheduled /
  *                                      started / gone) before this channel enqueued.
+ *  - NOT_APPLICABLE                 — this channel does not exist for this reminder KIND (e.g.
+ *                                      SMS on the email-only `SESSION_END_REMINDER`). Set once,
+ *                                      unconditionally, at creation — never a per-booking or
+ *                                      per-preference outcome, so it carries no eligibility or
+ *                                      preference information.
  */
 export const appointmentReminderChannelDecisions = [
   "PENDING",
@@ -80,6 +95,7 @@ export const appointmentReminderChannelDecisions = [
   "SKIPPED_NO_VERIFIED_PHONE",
   "SKIPPED_PROVIDER_NOT_CONFIGURED",
   "SKIPPED_INELIGIBLE",
+  "NOT_APPLICABLE",
 ] as const;
 export type AppointmentReminderChannelDecision =
   (typeof appointmentReminderChannelDecisions)[number];
@@ -93,6 +109,7 @@ export const isFinalChannelDecision = (
  * dedupeKey (`eventKey::templateKey::recipient`) is deterministic per reminder + recipient. */
 export const appointmentReminderEventKeyPrefix: Record<AppointmentReminderKind, string> = {
   REMINDER_24H: "APPOINTMENT_REMINDER_24H",
+  SESSION_END_REMINDER: "SESSION_END_REMINDER",
 };
 
 /**
@@ -105,8 +122,17 @@ export const buildAppointmentReminderDedupeKey = (
   scheduleStartAt: Date,
 ): string => `${appointmentReminderEventKeyPrefix[kind]}:${bookingId}:${scheduleStartAt.getTime()}`;
 
-/** Absolute-instant arithmetic only — never a timezone label, offset string, or local clock. */
+/** Absolute-instant arithmetic only — never a timezone label, offset string, or local clock.
+ * Only valid for a kind with a FIXED offset (see `APPOINTMENT_REMINDER_OFFSET_MINUTES`) — a
+ * per-booking-variable kind like `SESSION_END_REMINDER` has no fixed offset to look up here and
+ * must go through `AppointmentReminderRepository.schedule`'s explicit `offsetMinutes` instead. */
 export const computeAppointmentReminderDueAt = (
   scheduleStartAt: Date,
   kind: AppointmentReminderKind,
-): Date => new Date(scheduleStartAt.getTime() - APPOINTMENT_REMINDER_OFFSET_MINUTES[kind] * 60_000);
+): Date => {
+  const offsetMinutes = APPOINTMENT_REMINDER_OFFSET_MINUTES[kind];
+  if (offsetMinutes === undefined) {
+    throw new Error(`No fixed offset configured for appointment reminder kind "${kind}"`);
+  }
+  return new Date(scheduleStartAt.getTime() - offsetMinutes * 60_000);
+};

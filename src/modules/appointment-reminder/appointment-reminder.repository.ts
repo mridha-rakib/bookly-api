@@ -5,11 +5,16 @@ import {
   AppointmentReminderModel,
 } from "./appointment-reminder.model.js";
 import {
+  APPOINTMENT_REMINDER_OFFSET_MINUTES,
   type AppointmentReminderChannelDecision,
   type AppointmentReminderKind,
   buildAppointmentReminderDedupeKey,
-  computeAppointmentReminderDueAt,
 } from "./appointment-reminder.types.js";
+
+/** Kinds with no SMS channel at all — their `smsDecision` is fixed to `NOT_APPLICABLE` at
+ * creation (never `PENDING`), so the worker never attempts SMS and the row can complete on the
+ * email decision alone. */
+const EMAIL_ONLY_KINDS = new Set<AppointmentReminderKind>(["SESSION_END_REMINDER"]);
 
 const isDuplicateKeyError = (error: unknown): boolean =>
   typeof error === "object" &&
@@ -25,6 +30,11 @@ export type ScheduleReminderInput = {
   businessId: Types.ObjectId;
   customerUserId: Types.ObjectId;
   scheduleStartAt: Date;
+  /** Explicit per-booking offset. REQUIRED for a kind with no fixed entry in
+   * `APPOINTMENT_REMINDER_OFFSET_MINUTES` (currently `SESSION_END_REMINDER`, whose minutes are a
+   * per-booking Service snapshot) — throws if omitted for such a kind. Omit for a fixed-offset
+   * kind (`REMINDER_24H`) to use its constant unchanged. */
+  offsetMinutes?: number | undefined;
   /** Absolute instant used for the `dueAt <= now` late-booking decision. */
   now: Date;
 };
@@ -69,14 +79,21 @@ export class AppointmentReminderRepository {
    * (same `dedupeKey`) is a no-op that returns the existing row.
    */
   public async schedule(input: ScheduleReminderInput): Promise<ScheduleReminderResult> {
+    const offsetMinutes = input.offsetMinutes ?? APPOINTMENT_REMINDER_OFFSET_MINUTES[input.kind];
+    if (offsetMinutes === undefined) {
+      throw new Error(
+        `Appointment reminder kind "${input.kind}" has no fixed offset — an explicit offsetMinutes is required`,
+      );
+    }
     const dedupeKey = buildAppointmentReminderDedupeKey(
       input.kind,
       String(input.bookingId),
       input.scheduleStartAt,
     );
-    const dueAt = computeAppointmentReminderDueAt(input.scheduleStartAt, input.kind);
+    const dueAt = new Date(input.scheduleStartAt.getTime() - offsetMinutes * 60_000);
     const isLate = dueAt.getTime() <= input.now.getTime();
-    const channelDecision = isLate ? "SKIPPED_INELIGIBLE" : "PENDING";
+    const emailDecision = isLate ? "SKIPPED_INELIGIBLE" : "PENDING";
+    const smsDecision = EMAIL_ONLY_KINDS.has(input.kind) ? "NOT_APPLICABLE" : emailDecision;
 
     try {
       const record = await AppointmentReminderModel.create({
@@ -85,13 +102,13 @@ export class AppointmentReminderRepository {
         bookingId: input.bookingId,
         businessId: input.businessId,
         customerUserId: input.customerUserId,
-        offsetMinutes: Math.round((input.scheduleStartAt.getTime() - dueAt.getTime()) / 60_000),
+        offsetMinutes,
         scheduleStartAt: input.scheduleStartAt,
         dueAt,
         status: isLate ? "SKIPPED" : "PENDING",
         attemptCount: 0,
-        emailDecision: channelDecision,
-        smsDecision: channelDecision,
+        emailDecision,
+        smsDecision,
         ...(isLate ? { processedAt: input.now, lastErrorCategory: "CREATED_INSIDE_WINDOW" } : {}),
       });
       return { created: true, record };
@@ -127,14 +144,26 @@ export class AppointmentReminderRepository {
   public async retireActiveForBooking(
     bookingId: Types.ObjectId | string,
     reasonCategory: string,
-    options: { now: Date; exceptDedupeKey?: string | undefined } = { now: new Date() },
+    options: {
+      now: Date;
+      exceptDedupeKey?: string | undefined;
+      /** Same as `exceptDedupeKey` but for more than one logical identity at once — a reschedule
+       * that (re)schedules several reminder KINDS off the same booking must except all of their
+       * current dedupe keys in one atomic retire, not just one. Union'd with `exceptDedupeKey`
+       * when both are given. */
+      exceptDedupeKeys?: string[] | undefined;
+    } = { now: new Date() },
   ): Promise<number> {
     const filter: Record<string, unknown> = {
       bookingId,
       status: { $in: ["PENDING", "PROCESSING"] },
     };
-    if (options.exceptDedupeKey) {
-      filter["dedupeKey"] = { $ne: options.exceptDedupeKey };
+    const excepted = [
+      ...(options.exceptDedupeKey ? [options.exceptDedupeKey] : []),
+      ...(options.exceptDedupeKeys ?? []),
+    ];
+    if (excepted.length > 0) {
+      filter["dedupeKey"] = { $nin: excepted };
     }
 
     const result = await AppointmentReminderModel.updateMany(filter, {

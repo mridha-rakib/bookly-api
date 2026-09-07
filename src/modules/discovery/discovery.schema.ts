@@ -48,9 +48,10 @@ export type ListDiscoveryBusinessesQuery = z.infer<typeof listDiscoveryBusinesse
 
 /**
  * Batch 17 — homepage discovery sections. `city` (single, real enum) is the hero search bar's
- * picked city and drives "Services near you". `category` (comma-separated real category
- * strings) is an optional context that narrows "Recommended" for logged-out visitors. Both are
- * optional — with neither, every section still returns an honest ranking.
+ * picked city and drives "Services near you". `category` (comma-separated real
+ * `Business.category` strings — the homepage category tile the visitor picked) is an optional
+ * hard eligibility filter applied to all three rows; each row keeps its own ranking within it.
+ * Both are optional — with neither, every section still returns an honest, unfiltered ranking.
  */
 export const homeSectionsQuerySchema = z
   .object({
