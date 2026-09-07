@@ -117,6 +117,49 @@ describe("cancellation email data + templates", () => {
     }
   });
 
+  // Phase 4B close-out fix — refundOverride (Package price €200 / collected deposit €35 example).
+  it("refundOverride reflects the actual authoritative refund amount, never the bundle/package price", () => {
+    const data = buildCancellationEmailData(buildCancelledBooking(), {
+      ...CTX_CUSTOMER,
+      refundOverride: { succeeded: true, amountCents: 3500 },
+    });
+    expect(data.financialOutcome.refundFormatted).toBe("€35.00");
+    expect(data.financialOutcome.hasRefund).toBe(true);
+    expect(data.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+    expect(renderBookingCancelledCustomerEmail(data).text).toContain(
+      "Refund of €35.00 for your upfront payment has been processed.",
+    );
+  });
+
+  it("a FAILED refundOverride never states the refund was processed", () => {
+    const data = buildCancellationEmailData(buildCancelledBooking(), {
+      ...CTX_CUSTOMER,
+      refundOverride: { succeeded: false, amountCents: 3500 },
+    });
+    expect(data.financialOutcome.settlementStatus).toBe("FAILED");
+    const text = renderBookingCancelledCustomerEmail(data).text;
+    expect(text).not.toContain("has been processed");
+    expect(text).toContain("is being arranged");
+  });
+
+  it("without refundOverride, existing normal-booking behavior (persisted cancellationOutcome) is unchanged", () => {
+    const data = buildCancellationEmailData(
+      buildCancelledBooking({ refundOwedCents: 2500, settlementStatus: "SUCCEEDED" }),
+      CTX_BUSINESS,
+    );
+    expect(data.financialOutcome.refundFormatted).toBe("€25.00");
+    expect(data.financialOutcome.hasRefund).toBe(true);
+    expect(data.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+  });
+
+  it("an existing no-refund business cancellation still shows no refund line", () => {
+    const data = buildCancellationEmailData(buildCancelledBooking(), CTX_BUSINESS);
+    expect(data.financialOutcome.hasRefund).toBe(false);
+    expect(renderBookingCancelledCustomerEmail(data).text).toContain(
+      "There was no upfront payment to refund for this booking.",
+    );
+  });
+
   it("registry renders both cancellation keys", () => {
     const data = buildCancellationEmailData(buildCancelledBooking(), CTX_CUSTOMER);
     expect(renderEmailTemplate("BOOKING_CANCELLED_CUSTOMER", data).subject).toBe(

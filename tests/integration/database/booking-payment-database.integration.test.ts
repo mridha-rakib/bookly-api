@@ -24,6 +24,9 @@ import { BusinessHoursService } from "../../../src/modules/business-hours/busine
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
+import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
 import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
@@ -792,6 +795,65 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     const refundEntries = ledger.filter((entry) => entry.type === "REFUND");
     expect(refundEntries).toHaveLength(1);
     expect(refundEntries[0]?.status).toBe("SUCCEEDED");
+  });
+
+  // Phase 4B close-out fix — the cancellation email must show the ACTUAL refunded amount, not
+  // €0 (see cancellation-email-data.ts's own doc comment for why `cancellationOutcome`'s own
+  // persisted amount is treated as authoritative here — this is the happy path it already
+  // reflects correctly; the fix corrects the FAILED case and BookingLifecycleService.
+  // voidUnusedPackage's own separate flow, exercised elsewhere).
+  it("business cancellation's refund email reflects the actual refunded amount (never €0)", async () => {
+    const { business, owner, membership, service } = await setupBookableBusiness();
+    const customer = await createCustomer("refund-email");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+    const isolatedLifecycleService = new BookingLifecycleService(
+      bookingService,
+      bookingRepository,
+      businessRepository,
+      reservationService,
+      availabilityService,
+      serviceRepository,
+      staffRepository,
+      paymentService,
+      financialTransactionService,
+      undefined,
+      undefined,
+      new BookingCancelledNotifier(new EmailOutboxService(), userRepository),
+    );
+
+    const finalizeResult = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    const expectedRefundCents = finalizeResult.booking.financials.depositCents;
+
+    await isolatedLifecycleService.cancelByBusiness(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+      String(finalizeResult.booking._id),
+      "Business closed for the day",
+    );
+
+    const rows = await EmailOutboxModel.find({
+      eventKey: `BOOKING_CANCELLED:${String(finalizeResult.booking._id)}`,
+    }).exec();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      const payload = row.payload as {
+        financialOutcome: { refundFormatted: string; hasRefund: boolean; settlementStatus: string };
+      };
+      expect(payload.financialOutcome.hasRefund).toBe(true);
+      expect(payload.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+      expect(payload.financialOutcome.refundFormatted).not.toBe("€0.00");
+      expect(payload.financialOutcome.refundFormatted).toBe(
+        `€${(expectedRefundCents / 100).toFixed(2)}`,
+      );
+    }
   });
 
   // --- No-show worker ----------------------------------------------------------------------------

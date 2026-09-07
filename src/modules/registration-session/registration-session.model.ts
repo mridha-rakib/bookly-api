@@ -7,17 +7,22 @@ export const registrationPortals = ["CUSTOMER", "PROFESSIONAL"] as const;
 export type RegistrationPortal = (typeof registrationPortals)[number];
 
 /**
- * How the registration is being completed. Phase 2C — a `"GOOGLE"` PROFESSIONAL session carries a
- * Google-verified identity + email and never collects a password; `"PASSWORD"` is the classic
- * email + password + OTP flow. Absent on rows written before Phase 2C — resolve via
- * {@link resolveRegistrationAuthProvider}.
+ * How the registration is being completed. A `"GOOGLE"` / `"FACEBOOK"` / `"APPLE"` PROFESSIONAL
+ * session carries a provider-verified identity + email and never collects a password;
+ * `"PASSWORD"` is the classic email + password + OTP flow. Absent on rows written before this
+ * field existed — resolve via {@link resolveRegistrationAuthProvider}.
  */
-export const registrationAuthProviders = ["PASSWORD", "GOOGLE"] as const;
+export const registrationAuthProviders = ["PASSWORD", "GOOGLE", "FACEBOOK", "APPLE"] as const;
 export type RegistrationAuthProvider = (typeof registrationAuthProviders)[number];
 
 export const resolveRegistrationAuthProvider = (
   value: RegistrationAuthProvider | undefined,
 ): RegistrationAuthProvider => value ?? "PASSWORD";
+
+/** True for any provider-verified session (no password collected / needed). */
+export const isSocialRegistrationProvider = (
+  value: RegistrationAuthProvider | undefined,
+): boolean => resolveRegistrationAuthProvider(value) !== "PASSWORD";
 
 export const registrationSteps = [
   "EMAIL_ENTRY",
@@ -68,6 +73,11 @@ export type RegistrationSession = {
    * the LinkedAccount is created in the SAME transaction as the User + Business. Not a
    * credential (an opaque stable id), so not `select:false` — mirrors LinkedAccount.providerAccountId. */
   googleProviderAccountId?: string | undefined;
+  /** Non-Google social sessions (currently FACEBOOK) — the provider's stable app-scoped id, same
+   * role as `googleProviderAccountId`. Kept as a separate generic field so the Google flow's
+   * stored shape / tests are byte-unchanged. `completeBusinessOwner` reads whichever matches
+   * `authProvider`. */
+  oauthProviderAccountId?: string | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
   businessVisitType?: BusinessVisitType | undefined;
@@ -116,6 +126,7 @@ const registrationSessionSchema = new Schema<RegistrationSession>(
     passwordHash: { type: String, select: false },
     authProvider: { type: String, enum: registrationAuthProviders },
     googleProviderAccountId: { type: String, trim: true },
+    oauthProviderAccountId: { type: String, trim: true },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
     businessVisitType: {

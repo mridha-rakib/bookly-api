@@ -2,6 +2,7 @@ import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { AppointmentReminderRepository } from "./appointment-reminder.repository.js";
 import {
+  APPOINTMENT_REMINDER_OFFSET_MINUTES,
   type AppointmentReminderKind,
   buildAppointmentReminderDedupeKey,
 } from "./appointment-reminder.types.js";
@@ -24,17 +25,50 @@ export type AppointmentReminderSchedulingPort = {
   onBookingRetired(booking: BookingDocument, reasonCategory: string): Promise<void>;
 };
 
-const KIND: AppointmentReminderKind = "REMINDER_24H";
+type ReminderPlan = {
+  kind: AppointmentReminderKind;
+  anchorAt(booking: BookingDocument): Date;
+  /** `undefined` = this kind does not apply to this booking at all (nothing is scheduled, and
+   * nothing needs to be retired for it either — see `onBookingRescheduled`'s except-list). */
+  offsetMinutes(booking: BookingDocument): number | undefined;
+};
+
+/**
+ * Every reminder kind a booking may get, in a single declarative list — adding a future kind
+ * (e.g. `"REMINDER_1H"`) means adding one entry here, never a second scheduler class/subsystem.
+ */
+const PLANS: ReminderPlan[] = [
+  {
+    kind: "REMINDER_24H",
+    anchorAt: (booking) => booking.schedule.startAt,
+    offsetMinutes: () => APPOINTMENT_REMINDER_OFFSET_MINUTES.REMINDER_24H,
+  },
+  {
+    kind: "SESSION_END_REMINDER",
+    anchorAt: (booking) => booking.schedule.endAt,
+    // The Service.sessionExpiryAlert snapshot taken at Booking-creation time (see
+    // booking.model.ts's own doc comment) — NEVER the live Service setting, and NEVER inferred
+    // for a legacy booking with no snapshot at all.
+    offsetMinutes: (booking) => {
+      const snapshot = booking.sessionEndReminderSnapshot;
+      if (!snapshot?.enabled) return undefined;
+      const minutes = snapshot.minutesBeforeSessionEnds;
+      return typeof minutes === "number" && minutes > 0 ? minutes : undefined;
+    },
+  },
+];
+
+type PlanOutcome = "scheduled" | "skipped_inside_window" | "not_eligible";
 
 /**
  * Orchestrates the {@link AppointmentReminderRepository}: turns booking lifecycle events into
- * reminder-row scheduling / retirement. Holds no delivery knowledge — the reminder worker does
- * the actual "is this due, is it still eligible, what does the customer want, enqueue the email"
- * work later.
+ * reminder-row scheduling / retirement, for every {@link PLANS} entry that applies to the
+ * booking. Holds no delivery knowledge — the reminder worker does the actual "is this due, is it
+ * still eligible, what does the customer want, enqueue the email" work later.
  *
  * A reminder is scheduled ONLY for a booking that is for a linked Customer account
  * (`customer.customerUserId` present) and currently `UPCOMING`: those are the only bookings with
- * a stored notification preference and a resolvable current email.
+ * a resolvable current email (and, for `REMINDER_24H`, a stored notification preference).
  */
 export class AppointmentReminderScheduler implements AppointmentReminderSchedulingPort {
   public constructor(private readonly repository: AppointmentReminderRepository) {}
@@ -45,24 +79,23 @@ export class AppointmentReminderScheduler implements AppointmentReminderScheduli
 
   public async onBookingRescheduled(booking: BookingDocument): Promise<void> {
     await this.safely("schedule (rescheduled)", booking, async () => {
-      const currentDedupeKey = buildAppointmentReminderDedupeKey(
-        KIND,
-        String(booking._id),
-        booking.schedule.startAt,
+      const currentDedupeKeys = PLANS.map((plan) =>
+        buildAppointmentReminderDedupeKey(plan.kind, String(booking._id), plan.anchorAt(booking)),
       );
       const retired = await this.repository.retireActiveForBooking(
         booking._id,
         "SUPERSEDED_BY_RESCHEDULE",
-        { now: new Date(), exceptDedupeKey: currentDedupeKey },
-      );
-      const result = await this.ensureScheduled(booking);
-      logger.info(
         {
-          bookingId: String(booking._id),
-          retired,
-          scheduled: result === "scheduled",
-          reminderStatus: result,
+          now: new Date(),
+          // `exceptDedupeKey` (singular) kept for backward compatibility with callers/tests that
+          // only know one identity; `exceptDedupeKeys` covers every plan.
+          exceptDedupeKey: currentDedupeKeys[0],
+          exceptDedupeKeys: currentDedupeKeys,
         },
+      );
+      const results = await this.ensureScheduled(booking);
+      logger.info(
+        { bookingId: String(booking._id), retired, results },
         "Appointment reminder rescheduled",
       );
     });
@@ -84,35 +117,48 @@ export class AppointmentReminderScheduler implements AppointmentReminderScheduli
 
   private async ensureScheduled(
     booking: BookingDocument,
-  ): Promise<"scheduled" | "skipped_inside_window" | "not_eligible"> {
+  ): Promise<Record<AppointmentReminderKind, PlanOutcome>> {
+    const results = {} as Record<AppointmentReminderKind, PlanOutcome>;
     const customerUserId = booking.customer.customerUserId;
     if (!customerUserId || booking.status !== "UPCOMING") {
-      return "not_eligible";
+      for (const plan of PLANS) results[plan.kind] = "not_eligible";
+      return results;
     }
 
-    const { created, record } = await this.repository.schedule({
-      kind: KIND,
-      bookingId: booking._id,
-      businessId: booking.businessId,
-      customerUserId,
-      scheduleStartAt: booking.schedule.startAt,
-      now: new Date(),
-    });
+    for (const plan of PLANS) {
+      const offsetMinutes = plan.offsetMinutes(booking);
+      if (offsetMinutes === undefined) {
+        results[plan.kind] = "not_eligible";
+        continue;
+      }
 
-    const outcome = record.status === "SKIPPED" ? "skipped_inside_window" : "scheduled";
-    if (created) {
-      logger.info(
-        {
-          bookingId: String(booking._id),
-          dueAt: record.dueAt.toISOString(),
-          reminderStatus: record.status,
-        },
-        outcome === "skipped_inside_window"
-          ? "Appointment reminder skipped — booking is inside the 24h window"
-          : "Appointment reminder scheduled",
-      );
+      const { created, record } = await this.repository.schedule({
+        kind: plan.kind,
+        bookingId: booking._id,
+        businessId: booking.businessId,
+        customerUserId,
+        scheduleStartAt: plan.anchorAt(booking),
+        offsetMinutes,
+        now: new Date(),
+      });
+
+      const outcome = record.status === "SKIPPED" ? "skipped_inside_window" : "scheduled";
+      results[plan.kind] = outcome;
+      if (created) {
+        logger.info(
+          {
+            bookingId: String(booking._id),
+            kind: plan.kind,
+            dueAt: record.dueAt.toISOString(),
+            reminderStatus: record.status,
+          },
+          outcome === "skipped_inside_window"
+            ? "Appointment reminder skipped — booking is inside the offset window"
+            : "Appointment reminder scheduled",
+        );
+      }
     }
-    return outcome;
+    return results;
   }
 
   private async safely(

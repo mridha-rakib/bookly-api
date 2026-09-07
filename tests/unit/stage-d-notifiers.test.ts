@@ -100,6 +100,102 @@ describe("BookingCancelledNotifier", () => {
       notifier.notifyBookingCancelled(buildCancelledBooking(), buildBusiness(), "CUSTOMER"),
     ).resolves.toBeUndefined();
   });
+
+  // Phase 4B close-out fix — refundOutcome/eventKeyOverride (Package void/refund notification).
+  it("forwards a refundOutcome override into the enqueued payload's refund amount/status", async () => {
+    const outbox = makeOutbox();
+    const business = buildBusiness();
+    const booking = buildCancelledBooking(
+      { refundOwedCents: 0, settlementStatus: "NOT_APPLICABLE" },
+      { businessId: business._id },
+    );
+    const users = {
+      findManyByIds: vi.fn(async () => [
+        { _id: business.ownerUserId, normalizedEmail: "owner@example.com" },
+      ]),
+    };
+
+    await new BookingCancelledNotifier(outbox.service, users).notifyBookingCancelled(
+      booking,
+      business,
+      "CUSTOMER",
+      { succeeded: true, amountCents: 3500 },
+    );
+
+    const payload = outbox.spy.mock.calls[0]?.[0].payload;
+    expect(payload.financialOutcome.hasRefund).toBe(true);
+    expect(payload.financialOutcome.refundFormatted).toBe("€35.00");
+    expect(payload.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+  });
+
+  it("a failed refundOutcome never claims the refund was processed", async () => {
+    const outbox = makeOutbox();
+    const business = buildBusiness();
+    const booking = buildCancelledBooking({}, { businessId: business._id });
+    const users = {
+      findManyByIds: vi.fn(async () => [
+        { _id: business.ownerUserId, normalizedEmail: "owner@example.com" },
+      ]),
+    };
+
+    await new BookingCancelledNotifier(outbox.service, users).notifyBookingCancelled(
+      booking,
+      business,
+      "CUSTOMER",
+      { succeeded: false, amountCents: 3500 },
+    );
+
+    const payload = outbox.spy.mock.calls[0]?.[0].payload;
+    expect(payload.financialOutcome.settlementStatus).toBe("FAILED");
+    expect(payload.financialOutcome.refundFormatted).toBe("€35.00");
+  });
+
+  it("eventKeyOverride is used verbatim instead of the default BOOKING_CANCELLED key", async () => {
+    const outbox = makeOutbox();
+    const business = buildBusiness();
+    const booking = buildCancelledBooking({}, { businessId: business._id });
+    const users = {
+      findManyByIds: vi.fn(async () => [
+        { _id: business.ownerUserId, normalizedEmail: "owner@example.com" },
+      ]),
+    };
+
+    await new BookingCancelledNotifier(outbox.service, users).notifyBookingCancelled(
+      booking,
+      business,
+      "CUSTOMER",
+      { succeeded: true, amountCents: 3500 },
+      `PACKAGE_REFUND:${String(booking._id)}`,
+    );
+
+    expect(
+      outbox.spy.mock.calls.every((c) => c[0].eventKey === `PACKAGE_REFUND:${String(booking._id)}`),
+    ).toBe(true);
+  });
+
+  it("without eventKeyOverride, behavior for an existing caller (e.g. cancelByBusiness) is unchanged", async () => {
+    const outbox = makeOutbox();
+    const business = buildBusiness();
+    const booking = buildCancelledBooking({}, { businessId: business._id });
+    const users = {
+      findManyByIds: vi.fn(async () => [
+        { _id: business.ownerUserId, normalizedEmail: "owner@example.com" },
+      ]),
+    };
+
+    await new BookingCancelledNotifier(outbox.service, users).notifyBookingCancelled(
+      booking,
+      business,
+      "BUSINESS",
+      { succeeded: true, amountCents: 2500 },
+    );
+
+    expect(
+      outbox.spy.mock.calls.every(
+        (c) => c[0].eventKey === `BOOKING_CANCELLED:${String(booking._id)}`,
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("NoShowNotifier", () => {

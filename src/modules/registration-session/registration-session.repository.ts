@@ -26,6 +26,26 @@ type CreateGoogleProfessionalSessionInput = {
   expiresAt: Date;
 };
 
+type CreateFacebookProfessionalSessionInput = {
+  normalizedEmail: string;
+  facebookProviderAccountId: string;
+  firstName: string;
+  lastName: string;
+  businessVisitType: BusinessVisitType;
+  emailVerifiedAt: Date;
+  expiresAt: Date;
+};
+
+type CreateAppleProfessionalSessionInput = {
+  normalizedEmail: string;
+  appleProviderAccountId: string;
+  firstName: string;
+  lastName: string;
+  businessVisitType: BusinessVisitType;
+  emailVerifiedAt: Date;
+  expiresAt: Date;
+};
+
 export class RegistrationSessionRepository {
   public async create(input: CreateSessionInput): Promise<RegistrationSessionDocument> {
     return RegistrationSessionModel.create({
@@ -109,6 +129,79 @@ export class RegistrationSessionRepository {
       currentStep: "EMAIL_VERIFIED",
       authProvider: "GOOGLE",
       googleProviderAccountId: input.googleProviderAccountId,
+      emailVerification: {
+        verifiedAt: input.emailVerifiedAt,
+        attempts: 0,
+        resendTimestamps: [],
+      },
+      phoneVerification: { attempts: 0, resendTimestamps: [] },
+      personalProfile: {
+        firstName: input.firstName,
+        lastName: input.lastName,
+        gender: "other",
+      },
+      businessVisitType: input.businessVisitType,
+      expiresAt: input.expiresAt,
+    });
+  }
+
+  /**
+   * Facebook equivalent of {@link createGoogleProfessionalSession} — same shape, same "retire any
+   * earlier active PROFESSIONAL session first" guarantee, but `authProvider: "FACEBOOK"` and the
+   * provider id lands in the generic `oauthProviderAccountId` field.
+   */
+  public async createFacebookProfessionalSession(
+    input: CreateFacebookProfessionalSessionInput,
+  ): Promise<RegistrationSessionDocument> {
+    await RegistrationSessionModel.updateMany(
+      { normalizedEmail: input.normalizedEmail, portal: "PROFESSIONAL", isActive: true },
+      { $set: { isActive: false } },
+    );
+
+    return RegistrationSessionModel.create({
+      portal: "PROFESSIONAL",
+      intendedRole: "BUSINESS_OWNER",
+      normalizedEmail: input.normalizedEmail,
+      isActive: true,
+      currentStep: "EMAIL_VERIFIED",
+      authProvider: "FACEBOOK",
+      oauthProviderAccountId: input.facebookProviderAccountId,
+      emailVerification: {
+        verifiedAt: input.emailVerifiedAt,
+        attempts: 0,
+        resendTimestamps: [],
+      },
+      phoneVerification: { attempts: 0, resendTimestamps: [] },
+      personalProfile: {
+        firstName: input.firstName,
+        lastName: input.lastName,
+        gender: "other",
+      },
+      businessVisitType: input.businessVisitType,
+      expiresAt: input.expiresAt,
+    });
+  }
+
+  /**
+   * Apple equivalent of {@link createFacebookProfessionalSession} — `authProvider: "APPLE"` and
+   * the Apple `sub` in the generic `oauthProviderAccountId` field.
+   */
+  public async createAppleProfessionalSession(
+    input: CreateAppleProfessionalSessionInput,
+  ): Promise<RegistrationSessionDocument> {
+    await RegistrationSessionModel.updateMany(
+      { normalizedEmail: input.normalizedEmail, portal: "PROFESSIONAL", isActive: true },
+      { $set: { isActive: false } },
+    );
+
+    return RegistrationSessionModel.create({
+      portal: "PROFESSIONAL",
+      intendedRole: "BUSINESS_OWNER",
+      normalizedEmail: input.normalizedEmail,
+      isActive: true,
+      currentStep: "EMAIL_VERIFIED",
+      authProvider: "APPLE",
+      oauthProviderAccountId: input.appleProviderAccountId,
       emailVerification: {
         verifiedAt: input.emailVerifiedAt,
         attempts: 0,

@@ -20,7 +20,21 @@ export const BOOKING_CANCELLED_CUSTOMER_SUBJECT = "Your booking has been cancell
 const financialLinesText = (data: CancellationEmailData): string[] => {
   const f = data.financialOutcome;
   const lines: string[] = [];
-  if (data.cancelledBy === "CUSTOMER") {
+  // Phase 4B close-out fix: `hasRefund` takes priority over the `cancelledBy` branch below. Every
+  // EXISTING caller is unaffected — a customer-initiated cancellation never actually refunds in
+  // this codebase (see cancellation-email-data.ts's own doc comment), so `hasRefund` was always
+  // false whenever `cancelledBy === "CUSTOMER"` before this fix. This only newly applies to a
+  // customer-initiated event that DOES carry a real refund — e.g.
+  // BookingLifecycleService.voidUnusedPackage, a customer's own self-service Package refund
+  // request, which is correctly still `cancelledBy: "CUSTOMER"` (they did request it) but must
+  // still truthfully report the refund, not omit it the way the old CUSTOMER-only branch would.
+  if (f.hasRefund) {
+    lines.push(
+      f.settlementStatus === "SUCCEEDED"
+        ? `Refund of ${f.refundFormatted} for your upfront payment has been processed.`
+        : `A refund of ${f.refundFormatted} for your upfront payment is being arranged — our team will be in touch if anything is needed.`,
+    );
+  } else if (data.cancelledBy === "CUSTOMER") {
     if (f.hasCancellationFee) {
       lines.push(`Cancellation fee: ${f.cancellationFeeFormatted}`);
       if (f.hasDepositApplied)
@@ -31,15 +45,7 @@ const financialLinesText = (data: CancellationEmailData): string[] => {
       lines.push("No cancellation fee applies to this cancellation.");
     }
   } else {
-    if (f.hasRefund) {
-      lines.push(
-        f.settlementStatus === "SUCCEEDED"
-          ? `Refund of ${f.refundFormatted} for your upfront payment has been processed.`
-          : `A refund of ${f.refundFormatted} for your upfront payment is being arranged — our team will be in touch if anything is needed.`,
-      );
-    } else {
-      lines.push("There was no upfront payment to refund for this booking.");
-    }
+    lines.push("There was no upfront payment to refund for this booking.");
   }
   return lines;
 };

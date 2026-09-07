@@ -4,13 +4,19 @@ const mockEnv = {
   GOOGLE_CLIENT_ID: "test-client-id",
   GOOGLE_CLIENT_SECRET: "test-client-secret",
   GOOGLE_ACCOUNT_LINK_REDIRECT_URI: "http://localhost:3000/api/v1/auth/oauth/google/callback",
+  FACEBOOK_CLIENT_ID: "fb-app-123",
+  FACEBOOK_CLIENT_SECRET: "fb-test-secret",
+  FACEBOOK_ACCOUNT_LINK_REDIRECT_URI: "http://localhost:3000/api/v1/auth/oauth/facebook/callback",
 };
 
 vi.mock("../../src/config/env.js", () => ({ env: mockEnv }));
 
-const { signGoogleLinkState, verifyGoogleLinkState } = await import(
-  "../../src/modules/linked-account/linked-account.state.js"
-);
+const {
+  signGoogleLinkState,
+  verifyGoogleLinkState,
+  signFacebookLinkState,
+  verifyFacebookLinkState,
+} = await import("../../src/modules/linked-account/linked-account.state.js");
 
 describe("linked-account OAuth state", () => {
   beforeEach(() => {
@@ -58,5 +64,48 @@ describe("linked-account OAuth state", () => {
     vi.setSystemTime(new Date("2026-09-02T12:10:31.000Z"));
 
     await expect(verifyGoogleLinkState(token)).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+describe("linked-account OAuth state — Facebook", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("round-trips the userId through a signed token", async () => {
+    const userId = "64b7f0c2a1b2c3d4e5f60718";
+    const token = await signFacebookLinkState({ userId });
+
+    await expect(verifyFacebookLinkState(token)).resolves.toEqual({ userId });
+  });
+
+  it("rejects a tampered/forged token with LINKED_ACCOUNT_INVALID_STATE (400)", async () => {
+    await expect(verifyFacebookLinkState("not-a-real-signed-token")).rejects.toMatchObject({
+      statusCode: 400,
+      details: [{ code: "LINKED_ACCOUNT_INVALID_STATE" }],
+    });
+  });
+
+  it("rejects an expired token once the 10 minute TTL has elapsed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-02T12:00:00.000Z"));
+
+    const token = await signFacebookLinkState({ userId: "expiry-user" });
+
+    vi.setSystemTime(new Date("2026-09-02T12:10:31.000Z"));
+
+    await expect(verifyFacebookLinkState(token)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("does not verify a Google-signed state, and vice-versa (separate key contexts)", async () => {
+    const googleState = await signGoogleLinkState({ userId: "cross-user" });
+    await expect(verifyFacebookLinkState(googleState)).rejects.toMatchObject({ statusCode: 400 });
+
+    const facebookState = await signFacebookLinkState({ userId: "cross-user" });
+    await expect(verifyGoogleLinkState(facebookState)).rejects.toMatchObject({ statusCode: 400 });
   });
 });

@@ -319,8 +319,9 @@ export class DiscoveryRepository {
 
   /** "Recommended". `affinity` (a logged-in Customer's really-booked categories/cities) tiers
    * the results — category match outranks city match — with quality ordering inside each tier.
-   * Empty affinity (logged-out / no history) collapses to pure quality, optionally narrowed to
-   * a real `contextCategories` list. Never reads a stored recommendation/score. */
+   * Empty affinity (logged-out / no history) collapses to pure quality. `contextCategories`
+   * narrows eligibility to those exact `Business.category` strings — the affinity/quality
+   * ordering is unchanged within the narrowed set. Never reads a stored recommendation/score. */
   public async rankRecommended(
     params: HomeRankParams & {
       affinity: CustomerAffinity;
@@ -380,11 +381,16 @@ export class DiscoveryRepository {
    * within). With no city it falls back to "can serve you anywhere": TRAVEL_TO_CUSTOMER
    * Businesses first, then quality. No coordinates, no distance — ever. */
   public async rankNearYou(
-    params: HomeRankParams & { city?: BusinessCity | undefined },
+    params: HomeRankParams & { city?: BusinessCity | undefined; category?: string[] | undefined },
   ): Promise<DiscoveryAggregateRow[]> {
     const match = homeVisibilityMatch(params.excludeIds);
     if (params.city) {
       match["address.city"] = params.city;
+    }
+    // An explicit homepage category selection narrows eligibility only — the near-you ranking
+    // (city hard-filter / travel-first fallback, then quality) is unchanged within it.
+    if (params.category && params.category.length > 0) {
+      match["category"] = { $in: params.category };
     }
     const travelFirst = !params.city;
 
@@ -423,9 +429,17 @@ export class DiscoveryRepository {
   /** "Popular" — `completedBookings*3 + favorites*2 + publishedReviewCount`. Every term is a
    * live COUNT resolved here, never a stored `popularityScore`/`viewCount`/seeded rank. A
    * Business with no activity at all scores 0 and falls to a deterministic `_id` tail. */
-  public async rankByPopularity(params: HomeRankParams): Promise<DiscoveryAggregateRow[]> {
+  public async rankByPopularity(
+    params: HomeRankParams & { category?: string[] | undefined },
+  ): Promise<DiscoveryAggregateRow[]> {
+    const match = homeVisibilityMatch(params.excludeIds);
+    // Explicit homepage category selection narrows eligibility only — the popularity score and
+    // its deterministic tie-breaks are unchanged within it.
+    if (params.category && params.category.length > 0) {
+      match["category"] = { $in: params.category };
+    }
     const pipeline: PipelineStage[] = [
-      { $match: homeVisibilityMatch(params.excludeIds) },
+      { $match: match },
       ...ratingAndPriceLookupStages,
       homeSortFieldsStage,
       {

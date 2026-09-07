@@ -65,6 +65,7 @@ import {
   bookingBusinessParamsSchema,
   bookingIdOnlyParamsSchema,
   bookingIdParamsSchema,
+  bookingServiceParamsSchema,
   calendarQuerySchema,
   cancelBookingBodySchema,
   completeBookingBodySchema,
@@ -235,6 +236,29 @@ export const createBusinessBookingRoute = (): Router => {
     requireApprovedBusiness(businessRepository),
     validateRequest({ params: bookingBusinessParamsSchema, body: createManualBookingBodySchema }),
     asyncHandler(controller.createManual),
+  );
+
+  // Manual-booking picker read context (Owner-or-Supervisor) — fixes the Supervisor 403/empty-
+  // picker mismatch: see BookingService's own "Manual-booking read context" doc comment. Never
+  // gated on Business approval status — reading a picker (unlike creating a NEW booking above)
+  // is harmless for a PENDING/SUSPENDED Business, and gating it would only break the Owner's own
+  // existing ability to view/troubleshoot their catalogue while in that state.
+  router.get(
+    "/:businessId/bookings/bookable-services",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({ params: bookingBusinessParamsSchema }),
+    asyncHandler(controller.listBookableServices),
+  );
+
+  router.get(
+    "/:businessId/bookings/services/:serviceId/addons",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({ params: bookingServiceParamsSchema }),
+    asyncHandler(controller.listBookableAddonsForService),
   );
 
   router.get(
