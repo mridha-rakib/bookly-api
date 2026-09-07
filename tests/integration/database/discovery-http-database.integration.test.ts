@@ -346,6 +346,32 @@ describe("HTTP-level Discovery/Favorites/Book Again endpoints (Batch 16)", () =>
     expect(authed.body.data.meta.personalized).toBe(true);
   });
 
+  it("GET /discovery/home-sections?category=<Business.category> filters every row; an absent category yields empty rows", async () => {
+    const { business } = await createBusiness("Barber Home"); // createBusiness() uses category "Barber"
+    const app = buildApp();
+
+    const matching = await request(app).get("/discovery/home-sections?category=Barber");
+    expect(matching.status).toBe(200);
+    const matchingCards = [
+      ...matching.body.data.recommended,
+      ...matching.body.data.nearYou,
+      ...matching.body.data.popular,
+    ];
+    expect(matchingCards.length).toBeGreaterThan(0);
+    for (const card of matchingCards) {
+      expect(card.category).toBe("Barber");
+    }
+    expect(matchingCards.some((c: { id: string }) => c.id === String(business._id))).toBe(true);
+
+    const other = await request(app).get(
+      "/discovery/home-sections?category=Experience%20%26%20Tours",
+    );
+    expect(other.status).toBe(200);
+    expect(other.body.data.recommended).toEqual([]);
+    expect(other.body.data.nearYou).toEqual([]);
+    expect(other.body.data.popular).toEqual([]);
+  });
+
   it("GET /discovery/home-sections degrades to anonymous on a garbage bearer token (never 401)", async () => {
     await createBusiness("Still Public");
     const app = buildApp();

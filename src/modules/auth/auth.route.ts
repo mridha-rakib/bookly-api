@@ -18,8 +18,14 @@ import { BusinessOnboardingService } from "../business-onboarding/business-onboa
 import { ClientRepository } from "../client/client.repository.js";
 import { ClientIdentityService } from "../client/client-identity.service.js";
 import { ContactChangeChallengeRepository } from "../contact-change/contact-change-challenge.repository.js";
+import { CustomerAppleAuthController } from "../customer-apple-auth/customer-apple-auth.controller.js";
+import { createCustomerAppleAuthRoute } from "../customer-apple-auth/customer-apple-auth.route.js";
+import { CustomerAppleAuthService } from "../customer-apple-auth/customer-apple-auth.service.js";
 import { CustomerAvatarError } from "../customer-avatar/customer-avatar.errors.js";
 import { CustomerAvatarService } from "../customer-avatar/customer-avatar.service.js";
+import { CustomerFacebookAuthController } from "../customer-facebook-auth/customer-facebook-auth.controller.js";
+import { createCustomerFacebookAuthRoute } from "../customer-facebook-auth/customer-facebook-auth.route.js";
+import { CustomerFacebookAuthService } from "../customer-facebook-auth/customer-facebook-auth.service.js";
 import { CustomerGoogleAuthController } from "../customer-google-auth/customer-google-auth.controller.js";
 import { createCustomerGoogleAuthRoute } from "../customer-google-auth/customer-google-auth.route.js";
 import { CustomerGoogleAuthService } from "../customer-google-auth/customer-google-auth.service.js";
@@ -31,6 +37,12 @@ import { createLinkedAccountRoute } from "../linked-account/linked-account.route
 import { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import { BusinessRegisteredNotifier } from "../notification/business-registered.notifier.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
+import { ProfessionalAppleAuthController } from "../professional-apple-auth/professional-apple-auth.controller.js";
+import { createProfessionalAppleAuthRoute } from "../professional-apple-auth/professional-apple-auth.route.js";
+import { ProfessionalAppleAuthService } from "../professional-apple-auth/professional-apple-auth.service.js";
+import { ProfessionalFacebookAuthController } from "../professional-facebook-auth/professional-facebook-auth.controller.js";
+import { createProfessionalFacebookAuthRoute } from "../professional-facebook-auth/professional-facebook-auth.route.js";
+import { ProfessionalFacebookAuthService } from "../professional-facebook-auth/professional-facebook-auth.service.js";
 import { ProfessionalGoogleAuthController } from "../professional-google-auth/professional-google-auth.controller.js";
 import { createProfessionalGoogleAuthRoute } from "../professional-google-auth/professional-google-auth.route.js";
 import { ProfessionalGoogleAuthService } from "../professional-google-auth/professional-google-auth.service.js";
@@ -182,6 +194,48 @@ export const createAuthRoute = (): Router => {
   );
   const professionalGoogleAuthController = new ProfessionalGoogleAuthController(
     professionalGoogleAuthService,
+  );
+  // Customer + Business Owner "Continue with Facebook" — LOGIN (and, email permitting, signup).
+  // Separate from Settings → Link Facebook: these are public, unauthenticated, and resolve the
+  // account by LinkedAccount(FACEBOOK, providerAccountId). Reuse the shared repositories /
+  // tokenService / businessOnboardingService, exactly like the Google equivalents above.
+  const customerFacebookAuthService = new CustomerFacebookAuthService(
+    userRepository,
+    linkedAccountRepository,
+    tokenService,
+  );
+  const customerFacebookAuthController = new CustomerFacebookAuthController(
+    customerFacebookAuthService,
+  );
+  const professionalFacebookAuthService = new ProfessionalFacebookAuthService(
+    userRepository,
+    linkedAccountRepository,
+    registrationSessionRepository,
+    businessOnboardingService,
+    tokenService,
+  );
+  const professionalFacebookAuthController = new ProfessionalFacebookAuthController(
+    professionalFacebookAuthService,
+  );
+  // Customer + Business Owner "Continue with Apple" — LOGIN (and, verified-email permitting,
+  // signup). Same shared repositories / tokenService / businessOnboardingService as the
+  // Google/Facebook equivalents. Apple's callback is a cross-site POST (form_post) with NO nonce
+  // cookie — trust is the signed state + the id_token `nonce` claim (see the Apple modules).
+  const customerAppleAuthService = new CustomerAppleAuthService(
+    userRepository,
+    linkedAccountRepository,
+    tokenService,
+  );
+  const customerAppleAuthController = new CustomerAppleAuthController(customerAppleAuthService);
+  const professionalAppleAuthService = new ProfessionalAppleAuthService(
+    userRepository,
+    linkedAccountRepository,
+    registrationSessionRepository,
+    businessOnboardingService,
+    tokenService,
+  );
+  const professionalAppleAuthController = new ProfessionalAppleAuthController(
+    professionalAppleAuthService,
   );
   // Phase 2D — Staff/Supervisor invitation acceptance (password OR Continue with Google). The
   // invitation is the only account-creation path for these roles; accepting it creates the
@@ -509,6 +563,48 @@ export const createAuthRoute = (): Router => {
   router.use(
     createProfessionalGoogleAuthRoute({
       controller: professionalGoogleAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Public Customer "Continue with Facebook": GET /auth/customer/oauth/facebook/start and
+  // GET /auth/customer/oauth/facebook/callback. Same public + signed-state + nonce-cookie model
+  // as the Customer Google flow; same `loginLimiter` budget.
+  router.use(
+    createCustomerFacebookAuthRoute({
+      controller: customerFacebookAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Public Business Owner "Continue with Facebook": GET /auth/professional/oauth/facebook/start
+  // (validates + signs the required `visitType`) and GET /auth/professional/oauth/facebook/callback.
+  router.use(
+    createProfessionalFacebookAuthRoute({
+      controller: professionalFacebookAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Public Customer "Continue with Apple": GET /auth/customer/oauth/apple/start and
+  // POST /auth/customer/oauth/apple/callback (Apple form_post). No nonce cookie — signed state +
+  // id_token nonce.
+  router.use(
+    createCustomerAppleAuthRoute({
+      controller: customerAppleAuthController,
+      startLimiter: loginLimiter,
+      callbackLimiter: loginLimiter,
+    }),
+  );
+
+  // Public Business Owner "Continue with Apple": GET /auth/professional/oauth/apple/start
+  // (validates + signs `visitType`) and POST /auth/professional/oauth/apple/callback.
+  router.use(
+    createProfessionalAppleAuthRoute({
+      controller: professionalAppleAuthController,
       startLimiter: loginLimiter,
       callbackLimiter: loginLimiter,
     }),

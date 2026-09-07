@@ -389,4 +389,91 @@ describe("database-backed AppointmentReminder integration", () => {
     expect(late.record.smsDecision).toBe("SKIPPED_INELIGIBLE");
     expect(late.record.emailDecision).toBe("SKIPPED_INELIGIBLE");
   });
+
+  describe("SESSION_END_REMINDER (Session End Email Reminder — explicit per-booking offset)", () => {
+    const sessionEndInput = (overrides: Record<string, unknown> = {}) =>
+      scheduleInput({
+        kind: "SESSION_END_REMINDER",
+        offsetMinutes: 15,
+        ...overrides,
+      });
+
+    it("uses the caller-supplied offsetMinutes rather than any fixed per-kind table entry", async () => {
+      const anchor = new Date(Date.now() + 72 * H); // scheduleStartAt holds the endAt anchor
+      const result = await repository.schedule(sessionEndInput({ scheduleStartAt: anchor }));
+
+      expect(result.record.status).toBe("PENDING");
+      expect(result.record.offsetMinutes).toBe(15);
+      expect(result.record.dueAt.getTime()).toBe(anchor.getTime() - 15 * 60_000);
+      expect(result.record.dedupeKey).toBe(
+        `SESSION_END_REMINDER:${sessionEndInput().bookingId}:${anchor.getTime()}`,
+      );
+    });
+
+    it("throws when scheduled with no offsetMinutes at all (this kind has no fixed table entry)", async () => {
+      await expect(
+        repository.schedule(scheduleInput({ kind: "SESSION_END_REMINDER" })),
+      ).rejects.toThrow(/offsetMinutes is required/);
+    });
+
+    it("persists smsDecision:NOT_APPLICABLE from creation — never PENDING, even for a PENDING (not late) row", async () => {
+      const result = await repository.schedule(sessionEndInput());
+      expect(result.record.status).toBe("PENDING");
+      expect(result.record.smsDecision).toBe("NOT_APPLICABLE");
+      expect(result.record.emailDecision).toBe("PENDING");
+    });
+
+    it("persists smsDecision:NOT_APPLICABLE (not SKIPPED_INELIGIBLE) even for a late/inside-window row", async () => {
+      // offset is 15 minutes — an anchor only 10 minutes out is already inside the window.
+      const result = await repository.schedule(
+        sessionEndInput({ scheduleStartAt: new Date(Date.now() + 10 * 60_000) }),
+      );
+      expect(result.record.status).toBe("SKIPPED");
+      expect(result.record.emailDecision).toBe("SKIPPED_INELIGIBLE");
+      expect(result.record.smsDecision).toBe("NOT_APPLICABLE");
+    });
+
+    it("REMINDER_24H and SESSION_END_REMINDER for the SAME booking+timestamp are distinct logical identities (no dedupe collision)", async () => {
+      const bookingId = new Types.ObjectId();
+      const sharedInstant = new Date(Date.now() + 72 * H);
+      const reminder24h = await repository.schedule(
+        scheduleInput({ bookingId, scheduleStartAt: sharedInstant }),
+      );
+      const sessionEnd = await repository.schedule(
+        sessionEndInput({ bookingId, scheduleStartAt: sharedInstant }),
+      );
+
+      expect(reminder24h.record.dedupeKey).not.toBe(sessionEnd.record.dedupeKey);
+      expect(await AppointmentReminderModel.countDocuments({ bookingId })).toBe(2);
+    });
+
+    it("retireActiveForBooking's exceptDedupeKeys (plural) excepts multiple kinds in one call", async () => {
+      const bookingId = new Types.ObjectId();
+      const keep24h = await repository.schedule(scheduleInput({ bookingId }));
+      const newSessionEndAnchor = new Date(Date.now() + 96 * H);
+      const oldSessionEndAnchor = new Date(Date.now() + 84 * H);
+      const keepSessionEnd = await repository.schedule(
+        sessionEndInput({ bookingId, scheduleStartAt: newSessionEndAnchor }),
+      );
+      const stale = await repository.schedule(
+        sessionEndInput({ bookingId, scheduleStartAt: oldSessionEndAnchor }),
+      );
+
+      const retired = await repository.retireActiveForBooking(
+        bookingId,
+        "SUPERSEDED_BY_RESCHEDULE",
+        {
+          now: new Date(),
+          exceptDedupeKeys: [keep24h.record.dedupeKey, keepSessionEnd.record.dedupeKey],
+        },
+      );
+
+      expect(retired).toBe(1);
+      expect((await AppointmentReminderModel.findById(stale.record._id))?.status).toBe("CANCELLED");
+      expect((await AppointmentReminderModel.findById(keep24h.record._id))?.status).toBe("PENDING");
+      expect((await AppointmentReminderModel.findById(keepSessionEnd.record._id))?.status).toBe(
+        "PENDING",
+      );
+    });
+  });
 });

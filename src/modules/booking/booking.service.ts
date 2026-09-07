@@ -4,6 +4,12 @@ import type { AddonServiceAssignmentRepository } from "../addons/addon-service-a
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
+import {
+  type CatalogAddonDto,
+  type CatalogServiceDto,
+  toCatalogAddonDto,
+  toCatalogServiceDto,
+} from "../catalog/catalog.dto.js";
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
 import type { ServiceDocument } from "../services/service.model.js";
@@ -110,6 +116,68 @@ export class BookingService {
     }
 
     throw new BookingError("BOOKING_BUSINESS_NOT_FOUND", 404);
+  }
+
+  // --- Manual-booking read context (Owner-or-Supervisor) ------------------------------------
+  //
+  // Fixes a real integration mismatch: the manual-booking UI (Owner AND Supervisor, both
+  // already authorized by createManualBooking's own `requireRoles(["BUSINESS_OWNER",
+  // "SUPERVISOR"])` gate — see booking.route.ts) previously read its Service/Add-on picker data
+  // from the Service-MANAGEMENT endpoints, which are deliberately Owner-only (confirmed rule:
+  // "Services are Business-Owner-only management functionality" — see service.route.ts's own
+  // doc comment). A Supervisor calling those got 403, leaving the picker empty. These two
+  // methods expose ONLY a read-only booking-context view — no mutation, no category/staff-
+  // management fields — reusing `requireBookingManagementAccess` (the exact same authorization
+  // createManualBooking itself already runs) plus the EXACT existing, already-narrowed
+  // `CatalogServiceDto`/`CatalogAddonDto` shapes and mapping functions (Batch 9's customer-
+  // facing catalog read) — never a second, independently-invented DTO or business rule. The
+  // catalog module's own ROUTES stay Customer-only and untouched; only its pure, dependency-free
+  // `toCatalogServiceDto`/`toCatalogAddonDto` mapping functions are reused here, gated by a
+  // completely different (Owner-or-Supervisor) authorization check.
+
+  /** Every ACTIVE, currently-bookable Service for this Business — the same `status: "ACTIVE"`
+   * filter and DTO shape the public catalog already uses (Package Deal Services are included
+   * here exactly as the catalog includes them; `createManualBooking` itself is what actually
+   * rejects a Package Deal line via BOOKING_PACKAGE_SERVICE_NOT_SUPPORTED_YET — this read never
+   * duplicates that rule, the caller's own client-side filter mirrors it for picker UX only). */
+  public async listBookableServices(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+  ): Promise<CatalogServiceDto[]> {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+    const services = await this.serviceRepository.listByBusinessId(business._id, {
+      status: "ACTIVE",
+    });
+    return services.map(toCatalogServiceDto);
+  }
+
+  /** The Add-ons actually assignable to one specific, currently-ACTIVE Service — the exact same
+   * query/filter CatalogService.listServiceAddons already runs (assignment lookup, ACTIVE-only),
+   * never a second Add-on eligibility rule. `createManualBooking`'s own
+   * `resolveAddonSnapshots` remains the authoritative, independent server-side check at booking
+   * time — this is a read-only convenience for the picker. */
+  public async listBookableAddonsForService(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    serviceId: string,
+  ): Promise<CatalogAddonDto[]> {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+
+    if (!Types.ObjectId.isValid(serviceId)) {
+      throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
+    }
+    const service = await this.serviceRepository.findById(business._id, serviceId);
+    if (!service || service.status !== "ACTIVE") {
+      throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
+    }
+
+    const assignments = await this.addonServiceAssignmentRepository.findByServiceIds([service._id]);
+    const addonIds = assignments.map((assignment) => assignment.addonId);
+    const addons = await this.addonRepository.findManyByIdsForBusiness(business._id, addonIds);
+
+    return addons.filter((addon) => addon.status === "ACTIVE").map(toCatalogAddonDto);
   }
 
   // --- Domain validation building blocks ---------------------------------------------------

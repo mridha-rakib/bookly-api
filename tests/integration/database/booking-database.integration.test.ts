@@ -887,4 +887,262 @@ describe("database-backed Booking integration", () => {
       ),
     ).rejects.toMatchObject({ statusCode: 404 });
   });
+
+  // --- Manual-booking read context (Supervisor Service/Add-on access fix) -------------------
+
+  describe("listBookableServices / listBookableAddonsForService", () => {
+    it("Business Owner sees the same ACTIVE Services the manual-booking flow can actually book", async () => {
+      const { owner, business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+
+      const services = await bookingService.listBookableServices(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+      );
+
+      expect(services).toHaveLength(1);
+      expect(services[0]?.id).toBe(String(service._id));
+      expect(services[0]?.assignedStaffMembershipIds).toEqual([String(membership._id)]);
+    });
+
+    it("an active Supervisor can read the same bookable Services — the fixed 403/empty-picker case", async () => {
+      const { business } = await createBusiness();
+      const { staffUser: supervisorUser } = await createStaffMembership(business._id, "SUPERVISOR");
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+
+      const services = await bookingService.listBookableServices(
+        String(supervisorUser._id),
+        "SUPERVISOR",
+        String(business._id),
+      );
+
+      expect(services).toHaveLength(1);
+      expect(services[0]?.id).toBe(String(service._id));
+    });
+
+    it("excludes ARCHIVED and DRAFT Services — only ACTIVE Services are bookable", async () => {
+      const { owner, business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const activeService = await createService(business._id, [membership._id]);
+      const archivedService = await createService(business._id, [membership._id]);
+      await serviceRepository.archiveById(business._id, archivedService._id);
+      const draftService = await serviceRepository.create({
+        businessId: business._id,
+        status: "DRAFT",
+        isFeatured: false,
+        isPackageDeal: false,
+        category: "Barber",
+        name: "Incomplete draft",
+        sessionExpiryAlert: { enabled: false },
+        scheduleMode: "AUTO",
+        manualSchedule: [],
+        servedCities: [],
+        assignedStaffMembershipIds: [],
+      } as Parameters<typeof serviceRepository.create>[0]);
+
+      const services = await bookingService.listBookableServices(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+      );
+
+      const ids = services.map((s) => s.id);
+      expect(ids).toContain(String(activeService._id));
+      expect(ids).not.toContain(String(archivedService._id));
+      expect(ids).not.toContain(String(draftService._id));
+    });
+
+    it("a Package Deal Service is still included in the read (parity with Owner today) — createManualBooking, not this read, is what rejects it", async () => {
+      const { owner, business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const packageService = await serviceRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        isFeatured: false,
+        isPackageDeal: true,
+        category: "Barber",
+        name: "5 Session Pack",
+        packageServicesName: "Haircut",
+        packagePricing: {
+          durationMin: 30,
+          sessionsInPackage: 5,
+          bundlePriceCents: 8_000,
+        },
+        sessionExpiryAlert: { enabled: false },
+        scheduleMode: "AUTO",
+        manualSchedule: [],
+        servedCities: [],
+        assignedStaffMembershipIds: [membership._id],
+      } as Parameters<typeof serviceRepository.create>[0]);
+
+      const services = await bookingService.listBookableServices(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+      );
+      expect(services.some((s) => s.id === String(packageService._id) && s.isPackageDeal)).toBe(
+        true,
+      );
+    });
+
+    it("returns only the Add-ons actually assigned to the requested (ACTIVE) Service", async () => {
+      const { owner, business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const otherService = await createService(business._id, [membership._id]);
+      const assignedAddon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "Hair wash",
+        priceCents: 500,
+      });
+      const inactiveAddon = await addonRepository.create({
+        businessId: business._id,
+        status: "INACTIVE",
+        name: "Retired addon",
+        priceCents: 300,
+      });
+      const unassignedAddon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "For a different service",
+        priceCents: 400,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: business._id, addonId: assignedAddon._id, serviceId: service._id },
+        { businessId: business._id, addonId: inactiveAddon._id, serviceId: service._id },
+        { businessId: business._id, addonId: unassignedAddon._id, serviceId: otherService._id },
+      ]);
+
+      const addons = await bookingService.listBookableAddonsForService(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(service._id),
+      );
+
+      expect(addons).toEqual([
+        { id: String(assignedAddon._id), name: "Hair wash", priceCents: 500 },
+      ]);
+    });
+
+    it("an active Supervisor can read the same bookable Add-ons for a selectable Service", async () => {
+      const { business } = await createBusiness();
+      const { staffUser: supervisorUser } = await createStaffMembership(business._id, "SUPERVISOR");
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const addon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "Hair wash",
+        priceCents: 500,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: business._id, addonId: addon._id, serviceId: service._id },
+      ]);
+
+      const addons = await bookingService.listBookableAddonsForService(
+        String(supervisorUser._id),
+        "SUPERVISOR",
+        String(business._id),
+        String(service._id),
+      );
+      expect(addons).toEqual([{ id: String(addon._id), name: "Hair wash", priceCents: 500 }]);
+    });
+
+    it("rejects an ARCHIVED Service's add-on read the same way the picker should never offer it", async () => {
+      const { owner, business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      await serviceRepository.archiveById(business._id, service._id);
+
+      await expect(
+        bookingService.listBookableAddonsForService(
+          String(owner._id),
+          "BUSINESS_OWNER",
+          String(business._id),
+          String(service._id),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it("a Supervisor from a DIFFERENT Business cannot read this Business's bookable Services or Add-ons (anti-enumeration unchanged)", async () => {
+      const { business } = await createBusiness();
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const { business: otherBusiness } = await createBusiness();
+      const { staffUser: outsiderSupervisor } = await createStaffMembership(
+        otherBusiness._id,
+        "SUPERVISOR",
+      );
+
+      await expect(
+        bookingService.listBookableServices(
+          String(outsiderSupervisor._id),
+          "SUPERVISOR",
+          String(business._id),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+
+      await expect(
+        bookingService.listBookableAddonsForService(
+          String(outsiderSupervisor._id),
+          "SUPERVISOR",
+          String(business._id),
+          String(service._id),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it("a plain STAFF membership cannot read the manual-booking context (only Owner/Supervisor are authorized, unchanged)", async () => {
+      const { business } = await createBusiness();
+      const { staffUser } = await createStaffMembership(business._id, "STAFF");
+      const { membership } = await createStaffMembership(business._id);
+      await createService(business._id, [membership._id]);
+
+      await expect(
+        bookingService.listBookableServices(String(staffUser._id), "STAFF", String(business._id)),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it("end-to-end: a Supervisor reads the bookable Service/Add-on/staff-eligible data and successfully creates a manual booking from it", async () => {
+      const { business } = await createBusiness();
+      const { staffUser: supervisorUser } = await createStaffMembership(business._id, "SUPERVISOR");
+      const { membership } = await createStaffMembership(business._id);
+      const service = await createService(business._id, [membership._id]);
+      const client = await createClient(business._id);
+
+      const services = await bookingService.listBookableServices(
+        String(supervisorUser._id),
+        "SUPERVISOR",
+        String(business._id),
+      );
+      const bookable = services.find((s) => s.id === String(service._id));
+      expect(bookable).toBeTruthy();
+      expect(bookable?.assignedStaffMembershipIds).toContain(String(membership._id));
+
+      const { service: eligibleService, staffMembership: eligibleStaff } =
+        await bookingService.validateResponsibleStaff(
+          business,
+          bookable!.id,
+          bookable!.assignedStaffMembershipIds[0]!,
+        );
+      expect(eligibleService._id.equals(service._id)).toBe(true);
+      expect(eligibleStaff._id.equals(membership._id)).toBe(true);
+
+      const created = await bookingRepository.create(
+        buildValidBookingInput({
+          businessId: business._id,
+          clientId: client._id,
+          serviceId: service._id,
+          staffMembershipId: membership._id,
+          actorUserId: supervisorUser._id,
+        }),
+      );
+      expect(created.status).toBe("UPCOMING");
+    });
+  });
 });

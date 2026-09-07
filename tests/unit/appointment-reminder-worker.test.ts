@@ -274,6 +274,110 @@ describe("AppointmentReminderWorker.processOne — channel matrix", () => {
   });
 });
 
+describe("AppointmentReminderWorker.processOne — SESSION_END_REMINDER (Session End Email Reminder)", () => {
+  const makeSessionEndReminder = (overrides: Partial<AppointmentReminderDocument> = {}) =>
+    makeReminder({
+      kind: "SESSION_END_REMINDER" as never,
+      dedupeKey: `SESSION_END_REMINDER:650000000000000000000001:${(START.getTime() + 3_600_000).toString()}`,
+      scheduleStartAt: new Date(START.getTime() + 3_600_000), // holds schedule.endAt for this kind
+      // Reflects what AppointmentReminderRepository.schedule() actually persists for an
+      // email-only kind — smsDecision is NEVER "PENDING" for SESSION_END_REMINDER.
+      smsDecision: "NOT_APPLICABLE" as never,
+      ...overrides,
+    });
+
+  it("sends the email even when the OPTIONAL 24h appointmentReminderEmail preference is OFF — transactional, not preference-gated", async () => {
+    const repo = buildRepo();
+    const h = build({
+      repo,
+      profile: {
+        notifications: { appointmentReminderEmail: false, appointmentReminderSms: false },
+      },
+    });
+    const r = await h.worker.processOne(makeSessionEndReminder());
+
+    expect(r.status).toBe("completed");
+    expect(h.emailOutbox.enqueue).toHaveBeenCalledTimes(1);
+    expect(lastDecision(repo, "email")?.decision).toBe("ENQUEUED");
+  });
+
+  it("never attempts SMS — smsDecision is already NOT_APPLICABLE from creation, so recordChannelDecision is never called for sms", async () => {
+    const repo = buildRepo();
+    const h = build({ repo });
+    await h.worker.processOne(makeSessionEndReminder());
+
+    expect(h.smsOutbox.enqueue).not.toHaveBeenCalled();
+    expect(lastDecision(repo, "sms")).toBeUndefined();
+  });
+
+  it("enqueues with the SESSION_END_REMINDER template key and the Customer's own resolved email, never a business/staff address", async () => {
+    const repo = buildRepo();
+    const h = build({ repo });
+    await h.worker.processOne(makeSessionEndReminder());
+
+    expect(h.emailOutbox.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        templateKey: "SESSION_END_REMINDER",
+        recipient: "current@account.example",
+      }),
+    );
+  });
+
+  // Unlike REMINDER_24H, an ineligible SESSION_END_REMINDER never hits the whole-reminder
+  // `markSkipped` path here: its smsDecision is ALREADY final (NOT_APPLICABLE) from creation, so
+  // the worker takes the "per-channel skip, booking now ineligible" branch instead — only the
+  // still-PENDING email channel is resolved, as SKIPPED_INELIGIBLE.
+
+  it("SCHEDULE_CHANGED fires off schedule.endAt (not startAt) for this kind — an endAt-only change makes it ineligible", async () => {
+    const repo = buildRepo();
+    const h = build({
+      repo,
+      booking: makeBooking({
+        schedule: {
+          startAt: START, // unchanged
+          endAt: new Date(START.getTime() + 7_200_000), // moved — was +3_600_000 at scheduling time
+          timezone: "Europe/Nicosia",
+        },
+      }),
+    });
+    const r = await h.worker.processOne(makeSessionEndReminder());
+    expect(h.emailOutbox.enqueue).not.toHaveBeenCalled();
+    expect(r.email).toBe("skipped_ineligible");
+    expect(lastDecision(repo, "email")?.decision).toBe("SKIPPED_INELIGIBLE");
+  });
+
+  it("SESSION_ALREADY_ENDED — the session's endAt anchor has already passed", async () => {
+    const repo = buildRepo();
+    const endAt = new Date(NOW.getTime() - 60_000); // already in the past relative to clock NOW
+    const h = build({
+      repo,
+      booking: makeBooking({
+        schedule: { startAt: START, endAt, timezone: "Europe/Nicosia" },
+      }),
+    });
+    const r = await h.worker.processOne(
+      makeSessionEndReminder({ scheduleStartAt: endAt } as never),
+    );
+    expect(h.emailOutbox.enqueue).not.toHaveBeenCalled();
+    expect(r.email).toBe("skipped_ineligible");
+    expect(lastDecision(repo, "email")?.decision).toBe("SKIPPED_INELIGIBLE");
+  });
+
+  it("the existing REMINDER_24H kind is completely unaffected — still preference-gated, still uses schedule.startAt", async () => {
+    const repo = buildRepo();
+    const h = build({
+      repo,
+      profile: {
+        notifications: { appointmentReminderEmail: false, appointmentReminderSms: false },
+      },
+    });
+    const r = await h.worker.processOne(makeReminder()); // kind defaults to REMINDER_24H shape
+    expect(r.status).toBe("completed");
+    expect(h.emailOutbox.enqueue).not.toHaveBeenCalled();
+    expect(lastDecision(repo, "email")?.decision).toBe("SUPPRESSED_BY_PREFERENCE");
+  });
+});
+
 describe("AppointmentReminderWorker.processOne — partial failure & retry", () => {
   it("email success + SMS infra fail → email ENQUEUED persisted, reminder retried", async () => {
     const repo = buildRepo();

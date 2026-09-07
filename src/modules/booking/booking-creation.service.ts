@@ -39,6 +39,7 @@ import type {
   BookingNoShowEligibilitySnapshot,
   BookingServiceLine,
   BookingServiceLineAddon,
+  BookingSessionEndReminderSnapshot,
 } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
 import type { BookingService } from "./booking.service.js";
@@ -241,6 +242,30 @@ export class BookingCreationService {
       categoryKey,
       opensAfterMinutes: window.opensAfterMinutes,
       closesAfterMinutes: window.closesAfterMinutes,
+    };
+  }
+
+  /**
+   * Booking-time snapshot of Service.sessionExpiryAlert (see
+   * BookingSessionEndReminderSnapshot's own doc comment) — ALWAYS taken, even when `enabled` is
+   * false, so a legacy Booking (no snapshot at all) stays unambiguously distinguishable from a
+   * new Booking whose alert simply happens to be off. Never re-derived from the live Service
+   * later. A multi-line booking has one root `schedule.endAt` shared by every line (see
+   * booking.model.ts); the line that actually ends at that instant is the one whose setting
+   * governs the whole Booking's reminder — ties/first match wins deterministically.
+   */
+  private buildSessionEndReminderSnapshot(
+    lines: ResolvedServiceLine[],
+    overallEndAt: Date,
+  ): BookingSessionEndReminderSnapshot {
+    const governingLine =
+      lines.find((line) => line.endAt.getTime() === overallEndAt.getTime()) ?? lines[0];
+    const alert = (governingLine as ResolvedServiceLine).service.sessionExpiryAlert;
+    return {
+      enabled: alert.enabled,
+      ...(alert.minutesBeforeSessionEnds !== undefined
+        ? { minutesBeforeSessionEnds: alert.minutesBeforeSessionEnds }
+        : {}),
     };
   }
 
@@ -1079,6 +1104,15 @@ export class BookingCreationService {
     };
     const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
     const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
+    // A redemption is always exactly one Service line, so it alone governs the reminder
+    // snapshot — same rule as buildSessionEndReminderSnapshot's multi-line tie-break, trivially
+    // satisfied here.
+    const sessionEndReminderSnapshot: BookingSessionEndReminderSnapshot = {
+      enabled: service.sessionExpiryAlert.enabled,
+      ...(service.sessionExpiryAlert.minutesBeforeSessionEnds !== undefined
+        ? { minutesBeforeSessionEnds: service.sessionExpiryAlert.minutesBeforeSessionEnds }
+        : {}),
+    };
 
     // Same staffSnapshot convention resolveServiceLines already establishes for a normal
     // booking (booking.model.ts's own doc comment: snapshots survive a later profile change) —
@@ -1286,6 +1320,7 @@ export class BookingCreationService {
             ],
             ...(cancellationPolicySnapshot ? { cancellationPolicySnapshot } : {}),
             ...(noShowEligibilitySnapshot ? { noShowEligibilitySnapshot } : {}),
+            sessionEndReminderSnapshot,
             ...(input.notes ? { notes: input.notes } : {}),
           },
           dbSession,
@@ -1534,6 +1569,10 @@ export class BookingCreationService {
           (max, line) => (line.endAt > max ? line.endAt : max),
           params.lines[0]?.endAt ?? params.startAt,
         );
+        const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
+          params.lines,
+          overallEndAt,
+        );
 
         const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
           serviceId: line.service._id,
@@ -1640,6 +1679,7 @@ export class BookingCreationService {
             ...(params.noShowEligibilitySnapshot
               ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
               : {}),
+            sessionEndReminderSnapshot,
             ...(params.notes ? { notes: params.notes } : {}),
             ...(params.resolvedPromo
               ? {
@@ -2250,6 +2290,10 @@ export class BookingCreationService {
           (max, line) => (line.endAt > max ? line.endAt : max),
           params.lines[0]?.endAt ?? params.startAt,
         );
+        const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
+          params.lines,
+          overallEndAt,
+        );
 
         const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
           serviceId: line.service._id,
@@ -2296,6 +2340,7 @@ export class BookingCreationService {
             ...(params.noShowEligibilitySnapshot
               ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
               : {}),
+            sessionEndReminderSnapshot,
             ...(params.notes ? { notes: params.notes } : {}),
           },
           dbSession,

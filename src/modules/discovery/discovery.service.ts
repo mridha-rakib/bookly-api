@@ -92,6 +92,11 @@ export class DiscoveryService {
    * De-dup: Recommended is built first, then Near You excluding it, then Popular excluding
    * both. A section that comes up short (small eligible inventory) is topped up with a second,
    * exclusion-relaxed ranked query — deterministic overlap, never random padding.
+   *
+   * `contextCategories` (the homepage category tile the visitor picked) is a hard eligibility
+   * filter applied identically to all three rows — each row keeps its own ranking, just over
+   * the businesses whose `Business.category` is in the list. Omitted / empty = every row
+   * behaves exactly as before.
    */
   public async getHomeSections(params: {
     city?: BusinessCity | undefined;
@@ -106,22 +111,37 @@ export class DiscoveryService {
       : { categories: [], cities: [] };
     const personalized = affinity.categories.length > 0 || affinity.cities.length > 0;
 
+    // The picked homepage category tile (if any) — a hard eligibility filter for every row.
+    const categoryFilter =
+      params.contextCategories && params.contextCategories.length > 0
+        ? params.contextCategories
+        : undefined;
+
     const recommendedRows = await this.discoveryRepository.rankRecommended({
       affinity,
-      // A logged-out category context only narrows when we have nothing personal to go on.
-      contextCategories: personalized ? undefined : params.contextCategories,
+      contextCategories: categoryFilter,
       excludeIds: [],
       limit,
     });
 
     const nearYouRows = await this.fillSection(recommendedRows, limit, (excludeIds, take) =>
-      this.discoveryRepository.rankNearYou({ city: params.city, excludeIds, limit: take }),
+      this.discoveryRepository.rankNearYou({
+        city: params.city,
+        category: categoryFilter,
+        excludeIds,
+        limit: take,
+      }),
     );
 
     const popularRows = await this.fillSection(
       [...recommendedRows, ...nearYouRows],
       limit,
-      (excludeIds, take) => this.discoveryRepository.rankByPopularity({ excludeIds, limit: take }),
+      (excludeIds, take) =>
+        this.discoveryRepository.rankByPopularity({
+          category: categoryFilter,
+          excludeIds,
+          limit: take,
+        }),
     );
 
     const imageUrlByBusinessId = await this.imageUrlByBusinessId([

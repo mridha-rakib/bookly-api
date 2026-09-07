@@ -15,6 +15,10 @@ export const bookingIdParamsSchema = z
 
 export const bookingIdOnlyParamsSchema = z.object({ bookingId: objectIdSchema }).strict();
 
+export const bookingServiceParamsSchema = z
+  .object({ businessId: objectIdSchema, serviceId: objectIdSchema })
+  .strict();
+
 const pricingInputBodySchema = z
   .object({
     hours: z.coerce.number().positive().max(24).optional(),
@@ -233,6 +237,7 @@ export const calendarQuerySchema = z
 export type BookingBusinessParams = z.infer<typeof bookingBusinessParamsSchema>;
 export type BookingIdParams = z.infer<typeof bookingIdParamsSchema>;
 export type BookingIdOnlyParams = z.infer<typeof bookingIdOnlyParamsSchema>;
+export type BookingServiceParams = z.infer<typeof bookingServiceParamsSchema>;
 export type CreateManualBookingBody = z.infer<typeof createManualBookingBodySchema>;
 export type CreateCustomerBookingPreviewBody = z.infer<
   typeof createCustomerBookingPreviewBodySchema

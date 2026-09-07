@@ -13,6 +13,16 @@ export const bookingCancelledOwnerSubject = (bookingReference: string): string =
 
 const settlementLine = (data: CancellationEmailData): string | undefined => {
   const f = data.financialOutcome;
+  // Phase 4B close-out fix: same priority change as the customer template's financialLinesText —
+  // `hasRefund` is checked first and is unaffected for every existing caller (a customer-
+  // initiated cancellation never actually refunds today, so this was always false whenever
+  // `cancelledBy === "CUSTOMER"` before this fix). Only newly applies to a customer-initiated
+  // event that DOES carry a real refund (e.g. a Package void).
+  if (f.hasRefund) {
+    return f.settlementStatus === "SUCCEEDED"
+      ? `Upfront payment of ${f.refundFormatted} refunded to the customer.`
+      : `Refund of ${f.refundFormatted} did not complete automatically and is flagged for manual follow-up.`;
+  }
   if (data.cancelledBy === "CUSTOMER") {
     if (!f.hasCancellationFee) {
       return "No cancellation fee applied.";
@@ -25,12 +35,7 @@ const settlementLine = (data: CancellationEmailData): string | undefined => {
     }
     return `Cancellation fee ${f.cancellationFeeFormatted} classified.`;
   }
-  if (!f.hasRefund) {
-    return "No upfront payment was held, so no refund was required.";
-  }
-  return f.settlementStatus === "SUCCEEDED"
-    ? `Upfront payment of ${f.refundFormatted} refunded to the customer.`
-    : `Refund of ${f.refundFormatted} did not complete automatically and is flagged for manual follow-up.`;
+  return "No upfront payment was held, so no refund was required.";
 };
 
 export const renderBookingCancelledOwnerEmail = (data: CancellationEmailData): RenderedEmail => {

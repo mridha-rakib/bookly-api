@@ -602,6 +602,85 @@ export const env = createEnv({
           });
         }
       }),
+    // Facebook (Meta) OAuth app — ONE app powers three flows: Settings → "Link Facebook"
+    // (account linking), Customer "Continue with Facebook" (login/signup), and Business Owner
+    // "Continue with Facebook" (login/onboarding). Same convention as the Google client above:
+    // required in production, optional in dev/test where the per-flow `is*Configured()` gates
+    // keep the app booting and each endpoint returns a clear NOT_CONFIGURED / status=error.
+    // Create the app at https://developers.facebook.com/apps, add the "Facebook Login" product,
+    // request ONLY the `email` + `public_profile` scopes, and register EVERY redirect URI below
+    // as a "Valid OAuth Redirect URI" on this one app.
+    FACEBOOK_CLIENT_ID: optionalProductionRequiredString("FACEBOOK_CLIENT_ID"),
+    FACEBOOK_CLIENT_SECRET: optionalProductionRequiredString("FACEBOOK_CLIENT_SECRET"),
+    // Settings → Link Facebook. e.g. https://api.bookly.cy/api/v1/auth/oauth/facebook/callback
+    FACEBOOK_ACCOUNT_LINK_REDIRECT_URI: optionalProductionRequiredUrl(
+      "FACEBOOK_ACCOUNT_LINK_REDIRECT_URI",
+    ),
+    // Customer "Continue with Facebook" (customer-facebook-auth module).
+    // e.g. https://api.bookly.cy/api/v1/auth/customer/oauth/facebook/callback
+    FACEBOOK_CUSTOMER_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "FACEBOOK_CUSTOMER_OAUTH_REDIRECT_URI",
+    ),
+    // Business Owner "Continue with Facebook" (professional-facebook-auth module).
+    // e.g. https://api.bookly.cy/api/v1/auth/professional/oauth/facebook/callback
+    FACEBOOK_PROFESSIONAL_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "FACEBOOK_PROFESSIONAL_OAUTH_REDIRECT_URI",
+    ),
+    // Sign in with Apple — ONE Services ID powers three flows: Settings → "Link Apple", Customer
+    // "Continue with Apple", and Business Owner "Continue with Apple". Same optional-in-dev /
+    // required-in-production convention as the Google/Facebook clients. Apple's "client secret" is
+    // an ES256 JWT generated at runtime from the .p8 key (see common/oauth/apple-client-secret.ts)
+    // — there is no static secret string.
+    //   APPLE_CLIENT_ID     = the web Services ID (e.g. "cy.bookly.web"); also the id_token `aud`
+    //   APPLE_TEAM_ID       = 10-char Apple Developer Team ID; client-secret JWT `iss`
+    //   APPLE_KEY_ID        = 10-char Key ID of the "Sign in with Apple" key; JWT header `kid`
+    //   APPLE_PRIVATE_KEY   = the .p8 PEM, base64-encoded to a single line (decoded in the helper);
+    //                         never logged, never echoed, no example value in .env.example
+    APPLE_CLIENT_ID: optionalProductionRequiredString("APPLE_CLIENT_ID"),
+    APPLE_TEAM_ID: optionalProductionRequiredString("APPLE_TEAM_ID"),
+    APPLE_KEY_ID: optionalProductionRequiredString("APPLE_KEY_ID"),
+    APPLE_PRIVATE_KEY: z
+      .string()
+      .optional()
+      .superRefine((value, context) => {
+        if (rawNodeEnv === "production" && !value) {
+          context.addIssue({
+            code: "custom",
+            message: "APPLE_PRIVATE_KEY is required in production",
+          });
+          return;
+        }
+        if (value !== undefined && value.length > 0) {
+          let decoded: string;
+          try {
+            decoded = Buffer.from(value, "base64").toString("utf8");
+          } catch {
+            context.addIssue({
+              code: "custom",
+              message: "APPLE_PRIVATE_KEY must be base64-encoded",
+            });
+            return;
+          }
+          if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(decoded)) {
+            context.addIssue({
+              code: "custom",
+              message: "APPLE_PRIVATE_KEY must base64-decode to a PRIVATE KEY PEM",
+            });
+          }
+        }
+      }),
+    // Settings → Link Apple. e.g. https://api.bookly.cy/api/v1/auth/oauth/apple/callback
+    APPLE_ACCOUNT_LINK_REDIRECT_URI: optionalProductionRequiredUrl(
+      "APPLE_ACCOUNT_LINK_REDIRECT_URI",
+    ),
+    // Customer "Continue with Apple". e.g. https://api.bookly.cy/api/v1/auth/customer/oauth/apple/callback
+    APPLE_CUSTOMER_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "APPLE_CUSTOMER_OAUTH_REDIRECT_URI",
+    ),
+    // Business Owner "Continue with Apple". e.g. https://api.bookly.cy/api/v1/auth/professional/oauth/apple/callback
+    APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
+      "APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI",
+    ),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

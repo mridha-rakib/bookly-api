@@ -12,12 +12,14 @@ export const professionalRoles: UserRole[] = ["BUSINESS_OWNER", "SUPERVISOR", "S
 
 /**
  * How a User can authenticate. `PASSWORD` — a usable `passwordHash` is set (email/password
- * login). `GOOGLE` — a verified Google identity is linked (see LinkedAccount). Every User carries
- * at least one. `authProviders` is the single source of truth for "can this account sign in
- * without a password"; the value is kept in lockstep with `passwordHash` presence by
+ * login). `GOOGLE` / `FACEBOOK` / `APPLE` — a verified social identity is linked (see
+ * LinkedAccount) and "Continue with <provider>" resolves the account by
+ * `LinkedAccount(provider, providerAccountId)`. Every User carries at least one. `authProviders`
+ * is the single source of truth for "can this account sign in without a password"; only
+ * `PASSWORD` membership is coupled to `passwordHash` presence, checked by
  * {@link assertUserAuthProvidersConsistent}.
  */
-export const authProviders = ["PASSWORD", "GOOGLE"] as const;
+export const authProviders = ["PASSWORD", "GOOGLE", "FACEBOOK", "APPLE"] as const;
 
 export type AuthProvider = (typeof authProviders)[number];
 

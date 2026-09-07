@@ -3,6 +3,7 @@ import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { buildAppointmentReminderEmailData } from "../email/templates/booking/appointment-reminder-24h.template.js";
+import { buildSessionEndReminderEmailData } from "../email/templates/booking/session-end-reminder.template.js";
 import {
   formatDateInTimezone,
   formatTimeInTimezone,
@@ -85,10 +86,13 @@ const safeMessage = (error: unknown): string =>
 const OWNERSHIP_LOST = Symbol("ownership-lost");
 
 /**
- * Multi-channel 24h reminder orchestration. Per due reminder, INDEPENDENTLY decides and durably
- * records an Email outcome and an SMS outcome, enqueuing eligible messages into the EXISTING
- * EmailOutbox / SmsOutbox. Never calls SendGrid or Twilio directly. Never waits for provider
- * delivery — a successful outbox enqueue is the FINAL channel decision.
+ * Multi-kind, multi-channel reminder orchestration — `REMINDER_24H` (email + SMS, preference-
+ * gated) and `SESSION_END_REMINDER` (email only, transactional/unconditional — its `smsDecision`
+ * is `NOT_APPLICABLE` from creation, so this worker never attempts SMS for it). Per due reminder,
+ * INDEPENDENTLY decides and durably records an Email outcome and an SMS outcome, enqueuing
+ * eligible messages into the EXISTING EmailOutbox / SmsOutbox. Never calls SendGrid or Twilio
+ * directly. Never waits for provider delivery — a successful outbox enqueue is the FINAL channel
+ * decision.
  *
  * Correctness rests on: the atomic `claimNext` + per-claim ownership token fenced into every
  * write; frozen per-channel recipients (set-once) + the deterministic outbox dedupe keys, which
@@ -259,8 +263,15 @@ export class AppointmentReminderWorker {
 
     const needEmail = !emailFinal;
     const needSms = !smsFinal;
+    // SESSION_END_REMINDER is a transactional, non-preference-gated email (see
+    // CustomerNotificationPolicy's own "scope guard" doc comment — it only knows about the two
+    // OPTIONAL channels below, never this one): eligibility alone decides it, same as booking
+    // confirmation/cancellation/completion. REMINDER_24H is unchanged — still preference-gated.
     const wantEmail =
-      needEmail && this.notificationPolicy.mayReceiveAppointmentReminderEmail(prefs);
+      needEmail &&
+      (reminder.kind === "SESSION_END_REMINDER"
+        ? true
+        : this.notificationPolicy.mayReceiveAppointmentReminderEmail(prefs));
 
     const needUserForEmail = wantEmail && !reminder.emailRecipient;
     const needUserForSms = needSms && smsPrefOn && !reminder.smsRecipientE164;
@@ -442,13 +453,17 @@ export class AppointmentReminderWorker {
 
     // `business` is guaranteed non-null here (needBusiness was true → checked above).
     const businessName = (ctx.business as { name: string }).name;
+    const isSessionEnd = reminder.kind === "SESSION_END_REMINDER";
     const enqueueResult = await this.emailOutbox.enqueue({
       eventKey: reminder.dedupeKey,
-      templateKey: "APPOINTMENT_REMINDER_24H",
+      templateKey: isSessionEnd ? "SESSION_END_REMINDER" : "APPOINTMENT_REMINDER_24H",
       recipient: recipient as string,
-      payload: buildAppointmentReminderEmailData(ctx.booking, {
-        businessName,
-      }) as unknown as Record<string, unknown>,
+      payload: (isSessionEnd
+        ? buildSessionEndReminderEmailData(ctx.booking, { businessName })
+        : buildAppointmentReminderEmailData(ctx.booking, { businessName })) as unknown as Record<
+        string,
+        unknown
+      >,
     });
 
     const r = await this.reminderRepository.recordChannelDecision(reminder._id, token, {
@@ -612,8 +627,11 @@ export class AppointmentReminderWorker {
   }
 
   /** Booking is no longer a valid target for this reminder → returns a category string; else
-   * `undefined`. Unchanged from Stage 2: must exist, be UPCOMING, match the reminder's schedule
-   * version, and not have started. */
+   * `undefined`. Must exist, be UPCOMING, match the reminder's schedule version, and not have
+   * passed its anchor instant yet. The anchor is kind-dependent: `REMINDER_24H` is anchored to
+   * `schedule.startAt` (unchanged from Stage 2); `SESSION_END_REMINDER` to `schedule.endAt` —
+   * `reminder.scheduleStartAt` holds whichever anchor this reminder's kind uses (see
+   * appointment-reminder.model.ts's own doc comment). */
   private eligibilityFailure(
     booking: BookingDocument | null,
     reminder: AppointmentReminderDocument,
@@ -625,11 +643,13 @@ export class AppointmentReminderWorker {
     if (booking.status !== "UPCOMING" || TERMINAL_BOOKING_STATUSES.has(booking.status)) {
       return `BOOKING_${booking.status}`;
     }
-    if (booking.schedule.startAt.getTime() !== reminder.scheduleStartAt.getTime()) {
+    const isSessionEnd = reminder.kind === "SESSION_END_REMINDER";
+    const anchor = isSessionEnd ? booking.schedule.endAt : booking.schedule.startAt;
+    if (anchor.getTime() !== reminder.scheduleStartAt.getTime()) {
       return "SCHEDULE_CHANGED";
     }
-    if (booking.schedule.startAt.getTime() <= now.getTime()) {
-      return "APPOINTMENT_ALREADY_STARTED";
+    if (anchor.getTime() <= now.getTime()) {
+      return isSessionEnd ? "SESSION_ALREADY_ENDED" : "APPOINTMENT_ALREADY_STARTED";
     }
     return undefined;
   }

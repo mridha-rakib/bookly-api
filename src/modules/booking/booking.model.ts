@@ -326,6 +326,21 @@ export type BookingNoShowEligibilitySnapshot = {
 };
 
 /**
+ * Service.sessionExpiryAlert snapshot, taken ONCE at Booking-creation time — the SAME
+ * historical-integrity discipline as `cancellationPolicySnapshot`/`noShowEligibilitySnapshot`: a
+ * later edit to the Service's setting (enabling, disabling, or changing the minutes) must never
+ * retroactively change an already-created Booking's own reminder behavior. Always written on a
+ * Booking created after this feature shipped (even when `enabled` is false at that moment) — so
+ * `undefined` unambiguously means "this Booking predates the feature" (legacy) and must NEVER be
+ * read as "look up the live Service setting" or backfilled; a legacy Booking simply has no
+ * session-end reminder. `minutesBeforeSessionEnds` mirrors ServiceSessionExpiryAlert exactly.
+ */
+export type BookingSessionEndReminderSnapshot = {
+  enabled: boolean;
+  minutesBeforeSessionEnds?: number | undefined;
+};
+
+/**
  * `cancellationFeeCents`/`refundOwedCents` are the CLASSIFIED amounts (what the policy says is
  * owed/refundable) — never proof that money actually moved. `settlementStatus` is the honest,
  * separately-tracked record of whether the associated Stripe charge/refund actually succeeded
@@ -441,6 +456,7 @@ export type BookingDocument = {
   noShowDeadlineAt?: Date | undefined;
   cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
   noShowEligibilitySnapshot?: BookingNoShowEligibilitySnapshot | undefined;
+  sessionEndReminderSnapshot?: BookingSessionEndReminderSnapshot | undefined;
   cancellationOutcome?: BookingCancellationOutcome | undefined;
   completionPayment?: BookingCompletionPayment | undefined;
   promo?: BookingPromoSnapshot | undefined;
@@ -774,6 +790,16 @@ const bookingNoShowEligibilitySnapshotSchema = new Schema<BookingNoShowEligibili
   { _id: false },
 );
 
+const bookingSessionEndReminderSnapshotSchema = new Schema<BookingSessionEndReminderSnapshot>(
+  {
+    enabled: { type: Boolean, required: true },
+    // Mirrors ServiceSessionExpiryAlert's own schema exactly (service.model.ts) — `min: 1`, no
+    // integer constraint, so a snapshot can never be stricter than the source it was copied from.
+    minutesBeforeSessionEnds: { type: Number, min: 1 },
+  },
+  { _id: false },
+);
+
 const bookingCancellationOutcomeSchema = new Schema<BookingCancellationOutcome>(
   {
     classifiedAt: { type: Date, required: true },
@@ -860,6 +886,7 @@ const bookingSchema = new Schema<BookingDocument>(
     noShowDeadlineAt: { type: Date },
     cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
     noShowEligibilitySnapshot: { type: bookingNoShowEligibilitySnapshotSchema },
+    sessionEndReminderSnapshot: { type: bookingSessionEndReminderSnapshotSchema },
     cancellationOutcome: { type: bookingCancellationOutcomeSchema },
     completionPayment: { type: bookingCompletionPaymentSchema },
     promo: { type: bookingPromoSnapshotSchema },

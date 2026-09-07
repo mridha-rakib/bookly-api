@@ -8,7 +8,10 @@ import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { LinkedAccountModel } from "../../../src/modules/linked-account/linked-account.model.js";
 import { LinkedAccountRepository } from "../../../src/modules/linked-account/linked-account.repository.js";
-import { signGoogleLinkState } from "../../../src/modules/linked-account/linked-account.state.js";
+import {
+  signFacebookLinkState,
+  signGoogleLinkState,
+} from "../../../src/modules/linked-account/linked-account.state.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
@@ -38,6 +41,26 @@ vi.mock("../../../src/modules/linked-account/google-oauth.client.js", () => ({
   isGoogleAccountLinkConfigured,
   buildGoogleAccountLinkAuthUrl,
   verifyGoogleAccountLinkCallback,
+}));
+
+// Same treatment for the Facebook adapter — the three Graph `fetch` calls are the only network
+// seam. State signing/verification stays REAL (signFacebookLinkState import above).
+const {
+  isFacebookAccountLinkConfigured,
+  buildFacebookAccountLinkAuthUrl,
+  verifyFacebookAccountLinkCallback,
+} = vi.hoisted(() => ({
+  isFacebookAccountLinkConfigured: vi.fn(() => true),
+  buildFacebookAccountLinkAuthUrl: vi.fn(
+    (state: string) => `https://www.facebook.com/v23.0/dialog/oauth?state=${state}`,
+  ),
+  verifyFacebookAccountLinkCallback: vi.fn(),
+}));
+
+vi.mock("../../../src/modules/linked-account/facebook-oauth.client.js", () => ({
+  isFacebookAccountLinkConfigured,
+  buildFacebookAccountLinkAuthUrl,
+  verifyFacebookAccountLinkCallback,
 }));
 
 describe("HTTP-level Customer → Google account linking", () => {
@@ -377,6 +400,321 @@ describe("HTTP-level Customer → Google account linking", () => {
         provider: "GOOGLE",
         providerAccountId: "google-sub-closing",
         email: "closing@gmail.com",
+        emailVerified: true,
+        linkedAt: new Date(),
+      });
+
+      const response = await request(buildApp())
+        .delete("/api/v1/auth/me")
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
+        .send({ currentPassword: "correct-horse", confirmationText: "DELETE" });
+
+      expect(response.status).toBe(200);
+      expect(await LinkedAccountModel.countDocuments({ userId: customer._id })).toBe(0);
+    });
+  });
+});
+
+describe("HTTP-level Customer → Facebook account linking (linking only, never login)", () => {
+  let userRepository: UserRepository;
+  let linkedAccountRepository: LinkedAccountRepository;
+  let tokenService: TokenService;
+  const passwordHasher = new Argon2PasswordHasher();
+
+  beforeAll(async () => {
+    await connectIsolatedDatabase();
+  }, 120_000);
+
+  beforeEach(async () => {
+    await clearIsolatedDatabase();
+    vi.clearAllMocks();
+    isFacebookAccountLinkConfigured.mockReturnValue(true);
+    buildFacebookAccountLinkAuthUrl.mockImplementation(
+      (state: string) => `https://www.facebook.com/v23.0/dialog/oauth?state=${state}`,
+    );
+    userRepository = new UserRepository();
+    linkedAccountRepository = new LinkedAccountRepository();
+    tokenService = new TokenService(new SessionRepository());
+  });
+
+  afterAll(async () => {
+    await stopIsolatedReplicaSet();
+  });
+
+  const buildApp = () => {
+    const app = express();
+    app.use(express.json());
+    const dbStateReader = { getConnectionState: () => "connected" as const };
+    app.use("/api/v1", createApiRouter(dbStateReader));
+    app.use(createErrorHandler({ isProduction: true }));
+    return app;
+  };
+
+  type TestRole = "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN";
+
+  const createUser = async (role: TestRole, password?: string) =>
+    userRepository.create({
+      normalizedEmail: `user-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: password ? await passwordHasher.hash(password) : "unusable-hash",
+      role,
+      status: "ACTIVE",
+    });
+
+  const bearerFor = (userId: Types.ObjectId | string, role: TestRole) =>
+    tokenService.createAccessToken({ userId, role }).then((token) => `Bearer ${token}`);
+
+  const AUTHORIZE_URL = "/api/v1/auth/me/linked-accounts/facebook/authorize-url";
+  const UNLINK_URL = "/api/v1/auth/me/linked-accounts/facebook";
+  const CALLBACK_URL = "/api/v1/auth/oauth/facebook/callback";
+
+  describe("GET authorize-url", () => {
+    it("rejects an unauthenticated caller (401)", async () => {
+      expect((await request(buildApp()).get(AUTHORIZE_URL)).status).toBe(401);
+    });
+
+    it("allows CUSTOMER/BUSINESS_OWNER/SUPERVISOR/STAFF; SUPER_ADMIN is 403 (matches Google)", async () => {
+      for (const role of ["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const) {
+        const user = await createUser(role);
+        const response = await request(buildApp())
+          .get(AUTHORIZE_URL)
+          .set("Authorization", await bearerFor(user._id, role));
+        expect(response.status).toBe(200);
+        expect(response.body.data.authUrl).toContain("facebook.com");
+      }
+
+      const admin = await createUser("SUPER_ADMIN");
+      const denied = await request(buildApp())
+        .get(AUTHORIZE_URL)
+        .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"));
+      expect(denied.status).toBe(403);
+    });
+
+    it("returns 503 when Facebook linking is not configured", async () => {
+      isFacebookAccountLinkConfigured.mockReturnValue(false);
+      const customer = await createUser("CUSTOMER");
+
+      const response = await request(buildApp())
+        .get(AUTHORIZE_URL)
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"));
+
+      expect(response.status).toBe(503);
+    });
+  });
+
+  describe("GET callback", () => {
+    it("400s when no state param is present", async () => {
+      expect((await request(buildApp()).get(CALLBACK_URL)).status).toBe(400);
+    });
+
+    it("redirects result=error for a forged state, writing nothing", async () => {
+      const response = await request(buildApp())
+        .get(CALLBACK_URL)
+        .query({ state: "forged", code: "abc" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers["location"]).toContain("linkedAccount=facebook");
+      expect(response.headers["location"]).toContain("result=error");
+      expect(await LinkedAccountModel.countDocuments()).toBe(0);
+    });
+
+    it("redirects result=error when the user denied consent (no code)", async () => {
+      const customer = await createUser("CUSTOMER");
+      const state = await signFacebookLinkState({ userId: String(customer._id) });
+
+      const response = await request(buildApp())
+        .get(CALLBACK_URL)
+        .query({ state, error: "access_denied" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers["location"]).toContain("result=error");
+      expect(verifyFacebookAccountLinkCallback).not.toHaveBeenCalled();
+    });
+
+    it("links the verified Facebook identity to the state's user and redirects result=connected", async () => {
+      const customer = await createUser("CUSTOMER");
+      const state = await signFacebookLinkState({ userId: String(customer._id) });
+      verifyFacebookAccountLinkCallback.mockResolvedValue({
+        providerAccountId: "fb-user-42",
+        email: "Pat@Example.com",
+        emailVerified: true,
+        displayName: "Pat Example",
+      });
+
+      const response = await request(buildApp())
+        .get(CALLBACK_URL)
+        .query({ state, code: "auth-code" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers["location"]).toContain("result=connected");
+
+      const row = await LinkedAccountModel.findOne({ userId: customer._id }).lean();
+      expect(row).toMatchObject({
+        provider: "FACEBOOK",
+        providerAccountId: "fb-user-42",
+        email: "pat@example.com",
+        emailVerified: true,
+        displayName: "Pat Example",
+      });
+    });
+
+    it("redirects result=error when the Facebook identity already belongs to another user", async () => {
+      const other = await createUser("CUSTOMER");
+      const customer = await createUser("CUSTOMER");
+      await linkedAccountRepository.create({
+        userId: other._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-user-taken",
+        email: "taken@example.com",
+        emailVerified: true,
+        linkedAt: new Date(),
+      });
+      const state = await signFacebookLinkState({ userId: String(customer._id) });
+      verifyFacebookAccountLinkCallback.mockResolvedValue({
+        providerAccountId: "fb-user-taken",
+        email: "taken@example.com",
+        emailVerified: true,
+      });
+
+      const response = await request(buildApp())
+        .get(CALLBACK_URL)
+        .query({ state, code: "auth-code" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers["location"]).toContain("result=error");
+      expect(await LinkedAccountModel.countDocuments({ userId: customer._id })).toBe(0);
+    });
+
+    it("a GOOGLE-signed state cannot drive the Facebook callback", async () => {
+      const customer = await createUser("CUSTOMER");
+      const googleState = await signGoogleLinkState({ userId: String(customer._id) });
+
+      const response = await request(buildApp())
+        .get(CALLBACK_URL)
+        .query({ state: googleState, code: "auth-code" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers["location"]).toContain("result=error");
+      expect(await LinkedAccountModel.countDocuments()).toBe(0);
+    });
+  });
+
+  describe("GET /auth/me linkedAccounts", () => {
+    it("returns the FACEBOOK summary after linking, without providerAccountId", async () => {
+      const customer = await createUser("CUSTOMER");
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-user-me",
+        email: "me@example.com",
+        emailVerified: true,
+        displayName: "Me Example",
+        linkedAt: new Date("2026-09-03T08:00:00.000Z"),
+      });
+
+      const response = await request(buildApp())
+        .get("/api/v1/auth/me")
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"));
+
+      expect(response.body.data.linkedAccounts).toEqual([
+        {
+          provider: "FACEBOOK",
+          email: "me@example.com",
+          displayName: "Me Example",
+          linkedAt: "2026-09-03T08:00:00.000Z",
+        },
+      ]);
+      expect(JSON.stringify(response.body.data.linkedAccounts)).not.toContain("fb-user-me");
+    });
+
+    it("shows GOOGLE + FACEBOOK together for a user who linked both", async () => {
+      const customer = await createUser("CUSTOMER");
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "GOOGLE",
+        providerAccountId: "g-sub-both",
+        email: "both@gmail.com",
+        emailVerified: true,
+        linkedAt: new Date("2026-09-01T00:00:00.000Z"),
+      });
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-both",
+        email: "both@example.com",
+        emailVerified: true,
+        linkedAt: new Date("2026-09-02T00:00:00.000Z"),
+      });
+
+      const response = await request(buildApp())
+        .get("/api/v1/auth/me")
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"));
+
+      const providers = (response.body.data.linkedAccounts as Array<{ provider: string }>)
+        .map((a) => a.provider)
+        .sort();
+      expect(providers).toEqual(["FACEBOOK", "GOOGLE"]);
+    });
+  });
+
+  describe("DELETE unlink", () => {
+    it("rejects a wrong current password (400) and keeps the link", async () => {
+      const customer = await createUser("CUSTOMER", "correct-horse");
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-keep",
+        email: "keep@example.com",
+        emailVerified: true,
+        linkedAt: new Date(),
+      });
+
+      const response = await request(buildApp())
+        .delete(UNLINK_URL)
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
+        .send({ currentPassword: "wrong" });
+
+      expect(response.status).toBe(400);
+      expect(await LinkedAccountModel.countDocuments({ userId: customer._id })).toBe(1);
+    });
+
+    it("unlinks only the FACEBOOK row on a correct password, leaving GOOGLE untouched", async () => {
+      const customer = await createUser("CUSTOMER", "correct-horse");
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "GOOGLE",
+        providerAccountId: "g-sub-stays",
+        email: "stays@gmail.com",
+        emailVerified: true,
+        linkedAt: new Date(),
+      });
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-bye",
+        email: "bye@example.com",
+        emailVerified: true,
+        linkedAt: new Date(),
+      });
+
+      const response = await request(buildApp())
+        .delete(UNLINK_URL)
+        .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
+        .send({ currentPassword: "correct-horse" });
+
+      expect(response.status).toBe(200);
+      const rows = await LinkedAccountModel.find({ userId: customer._id }).lean();
+      expect(rows.map((r) => r.provider)).toEqual(["GOOGLE"]);
+    });
+  });
+
+  describe("account deletion cleanup", () => {
+    it("removes the FACEBOOK row when the customer closes their account", async () => {
+      const customer = await createUser("CUSTOMER", "correct-horse");
+      await linkedAccountRepository.create({
+        userId: customer._id,
+        provider: "FACEBOOK",
+        providerAccountId: "fb-closing",
+        email: "closing@example.com",
         emailVerified: true,
         linkedAt: new Date(),
       });
