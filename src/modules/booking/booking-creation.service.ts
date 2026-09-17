@@ -111,6 +111,32 @@ export type FinalizeBookingResult =
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Booking-creation-time-only coordinate snapshot guard — a finite lat/lng within real
+ * geographic ranges, never fabricated/coerced. Same validation as discovery.repository.ts's and
+ * catalog.dto.ts's own local `validLocation` (kept local here too, matching this codebase's
+ * existing per-module convention rather than a shared util). Called exactly once, at the moment
+ * a Booking's fulfilment snapshot is built — never again afterward, so a later change to
+ * `business.location` can never reach an already-created Booking. */
+const resolveValidCoordinate = (
+  location: BusinessDocument["location"],
+): { lat: number; lng: number } | undefined => {
+  if (!location) return undefined;
+  const { lat, lng } = location;
+  if (
+    typeof lat !== "number" ||
+    typeof lng !== "number" ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return undefined;
+  }
+  return { lat, lng };
+};
+
 /**
  * Batch 3's central orchestration: composes AvailabilityService's write-time re-validation
  * (assertSlotIsBookable / requireServedCity), BookingSlotReservationService's atomic occupancy
@@ -2088,6 +2114,10 @@ export class BookingCreationService {
           streetNumber: business.address.streetNumber,
           floorUnit: business.address.floorUnit,
           aptRoom: business.address.aptRoom,
+          // Frozen at booking-creation time only — see BookingLocationSnapshot's own doc
+          // comment. Never re-read/re-derived after this; a later Business.location change
+          // must never reach an already-created Booking.
+          location: resolveValidCoordinate(business.location),
         },
       };
     }
@@ -2107,6 +2137,9 @@ export class BookingCreationService {
         floorUnit: input.travelAddress.floorUnit,
         aptRoom: input.travelAddress.aptRoom,
         additionalDirections: input.travelAddress.additionalDirections,
+        // No real customer/travel coordinate is ever supplied at booking creation today (see
+        // CreateBookingTravelAddressInput — address text only) — deliberately NOT geocoded here
+        // to manufacture one; `location` simply stays undefined until a real source exists.
       },
     };
   }

@@ -1,3 +1,4 @@
+import type { BusinessVisitType } from "../business/business.types.js";
 import type { BookingDocument } from "./booking.model.js";
 
 /**
@@ -89,6 +90,52 @@ export type BookingDetailDto = {
   updatedAt: string;
 };
 
+/** Batch — the compact historical location a list row needs (address display + Get Directions),
+ * WITHOUT dumping the full `fulfilment` object (service-line/financial-shaped detail a list view
+ * never needs). Always the Booking's OWN frozen snapshot — never re-read from the Business's
+ * current address — see BookingLocationSnapshot's own doc comment for why. `location` is present
+ * only when a real coordinate was available and valid at booking-creation time; absent for every
+ * Booking created before that field existed, or where no valid source coordinate existed. */
+export type BookingListFulfilmentLocationDto = {
+  mode: BusinessVisitType;
+  address: {
+    city: string;
+    area: string;
+    streetName: string;
+    streetNumber: string;
+    floorUnit?: string | undefined;
+    aptRoom?: string | undefined;
+  };
+  location?: { lat: number; lng: number } | undefined;
+};
+
+const toFulfilmentLocationDto = (
+  fulfilment: BookingDocument["fulfilment"],
+): BookingListFulfilmentLocationDto | undefined => {
+  const snapshot =
+    fulfilment.mode === "AT_BUSINESS_LOCATION"
+      ? fulfilment.businessLocation
+      : fulfilment.travelAddress;
+  if (!snapshot) return undefined;
+
+  return {
+    mode: fulfilment.mode,
+    address: {
+      city: snapshot.city,
+      area: snapshot.area,
+      streetName: snapshot.streetName,
+      streetNumber: snapshot.streetNumber,
+      floorUnit: snapshot.floorUnit,
+      aptRoom: snapshot.aptRoom,
+    },
+    // A plain object, never the raw Mongoose subdocument — matches
+    // catalog.dto.ts/discovery.repository.ts's own convention for a coordinate DTO field.
+    location: snapshot.location
+      ? { lat: snapshot.location.lat, lng: snapshot.location.lng }
+      : undefined,
+  };
+};
+
 export type BookingListItemDto = {
   id: string;
   /** Batch 9 — added so the CUSTOMER-scoped `/me/bookings` list (which spans many Businesses)
@@ -107,6 +154,9 @@ export type BookingListItemDto = {
   totalCents: number;
   depositCents: number;
   currency: string;
+  /** The Booking's own historical fulfilment snapshot — see BookingListFulfilmentLocationDto's
+   * own doc comment. Never the Business's current address/location. */
+  fulfilmentLocation?: BookingListFulfilmentLocationDto | undefined;
   /** First-vs-returning display only (Batch 6, item 17) — never a second source of truth for
    * money: for a BOOKLY_MANAGED booking, `platformFeeCents > 0` means this WAS the customer's
    * first booking at this business (see booking-creation.service.ts's own
@@ -267,6 +317,7 @@ export const toBookingListItemDto = (booking: BookingDocument): BookingListItemD
   totalCents: booking.financials.totalCents,
   depositCents: booking.financials.depositCents,
   currency: booking.financials.currency,
+  fulfilmentLocation: toFulfilmentLocationDto(booking.fulfilment),
   platformFeeCents: booking.financials.platformFeeCents,
 });
 

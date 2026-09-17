@@ -87,6 +87,13 @@ export type BookingLocationSnapshot = {
   streetNumber: string;
   floorUnit?: string | undefined;
   aptRoom?: string | undefined;
+  /** The historical provider-neutral coordinate at booking-creation time, when a real one was
+   * available then — NEVER re-derived from the Business's CURRENT location afterward (same rule
+   * L this whole snapshot exists for). Optional and backward-compatible: every Booking created
+   * before this field existed, and any created without a valid source coordinate, simply has no
+   * `location` here — the frontend must show historical address text with no marker in that
+   * case, never fabricate or backfill one from current data. */
+  location?: { lat: number; lng: number } | undefined;
 };
 
 export type BookingTravelAddressSnapshot = BookingLocationSnapshot & {
@@ -502,6 +509,16 @@ const bookingActorSchema = new Schema<BookingActor>(
   { _id: false },
 );
 
+// Shared by both snapshot schemas below — a plain, optional `{lat,lng}` sub-document, never
+// required (backward compatible with every Booking created before this field existed).
+const bookingSnapshotLocationSchema = new Schema<{ lat: number; lng: number }>(
+  {
+    lat: { type: Number, required: true },
+    lng: { type: Number, required: true },
+  },
+  { _id: false },
+);
+
 const bookingLocationSnapshotSchema = new Schema<BookingLocationSnapshot>(
   {
     city: { type: String, enum: businessCities, required: true },
@@ -510,6 +527,7 @@ const bookingLocationSnapshotSchema = new Schema<BookingLocationSnapshot>(
     streetNumber: { type: String, required: true, trim: true },
     floorUnit: { type: String, trim: true },
     aptRoom: { type: String, trim: true },
+    location: { type: bookingSnapshotLocationSchema },
   },
   { _id: false },
 );
@@ -524,6 +542,7 @@ const bookingTravelAddressSnapshotSchema = new Schema<BookingTravelAddressSnapsh
     floorUnit: { type: String, trim: true },
     aptRoom: { type: String, trim: true },
     additionalDirections: { type: String, trim: true, maxlength: 500 },
+    location: { type: bookingSnapshotLocationSchema },
   },
   { _id: false },
 );
