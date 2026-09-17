@@ -48,6 +48,26 @@ type CreateAppleProfessionalSessionInput = {
   expiresAt: Date;
 };
 
+type CreateFacebookProfessionalSessionInput = {
+  normalizedEmail: string;
+  facebookProviderAccountId: string;
+  firstName: string;
+  lastName: string;
+  businessVisitType: BusinessVisitType;
+  emailVerifiedAt: Date;
+  expiresAt: Date;
+};
+
+type CreateAppleProfessionalSessionInput = {
+  normalizedEmail: string;
+  appleProviderAccountId: string;
+  firstName: string;
+  lastName: string;
+  businessVisitType: BusinessVisitType;
+  emailVerifiedAt: Date;
+  expiresAt: Date;
+};
+
 export class RegistrationSessionRepository {
   public async create(input: CreateSessionInput): Promise<RegistrationSessionDocument> {
     return RegistrationSessionModel.create({
