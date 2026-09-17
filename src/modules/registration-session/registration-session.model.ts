@@ -26,12 +26,12 @@ export const isSocialRegistrationProvider = (
 
 export const registrationSteps = [
   "EMAIL_ENTRY",
-  "VISIT_TYPE_SELECTED",
   "EMAIL_OTP_SENT",
   "EMAIL_VERIFIED",
   "PROFILE_SUBMITTED",
   "PHONE_OTP_SENT",
   "PHONE_VERIFIED",
+  "VISIT_TYPE_SELECTED",
   "BUSINESS_DETAILS_SUBMITTED",
   "CATEGORIES_SUBMITTED",
   "COMPLETED",

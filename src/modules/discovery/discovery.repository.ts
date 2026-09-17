@@ -43,6 +43,9 @@ export type DiscoveryAggregateRow = {
   startingPriceCents: number | null;
   startingPricingMode: ServicePricingMode | null;
   isAvailable: boolean;
+  /** Real persisted `Business.location`, never fabricated — undefined when the Business has no
+   * stored coordinate. */
+  location: { lat: number; lng: number } | undefined;
 };
 
 export type FoundingPartnerRow = {
@@ -63,6 +66,7 @@ type RawAggregateRow = {
   reviewCount: number;
   startingPriceCents: number | null;
   startingPricingMode: ServicePricingMode | null;
+  location?: { lat: number; lng: number } | undefined;
 };
 
 /** The rating + cheapest-Service lookup stages shared by both `search` (Explore) and
@@ -149,6 +153,8 @@ const cardProjection = {
   reviewCount: 1,
   startingPriceCents: 1,
   startingPricingMode: 1,
+  "location.lat": 1,
+  "location.lng": 1,
 };
 
 /** Batch 17 — the null-safe sort scaffolding every home-section ranking shares. `qualityScore`
@@ -180,6 +186,28 @@ const homeVisibilityMatch = (excludeIds: Types.ObjectId[]): Record<string, unkno
   ...(excludeIds.length > 0 ? { _id: { $nin: excludeIds } } : {}),
 });
 
+/** A valid marker requires a finite lat/lng within real geographic ranges — never fabricated,
+ * and never passed through as-is if the stored document happens to hold a malformed value. */
+const validLocation = (
+  location: RawAggregateRow["location"],
+): { lat: number; lng: number } | undefined => {
+  if (!location) return undefined;
+  const { lat, lng } = location;
+  if (
+    typeof lat !== "number" ||
+    typeof lng !== "number" ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return undefined;
+  }
+  return { lat, lng };
+};
+
 const toAggregateRow = (row: RawAggregateRow): DiscoveryAggregateRow => ({
   _id: row._id,
   name: row.name,
@@ -194,6 +222,7 @@ const toAggregateRow = (row: RawAggregateRow): DiscoveryAggregateRow => ({
   isAvailable: PUBLICLY_VISIBLE_STATUSES.includes(
     row.status as (typeof PUBLICLY_VISIBLE_STATUSES)[number],
   ),
+  location: validLocation(row.location),
 });
 
 // The Business statuses a Customer-facing surface may ever see — matches

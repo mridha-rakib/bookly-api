@@ -39,9 +39,17 @@ export class TwilioVerifyPhoneOtpProvider implements PhoneOtpProvider {
 
       return verification.sid ? { providerVerificationId: verification.sid } : {};
     } catch (error) {
+      // TEMPORARY diagnostic logging — narrows why Twilio Verify rejected the request.
+      // Deliberately excludes credentials/SIDs/headers/full phone; safe to leave enabled briefly
+      // but should be removed (or the destination field dropped) once the root cause is captured.
       logger.warn(
-        { provider: "twilio", category: classifyProviderError(error) },
-        "Phone OTP delivery failed",
+        {
+          provider: "twilio",
+          category: classifyProviderError(error),
+          ...extractSafeProviderErrorDetails(error),
+          destination: maskE164ForLog(input.toE164),
+        },
+        "Twilio Verify OTP send failed",
       );
       throw new AuthError(
         classifyProviderError(error) === "rate_limited"
@@ -120,4 +128,44 @@ const classifyProviderError = (error: unknown): "rate_limited" | "provider_faile
   }
 
   return "provider_failed";
+};
+
+/**
+ * TEMPORARY diagnostic helper — narrows an unknown thrown value down to the handful of fields
+ * Twilio's REST error shape (`RestException`) carries, without assuming that shape. Only ever
+ * reads primitive `status`/`code`/`message`/`moreInfo` — never logs the error object itself
+ * (which could carry request/response metadata), never touches credentials, SIDs, or headers.
+ */
+const extractSafeProviderErrorDetails = (
+  error: unknown,
+): { status?: number | string; code?: number | string; message?: string; moreInfo?: string } => {
+  if (typeof error !== "object" || error === null) {
+    return {};
+  }
+
+  const record = error as Record<string, unknown>;
+  const status = record["status"];
+  const code = record["code"];
+  const message = record["message"];
+  const moreInfo = record["moreInfo"];
+
+  return {
+    ...(typeof status === "number" || typeof status === "string" ? { status } : {}),
+    ...(typeof code === "number" || typeof code === "string" ? { code } : {}),
+    ...(typeof message === "string" ? { message } : {}),
+    ...(typeof moreInfo === "string" ? { moreInfo } : {}),
+  };
+};
+
+/**
+ * TEMPORARY diagnostic helper — logs enough of the destination to correlate a log line with a
+ * specific country/report ("which market is failing"), never the full E.164 number. Keeps a
+ * leading `+` + up to 3 country-code digits and the trailing 4 digits; everything in between
+ * (the actual subscriber number) is replaced with `*`.
+ */
+const maskE164ForLog = (e164: string): string => {
+  const leading = e164.slice(0, 4); // "+" + up to 3 country-code digits
+  const trailing = e164.slice(-4);
+  const maskedLength = Math.max(e164.length - leading.length - trailing.length, 0);
+  return `${leading}${"*".repeat(maskedLength)}${trailing}`;
 };

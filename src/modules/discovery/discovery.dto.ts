@@ -19,6 +19,10 @@ export type DiscoveryBusinessCardDto = {
   startingPriceCents: number | null;
   startingPricingMode: ServicePricingMode | null;
   imageUrl?: string | undefined;
+  /** Real persisted `Business.location`, never fabricated/geocoded here — undefined when the
+   * Business has no valid stored coordinate. Frontend must not invent a marker position when
+   * this is absent. */
+  location?: { lat: number; lng: number } | undefined;
   /** Always `true` for an Explore search result (the query itself only ever returns visible
    * Businesses). Can be `false` for a Favorites-list row — a Favorite relationship is never
    * deleted just because the Business later became PENDING/SUSPENDED (confirmed rule: removing a

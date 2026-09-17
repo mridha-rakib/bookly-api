@@ -213,6 +213,7 @@ export class DiscoveryService {
       startingPricingMode: row.startingPricingMode,
       imageUrl: imageUrlByBusinessId.get(String(row._id)),
       isAvailable: row.isAvailable,
+      location: row.location,
     };
   }
 

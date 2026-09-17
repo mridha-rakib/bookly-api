@@ -45,6 +45,7 @@ import type {
   BusinessDetailsBody,
   CategorySelectionBody,
   ChangeMyPasswordBody,
+  ChangePhoneBody,
   DeleteMyAccountBody,
   EntryBody,
   LoginBody,
@@ -127,17 +128,10 @@ export class AuthService {
   }
 
   public async professionalEntry(input: ProfessionalEntryBody) {
-    const result = await this.entry("PROFESSIONAL", normalizeEmail(input.email));
-
-    if (result.nextStep === nextStepValues.EMAIL_VERIFICATION && input.visitType) {
-      const session = await this.getRegistrationSession(result.sessionId);
-      await this.saveProfessionalVisitType({
-        sessionId: String(session._id),
-        visitType: input.visitType,
-      });
-    }
-
-    return result;
+    // Visit type is no longer captured at entry — it is a post-phone-verification onboarding
+    // step (see saveProfessionalVisitType). This also removes the resume bug where a reused,
+    // already-advanced session was forced back through the (now-later) visit-type guard.
+    return this.entry("PROFESSIONAL", normalizeEmail(input.email));
   }
 
   public async login(
@@ -298,6 +292,40 @@ export class AuthService {
     return { sessionId: String(session._id) };
   }
 
+  /**
+   * Onboarding-only recovery path for an UNVERIFIED registration phone that can't receive an OTP
+   * (e.g. the provider temporarily blocks that destination) — lets the user replace it and get a
+   * code sent to the new number, without restarting registration. Deliberately professional-only
+   * (ensureProfessionalSession) even though sendPhoneOtp itself is portal-neutral — this endpoint
+   * is reached only from the professional signup page.
+   *
+   * Allowed only pre-verification (PROFILE_SUBMITTED/PHONE_OTP_SENT) — once PHONE_VERIFIED,
+   * editing a *verified* phone is a future account/Settings concern (requestPhoneChange), not
+   * this onboarding path; ensureStep below rejects it exactly like every other guard here.
+   *
+   * Does NOT touch phoneVerification.attempts/resendTimestamps/sentAt — those stay tied to the
+   * session, not the phone number, so switching numbers can never reset/bypass the OTP
+   * cooldown or per-hour resend limit (assertOtpResendAllowed, invoked by sendPhoneOtp below,
+   * still applies against the same counters).
+   *
+   * The new phone is saved FIRST, then sendPhoneOtp (the exact same method the normal resend
+   * path uses — no duplicated send/normalization/guard logic) is called against it. If the send
+   * then fails, the new phone stays as session.phone (it's already saved) and currentStep stays
+   * wherever it was — sendPhoneOtp only advances currentStep to PHONE_OTP_SENT on provider
+   * success, so a failed send here never claims a code was delivered, and the user can retry via
+   * the ordinary resend action (which will already target the new number) or change it again.
+   */
+  public async changeProfessionalPhone(input: ChangePhoneBody): Promise<{ sessionId: string }> {
+    const session = await this.getRegistrationSession(input.sessionId);
+    this.ensureProfessionalSession(session);
+    this.ensureStep(session, ["PROFILE_SUBMITTED", "PHONE_OTP_SENT"]);
+
+    session.phone = normalizePhoneNumber(input.countryCode, input.nationalNumber);
+    await this.registrationSessionRepository.save(session);
+
+    return this.sendPhoneOtp({ sessionId: input.sessionId });
+  }
+
   public async verifyCustomerPhoneAndComplete(
     input: VerifyPhoneOtpBody,
     context: RequestContext,
@@ -338,7 +366,7 @@ export class AuthService {
     const session = await this.verifyPhoneOtp(input);
     session.currentStep = "PHONE_VERIFIED";
     await this.registrationSessionRepository.save(session);
-    return { sessionId: String(session._id), nextStep: "BUSINESS_DETAILS" };
+    return { sessionId: String(session._id), nextStep: "VISIT_TYPE" };
   }
 
   public async saveProfessionalVisitType(
@@ -346,13 +374,16 @@ export class AuthService {
   ): Promise<{ sessionId: string; nextStep: string }> {
     const session = await this.getRegistrationSession(input.sessionId);
     this.ensureProfessionalSession(session);
-    this.ensureStep(session, ["EMAIL_ENTRY", "VISIT_TYPE_SELECTED"]);
+    // Visit type is a post-phone-verification onboarding step. "VISIT_TYPE_SELECTED" stays in
+    // the allow-list so a resumed session can idempotently resubmit/confirm the same value
+    // (see the frontend visit-type page, which pre-selects and preserves an existing choice).
+    this.ensureStep(session, ["PHONE_VERIFIED", "VISIT_TYPE_SELECTED"]);
     session.businessVisitType = input.visitType;
     session.currentStep = "VISIT_TYPE_SELECTED";
     const draft = await this.businessOnboardingService.saveVisitType(session._id, input.visitType);
     session.businessOnboardingDraftId = draft._id;
     await this.registrationSessionRepository.save(session);
-    return { sessionId: String(session._id), nextStep: "EMAIL_VERIFICATION" };
+    return { sessionId: String(session._id), nextStep: "BUSINESS_DETAILS" };
   }
 
   public async saveBusinessDetails(
@@ -360,7 +391,7 @@ export class AuthService {
   ): Promise<{ sessionId: string; nextStep: string }> {
     const session = await this.getRegistrationSession(input.sessionId);
     this.ensureProfessionalSession(session);
-    this.ensureStep(session, ["PHONE_VERIFIED", "BUSINESS_DETAILS_SUBMITTED"]);
+    this.ensureStep(session, ["VISIT_TYPE_SELECTED", "BUSINESS_DETAILS_SUBMITTED"]);
     const draft = await this.businessOnboardingService.saveBusinessDetails(session._id, input);
     session.businessOnboardingDraftId = draft._id;
     session.currentStep = "BUSINESS_DETAILS_SUBMITTED";
@@ -1463,6 +1494,10 @@ export class AuthService {
             },
           }
         : {}),
+      // Present once the visit-type step has been completed (or, for a legacy in-flight
+      // session created under the old step order, if it was captured earlier) — lets a resumed
+      // session pre-select/preserve the existing choice instead of asking again.
+      ...(session.businessVisitType ? { businessVisitType: session.businessVisitType } : {}),
     };
   }
 

@@ -1,15 +1,11 @@
 import { z } from "zod";
 
-import { visitTypeInputSchema } from "../auth/auth.schema.js";
-
 /**
- * `/professional/oauth/facebook/start` — `visitType` is REQUIRED (mirrors the Google professional
- * flow): the existing Business Owner registration depends on it and there is no later step that
- * collects it. Accepts the canonical values and the `location`/`travel` aliases.
+ * `/professional/oauth/facebook/start` — no query params required. Visit type is now a
+ * post-phone-verification onboarding step, collected well after this OAuth round trip, so it no
+ * longer needs to travel through the signed state (mirrors the Google professional flow).
  */
-export const professionalFacebookStartQuerySchema = z.object({
-  visitType: visitTypeInputSchema,
-});
+export const professionalFacebookStartQuerySchema = z.object({});
 
 /**
  * `/professional/oauth/facebook/callback` — Facebook appends extra params, so this is NOT

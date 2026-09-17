@@ -1,15 +1,11 @@
 import { z } from "zod";
 
-import { visitTypeInputSchema } from "../auth/auth.schema.js";
-
 /**
- * `/professional/oauth/google/start` — `visitType` is REQUIRED: the existing Business Owner
- * registration depends on it, and there is no later step that collects it. Accepts the canonical
- * values and the `location`/`travel` aliases (transformed to canonical by `visitTypeInputSchema`).
+ * `/professional/oauth/google/start` — no query params required. Visit type is now a
+ * post-phone-verification onboarding step (`/auth/professional/register/visit-type`), collected
+ * well after this OAuth round trip, so it no longer needs to travel through the signed state.
  */
-export const professionalGoogleStartQuerySchema = z.object({
-  visitType: visitTypeInputSchema,
-});
+export const professionalGoogleStartQuerySchema = z.object({});
 
 /**
  * `/professional/oauth/google/callback` — Google appends extra params (`scope`, `authuser`, …),

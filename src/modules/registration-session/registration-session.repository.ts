@@ -21,7 +21,9 @@ type CreateGoogleProfessionalSessionInput = {
   googleProviderAccountId: string;
   firstName: string;
   lastName: string;
-  businessVisitType: BusinessVisitType;
+  // Visit type is now a post-phone-verification onboarding step, collected after this session
+  // already exists — so it is no longer known (or required) at social-registration seed time.
+  businessVisitType?: BusinessVisitType;
   emailVerifiedAt: Date;
   expiresAt: Date;
 };
@@ -31,7 +33,7 @@ type CreateFacebookProfessionalSessionInput = {
   facebookProviderAccountId: string;
   firstName: string;
   lastName: string;
-  businessVisitType: BusinessVisitType;
+  businessVisitType?: BusinessVisitType;
   emailVerifiedAt: Date;
   expiresAt: Date;
 };
@@ -41,7 +43,7 @@ type CreateAppleProfessionalSessionInput = {
   appleProviderAccountId: string;
   firstName: string;
   lastName: string;
-  businessVisitType: BusinessVisitType;
+  businessVisitType?: BusinessVisitType;
   emailVerifiedAt: Date;
   expiresAt: Date;
 };

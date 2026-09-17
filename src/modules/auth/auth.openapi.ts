@@ -18,9 +18,8 @@ const nationalNumberSchema = z.string().regex(/^\d{4,20}$/);
 const visitTypeOpenApiSchema = z.enum([...businessVisitTypes, ...businessVisitTypeAliases]);
 
 const entryOpenApiSchema = z.object({ email: emailSchema }).strict();
-const professionalEntryOpenApiSchema = entryOpenApiSchema
-  .extend({ visitType: visitTypeOpenApiSchema.optional() })
-  .strict();
+// Visit type is no longer collected at entry — it is a post-phone-verification onboarding step.
+const professionalEntryOpenApiSchema = entryOpenApiSchema;
 const loginOpenApiSchema = z.object({ email: emailSchema, password: z.string().min(1) }).strict();
 const deleteMyAccountOpenApiSchema = z
   .object({
@@ -49,6 +48,9 @@ const profileOpenApiSchema = sessionOpenApiSchema
   .strict();
 const visitTypeOpenApiBodySchema = sessionOpenApiSchema
   .extend({ visitType: visitTypeOpenApiSchema })
+  .strict();
+const changePhoneOpenApiBodySchema = sessionOpenApiSchema
+  .extend({ countryCode: countryCodeSchema, nationalNumber: nationalNumberSchema })
   .strict();
 const businessDetailsOpenApiSchema = sessionOpenApiSchema
   .extend({
@@ -134,6 +136,7 @@ const progressResponseSchema = z.object({
   emailVerified: z.boolean(),
   phoneVerified: z.boolean(),
   expiresAt: z.string().datetime(),
+  businessVisitType: visitTypeOpenApiSchema.optional(),
 });
 
 const meResponseSchema = z.object({
@@ -326,6 +329,13 @@ const authPaths: AuthPath[] = [
     path: "/auth/professional/register/resend-phone-otp",
     summary: "Resend professional phone OTP",
     body: sessionOpenApiSchema,
+    response: sessionStepResponseSchema,
+  },
+  {
+    method: "post",
+    path: "/auth/professional/register/change-phone",
+    summary: "Replace an unverified professional registration phone and resend the OTP",
+    body: changePhoneOpenApiBodySchema,
     response: sessionStepResponseSchema,
   },
   {

@@ -16,8 +16,8 @@ type ProfessionalFacebookAuthRouteDeps = {
 
 /**
  * Both routes are deliberately public: `start` is the unauthenticated "Continue with Facebook"
- * entry point (it validates the required `visitType` and signs it into the state), and Facebook
- * redirects the browser to `callback` with no Authorization header. Security comes from the
+ * entry point, and Facebook redirects the browser to `callback` with no Authorization header.
+ * Security comes from the
  * signed `state` + its matching professional Facebook nonce cookie, never from a session. This is
  * LOGIN — it never reuses the authenticated link route. Mounted with `router.use(...)` inside
  * createAuthRoute() so both paths sit under `/auth`.

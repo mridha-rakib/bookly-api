@@ -11,6 +11,7 @@ import type {
   BusinessDetailsBody,
   CategorySelectionBody,
   ChangeMyPasswordBody,
+  ChangePhoneBody,
   DeleteMyAccountBody,
   EntryBody,
   LoginBody,
@@ -96,6 +97,13 @@ export class AuthController {
       request.validated?.body as { sessionId: string },
     );
     sendSuccess(response, 200, "Phone verification code sent", result);
+  };
+
+  public changeProfessionalPhone = async (request: Request, response: Response): Promise<void> => {
+    const result = await this.authService.changeProfessionalPhone(
+      request.validated?.body as ChangePhoneBody,
+    );
+    sendSuccess(response, 200, "Phone number updated and verification code sent", result);
   };
 
   public completeCustomer = async (request: Request, response: Response): Promise<void> => {

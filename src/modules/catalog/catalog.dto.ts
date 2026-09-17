@@ -57,11 +57,39 @@ export type CatalogBusinessDto = {
   visitType: BusinessVisitType;
   timezone: string;
   address: BusinessAddress;
+  /** Real persisted `Business.location`, never fabricated/geocoded here — undefined when the
+   * Business has no valid stored coordinate. The venue page must not invent a marker position
+   * when this is absent (address text is still always shown from `address` above). */
+  location?: { lat: number; lng: number } | undefined;
   openStatus: CatalogOpenStatusDto;
   hours: CatalogBusinessHoursDayDto[];
   /** Business Media (business-media module), PROFILE first then GALLERY by sortOrder — powers
    * both the hero banner and the Gallery tab; never a second, separately-uploaded set of images. */
   media: CatalogMediaDto[];
+};
+
+/** A valid marker requires a finite lat/lng within real geographic ranges — never fabricated,
+ * and never passed through as-is if the stored document happens to hold a malformed value. Same
+ * validation as discovery.repository.ts's own `validLocation` (kept local here rather than
+ * shared, matching this module's existing standalone-DTO style). */
+const validLocation = (
+  location: BusinessDocument["location"],
+): { lat: number; lng: number } | undefined => {
+  if (!location) return undefined;
+  const { lat, lng } = location;
+  if (
+    typeof lat !== "number" ||
+    typeof lng !== "number" ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return undefined;
+  }
+  return { lat, lng };
 };
 
 export const toCatalogBusinessDto = (
@@ -80,6 +108,7 @@ export const toCatalogBusinessDto = (
   visitType: business.visitType,
   timezone: business.timezone,
   address: business.address,
+  location: validLocation(business.location),
   openStatus: extra.openStatus,
   hours: extra.hours,
   media: extra.media,

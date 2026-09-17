@@ -15,7 +15,7 @@ type ProfessionalAppleAuthRouteDeps = {
 };
 
 /**
- * `start` is a public GET (validates + signs the required `visitType`) that 302s to Apple.
+ * `start` is a public GET that signs a fresh nonce into the state and 302s to Apple.
  * `callback` is a public POST — Apple `response_mode=form_post`, fields in the urlencoded body.
  * Security is the signed `state` + the Apple id_token `nonce` claim, never a session or cookie.
  */
