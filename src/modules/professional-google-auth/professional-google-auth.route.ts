@@ -16,8 +16,8 @@ type ProfessionalGoogleAuthRouteDeps = {
 
 /**
  * Both routes are deliberately public: `start` is the unauthenticated "Continue with Google"
- * entry point (it validates the required `visitType` and signs it into the state), and Google
- * redirects the browser to `callback` with no Authorization header. Security comes from the
+ * entry point, and Google redirects the browser to `callback` with no Authorization header.
+ * Security comes from the
  * signed `state` + its matching professional nonce cookie, never from a session. Mounted with
  * `router.use(...)` inside createAuthRoute() so both paths sit under `/auth`.
  */

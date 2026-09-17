@@ -9,7 +9,6 @@ import { logger } from "../../config/logger.js";
 import { createOpaqueToken, normalizeEmail, safeCompare } from "../auth/auth.utils.js";
 import { type AuthResult, issueAuthSession, type RequestContext } from "../auth/auth-session.js";
 import type { TokenService } from "../auth/token.service.js";
-import type { BusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import type { LinkedAccountRepository } from "../linked-account/linked-account.repository.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
@@ -36,8 +35,9 @@ export type ProfessionalFacebookCallbackResult =
    * issue a session, go to their dashboard. */
   | { type: "SESSION"; auth: AuthResult }
   /** CASE 1 — brand-new owner: a PROFESSIONAL RegistrationSession was seeded; the frontend
-   * resumes the existing multi-step onboarding. NO User is created here. */
-  | { type: "REGISTRATION"; sessionId: string; visitType: BusinessVisitType }
+   * resumes the existing multi-step onboarding (profile → phone → visit type → Business Form).
+   * NO User is created here. */
+  | { type: "REGISTRATION"; sessionId: string }
   /** CASE 3 — the Facebook email already belongs to a Bookly account with no Facebook link. */
   | { type: "ACCOUNT_EXISTS" }
   | { type: "ERROR" };
@@ -51,7 +51,6 @@ export type ProfessionalFacebookCallbackResult =
  *
  * Security / product rules enforced here:
  *  - the browser is bound to the flow by a signed `state` nonce that must equal a cookie nonce;
- *  - `visitType` is read ONLY from the signed state, never a callback query param;
  *  - the Facebook identity is verified (token introspection + app-id pin + `/me`) before any read/write;
  *  - an account is resolved ONLY by LinkedAccount(FACEBOOK, providerAccountId) — never by email;
  *  - a Facebook email already on a Bookly account is NEVER silently linked or merged (ACCOUNT_EXISTS);
@@ -69,11 +68,9 @@ export class ProfessionalFacebookAuthService {
     private readonly tokenService: TokenService,
   ) {}
 
-  public async buildAuthorization(
-    visitType: BusinessVisitType,
-  ): Promise<ProfessionalFacebookAuthorization> {
+  public async buildAuthorization(): Promise<ProfessionalFacebookAuthorization> {
     const nonce = createOpaqueToken();
-    const state = await signProfessionalFacebookState({ nonce, visitType });
+    const state = await signProfessionalFacebookState({ nonce });
     return { url: buildProfessionalFacebookAuthUrl(state), nonce };
   }
 
@@ -83,9 +80,8 @@ export class ProfessionalFacebookAuthService {
   ): Promise<ProfessionalFacebookCallbackResult> {
     // 1. Signed + unexpired state, whose nonce must match the browser's cookie (CSRF / fixation).
     let nonce: string;
-    let visitType: BusinessVisitType;
     try {
-      ({ nonce, visitType } = await verifyProfessionalFacebookState(input.state));
+      ({ nonce } = await verifyProfessionalFacebookState(input.state));
     } catch {
       return { type: "ERROR" };
     }
@@ -128,7 +124,7 @@ export class ProfessionalFacebookAuthService {
     }
 
     // 6. CASE 1 — brand-new owner: seed a RegistrationSession only. No User.
-    return this.startRegistration(identity, normalizedEmail, visitType);
+    return this.startRegistration(identity, normalizedEmail);
   }
 
   private async loginLinkedProfessional(
@@ -162,27 +158,24 @@ export class ProfessionalFacebookAuthService {
   private async startRegistration(
     identity: FacebookVerifiedIdentity,
     normalizedEmail: string,
-    visitType: BusinessVisitType,
   ): Promise<ProfessionalFacebookCallbackResult> {
     const { firstName, lastName } = splitFacebookName(identity);
     const now = new Date();
 
     try {
+      // No businessVisitType / BusinessOnboardingDraft here — visit type is now collected later,
+      // by the shared post-phone-verification step (AuthService.saveProfessionalVisitType), the
+      // same one the password flow uses.
       const session = await this.registrationSessionRepository.createFacebookProfessionalSession({
         normalizedEmail,
         facebookProviderAccountId: identity.providerAccountId,
         firstName,
         lastName,
-        businessVisitType: visitType,
         emailVerifiedAt: now,
         expiresAt: new Date(now.getTime() + env.REGISTRATION_SESSION_TTL_HOURS * MS_PER_HOUR),
       });
 
-      const draft = await this.businessOnboardingService.saveVisitType(session._id, visitType);
-      session.businessOnboardingDraftId = draft._id;
-      await this.registrationSessionRepository.save(session);
-
-      return { type: "REGISTRATION", sessionId: String(session._id), visitType };
+      return { type: "REGISTRATION", sessionId: String(session._id) };
     } catch (error) {
       logger.error({ err: error }, "Business Owner Facebook registration seeding failed");
       return { type: "ERROR" };

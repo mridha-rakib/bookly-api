@@ -1,15 +1,11 @@
 import { z } from "zod";
 
-import { visitTypeInputSchema } from "../auth/auth.schema.js";
-
 /**
- * `/auth/professional/oauth/apple/start` — `visitType` is REQUIRED (mirrors the Google/Facebook
- * professional flows): the existing Business Owner registration depends on it. Signed into the
- * state; NEVER read from the callback body.
+ * `/auth/professional/oauth/apple/start` — no query params required. Visit type is now a
+ * post-phone-verification onboarding step, collected well after this OAuth round trip, so it no
+ * longer needs to travel through the signed state (mirrors the Google/Facebook professional flows).
  */
-export const professionalAppleStartQuerySchema = z.object({
-  visitType: visitTypeInputSchema,
-});
+export const professionalAppleStartQuerySchema = z.object({});
 
 /**
  * `/auth/professional/oauth/apple/callback` — a `POST` (`response_mode=form_post`); fields in the

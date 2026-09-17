@@ -9,10 +9,12 @@ import { AuthError } from "../../../src/modules/auth/auth.errors.js";
 import {
   businessDetailsBodySchema,
   categorySelectionBodySchema,
+  changePhoneBodySchema,
   professionalEntryBodySchema,
   profileBodySchema,
   verifyEmailOtpBodySchema,
   verifyPhoneOtpBodySchema,
+  visitTypeBodySchema,
 } from "../../../src/modules/auth/auth.schema.js";
 import { AuthService } from "../../../src/modules/auth/auth.service.js";
 import { sha256 } from "../../../src/modules/auth/auth.utils.js";
@@ -251,7 +253,7 @@ const completeBusinessOwner = async (
   }
 > => {
   const professionalEntry = await parts.authService.professionalEntry(
-    professionalEntryBodySchema.parse({ email, visitType: visitTypeInput }),
+    professionalEntryBodySchema.parse({ email }),
   );
   expect(professionalEntry.nextStep).toBe("EMAIL_VERIFICATION");
   const sessionId = professionalEntry.sessionId ?? "";
@@ -275,6 +277,9 @@ const completeBusinessOwner = async (
   await parts.authService.sendPhoneOtp({ sessionId });
   await parts.authService.verifyProfessionalPhone(
     verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+  );
+  await parts.authService.saveProfessionalVisitType(
+    visitTypeBodySchema.parse({ sessionId, visitType: visitTypeInput }),
   );
   await parts.authService.saveBusinessDetails(
     businessDetailsBodySchema.parse({
@@ -619,7 +624,6 @@ describe("database-backed authentication integration", () => {
     const professionalEntry = await parts.authService.professionalEntry(
       professionalEntryBodySchema.parse({
         email: "tamper-test@example.com",
-        visitType: "location",
       }),
     );
     const sessionId = professionalEntry.sessionId ?? "";
@@ -642,6 +646,9 @@ describe("database-backed authentication integration", () => {
     await parts.authService.sendPhoneOtp({ sessionId });
     await parts.authService.verifyProfessionalPhone(
       verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+    );
+    await parts.authService.saveProfessionalVisitType(
+      visitTypeBodySchema.parse({ sessionId, visitType: "location" }),
     );
 
     // Simulates a tampered client request (e.g. via DevTools) sending a different owner
@@ -684,7 +691,6 @@ describe("database-backed authentication integration", () => {
     const professionalEntry = await parts.authService.professionalEntry(
       professionalEntryBodySchema.parse({
         email: "progress-test@example.com",
-        visitType: "location",
       }),
     );
     const sessionId = professionalEntry.sessionId ?? "";
@@ -1667,6 +1673,128 @@ describe("database-backed authentication integration", () => {
       );
     });
   });
+
+  describe("AuthService.changeProfessionalPhone", () => {
+    const advanceToProfileSubmitted = async (
+      email: string,
+      parts: AuthServiceParts,
+    ): Promise<string> => {
+      const entry = await parts.authService.professionalEntry(
+        professionalEntryBodySchema.parse({ email }),
+      );
+      const sessionId = entry.sessionId ?? "";
+      await parts.authService.sendEmailOtp({ sessionId });
+      await parts.authService.verifyEmailOtp(
+        verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+      );
+      await parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Change",
+          lastName: "Phone",
+          gender: "other",
+          countryCode: "+880",
+          nationalNumber: "1700000000",
+          password: testPassword,
+        }),
+      );
+      return sessionId;
+    };
+
+    it("updates session.phone and sends a code to the new number while PROFILE_SUBMITTED, leaving unrelated fields untouched", async () => {
+      const parts = createAuthService();
+      const sendOtpSpy = vi.spyOn(parts.phoneProvider, "sendOtp");
+      const sessionId = await advanceToProfileSubmitted("change-phone-a@example.com", parts);
+
+      const result = await parts.authService.changeProfessionalPhone(
+        changePhoneBodySchema.parse({
+          sessionId,
+          countryCode: "+971",
+          nationalNumber: "501234567",
+        }),
+      );
+      expect(result.sessionId).toBe(sessionId);
+
+      const session = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(session.phone?.countryCode).toBe("+971");
+      expect(session.phone?.nationalNumber).toBe("501234567");
+      expect(session.phone?.e164).toBe("+971501234567");
+      expect(session.currentStep).toBe("PHONE_OTP_SENT");
+      expect(sendOtpSpy).toHaveBeenCalledWith({ toE164: "+971501234567" });
+
+      // Profile/email verification must be untouched by a phone-only change.
+      expect(session.personalProfile?.firstName).toBe("Change");
+      expect(session.personalProfile?.lastName).toBe("Phone");
+      expect(session.emailVerification.verifiedAt).toBeInstanceOf(Date);
+    });
+
+    it("allows changing again while PHONE_OTP_SENT, and rejects once PHONE_VERIFIED without touching the verified phone", async () => {
+      const parts = createAuthService();
+      const sessionId = await advanceToProfileSubmitted("change-phone-b@example.com", parts);
+      await parts.authService.changeProfessionalPhone(
+        changePhoneBodySchema.parse({
+          sessionId,
+          countryCode: "+971",
+          nationalNumber: "501234567",
+        }),
+      );
+
+      await parts.authService.verifyProfessionalPhone(
+        verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+      );
+      const verified = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(verified.currentStep).toBe("PHONE_VERIFIED");
+
+      await expect(
+        parts.authService.changeProfessionalPhone(
+          changePhoneBodySchema.parse({
+            sessionId,
+            countryCode: "+357",
+            nationalNumber: "99112233",
+          }),
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "INVALID_REGISTRATION_STEP" }] });
+
+      const untouched = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(untouched.phone?.countryCode).toBe("+971");
+      expect(untouched.currentStep).toBe("PHONE_VERIFIED");
+    });
+
+    it("preserves the resend cooldown across a phone change — switching numbers is not a rate-limit bypass", async () => {
+      const parts = createAuthService();
+      const sessionId = await advanceToProfileSubmitted("change-phone-c@example.com", parts);
+
+      await expect(
+        parts.authService.changeProfessionalPhone(
+          changePhoneBodySchema.parse({
+            sessionId,
+            countryCode: "+971",
+            nationalNumber: "501234567",
+          }),
+        ),
+      ).resolves.toBeDefined();
+
+      await expect(
+        parts.authService.changeProfessionalPhone(
+          changePhoneBodySchema.parse({
+            sessionId,
+            countryCode: "+357",
+            nationalNumber: "99112233",
+          }),
+        ),
+      ).rejects.toMatchObject({ details: [{ code: "OTP_RESEND_COOLDOWN" }] });
+    });
+
+    it("rejects an invalid phone at the schema level, same validation as the profile step", () => {
+      expect(() =>
+        changePhoneBodySchema.parse({
+          sessionId: "irrelevant",
+          countryCode: "357",
+          nationalNumber: "abc",
+        }),
+      ).toThrow();
+    });
+  });
 });
 
 const prepareBusinessOwnerForCompletion = async (
@@ -1674,7 +1802,7 @@ const prepareBusinessOwnerForCompletion = async (
   parts: AuthServiceParts,
 ): Promise<string> => {
   const professionalEntry = await parts.authService.professionalEntry(
-    professionalEntryBodySchema.parse({ email, visitType: "location" }),
+    professionalEntryBodySchema.parse({ email }),
   );
   const sessionId = professionalEntry.sessionId ?? "";
   await parts.authService.sendEmailOtp({ sessionId });
@@ -1693,6 +1821,9 @@ const prepareBusinessOwnerForCompletion = async (
   await parts.authService.sendPhoneOtp({ sessionId });
   await parts.authService.verifyProfessionalPhone(
     verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+  );
+  await parts.authService.saveProfessionalVisitType(
+    visitTypeBodySchema.parse({ sessionId, visitType: "location" }),
   );
   await parts.authService.saveBusinessDetails(
     businessDetailsBodySchema.parse({

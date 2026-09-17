@@ -9,10 +9,7 @@ import {
   readOAuthNonceCookie,
   setOAuthNonceCookie,
 } from "./professional-google-auth.nonce.js";
-import type {
-  ProfessionalGoogleCallbackQuery,
-  ProfessionalGoogleStartQuery,
-} from "./professional-google-auth.schema.js";
+import type { ProfessionalGoogleCallbackQuery } from "./professional-google-auth.schema.js";
 import type {
   ProfessionalGoogleAuthService,
   ProfessionalGoogleCallbackResult,
@@ -37,8 +34,7 @@ export class ProfessionalGoogleAuthController {
       return;
     }
 
-    const query = request.validated?.query as ProfessionalGoogleStartQuery;
-    const { url, nonce } = await this.service.buildAuthorization(query.visitType);
+    const { url, nonce } = await this.service.buildAuthorization();
     setOAuthNonceCookie(response, nonce);
     response.redirect(url);
   };
@@ -74,12 +70,8 @@ export class ProfessionalGoogleAuthController {
     }
 
     if (result.type === "REGISTRATION") {
-      const visitTypeAlias = result.visitType === "AT_BUSINESS_LOCATION" ? "location" : "travel";
       response.redirect(
-        this.frontendRedirect(
-          "onboarding",
-          `sessionId=${encodeURIComponent(result.sessionId)}&visitType=${visitTypeAlias}`,
-        ),
+        this.frontendRedirect("onboarding", `sessionId=${encodeURIComponent(result.sessionId)}`),
       );
       return;
     }

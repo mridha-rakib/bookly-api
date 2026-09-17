@@ -10,7 +10,6 @@ import { logger } from "../../config/logger.js";
 import { createOpaqueToken, normalizeEmail } from "../auth/auth.utils.js";
 import { type AuthResult, issueAuthSession, type RequestContext } from "../auth/auth-session.js";
 import type { TokenService } from "../auth/token.service.js";
-import type { BusinessVisitType } from "../business/business.types.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import type { LinkedAccountRepository } from "../linked-account/linked-account.repository.js";
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
@@ -41,7 +40,7 @@ export type ProfessionalAppleCallbackInput = {
 
 export type ProfessionalAppleCallbackResult =
   | { type: "SESSION"; auth: AuthResult }
-  | { type: "REGISTRATION"; sessionId: string; visitType: BusinessVisitType }
+  | { type: "REGISTRATION"; sessionId: string }
   | { type: "ACCOUNT_EXISTS" }
   | { type: "ERROR" };
 
@@ -51,10 +50,10 @@ export type ProfessionalAppleCallbackResult =
  * RegistrationSession (Option B); the User + LinkedAccount + Business are created together, in one
  * transaction, by `AuthService.completeBusinessOwner` at the end of onboarding.
  *
- * Locked rules: `visitType` from the signed state only; account resolved by
- * LinkedAccount(APPLE, sub) only; email never merges; a "no link" signup needs a verified unused
- * email (no email / unverified → ERROR); the "no link" branch is BUSINESS_OWNER-only (never
- * Supervisor/Staff).
+ * Locked rules: account resolved by LinkedAccount(APPLE, sub) only; email never merges; a "no
+ * link" signup needs a verified unused email (no email / unverified → ERROR); the "no link"
+ * branch is BUSINESS_OWNER-only (never Supervisor/Staff). Visit type is no longer collected here
+ * — it is a post-phone-verification onboarding step (see AuthService.saveProfessionalVisitType).
  */
 export class ProfessionalAppleAuthService {
   public constructor(
@@ -65,11 +64,9 @@ export class ProfessionalAppleAuthService {
     private readonly tokenService: TokenService,
   ) {}
 
-  public async buildAuthorization(
-    visitType: BusinessVisitType,
-  ): Promise<ProfessionalAppleAuthorization> {
+  public async buildAuthorization(): Promise<ProfessionalAppleAuthorization> {
     const nonce = createOpaqueToken();
-    const state = await signProfessionalAppleState({ nonce, visitType });
+    const state = await signProfessionalAppleState({ nonce });
     return { url: buildProfessionalAppleAuthUrl(state, nonce), nonce };
   }
 
@@ -78,9 +75,8 @@ export class ProfessionalAppleAuthService {
     context: RequestContext,
   ): Promise<ProfessionalAppleCallbackResult> {
     let nonce: string;
-    let visitType: BusinessVisitType;
     try {
-      ({ nonce, visitType } = await verifyProfessionalAppleState(input.state));
+      ({ nonce } = await verifyProfessionalAppleState(input.state));
     } catch {
       return { type: "ERROR" };
     }
@@ -119,7 +115,7 @@ export class ProfessionalAppleAuthService {
     }
 
     // CASE 1 — brand-new owner: seed a RegistrationSession only. No User.
-    return this.startRegistration(identity, normalizedEmail, input.appleUser, visitType);
+    return this.startRegistration(identity, normalizedEmail, input.appleUser);
   }
 
   private async loginLinkedProfessional(
@@ -152,27 +148,24 @@ export class ProfessionalAppleAuthService {
     identity: AppleVerifiedIdentity,
     normalizedEmail: string,
     appleUser: string | undefined,
-    visitType: BusinessVisitType,
   ): Promise<ProfessionalAppleCallbackResult> {
     const { firstName, lastName } = splitAppleName(parseAppleUserJson(appleUser));
     const now = new Date();
 
     try {
+      // No businessVisitType / BusinessOnboardingDraft here — visit type is now collected later,
+      // by the shared post-phone-verification step (AuthService.saveProfessionalVisitType), the
+      // same one the password flow uses.
       const session = await this.registrationSessionRepository.createAppleProfessionalSession({
         normalizedEmail,
         appleProviderAccountId: identity.providerAccountId,
         firstName,
         lastName,
-        businessVisitType: visitType,
         emailVerifiedAt: now,
         expiresAt: new Date(now.getTime() + env.REGISTRATION_SESSION_TTL_HOURS * MS_PER_HOUR),
       });
 
-      const draft = await this.businessOnboardingService.saveVisitType(session._id, visitType);
-      session.businessOnboardingDraftId = draft._id;
-      await this.registrationSessionRepository.save(session);
-
-      return { type: "REGISTRATION", sessionId: String(session._id), visitType };
+      return { type: "REGISTRATION", sessionId: String(session._id) };
     } catch (error) {
       logger.error({ err: error }, "Business Owner Apple registration seeding failed");
       return { type: "ERROR" };

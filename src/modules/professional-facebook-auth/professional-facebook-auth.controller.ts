@@ -9,10 +9,7 @@ import {
   readOAuthNonceCookie,
   setOAuthNonceCookie,
 } from "./professional-facebook-auth.nonce.js";
-import type {
-  ProfessionalFacebookCallbackQuery,
-  ProfessionalFacebookStartQuery,
-} from "./professional-facebook-auth.schema.js";
+import type { ProfessionalFacebookCallbackQuery } from "./professional-facebook-auth.schema.js";
 import type {
   ProfessionalFacebookAuthService,
   ProfessionalFacebookCallbackResult,
@@ -36,8 +33,7 @@ export class ProfessionalFacebookAuthController {
       return;
     }
 
-    const query = request.validated?.query as ProfessionalFacebookStartQuery;
-    const { url, nonce } = await this.service.buildAuthorization(query.visitType);
+    const { url, nonce } = await this.service.buildAuthorization();
     setOAuthNonceCookie(response, nonce);
     response.redirect(url);
   };
@@ -72,12 +68,8 @@ export class ProfessionalFacebookAuthController {
     }
 
     if (result.type === "REGISTRATION") {
-      const visitTypeAlias = result.visitType === "AT_BUSINESS_LOCATION" ? "location" : "travel";
       response.redirect(
-        this.frontendRedirect(
-          "onboarding",
-          `sessionId=${encodeURIComponent(result.sessionId)}&visitType=${visitTypeAlias}`,
-        ),
+        this.frontendRedirect("onboarding", `sessionId=${encodeURIComponent(result.sessionId)}`),
       );
       return;
     }

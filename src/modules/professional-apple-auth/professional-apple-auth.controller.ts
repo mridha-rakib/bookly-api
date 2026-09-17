@@ -4,10 +4,7 @@ import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { setRefreshCookie } from "../auth/auth.cookies.js";
 import { isProfessionalAppleAuthConfigured } from "./professional-apple-auth.client.js";
-import type {
-  ProfessionalAppleCallbackBody,
-  ProfessionalAppleStartQuery,
-} from "./professional-apple-auth.schema.js";
+import type { ProfessionalAppleCallbackBody } from "./professional-apple-auth.schema.js";
 import type {
   ProfessionalAppleAuthService,
   ProfessionalAppleCallbackResult,
@@ -28,8 +25,7 @@ export class ProfessionalAppleAuthController {
       return;
     }
 
-    const query = request.validated?.query as ProfessionalAppleStartQuery;
-    const { url } = await this.service.buildAuthorization(query.visitType);
+    const { url } = await this.service.buildAuthorization();
     response.redirect(url);
   };
 
@@ -60,12 +56,8 @@ export class ProfessionalAppleAuthController {
     }
 
     if (result.type === "REGISTRATION") {
-      const visitTypeAlias = result.visitType === "AT_BUSINESS_LOCATION" ? "location" : "travel";
       response.redirect(
-        this.frontendRedirect(
-          "onboarding",
-          `sessionId=${encodeURIComponent(result.sessionId)}&visitType=${visitTypeAlias}`,
-        ),
+        this.frontendRedirect("onboarding", `sessionId=${encodeURIComponent(result.sessionId)}`),
       );
       return;
     }

@@ -69,6 +69,7 @@ import {
   businessDetailsBodySchema,
   categorySelectionBodySchema,
   changeMyPasswordBodySchema,
+  changePhoneBodySchema,
   deleteMyAccountBodySchema,
   entryBodySchema,
   loginBodySchema,
@@ -412,6 +413,17 @@ export const createAuthRoute = (): Router => {
     otpSendLimiter,
     validateRequest({ body: sessionBodySchema }),
     asyncHandler(controller.sendPhoneOtp),
+  );
+  // Onboarding-only recovery: replace an UNVERIFIED registration phone and send a code to it in
+  // one request. Rate-limited exactly like send/resend — it triggers a real provider send, so it
+  // must not become a way to route around the OTP send cooldown/hourly limit (which live on the
+  // session, not the phone, and are otherwise untouched by this endpoint — see
+  // AuthService.changeProfessionalPhone).
+  router.post(
+    "/professional/register/change-phone",
+    otpSendLimiter,
+    validateRequest({ body: changePhoneBodySchema }),
+    asyncHandler(controller.changeProfessionalPhone),
   );
   router.post(
     "/professional/register/verify-phone-otp",

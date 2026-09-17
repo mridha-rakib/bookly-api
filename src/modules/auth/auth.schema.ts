@@ -30,11 +30,9 @@ export const visitTypeInputSchema = z
 
 export const entryBodySchema = z.object({ email: emailSchema }).strict();
 
-export const professionalEntryBodySchema = entryBodySchema
-  .extend({
-    visitType: visitTypeInputSchema.optional(),
-  })
-  .strict();
+// Visit type is no longer collected at entry — it is a post-phone-verification onboarding step
+// (see visitTypeBodySchema / POST /professional/register/visit-type).
+export const professionalEntryBodySchema = entryBodySchema;
 
 export const loginBodySchema = z
   .object({
@@ -76,6 +74,16 @@ export const verifyPhoneOtpBodySchema = sessionBodySchema.extend({
 export const visitTypeBodySchema = sessionBodySchema
   .extend({
     visitType: visitTypeInputSchema,
+  })
+  .strict();
+
+// Onboarding-only phone replacement for an UNVERIFIED registration phone (e.g. the original
+// number can't receive an OTP). Reuses the exact same countryCode/nationalNumber shape and
+// normalization as profileBodySchema/businessDetailsBodySchema — no separate validation logic.
+export const changePhoneBodySchema = sessionBodySchema
+  .extend({
+    countryCode: countryCodeSchema,
+    nationalNumber: nationalNumberSchema,
   })
   .strict();
 
@@ -232,6 +240,7 @@ export type SessionBody = z.infer<typeof sessionBodySchema>;
 export type VerifyEmailOtpBody = z.infer<typeof verifyEmailOtpBodySchema>;
 export type ProfileBody = z.infer<typeof profileBodySchema>;
 export type VerifyPhoneOtpBody = z.infer<typeof verifyPhoneOtpBodySchema>;
+export type ChangePhoneBody = z.infer<typeof changePhoneBodySchema>;
 export type VisitTypeBody = z.infer<typeof visitTypeBodySchema>;
 export type BusinessDetailsBody = z.infer<typeof businessDetailsBodySchema>;
 export type CategorySelectionBody = z.infer<typeof categorySelectionBodySchema>;
