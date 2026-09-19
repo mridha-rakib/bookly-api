@@ -121,7 +121,7 @@ const makeService = (
 };
 
 const validInput = async (nonce = "nonce-value-1234567890") => {
-  const state = await signProfessionalAppleState({ nonce, visitType: "AT_BUSINESS_LOCATION" });
+  const state = await signProfessionalAppleState({ nonce });
   return { code: "auth-code", state, idToken: undefined, appleUser: undefined };
 };
 
@@ -141,9 +141,9 @@ beforeEach(() => {
 });
 
 describe("ProfessionalAppleAuthService", () => {
-  it("buildAuthorization signs nonce + visitType and returns a consent URL", async () => {
+  it("buildAuthorization signs the nonce and returns a consent URL", async () => {
     const { service } = makeService();
-    const { url, nonce } = await service.buildAuthorization("TRAVEL_TO_CUSTOMER");
+    const { url, nonce } = await service.buildAuthorization();
     expect(url).toContain("appleid.apple.com");
     expect(nonce).toHaveLength(64);
   });
@@ -263,7 +263,6 @@ describe("ProfessionalAppleAuthService", () => {
     expect(result).toEqual({
       type: "REGISTRATION",
       sessionId: String(sessionId),
-      visitType: "AT_BUSINESS_LOCATION",
     });
     expect(createAppleProfessionalSession).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -271,8 +270,10 @@ describe("ProfessionalAppleAuthService", () => {
         appleProviderAccountId: "apple-new-owner",
         firstName: "New",
         lastName: "Owner",
-        businessVisitType: "AT_BUSINESS_LOCATION",
       }),
+    );
+    expect(createAppleProfessionalSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({ businessVisitType: expect.anything() }),
     );
     expect((userRepository as { create?: unknown }).create).toBeUndefined();
     expect(tokenService.createRefreshSession).not.toHaveBeenCalled();

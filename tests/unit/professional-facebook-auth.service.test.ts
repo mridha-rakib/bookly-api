@@ -118,7 +118,7 @@ const makeService = (
 };
 
 const validInput = async (nonce = "nonce-value-1234567890") => {
-  const state = await signProfessionalFacebookState({ nonce, visitType: "AT_BUSINESS_LOCATION" });
+  const state = await signProfessionalFacebookState({ nonce });
   return { code: "auth-code", state, nonceCookie: nonce };
 };
 
@@ -138,9 +138,9 @@ beforeEach(() => {
 });
 
 describe("ProfessionalFacebookAuthService.buildAuthorization", () => {
-  it("signs nonce + visitType into the state and returns a consent URL", async () => {
+  it("signs the nonce into the state and returns a consent URL", async () => {
     const { service } = makeService();
-    const { url, nonce } = await service.buildAuthorization("TRAVEL_TO_CUSTOMER");
+    const { url, nonce } = await service.buildAuthorization();
     expect(url).toContain("facebook.com");
     expect(nonce).toHaveLength(64);
   });
@@ -157,10 +157,7 @@ describe("completeCallback — guard failures return ERROR", () => {
 
   it("missing nonce cookie", async () => {
     const { service } = makeService();
-    const state = await signProfessionalFacebookState({
-      nonce: "n123",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const state = await signProfessionalFacebookState({ nonce: "n123" });
     expect(
       await service.completeCallback({ code: "c", state, nonceCookie: undefined }, context),
     ).toEqual({ type: "ERROR" });
@@ -168,10 +165,7 @@ describe("completeCallback — guard failures return ERROR", () => {
 
   it("nonce cookie mismatch", async () => {
     const { service } = makeService();
-    const state = await signProfessionalFacebookState({
-      nonce: "real-nonce",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const state = await signProfessionalFacebookState({ nonce: "real-nonce" });
     expect(
       await service.completeCallback({ code: "c", state, nonceCookie: "other" }, context),
     ).toEqual({ type: "ERROR" });
@@ -289,7 +283,6 @@ describe("completeCallback — unknown identity", () => {
     expect(result).toEqual({
       type: "REGISTRATION",
       sessionId: String(sessionId),
-      visitType: "AT_BUSINESS_LOCATION",
     });
     expect(createFacebookProfessionalSession).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -297,8 +290,10 @@ describe("completeCallback — unknown identity", () => {
         facebookProviderAccountId: "fb-new-owner",
         firstName: "New",
         lastName: "Owner",
-        businessVisitType: "AT_BUSINESS_LOCATION",
       }),
+    );
+    expect(createFacebookProfessionalSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({ businessVisitType: expect.anything() }),
     );
     expect((userRepository as { create?: unknown }).create).toBeUndefined();
     expect(tokenService.createRefreshSession).not.toHaveBeenCalled();

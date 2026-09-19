@@ -17,15 +17,11 @@ describe("professional Google OAuth state", () => {
   beforeEach(() => vi.useRealTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("round-trips the nonce + visitType through a signed token", async () => {
-    const token = await signProfessionalGoogleState({
-      nonce: "nonce-abc-123",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+  it("round-trips the nonce through a signed token", async () => {
+    const token = await signProfessionalGoogleState({ nonce: "nonce-abc-123" });
 
     await expect(verifyProfessionalGoogleState(token)).resolves.toEqual({
       nonce: "nonce-abc-123",
-      visitType: "AT_BUSINESS_LOCATION",
     });
   });
 
@@ -37,10 +33,7 @@ describe("professional Google OAuth state", () => {
   });
 
   it("rejects a token whose signature was tampered with", async () => {
-    const good = await signProfessionalGoogleState({
-      nonce: "n",
-      visitType: "TRAVEL_TO_CUSTOMER",
-    });
+    const good = await signProfessionalGoogleState({ nonce: "n" });
     const parts = good.split(".");
     const flipped = parts[2]?.slice(-1) === "A" ? "B" : "A";
     parts[2] = `${parts[2]?.slice(0, -1)}${flipped}`;
@@ -50,19 +43,8 @@ describe("professional Google OAuth state", () => {
     });
   });
 
-  it("rejects a token with an unknown / missing visitType", async () => {
-    const bad = await signProfessionalGoogleState({
-      nonce: "n",
-      visitType: "SOMETHING_ELSE" as never,
-    });
-    await expect(verifyProfessionalGoogleState(bad)).rejects.toMatchObject({ statusCode: 400 });
-  });
-
   it("rejects an empty nonce", async () => {
-    const bad = await signProfessionalGoogleState({
-      nonce: "",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const bad = await signProfessionalGoogleState({ nonce: "" });
     await expect(verifyProfessionalGoogleState(bad)).rejects.toMatchObject({ statusCode: 400 });
   });
 
@@ -70,10 +52,7 @@ describe("professional Google OAuth state", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-03T12:00:00.000Z"));
 
-    const token = await signProfessionalGoogleState({
-      nonce: "expiring",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const token = await signProfessionalGoogleState({ nonce: "expiring" });
 
     vi.setSystemTime(new Date("2026-09-03T12:10:31.000Z"));
 
