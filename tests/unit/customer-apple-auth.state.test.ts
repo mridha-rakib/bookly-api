@@ -65,7 +65,7 @@ describe("customer Apple OAuth state", () => {
   it("context isolation: cannot verify an Apple-link / Professional-Apple / Google / Facebook state", async () => {
     for (const other of [
       await signAppleLinkState({ userId: "u1", nonce: "n" }),
-      await signProfessionalAppleState({ nonce: "n", visitType: "TRAVEL_TO_CUSTOMER" }),
+      await signProfessionalAppleState({ nonce: "n" }),
       await signCustomerGoogleState({ nonce: "n" }),
       await signCustomerFacebookState({ nonce: "n" }),
     ]) {

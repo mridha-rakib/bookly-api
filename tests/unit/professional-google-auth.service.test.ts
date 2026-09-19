@@ -115,7 +115,7 @@ const makeService = (
 };
 
 const validInput = async (nonce = "nonce-value-1234567890") => {
-  const state = await signProfessionalGoogleState({ nonce, visitType: "AT_BUSINESS_LOCATION" });
+  const state = await signProfessionalGoogleState({ nonce });
   return { code: "auth-code", state, nonceCookie: nonce };
 };
 
@@ -129,9 +129,9 @@ beforeEach(() => {
 });
 
 describe("ProfessionalGoogleAuthService.buildAuthorization", () => {
-  it("signs the nonce + visitType into the state and returns a consent URL", async () => {
+  it("signs the nonce into the state and returns a consent URL", async () => {
     const { service } = makeService();
-    const { url, nonce } = await service.buildAuthorization("TRAVEL_TO_CUSTOMER");
+    const { url, nonce } = await service.buildAuthorization();
     expect(url).toContain("accounts.google.com");
     expect(nonce).toHaveLength(64);
   });
@@ -150,10 +150,7 @@ describe("completeCallback — guard failures return ERROR", () => {
 
   it("missing nonce cookie", async () => {
     const { service } = makeService();
-    const state = await signProfessionalGoogleState({
-      nonce: "n123",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const state = await signProfessionalGoogleState({ nonce: "n123" });
     expect(
       await service.completeCallback({ code: "c", state, nonceCookie: undefined }, context),
     ).toEqual({ type: "ERROR" });
@@ -161,10 +158,7 @@ describe("completeCallback — guard failures return ERROR", () => {
 
   it("nonce cookie mismatch", async () => {
     const { service } = makeService();
-    const state = await signProfessionalGoogleState({
-      nonce: "real-nonce",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+    const state = await signProfessionalGoogleState({ nonce: "real-nonce" });
     expect(
       await service.completeCallback({ code: "c", state, nonceCookie: "other-nonce" }, context),
     ).toEqual({ type: "ERROR" });
@@ -286,7 +280,6 @@ describe("completeCallback — CASE 1 brand-new Business Owner", () => {
     expect(result).toEqual({
       type: "REGISTRATION",
       sessionId: String(sessionId),
-      visitType: "AT_BUSINESS_LOCATION",
     });
     expect(createGoogleProfessionalSession).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -294,8 +287,10 @@ describe("completeCallback — CASE 1 brand-new Business Owner", () => {
         googleProviderAccountId: "sub-new-owner",
         firstName: "New",
         lastName: "Owner",
-        businessVisitType: "AT_BUSINESS_LOCATION",
       }),
+    );
+    expect(createGoogleProfessionalSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({ businessVisitType: expect.anything() }),
     );
     // No User is created here (Option B).
     expect((userRepository as { create?: unknown }).create).toBeUndefined();

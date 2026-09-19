@@ -23,15 +23,9 @@ describe("professional Apple OAuth state", () => {
   beforeEach(() => vi.useRealTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("round-trips nonce + visitType", async () => {
-    const token = await signProfessionalAppleState({
-      nonce: "n1",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
-    await expect(verifyProfessionalAppleState(token)).resolves.toEqual({
-      nonce: "n1",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+  it("round-trips the nonce", async () => {
+    const token = await signProfessionalAppleState({ nonce: "n1" });
+    await expect(verifyProfessionalAppleState(token)).resolves.toEqual({ nonce: "n1" });
   });
 
   it("rejects a forged token with PROFESSIONAL_APPLE_INVALID_STATE (400)", async () => {
@@ -42,7 +36,7 @@ describe("professional Apple OAuth state", () => {
   });
 
   it("rejects a tampered payload", async () => {
-    const good = await signProfessionalAppleState({ nonce: "n", visitType: "TRAVEL_TO_CUSTOMER" });
+    const good = await signProfessionalAppleState({ nonce: "n" });
     const parts = good.split(".");
     parts[1] = `${parts[1]?.[0] === "e" ? "X" : "e"}${parts[1]?.slice(1)}`;
     await expect(verifyProfessionalAppleState(parts.join("."))).rejects.toMatchObject({
@@ -53,10 +47,7 @@ describe("professional Apple OAuth state", () => {
   it("rejects an expired token", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-02T12:00:00.000Z"));
-    const token = await signProfessionalAppleState({
-      nonce: "expiring",
-      visitType: "TRAVEL_TO_CUSTOMER",
-    });
+    const token = await signProfessionalAppleState({ nonce: "expiring" });
     vi.setSystemTime(new Date("2026-09-02T12:10:31.000Z"));
     await expect(verifyProfessionalAppleState(token)).rejects.toMatchObject({ statusCode: 400 });
   });

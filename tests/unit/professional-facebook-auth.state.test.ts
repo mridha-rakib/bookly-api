@@ -22,15 +22,9 @@ describe("professional Facebook OAuth state", () => {
   beforeEach(() => vi.useRealTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("round-trips the nonce + visitType through a signed token", async () => {
-    const token = await signProfessionalFacebookState({
-      nonce: "n1",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
-    await expect(verifyProfessionalFacebookState(token)).resolves.toEqual({
-      nonce: "n1",
-      visitType: "AT_BUSINESS_LOCATION",
-    });
+  it("round-trips the nonce through a signed token", async () => {
+    const token = await signProfessionalFacebookState({ nonce: "n1" });
+    await expect(verifyProfessionalFacebookState(token)).resolves.toEqual({ nonce: "n1" });
   });
 
   it("rejects a forged token with PROFESSIONAL_FACEBOOK_INVALID_STATE (400)", async () => {
@@ -41,10 +35,7 @@ describe("professional Facebook OAuth state", () => {
   });
 
   it("rejects a token whose payload was tampered with (signature no longer matches)", async () => {
-    const good = await signProfessionalFacebookState({
-      nonce: "n",
-      visitType: "TRAVEL_TO_CUSTOMER",
-    });
+    const good = await signProfessionalFacebookState({ nonce: "n" });
     const parts = good.split(".");
     // Mutate the payload segment — guarantees an HS256 signature mismatch.
     const payload = parts[1] ?? "";
@@ -58,10 +49,7 @@ describe("professional Facebook OAuth state", () => {
   it("rejects an expired token once the 10 minute TTL has elapsed", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-02T12:00:00.000Z"));
-    const token = await signProfessionalFacebookState({
-      nonce: "expiring",
-      visitType: "TRAVEL_TO_CUSTOMER",
-    });
+    const token = await signProfessionalFacebookState({ nonce: "expiring" });
     vi.setSystemTime(new Date("2026-09-02T12:10:31.000Z"));
     await expect(verifyProfessionalFacebookState(token)).rejects.toMatchObject({ statusCode: 400 });
   });

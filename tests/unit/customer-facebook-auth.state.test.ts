@@ -65,10 +65,7 @@ describe("customer Facebook OAuth state", () => {
     const linkState = await signFacebookLinkState({ userId: "u1" });
     await expect(verifyCustomerFacebookState(linkState)).rejects.toMatchObject({ statusCode: 400 });
 
-    const proState = await signProfessionalFacebookState({
-      nonce: "n",
-      visitType: "TRAVEL_TO_CUSTOMER",
-    });
+    const proState = await signProfessionalFacebookState({ nonce: "n" });
     await expect(verifyCustomerFacebookState(proState)).rejects.toMatchObject({ statusCode: 400 });
   });
 });
