@@ -19,7 +19,9 @@ vi.mock("../../src/config/logger.js", () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
 }));
 
-const buildGoogleAuthUrl = vi.fn(() => "https://accounts.google.com/o/oauth2/v2/auth?mock=1");
+const buildGoogleAuthUrl = vi.fn(
+  (_state: string) => "https://accounts.google.com/o/oauth2/v2/auth?mock=1",
+);
 const exchangeGoogleAuthCode = vi.fn();
 const refreshGoogleAccessToken = vi.fn();
 const createGoogleCalendarEvent = vi.fn();

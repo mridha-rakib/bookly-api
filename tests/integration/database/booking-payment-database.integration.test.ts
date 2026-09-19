@@ -525,6 +525,7 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     );
     const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
     const loserCustomerId = customerIds[results.findIndex((r) => r.status === "rejected")];
+    if (!loserCustomerId) throw new Error("expected exactly one rejected finalize call");
 
     // Exactly one customer actually gets the slot — the other's finalize call must surface a
     // real, catchable error (never a silent no-op, never a second Booking for the same slot).

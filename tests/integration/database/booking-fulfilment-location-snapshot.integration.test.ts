@@ -9,6 +9,7 @@ import {
   toBookingDetailDto,
   toBookingListItemDto,
 } from "../../../src/modules/booking/booking.dto.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
@@ -19,6 +20,7 @@ import { BookingFinancialTransactionService } from "../../../src/modules/booking
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import type { BusinessCity } from "../../../src/modules/business/business.types.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
@@ -231,7 +233,7 @@ describe("database-backed Booking fulfilment location snapshot", () => {
   const createFixedService = async (
     businessId: Types.ObjectId,
     staffId: Types.ObjectId,
-    servedCities: string[] = [],
+    servedCities: BusinessCity[] = [],
   ) =>
     serviceRepository.create({
       businessId,
@@ -270,7 +272,7 @@ describe("database-backed Booking fulfilment location snapshot", () => {
   const startAtFor = (time: string) => businessLocalToUtc(TIMEZONE, DATE, time).toISOString();
 
   const setupBookableBusiness = async (location?: { lat: number; lng: number }) => {
-    const { owner, business } = await createBusiness({ location });
+    const { owner, business } = await createBusiness({ ...(location ? { location } : {}) });
     const { membership } = await createStaff(business._id);
     const service = await createFixedService(business._id, membership._id);
     await openMondayToFriday(business._id, owner._id);
@@ -467,14 +469,15 @@ describe("database-backed Booking fulfilment location snapshot", () => {
     const { owner, business, membership, service, client } = await setupBookableBusiness(location);
     const booking = await bookAt(owner, business, membership, service, client);
 
-    // Simulate a pre-migration document: strip `location` directly at the DB level, exactly as
-    // an old Booking created before this field existed would look.
-    const original = await bookingRepository.findById(business._id, booking._id);
-    if (!original) throw new Error("booking missing");
-    if (original.fulfilment.businessLocation) {
-      original.fulfilment.businessLocation.location = undefined;
-    }
-    await original.save();
+    // Simulate a pre-migration document: strip `location` directly at the DB level (repository
+    // methods never expose a raw Mongoose `.save()` — mutations go through repository methods
+    // like `casUpdate`, so a legacy-shape write goes straight through the model, same as other
+    // integration suites simulating pre-migration documents), exactly as an old Booking created
+    // before this field existed would look.
+    await BookingModel.updateOne(
+      { _id: booking._id },
+      { $unset: { "fulfilment.businessLocation.location": "" } },
+    ).exec();
 
     const reread = await bookingRepository.findById(business._id, booking._id);
     if (!reread) throw new Error("booking missing after re-fetch");
