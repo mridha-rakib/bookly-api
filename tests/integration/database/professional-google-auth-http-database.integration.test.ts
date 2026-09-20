@@ -76,20 +76,18 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
   };
 
   const runFlow = async (query: Record<string, string>, agent = request.agent(buildApp())) => {
-    const startRes = await agent.get(START).query({ visitType: "location" });
+    const startRes = await agent.get(START);
     expect(startRes.status).toBe(302);
     const state = new URL(startRes.headers["location"] as string).searchParams.get("state");
     const cb = await agent.get(CALLBACK).query({ state: state ?? "", ...query });
     return { cb, agent };
   };
 
-  it("start requires visitType (400) and otherwise redirects to Google with an httpOnly nonce cookie", async () => {
-    const missing = await request(buildApp()).get(START);
-    expect(missing.status).toBe(400);
-
-    const ok = await request(buildApp()).get(START).query({ visitType: "location" });
+  it("start succeeds without a visitType input and redirects to Google with an httpOnly nonce cookie", async () => {
+    const ok = await request(buildApp()).get(START);
     expect(ok.status).toBe(302);
     expect(ok.headers["location"]).toContain("accounts.google.com");
+    expect(new URL(ok.headers["location"] as string).searchParams.has("visitType")).toBe(false);
     expect(String(ok.headers["set-cookie"])).toMatch(
       /bookly_refresh_token_oauth_nonce_professional=/,
     );
@@ -98,7 +96,7 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
 
   it("start redirects status=error (flow=professional) when not configured", async () => {
     isProfessionalGoogleAuthConfigured.mockReturnValue(false);
-    const res = await request(buildApp()).get(START).query({ visitType: "travel" });
+    const res = await request(buildApp()).get(START);
     expect(res.status).toBe(302);
     expect(res.headers["location"]).toBe(`${FRONTEND_CB}?flow=professional&status=error`);
   });
@@ -118,7 +116,8 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
     const loc = new URL(cb.headers["location"] as string);
     expect(loc.searchParams.get("flow")).toBe("professional");
     expect(loc.searchParams.get("status")).toBe("onboarding");
-    expect(loc.searchParams.get("visitType")).toBe("location");
+    // Visit type is no longer known at OAuth time — the redirect carries only the session id.
+    expect(loc.searchParams.has("visitType")).toBe(false);
     const sessionId = loc.searchParams.get("sessionId") ?? "";
     expect(sessionId).toMatch(/^[a-f0-9]{24}$/);
     expect(String(cb.headers["set-cookie"] ?? "")).not.toMatch(/bookly_refresh_token=/);
@@ -130,18 +129,19 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
       authProvider: "GOOGLE",
       googleProviderAccountId: "google-sub-owner-1",
       currentStep: "EMAIL_VERIFIED",
-      businessVisitType: "AT_BUSINESS_LOCATION",
     });
+    // Not seeded from OAuth — collected later by the dedicated post-phone step.
+    expect(session?.businessVisitType).toBeUndefined();
     expect(session?.emailVerification.verifiedAt).toBeInstanceOf(Date);
     expect(session?.personalProfile).toMatchObject({ firstName: "New", lastName: "Owner" });
     expect(session?.passwordHash).toBeUndefined();
 
     // NO User yet (Option B).
     expect(await UserModel.countDocuments({})).toBe(0);
-    const draft = await BusinessOnboardingDraftModel.findOne({
-      registrationSessionId: sessionId,
-    }).lean();
-    expect(draft?.visitType).toBe("AT_BUSINESS_LOCATION");
+    // No BusinessOnboardingDraft either — only the dedicated visit-type step (below) creates one.
+    expect(
+      await BusinessOnboardingDraftModel.findOne({ registrationSessionId: sessionId }).lean(),
+    ).toBeNull();
 
     // Drive the EXISTING onboarding flow over HTTP — no password anywhere.
     const profile = await agent.post(`${REG}/profile`).send({
@@ -159,6 +159,18 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
     expect(
       (await agent.post(`${REG}/verify-phone-otp`).send({ sessionId, code: "123456" })).status,
     ).toBe(200);
+
+    // Dedicated post-phone-verification step (/professional/visit-type on the frontend) — visit
+    // type is collected here, never during OAuth.
+    const visitType = await agent
+      .post("/api/v1/auth/professional/register/visit-type")
+      .send({ sessionId, visitType: "AT_BUSINESS_LOCATION" });
+    expect(visitType.status).toBe(200);
+
+    const draftAfterVisitType = await BusinessOnboardingDraftModel.findOne({
+      registrationSessionId: sessionId,
+    }).lean();
+    expect(draftAfterVisitType?.visitType).toBe("AT_BUSINESS_LOCATION");
 
     const details = await agent.post(`${REG}/business-details`).send({
       sessionId,
