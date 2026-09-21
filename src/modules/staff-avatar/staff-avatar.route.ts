@@ -7,7 +7,7 @@ import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
-import { staffIdParamsSchema } from "../staff/staff.schema.js";
+import { staffBusinessParamsSchema, staffIdParamsSchema } from "../staff/staff.schema.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { StaffAvatarController } from "./staff-avatar.controller.js";
 import { StaffAvatarError } from "./staff-avatar.errors.js";
@@ -57,6 +57,17 @@ export const createStaffAvatarRoute = (): Router => {
     { maxUploadBytes: env.STAFF_AVATAR_MAX_UPLOAD_BYTES },
   );
   const controller = new StaffAvatarController(service);
+
+  // Registered BEFORE "/:staffId/avatar" below: on the same "/staff" prefix, Express would
+  // otherwise match "me" as a literal :staffId value first (failing staffIdParamsSchema's
+  // ObjectId regex) before ever reaching this dedicated /me handler — same ordering rule
+  // staff.route.ts already documents for /staff/me/schedule.
+  router.put(
+    "/:businessId/staff/me/avatar",
+    validateRequest({ params: staffBusinessParamsSchema }),
+    uploadSingleImage,
+    asyncHandler(controller.uploadOwnerAvatar),
+  );
 
   router.put(
     "/:businessId/staff/:staffId/avatar",

@@ -409,6 +409,127 @@ describe("StaffAvatarService", () => {
     expect(staffAvatarRepository.rows).toHaveLength(1);
   });
 
+  describe("uploadOrReplaceOwnerAvatar", () => {
+    it("lets the Business Owner upload their own avatar, keyed by business.ownerUserId (not a StaffMembership)", async () => {
+      const { service, business, ownerUserId, staffAvatarRepository, storageService } =
+        createService({ membership: null });
+
+      const result = await service.uploadOrReplaceOwnerAvatar(
+        String(ownerUserId),
+        String(business?._id),
+        buildUpload(),
+      );
+
+      expect(result.userId).toBe(String(ownerUserId));
+      expect(result.avatarUrl).toContain(
+        `https://signed.example/users/${String(ownerUserId)}/avatar/`,
+      );
+      expect(staffAvatarRepository.rows).toHaveLength(1);
+      expect(staffAvatarRepository.rows[0]?.userId.equals(ownerUserId)).toBe(true);
+      expect(storageService.putObject).toHaveBeenCalledTimes(1);
+    });
+
+    it("replaces the Owner's existing avatar using the same safe replace semantics as a Staff member's", async () => {
+      const { service, business, ownerUserId, staffAvatarRepository, storageService } =
+        createService({ membership: null });
+
+      await service.uploadOrReplaceOwnerAvatar(
+        String(ownerUserId),
+        String(business?._id),
+        buildUpload({ originalFileName: "first.png" }),
+      );
+      const firstKey = staffAvatarRepository.rows[0]?.storageKey ?? "";
+
+      const result = await service.uploadOrReplaceOwnerAvatar(
+        String(ownerUserId),
+        String(business?._id),
+        buildUpload({ originalFileName: "second.png" }),
+      );
+
+      expect(staffAvatarRepository.rows).toHaveLength(1);
+      expect(storageService.putObject).toHaveBeenCalledTimes(2);
+      expect(storageService.deleteObject).toHaveBeenCalledWith({ key: firstKey });
+      expect(result.avatarUrl).not.toContain(firstKey);
+    });
+
+    it("denies another Business Owner — cannot upload an avatar for a business they do not own", async () => {
+      const business = buildBusiness();
+      const { service, storageService } = createService({ business, membership: null });
+      const otherOwnerUserId = new Types.ObjectId();
+
+      await expect(
+        service.uploadOrReplaceOwnerAvatar(
+          String(otherOwnerUserId),
+          String(business._id),
+          buildUpload(),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      expect(storageService.putObject).not.toHaveBeenCalled();
+    });
+
+    it("denies a SUPERVISOR of this same business — this endpoint is Owner-self only, never Owner-or-Supervisor", async () => {
+      const business = buildBusiness();
+      const supervisor = buildMembership({ businessId: business._id, role: "SUPERVISOR" });
+      const { service, storageService } = createService({ business, membership: supervisor });
+
+      await expect(
+        service.uploadOrReplaceOwnerAvatar(
+          String(supervisor.userId),
+          String(business._id),
+          buildUpload(),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      expect(storageService.putObject).not.toHaveBeenCalled();
+    });
+
+    it("denies a STAFF member of this same business", async () => {
+      const business = buildBusiness();
+      const staff = buildMembership({ businessId: business._id, role: "STAFF" });
+      const { service, storageService } = createService({ business, membership: staff });
+
+      await expect(
+        service.uploadOrReplaceOwnerAvatar(
+          String(staff.userId),
+          String(business._id),
+          buildUpload(),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      expect(storageService.putObject).not.toHaveBeenCalled();
+    });
+
+    it("cannot be used to set an avatar for an arbitrary userId — the subject is always business.ownerUserId", async () => {
+      // There is no userId parameter on uploadOrReplaceOwnerAvatar at all — this test proves
+      // the persisted record is keyed by the Business's own ownerUserId regardless of which
+      // membership/user documents happen to exist, not by anything a caller could influence.
+      const { service, business, membership, ownerUserId, staffAvatarRepository } = createService();
+
+      await service.uploadOrReplaceOwnerAvatar(
+        String(ownerUserId),
+        String(business?._id),
+        buildUpload(),
+      );
+
+      expect(staffAvatarRepository.rows).toHaveLength(1);
+      expect(staffAvatarRepository.rows[0]?.userId.equals(ownerUserId)).toBe(true);
+      expect(staffAvatarRepository.rows[0]?.userId.equals(membership!.userId)).toBe(false);
+    });
+
+    it("rejects invalid image MIME/content (400) without writing to storage — same validation as Staff avatars", async () => {
+      const { service, business, ownerUserId, storageService } = createService({
+        membership: null,
+      });
+
+      await expect(
+        service.uploadOrReplaceOwnerAvatar(
+          String(ownerUserId),
+          String(business?._id),
+          buildUpload({ buffer: textBuffer, mimeType: "image/png" }),
+        ),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(storageService.putObject).not.toHaveBeenCalled();
+    });
+  });
+
   it("getAvatarUrlsByUserIds([]) short-circuits with no repository/storage calls", async () => {
     const { service, staffAvatarRepository, storageService } = createService();
 

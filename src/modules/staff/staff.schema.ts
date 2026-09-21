@@ -91,6 +91,10 @@ export const putStaffScheduleBodySchema = z
     // At most one entry per day (enforced further by the service, which also dedupes) —
     // 7 is the maximum meaningful length since there are 7 days in a week.
     days: z.array(scheduleDaySchema).max(7),
+    // Explicit recurring weekly Weekend/Off days — distinct from a weekday simply not yet
+    // configured. Defaults to [] so every existing caller (every current test included) that
+    // only sends `days` keeps behaving exactly as before this field existed.
+    offDays: z.array(z.enum(daysOfWeek)).max(7).default([]),
   })
   .strict()
   .superRefine((value, context) => {
@@ -105,6 +109,30 @@ export const putStaffScheduleBodySchema = z
         });
       }
       seen.add(day.dayOfWeek);
+    }
+
+    const seenOff = new Set<string>();
+
+    for (const [index, dayOfWeek] of value.offDays.entries()) {
+      if (seenOff.has(dayOfWeek)) {
+        context.addIssue({
+          code: "custom",
+          path: ["offDays", index],
+          message: `Duplicate Weekend/Off entry for ${dayOfWeek}`,
+        });
+      }
+      seenOff.add(dayOfWeek);
+
+      // A weekday cannot be WORKING and OFF at the same time — a working shift always takes
+      // precedence conceptually, but this is rejected outright rather than silently resolved,
+      // so a caller never gets a different result than what it explicitly asked for.
+      if (seen.has(dayOfWeek)) {
+        context.addIssue({
+          code: "custom",
+          path: ["offDays", index],
+          message: `${dayOfWeek} cannot be both a working day and Weekend/Off`,
+        });
+      }
     }
   });
 
