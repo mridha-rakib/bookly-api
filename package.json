@@ -55,6 +55,7 @@
     "google-auth-library": "^9.15.1",
     "helmet": "^8.3.0",
     "jose": "^6.2.8",
+    "libphonenumber-js": "^1.13.13",
     "luxon": "^3.7.2",
     "mongoose": "^9.8.1",
     "multer": "^2.2.0",

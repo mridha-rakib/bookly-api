@@ -7,6 +7,11 @@ import {
   businessVisitTypes,
   normalizeBusinessVisitType,
 } from "../business/business.types.js";
+import { businessCategoryKeys } from "../platform-settings/business-category.js";
+import {
+  ALL_BUSINESS_TAXONOMY_SUBCATEGORY_KEYS,
+  isValidSubcategoryOfCategory,
+} from "../platform-settings/business-taxonomy.js";
 import { genders, userLanguages } from "../user/user.types.js";
 
 const emailSchema = z.email();
@@ -120,12 +125,43 @@ export const businessDetailsBodySchema = sessionBodySchema
     }
   });
 
+// Canonical business taxonomy contract (replaces the old free-text selectedCategory /
+// selectedSubcategories pair — see platform-settings/business-taxonomy.ts). The client sends
+// stable machine keys only; the backend is authoritative for display labels (never trusts a
+// browser-supplied label). Parent-child integrity (a subcategory must belong to the submitted
+// category) is enforced below — this is the mandatory backend validation the previous free-text
+// contract never had.
 export const categorySelectionBodySchema = sessionBodySchema
   .extend({
-    selectedCategory: z.string().trim().min(1),
-    selectedSubcategories: z.array(z.string().trim().min(1)).min(1).max(5),
+    selectedCategoryKey: z.enum(businessCategoryKeys),
+    selectedSubcategoryKeys: z
+      .array(z.enum(ALL_BUSINESS_TAXONOMY_SUBCATEGORY_KEYS as [string, ...string[]]))
+      .min(1)
+      .max(5),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const seen = new Set<string>();
+    for (const subcategoryKey of value.selectedSubcategoryKeys) {
+      if (seen.has(subcategoryKey)) {
+        context.addIssue({
+          code: "custom",
+          path: ["selectedSubcategoryKeys"],
+          message: `Duplicate subcategory selection: ${subcategoryKey}`,
+        });
+        continue;
+      }
+      seen.add(subcategoryKey);
+
+      if (!isValidSubcategoryOfCategory(value.selectedCategoryKey, subcategoryKey)) {
+        context.addIssue({
+          code: "custom",
+          path: ["selectedSubcategoryKeys"],
+          message: `"${subcategoryKey}" does not belong to category "${value.selectedCategoryKey}"`,
+        });
+      }
+    }
+  });
 
 export const progressQuerySchema = z.object({
   sessionId: sessionIdSchema,

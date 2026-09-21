@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  categorySelectionBodySchema,
   deleteMyAccountBodySchema,
   requestEmailChangeBodySchema,
   requestPhoneChangeBodySchema,
@@ -210,6 +211,115 @@ describe("deleteMyAccountBodySchema", () => {
         currentPassword: "secret",
         confirmationText: "DELETE",
         deletionReason: "x".repeat(501),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("categorySelectionBodySchema (canonical business taxonomy contract)", () => {
+  const sessionId = "session-1";
+
+  it("accepts a valid category + subcategories that actually belong to it", () => {
+    const result = categorySelectionBodySchema.safeParse({
+      sessionId,
+      selectedCategoryKey: "BEAUTY_WELLNESS",
+      selectedSubcategoryKeys: ["BEAUTY_WELLNESS__MASSAGE"],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts up to 5 subcategories", () => {
+    const result = categorySelectionBodySchema.safeParse({
+      sessionId,
+      selectedCategoryKey: "SPORTS_ACTIVITIES",
+      selectedSubcategoryKeys: [
+        "SPORTS_ACTIVITIES__ARCHERY",
+        "SPORTS_ACTIVITIES__GOLF",
+        "SPORTS_ACTIVITIES__SQUASH",
+        "SPORTS_ACTIVITIES__TENNIS",
+        "SPORTS_ACTIVITIES__BOWLING",
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects an unknown category key", () => {
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "NOT_A_REAL_CATEGORY",
+        selectedSubcategoryKeys: ["BEAUTY_WELLNESS__MASSAGE"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an unknown subcategory key", () => {
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "BEAUTY_WELLNESS",
+        selectedSubcategoryKeys: ["NOT_A_REAL_SUBCATEGORY"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a subcategory that belongs to a DIFFERENT category (parent-child integrity)", () => {
+    // The audit's motivating example: Automotive + Massage must fail — Massage belongs to
+    // Beauty & Wellness.
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "AUTOMOTIVE",
+        selectedSubcategoryKeys: ["BEAUTY_WELLNESS__MASSAGE"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects duplicate subcategory keys", () => {
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "BEAUTY_WELLNESS",
+        selectedSubcategoryKeys: ["BEAUTY_WELLNESS__MASSAGE", "BEAUTY_WELLNESS__MASSAGE"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects an empty subcategory selection", () => {
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "BEAUTY_WELLNESS",
+        selectedSubcategoryKeys: [],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects more than 5 subcategory selections", () => {
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategoryKey: "SPORTS_ACTIVITIES",
+        selectedSubcategoryKeys: [
+          "SPORTS_ACTIVITIES__ARCHERY",
+          "SPORTS_ACTIVITIES__GOLF",
+          "SPORTS_ACTIVITIES__SQUASH",
+          "SPORTS_ACTIVITIES__TENNIS",
+          "SPORTS_ACTIVITIES__BOWLING",
+          "SPORTS_ACTIVITIES__PADEL",
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("no longer accepts the old free-text selectedCategory/selectedSubcategories contract", () => {
+    // Arbitrary strings must no longer be persistable — this is the exact regression test for
+    // the audit's "arbitrary category/subcategory strings can be submitted" finding.
+    expect(
+      categorySelectionBodySchema.safeParse({
+        sessionId,
+        selectedCategory: "Wellness",
+        selectedSubcategories: ["Massage", "Spa"],
       }).success,
     ).toBe(false);
   });

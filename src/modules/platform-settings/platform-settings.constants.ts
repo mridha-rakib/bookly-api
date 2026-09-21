@@ -52,6 +52,11 @@ export const DEFAULT_NO_SHOW_CATEGORY_WINDOWS: NoShowCategoryWindow[] = [
   { categoryKey: "EXPERIENCES_TOURS", opensAfterMinutes: 15, closesAfterMinutes: 360 },
   { categoryKey: "ENTERTAINMENT_EVENTS", opensAfterMinutes: 15, closesAfterMinutes: 1440 },
   { categoryKey: "CREATIVE_EDUCATION", opensAfterMinutes: 15, closesAfterMinutes: 120 },
+  {
+    categoryKey: "PROFESSIONAL_SERVICES_CONSULTING_COACHING",
+    opensAfterMinutes: 15,
+    closesAfterMinutes: 120,
+  },
 ];
 
 export const defaultNoShowWindowFor = (categoryKey: BusinessCategoryKey): NoShowCategoryWindow => {

@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 
 import { sendSuccess } from "../../common/http/responses.js";
+import { getBusinessTaxonomyResponse } from "./business-taxonomy.js";
 import type { UpdatePlatformSettingsBody } from "./platform-settings.schema.js";
 import type { PlatformSettingsService } from "./platform-settings.service.js";
 
@@ -35,5 +36,15 @@ export class PlatformSettingsController {
   public getPublicBookingConfig = async (_request: Request, response: Response): Promise<void> => {
     const maxServicesPerBooking = await this.service.getMaxServicesPerBooking();
     sendSuccess(response, 200, "Booking config", { maxServicesPerBooking });
+  };
+
+  /**
+   * PUBLIC, READ-ONLY — the ONE canonical Business Owner registration category + subcategory
+   * taxonomy. Static in-process data (see business-taxonomy.ts), not persisted in Mongo, so
+   * there is nothing to fetch/await here. There is deliberately no corresponding
+   * POST/PUT/PATCH/DELETE — this taxonomy has no admin CRUD surface.
+   */
+  public getBusinessTaxonomy = (_request: Request, response: Response): void => {
+    sendSuccess(response, 200, "Business taxonomy", getBusinessTaxonomyResponse());
   };
 }

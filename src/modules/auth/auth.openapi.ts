@@ -7,6 +7,8 @@ import {
   businessVisitTypeAliases,
   businessVisitTypes,
 } from "../business/business.types.js";
+import { businessCategoryKeys } from "../platform-settings/business-category.js";
+import { ALL_BUSINESS_TAXONOMY_SUBCATEGORY_KEYS } from "../platform-settings/business-taxonomy.js";
 
 const emailSchema = z.string().email();
 const sessionIdSchema = z.string().min(1);
@@ -86,8 +88,11 @@ const businessDetailsOpenApiSchema = sessionOpenApiSchema
   });
 const categorySelectionOpenApiSchema = sessionOpenApiSchema
   .extend({
-    selectedCategory: z.string().min(1),
-    selectedSubcategories: z.array(z.string().min(1)).min(1).max(5),
+    selectedCategoryKey: z.enum(businessCategoryKeys),
+    selectedSubcategoryKeys: z
+      .array(z.enum(ALL_BUSINESS_TAXONOMY_SUBCATEGORY_KEYS as [string, ...string[]]))
+      .min(1)
+      .max(5),
   })
   .strict();
 const progressQueryOpenApiSchema = z.object({ sessionId: sessionIdSchema });

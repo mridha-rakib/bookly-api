@@ -35,6 +35,9 @@ export type CreateBusinessInput = {
   briefDescription: string;
   category: string;
   subcategories: string[];
+  /** Canonical subcategory keys (see platform-settings/business-taxonomy.ts) — omitted by any
+   * caller working from a legacy free-text draft that has none to offer. */
+  subcategoryKeys?: string[] | undefined;
 };
 
 export class BusinessRepository {

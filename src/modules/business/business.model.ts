@@ -64,6 +64,14 @@ export type BusinessDocument = {
    */
   categoryKey?: BusinessCategoryKey | undefined;
   subcategories: string[];
+  /**
+   * Canonical machine identity for `subcategories`, from the same canonical taxonomy as
+   * `categoryKey` (see platform-settings/business-taxonomy.ts). Populated for every NEW
+   * registration (the onboarding API now only accepts canonical subcategory keys — see
+   * auth.schema.ts categorySelectionBodySchema); absent on businesses created before the
+   * canonical taxonomy existed, exactly like `categoryKey` — no destructive backfill.
+   */
+  subcategoryKeys?: string[] | undefined;
   /** Explicit, Super Admin-controlled marketing flag (Business Detail action + public landing
    * "Trusted by local businesses" section). Never inferred from age / approval date / bookings —
    * an admin sets it. Defaults to false; pre-existing rows read as false via this schema default
@@ -131,6 +139,7 @@ const businessSchema = new Schema<BusinessDocument>(
     category: { type: String, required: true, trim: true },
     categoryKey: { type: String, enum: businessCategoryKeys, required: false },
     subcategories: { type: [String], required: true },
+    subcategoryKeys: { type: [String], required: false },
     isFoundingPartner: { type: Boolean, required: true, default: false },
     instagramHandle: { type: String, trim: true },
     facebookPageUrl: { type: String, trim: true },

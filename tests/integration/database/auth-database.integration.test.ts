@@ -27,6 +27,7 @@ import { BusinessRepository } from "../../../src/modules/business/business.repos
 import { BusinessService } from "../../../src/modules/business/business.service.js";
 import { BusinessAccessRepository } from "../../../src/modules/business/business-access.repository.js";
 import { BusinessLinkVerificationRepository } from "../../../src/modules/business/business-link-verification.repository.js";
+import { BusinessOnboardingDraftModel } from "../../../src/modules/business-onboarding/business-onboarding.model.js";
 import { BusinessOnboardingRepository } from "../../../src/modules/business-onboarding/business-onboarding.repository.js";
 import { BusinessOnboardingService } from "../../../src/modules/business-onboarding/business-onboarding.service.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
@@ -300,8 +301,8 @@ const completeBusinessOwner = async (
   await parts.authService.saveCategories(
     categorySelectionBodySchema.parse({
       sessionId,
-      selectedCategory: "Wellness",
-      selectedSubcategories: ["Massage", "Spa"],
+      selectedCategoryKey: "BEAUTY_WELLNESS",
+      selectedSubcategoryKeys: ["BEAUTY_WELLNESS__MASSAGE", "BEAUTY_WELLNESS__SPA"],
     }),
   );
   const result = await parts.authService.completeBusinessOwner({ sessionId }, context);
@@ -610,8 +611,10 @@ describe("database-backed authentication integration", () => {
     expect(business.ownerUserId.equals(user._id)).toBe(true);
     expect(business.visitType).toBe("AT_BUSINESS_LOCATION");
     expect(business.status).toBe("PENDING");
-    expect(business.category).toBe("Wellness");
+    expect(business.category).toBe("Beauty & Wellness");
     expect(business.subcategories).toEqual(["Massage", "Spa"]);
+    expect(business.categoryKey).toBe("BEAUTY_WELLNESS");
+    expect(business.subcategoryKeys).toEqual(["BEAUTY_WELLNESS__MASSAGE", "BEAUTY_WELLNESS__SPA"]);
 
     await clearIsolatedDatabase();
     await completeBusinessOwner("owner-travel@example.com", "travel");
@@ -670,8 +673,8 @@ describe("database-backed authentication integration", () => {
     await parts.authService.saveCategories(
       categorySelectionBodySchema.parse({
         sessionId,
-        selectedCategory: "Wellness",
-        selectedSubcategories: ["Spa"],
+        selectedCategoryKey: "BEAUTY_WELLNESS",
+        selectedSubcategoryKeys: ["BEAUTY_WELLNESS__SPA"],
       }),
     );
     const result = await parts.authService.completeBusinessOwner({ sessionId }, context);
@@ -733,6 +736,153 @@ describe("database-backed authentication integration", () => {
     expect(afterPhoneVerified.phoneVerified).toBe(true);
     expect(afterPhoneVerified.phone).toEqual({ countryCode: "+357", nationalNumber: "99330022" });
     expect(afterPhoneVerified.email).toBe("progress-test@example.com");
+  });
+
+  it("restores a saved category/subcategory selection through registration progress (resume fix)", async () => {
+    const parts = createAuthService();
+    const professionalEntry = await parts.authService.professionalEntry(
+      professionalEntryBodySchema.parse({ email: "resume-category@example.com" }),
+    );
+    const sessionId = professionalEntry.sessionId ?? "";
+
+    await parts.authService.sendEmailOtp({ sessionId });
+    await parts.authService.verifyEmailOtp(
+      verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+    );
+    await parts.authService.submitProfile(
+      profileBodySchema.parse({
+        sessionId,
+        firstName: "Resume",
+        lastName: "Tester",
+        gender: "other",
+        countryCode: "+357",
+        nationalNumber: "99330099",
+        password: testPassword,
+      }),
+    );
+    await parts.authService.sendPhoneOtp({ sessionId });
+    await parts.authService.verifyProfessionalPhone(
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+    );
+    await parts.authService.saveProfessionalVisitType(
+      visitTypeBodySchema.parse({ sessionId, visitType: "location" }),
+    );
+    await parts.authService.saveBusinessDetails(
+      businessDetailsBodySchema.parse({
+        sessionId,
+        businessName: "Resume Test Studio",
+        ownerName: "Resume Tester",
+        city: "Larnaca",
+        countryCode: "+357",
+        nationalNumber: "99330099",
+        area: "Center",
+        streetName: "Resume",
+        streetNumber: "1",
+        briefDesc: "Business used to verify category resume",
+      }),
+    );
+
+    // Before categories are ever saved, progress must not fabricate a selection.
+    const beforeCategories = await parts.authService.getProgress(sessionId);
+    expect(beforeCategories.categorySelection).toBeUndefined();
+
+    await parts.authService.saveCategories(
+      categorySelectionBodySchema.parse({
+        sessionId,
+        selectedCategoryKey: "AUTOMOTIVE",
+        selectedSubcategoryKeys: ["AUTOMOTIVE__CAR_DETAILING", "AUTOMOTIVE__CAR_WASH"],
+      }),
+    );
+
+    // A resumed session (reload / new tab / re-navigation) must see the saved selection restored,
+    // not silently reset — this is the exact gap the audit found.
+    const afterCategories = await parts.authService.getProgress(sessionId);
+    expect(afterCategories.categorySelection).toEqual({
+      categoryKey: "AUTOMOTIVE",
+      categoryLabel: "Automotive",
+      subcategoryKeys: ["AUTOMOTIVE__CAR_DETAILING", "AUTOMOTIVE__CAR_WASH"],
+      subcategoryLabels: ["Car Detailing", "Car Wash"],
+    });
+
+    // Idempotent resubmission (the existing CATEGORIES_SUBMITTED step guard) must still work.
+    await expect(
+      parts.authService.saveCategories(
+        categorySelectionBodySchema.parse({
+          sessionId,
+          selectedCategoryKey: "PETS_HOME",
+          selectedSubcategoryKeys: ["PETS_HOME__DOG_TRAINER"],
+        }),
+      ),
+    ).resolves.toBeDefined();
+    const afterResubmit = await parts.authService.getProgress(sessionId);
+    expect(afterResubmit.categorySelection?.categoryKey).toBe("PETS_HOME");
+  });
+
+  it("legacy pre-taxonomy draft (free-text category, no keys) resolves the category but requires reselecting subcategories", async () => {
+    const parts = createAuthService();
+    const professionalEntry = await parts.authService.professionalEntry(
+      professionalEntryBodySchema.parse({ email: "legacy-draft@example.com" }),
+    );
+    const sessionId = professionalEntry.sessionId ?? "";
+
+    await parts.authService.sendEmailOtp({ sessionId });
+    await parts.authService.verifyEmailOtp(
+      verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+    );
+    await parts.authService.submitProfile(
+      profileBodySchema.parse({
+        sessionId,
+        firstName: "Legacy",
+        lastName: "Draft",
+        gender: "other",
+        countryCode: "+357",
+        nationalNumber: "99330077",
+        password: testPassword,
+      }),
+    );
+    await parts.authService.sendPhoneOtp({ sessionId });
+    await parts.authService.verifyProfessionalPhone(
+      verifyPhoneOtpBodySchema.parse({ sessionId, code: "123456" }),
+    );
+    await parts.authService.saveProfessionalVisitType(
+      visitTypeBodySchema.parse({ sessionId, visitType: "location" }),
+    );
+    await parts.authService.saveBusinessDetails(
+      businessDetailsBodySchema.parse({
+        sessionId,
+        businessName: "Legacy Draft Studio",
+        ownerName: "Legacy Draft",
+        city: "Larnaca",
+        countryCode: "+357",
+        nationalNumber: "99330077",
+        area: "Center",
+        streetName: "Legacy",
+        streetNumber: "1",
+        briefDesc: "Business used to verify legacy draft resume compatibility",
+      }),
+    );
+
+    // Simulate a draft written by the OLD free-text system, before the canonical taxonomy
+    // existed: `category` is a plain label with no `categoryKey`, and "subcategories" are
+    // really just other top-level category names (the old pseudo-subcategory bug).
+    await BusinessOnboardingDraftModel.findOneAndUpdate(
+      { registrationSessionId: sessionId },
+      {
+        $set: {
+          categorySelection: { category: "HEALTH & FITNESS", subcategories: ["Automotive"] },
+        },
+      },
+      { upsert: true },
+    );
+
+    const progress = await parts.authService.getProgress(sessionId);
+    // The parent category resolves via the existing legacy-alias resolver...
+    expect(progress.categorySelection?.categoryKey).toBe("HEALTH_FITNESS");
+    expect(progress.categorySelection?.categoryLabel).toBe("Health & Fitness");
+    // ...but the bogus pseudo-subcategory ("Automotive" is not a real Health & Fitness child)
+    // must NOT be carried forward — the user is required to reselect valid subcategories.
+    expect(progress.categorySelection?.subcategoryKeys).toEqual([]);
+    expect(progress.categorySelection?.subcategoryLabels).toEqual([]);
   });
 
   it("rolls back Business Owner completion failures and rejects repeated/concurrent completion", async () => {
@@ -1795,6 +1945,236 @@ describe("database-backed authentication integration", () => {
       ).toThrow();
     });
   });
+
+  // Regression coverage for the professional-signup "Please complete the previous step first"
+  // dead end: submitProfile always advances currentStep to PROFILE_SUBMITTED before the caller's
+  // follow-up sendPhoneOtp is attempted, so a send failure right after a successful submit must
+  // never make a retried submitProfile look sane — the server-side truth is that step is done.
+  describe("AuthService.submitProfile + sendPhoneOtp partial-success recovery", () => {
+    it("leaves currentStep at PROFILE_SUBMITTED with the phone persisted when the OTP send fails, and rejects a second submitProfile", async () => {
+      const parts = createAuthService();
+      const entry = await parts.authService.professionalEntry(
+        professionalEntryBodySchema.parse({ email: "profile-then-otp-fails@example.com" }),
+      );
+      const sessionId = entry.sessionId ?? "";
+      await parts.authService.sendEmailOtp({ sessionId });
+      await parts.authService.verifyEmailOtp(
+        verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+      );
+
+      await parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Partial",
+          lastName: "Success",
+          gender: "other",
+          countryCode: "+357",
+          nationalNumber: "99887766",
+          password: testPassword,
+        }),
+      );
+
+      const afterProfile = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(afterProfile.currentStep).toBe("PROFILE_SUBMITTED");
+      expect(afterProfile.phone?.nationalNumber).toBe("99887766");
+
+      // The number the user submitted turns out to be undeliverable (or the provider otherwise
+      // fails) — sendPhoneOtp must not have advanced currentStep past PROFILE_SUBMITTED.
+      vi.spyOn(parts.phoneProvider, "sendOtp").mockRejectedValueOnce(
+        new Error("provider send failed"),
+      );
+      await expect(parts.authService.sendPhoneOtp({ sessionId })).rejects.toThrow(
+        "provider send failed",
+      );
+
+      const afterFailedSend = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(afterFailedSend.currentStep).toBe("PROFILE_SUBMITTED");
+      expect(afterFailedSend.phone?.nationalNumber).toBe("99887766");
+
+      // A client that doesn't know the send failed (and resubmits the profile form, e.g. with a
+      // corrected phone) must be rejected — the session is already past EMAIL_VERIFIED. The only
+      // supported recovery from here is changeProfessionalPhone (covered above), not a retried
+      // submitProfile.
+      const retry = parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Partial",
+          lastName: "Success",
+          gender: "other",
+          countryCode: "+357",
+          nationalNumber: "99112233",
+          password: testPassword,
+        }),
+      );
+      await expect(retry).rejects.toBeInstanceOf(AuthError);
+      await expect(retry).rejects.toMatchObject({
+        details: [{ code: "INVALID_REGISTRATION_STEP" }],
+      });
+
+      // The retry must not have mutated the persisted (still-wrong) phone.
+      const afterRetry = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(afterRetry.currentStep).toBe("PROFILE_SUBMITTED");
+      expect(afterRetry.phone?.nationalNumber).toBe("99887766");
+
+      // The documented recovery path remains available and authoritative.
+      await parts.authService.changeProfessionalPhone(
+        changePhoneBodySchema.parse({
+          sessionId,
+          countryCode: "+357",
+          nationalNumber: "99112233",
+        }),
+      );
+      const afterChange = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(afterChange.currentStep).toBe("PHONE_OTP_SENT");
+      expect(afterChange.phone?.nationalNumber).toBe("99112233");
+    });
+  });
+
+  // Country-aware phone validation now runs before submitProfile/changeProfessionalPhone persist
+  // anything or reach Twilio — see validateAndNormalizePhoneNumber (auth.utils.ts). Unit coverage
+  // for the validation logic itself (multiple countries, formatting variants) lives in
+  // tests/unit/auth-phone-validation.test.ts; these prove it's wired into the actual session
+  // lifecycle: nothing persists, the step doesn't advance, and the OTP provider is never called.
+  describe("submitProfile / changeProfessionalPhone reject implausible phone numbers", () => {
+    it("submitProfile rejects the reproduced incomplete Bangladeshi number, leaves the session at EMAIL_VERIFIED, and never calls the OTP provider", async () => {
+      const parts = createAuthService();
+      const sendOtpSpy = vi.spyOn(parts.phoneProvider, "sendOtp");
+      const entry = await parts.authService.professionalEntry(
+        professionalEntryBodySchema.parse({ email: "invalid-phone-submit@example.com" }),
+      );
+      const sessionId = entry.sessionId ?? "";
+      await parts.authService.sendEmailOtp({ sessionId });
+      await parts.authService.verifyEmailOtp(
+        verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+      );
+
+      const submit = parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Invalid",
+          lastName: "Phone",
+          gender: "other",
+          countryCode: "+880",
+          nationalNumber: "19620260",
+          password: testPassword,
+        }),
+      );
+      await expect(submit).rejects.toBeInstanceOf(AuthError);
+      await expect(submit).rejects.toMatchObject({
+        details: [expect.objectContaining({ code: "INVALID_PHONE_NUMBER" })],
+      });
+
+      const session = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(session.currentStep).toBe("EMAIL_VERIFIED");
+      expect(session.phone?.e164).toBeUndefined();
+      expect(session.personalProfile?.firstName).toBeUndefined();
+      expect(sendOtpSpy).not.toHaveBeenCalled();
+    });
+
+    it("submitProfile accepts a valid phone and proceeds exactly as before", async () => {
+      const parts = createAuthService();
+      const entry = await parts.authService.professionalEntry(
+        professionalEntryBodySchema.parse({ email: "valid-phone-submit@example.com" }),
+      );
+      const sessionId = entry.sessionId ?? "";
+      await parts.authService.sendEmailOtp({ sessionId });
+      await parts.authService.verifyEmailOtp(
+        verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+      );
+
+      await parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Valid",
+          lastName: "Phone",
+          gender: "other",
+          countryCode: "+880",
+          nationalNumber: "1712345678",
+          password: testPassword,
+        }),
+      );
+
+      const session = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(session.currentStep).toBe("PROFILE_SUBMITTED");
+      expect(session.phone?.e164).toBe("+8801712345678");
+    });
+
+    // Inlines the same three steps as the AuthService.changeProfessionalPhone describe block's
+    // local advanceToProfileSubmitted helper above (out of scope here as a sibling describe).
+    const advanceToProfileSubmittedWithValidPhone = async (
+      email: string,
+      parts: AuthServiceParts,
+    ): Promise<string> => {
+      const entry = await parts.authService.professionalEntry(
+        professionalEntryBodySchema.parse({ email }),
+      );
+      const sessionId = entry.sessionId ?? "";
+      await parts.authService.sendEmailOtp({ sessionId });
+      await parts.authService.verifyEmailOtp(
+        verifyEmailOtpBodySchema.parse({ sessionId, code: parts.emailProvider.lastCode }),
+      );
+      await parts.authService.submitProfile(
+        profileBodySchema.parse({
+          sessionId,
+          firstName: "Change",
+          lastName: "Phone",
+          gender: "other",
+          countryCode: "+880",
+          nationalNumber: "1700000000",
+          password: testPassword,
+        }),
+      );
+      return sessionId;
+    };
+
+    it("changeProfessionalPhone rejects an invalid replacement, leaves the previous phone authoritative, and never calls the OTP provider", async () => {
+      const parts = createAuthService();
+      const sessionId = await advanceToProfileSubmittedWithValidPhone(
+        "invalid-change-phone@example.com",
+        parts,
+      );
+      const sendOtpSpy = vi.spyOn(parts.phoneProvider, "sendOtp");
+
+      const change = parts.authService.changeProfessionalPhone(
+        changePhoneBodySchema.parse({
+          sessionId,
+          countryCode: "+357",
+          nationalNumber: "1234",
+        }),
+      );
+      await expect(change).rejects.toBeInstanceOf(AuthError);
+      await expect(change).rejects.toMatchObject({
+        details: [expect.objectContaining({ code: "INVALID_PHONE_NUMBER" })],
+      });
+
+      const session = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(session.phone?.countryCode).toBe("+880");
+      expect(session.phone?.nationalNumber).toBe("1700000000");
+      expect(session.currentStep).toBe("PROFILE_SUBMITTED");
+      expect(sendOtpSpy).not.toHaveBeenCalled();
+    });
+
+    it("changeProfessionalPhone accepts a valid replacement and reaches the existing send flow", async () => {
+      const parts = createAuthService();
+      const sessionId = await advanceToProfileSubmittedWithValidPhone(
+        "valid-change-phone@example.com",
+        parts,
+      );
+
+      const result = await parts.authService.changeProfessionalPhone(
+        changePhoneBodySchema.parse({
+          sessionId,
+          countryCode: "+44",
+          nationalNumber: "7911123456",
+        }),
+      );
+      expect(result.sessionId).toBe(sessionId);
+
+      const session = await RegistrationSessionModel.findById(sessionId).orFail();
+      expect(session.phone?.e164).toBe("+447911123456");
+      expect(session.currentStep).toBe("PHONE_OTP_SENT");
+    });
+  });
 });
 
 const prepareBusinessOwnerForCompletion = async (
@@ -1842,8 +2222,8 @@ const prepareBusinessOwnerForCompletion = async (
   await parts.authService.saveCategories(
     categorySelectionBodySchema.parse({
       sessionId,
-      selectedCategory: "Wellness",
-      selectedSubcategories: ["Spa"],
+      selectedCategoryKey: "BEAUTY_WELLNESS",
+      selectedSubcategoryKeys: ["BEAUTY_WELLNESS__SPA"],
     }),
   );
   return sessionId;

@@ -188,8 +188,8 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
 
     const categories = await agent.post(`${REG}/categories`).send({
       sessionId,
-      selectedCategory: "Wellness",
-      selectedSubcategories: ["Spa"],
+      selectedCategoryKey: "BEAUTY_WELLNESS",
+      selectedSubcategoryKeys: ["BEAUTY_WELLNESS__SPA"],
     });
     expect(categories.status).toBe(200);
 

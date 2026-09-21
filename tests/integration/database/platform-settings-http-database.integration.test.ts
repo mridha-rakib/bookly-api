@@ -253,4 +253,32 @@ describe("HTTP-level Super Admin Platform Settings (Batch 21)", () => {
     const after = await request(app).get("/platform/booking-config").expect(200);
     expect(after.body.data.maxServicesPerBooking).toBe(9);
   });
+
+  describe("GET /platform/business-taxonomy (canonical registration category taxonomy)", () => {
+    it("is anonymous and returns exactly 9 categories with grouped subcategories", async () => {
+      const app = buildApp();
+      const response = await request(app).get("/platform/business-taxonomy").expect(200);
+
+      const taxonomy = response.body.data as Array<{
+        key: string;
+        label: string;
+        subcategories: Array<{ key: string; label: string }>;
+      }>;
+      expect(taxonomy).toHaveLength(9);
+      expect(taxonomy.map((c) => c.key).sort()).toEqual([...businessCategoryKeys].sort());
+
+      const beautyWellness = taxonomy.find((c) => c.key === "BEAUTY_WELLNESS");
+      expect(beautyWellness?.label).toBe("Beauty & Wellness");
+      expect(beautyWellness?.subcategories.length).toBeGreaterThan(0);
+      expect(beautyWellness?.subcategories.some((s) => s.label === "Massage")).toBe(true);
+    });
+
+    it("exposes no mutation route for the taxonomy (GET only)", async () => {
+      const app = buildApp();
+      await request(app).post("/platform/business-taxonomy").expect(404);
+      await request(app).put("/platform/business-taxonomy").expect(404);
+      await request(app).patch("/platform/business-taxonomy").expect(404);
+      await request(app).delete("/platform/business-taxonomy").expect(404);
+    });
+  });
 });
