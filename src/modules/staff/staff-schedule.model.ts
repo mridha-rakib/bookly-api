@@ -20,6 +20,16 @@ export type StaffScheduleDocument = {
   membershipId: Types.ObjectId;
   businessId: Types.ObjectId;
   days: StaffScheduleDayDocument[];
+  /**
+   * Explicit recurring weekly Weekend/Off days — staff-specific product intent, distinct from
+   * a weekday that simply has no entry in `days` (which only ever meant "no shift configured
+   * yet", never "deliberately off"). Never overlaps `days` — enforced at the schema
+   * (staff.schema.ts) and service (staff.service.ts) layers, never assumed here. Absent on
+   * documents written before this concept existed; Mongoose's schema default applies `[]` on
+   * read, so legacy documents stay exactly "unconfigured" rather than being silently
+   * reinterpreted as Weekend/Off — no backfill/migration needed or performed.
+   */
+  offDays: DayOfWeek[];
   createdAt: Date;
   updatedAt: Date;
 };
@@ -38,6 +48,7 @@ const staffScheduleSchema = new Schema<StaffScheduleDocument>(
     membershipId: { type: Schema.Types.ObjectId, ref: "StaffMembership", required: true },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     days: { type: [staffScheduleDaySchema], required: true, default: [] },
+    offDays: { type: [String], enum: daysOfWeek, required: true, default: [] },
   },
   { timestamps: true },
 );

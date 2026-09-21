@@ -69,8 +69,40 @@ export class StaffAvatarService {
       throw new StaffAvatarError("STAFF_AVATAR_STAFF_NOT_FOUND", 404);
     }
 
+    return this.uploadOrReplaceForUserId(membership.userId, actorUserId, file);
+  }
+
+  /**
+   * Business Owner self-service — the Owner is never a StaffMembership (see staff.service.ts),
+   * so there is no `staffId` to resolve here. The subject is always `business.ownerUserId`,
+   * taken from the already-ownership-checked Business record — never from request input — so
+   * this can never be used to set an avatar for anyone but the caller's own account.
+   * StaffAvatar itself needs no change for this: it was already keyed by userId, not
+   * membershipId, precisely so it could support any professional-role identity.
+   */
+  public async uploadOrReplaceOwnerAvatar(
+    actorUserId: string,
+    businessId: string,
+    file: StaffAvatarUpload | undefined,
+  ): Promise<StaffAvatarUploadResult> {
+    const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
+
+    return this.uploadOrReplaceForUserId(business.ownerUserId, actorUserId, file);
+  }
+
+  /**
+   * Shared storage/replace mechanics behind both {@link uploadOrReplaceAvatar} (a Staff/
+   * Supervisor membership's avatar) and {@link uploadOrReplaceOwnerAvatar} (the Business
+   * Owner's own avatar) — StaffAvatar is keyed by `userId` either way, so once the caller has
+   * resolved which `userId` is being updated (and confirmed the actor may do so), everything
+   * below is identical.
+   */
+  private async uploadOrReplaceForUserId(
+    userId: Types.ObjectId,
+    actorUserId: string,
+    file: StaffAvatarUpload | undefined,
+  ): Promise<StaffAvatarUploadResult> {
     const validFile = this.requireValidImage(file);
-    const userId = membership.userId;
     const storageKey = this.buildStorageKey(userId, validFile.mimeType);
 
     const existing = await this.staffAvatarRepository.findByUserId(userId);

@@ -1672,6 +1672,298 @@ describe("database-backed StaffMembership integration", () => {
     });
   });
 
+  describe("Phase 2 — Staff schedule: explicit Weekend/Off days", () => {
+    it("persists explicit off days, survives reload, and appears in the Staff list DTO", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "off-days@example.com", role: "STAFF" },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        {
+          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          offDays: ["SATURDAY", "SUNDAY"],
+        },
+      );
+
+      // getSchedule/putSchedule keep returning only the WORKING days (unchanged contract) —
+      // offDays are surfaced through the Staff list DTO instead (see below).
+      const workingDays = await staffService.getSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+      );
+      expect(workingDays).toEqual([{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }]);
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const staffRow = list.members.find((m) => m.email === "off-days@example.com");
+      expect(staffRow?.offDays).toEqual(["SATURDAY", "SUNDAY"]);
+
+      const ownerRow = list.members.find((m) => m.isOwner);
+      expect(ownerRow?.offDays).toEqual([]);
+    });
+
+    it("different staff members can have different off days (no cross-staff leakage)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staffA = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "off-a@example.com", role: "STAFF" },
+      );
+      const staffB = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff B", email: "off-b@example.com", role: "STAFF" },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staffA),
+        { days: [], offDays: ["SATURDAY", "SUNDAY"] },
+      );
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staffB),
+        { days: [], offDays: ["SUNDAY", "MONDAY"] },
+      );
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      expect(list.members.find((m) => m.email === "off-a@example.com")?.offDays).toEqual([
+        "SATURDAY",
+        "SUNDAY",
+      ]);
+      expect(list.members.find((m) => m.email === "off-b@example.com")?.offDays).toEqual([
+        "SUNDAY",
+        "MONDAY",
+      ]);
+    });
+
+    it("rejects a weekday that is both a working day and an off day, at the real HTTP boundary", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "conflict@example.com", role: "STAFF" },
+      );
+      const app = buildStaffApp();
+      const token = await bearerFor(owner._id, "BUSINESS_OWNER");
+
+      const response = await request(app)
+        .put(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
+        .set("Authorization", token)
+        .send({
+          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          offDays: ["MONDAY"],
+        });
+      expect(response.status).toBe(400);
+      expect(await StaffScheduleModel.countDocuments()).toBe(0);
+    });
+
+    it("an active SUPERVISOR can save a colleague's off days (same authorization as working hours)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const supervisor = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Sup Ervisor", email: "supervisor-off@example.com", role: "SUPERVISOR" },
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "staff-off@example.com", role: "STAFF" },
+      );
+      const app = buildStaffApp();
+      const supervisorToken = await bearerFor(supervisor.userId, "SUPERVISOR");
+
+      const putResponse = await request(app)
+        .put(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
+        .set("Authorization", supervisorToken)
+        .send({ days: [], offDays: ["SATURDAY"] });
+      expect(putResponse.status).toBe(200);
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      expect(list.members.find((m) => m.email === "staff-off@example.com")?.offDays).toEqual([
+        "SATURDAY",
+      ]);
+    });
+
+    it("OFF -> WORKING: adding a shift for a day already marked off removes it from offDays in the same whole-week replace", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "off-to-working@example.com", role: "STAFF" },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        { days: [], offDays: ["SUNDAY"] },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        {
+          days: [{ dayOfWeek: "SUNDAY", startTime: "10:00", endTime: "14:00" }],
+          offDays: ["SUNDAY"],
+        },
+      );
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const staffRow = list.members.find((m) => m.email === "off-to-working@example.com");
+      expect(staffRow?.schedule).toEqual([
+        { dayOfWeek: "SUNDAY", startTime: "10:00", endTime: "14:00" },
+      ]);
+      expect(staffRow?.offDays).toEqual([]);
+    });
+
+    it("WORKING -> OFF: whole-week replace removes a stale shift once the day is resubmitted as off", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "working-to-off@example.com", role: "STAFF" },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        { days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }] },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        { days: [], offDays: ["MONDAY"] },
+      );
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const staffRow = list.members.find((m) => m.email === "working-to-off@example.com");
+      expect(staffRow?.schedule).toEqual([]);
+      expect(staffRow?.offDays).toEqual(["MONDAY"]);
+
+      // The underlying mechanism the availability engine already relies on (a weekday absent
+      // from `days` is unbookable) is unchanged — marking a day OFF simply removes it from
+      // `days`, same as before this feature existed, now with explicit recorded intent.
+      const doc = await StaffScheduleModel.findOne({
+        membershipId: staff.membershipId,
+      }).orFail();
+      expect(doc.days.some((day) => day.dayOfWeek === "MONDAY")).toBe(false);
+    });
+
+    it("a legacy schedule document saved before this feature existed still reads with offDays: []", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "legacy-schedule@example.com", role: "STAFF" },
+      );
+
+      // Bypasses the repository/service entirely to simulate a document written before the
+      // `offDays` field existed — a raw insert with no `offDays` key at all, not even `[]`.
+      await StaffScheduleModel.collection.insertOne({
+        membershipId: new mongoose.Types.ObjectId(requireMembershipId(staff)),
+        businessId: business._id,
+        days: [{ dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "17:00" }],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const staffRow = list.members.find((m) => m.email === "legacy-schedule@example.com");
+      expect(staffRow?.schedule).toEqual([
+        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "17:00" },
+      ]);
+      // Never silently reinterpreted as Weekend/Off for the other 6 weekdays — legacy data
+      // stays exactly "unconfigured" until someone explicitly sets an off day.
+      expect(staffRow?.offDays).toEqual([]);
+    });
+
+    it("recurring off days are independent of date-specific time off (different collections, no cross-effect)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-a@example.com",
+        "Business A",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "separate-concepts@example.com", role: "STAFF" },
+      );
+
+      await staffService.putSchedule(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        { days: [], offDays: ["SATURDAY", "SUNDAY"] },
+      );
+      await staffService.createTimeOff(
+        String(owner._id),
+        String(business._id),
+        requireMembershipId(staff),
+        { type: "ANNUAL_HOLIDAY", startDate: "2026-07-06" },
+      );
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const staffRow = list.members.find((m) => m.email === "separate-concepts@example.com");
+      expect(staffRow?.offDays).toEqual(["SATURDAY", "SUNDAY"]);
+      expect(staffRow?.timeOff).toEqual([
+        expect.objectContaining({ type: "ANNUAL_HOLIDAY", startDate: "2026-07-06" }),
+      ]);
+    });
+  });
+
   describe("Phase 2 — Staff time off", () => {
     it("supports a single day (startDate === endDate)", async () => {
       const { user: owner, business } = await createBusinessOwner(
@@ -1980,6 +2272,75 @@ describe("database-backed StaffMembership integration", () => {
 
       expect(ownerRow?.timeOff).toEqual([]);
       expect(staffRow?.timeOff).toEqual([]);
+    });
+  });
+
+  describe("Owner avatar — StaffAvatar is keyed by userId, so it already covers the Owner", () => {
+    it("listStaff surfaces a real, persisted StaffAvatar row on the Owner's own row (never a StaffMembership)", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-avatar@example.com",
+        "Business A",
+      );
+      const staffAvatarRepository = new StaffAvatarRepository();
+      await staffAvatarRepository.create({
+        userId: owner._id,
+        storageKey: `users/${String(owner._id)}/avatar/test.png`,
+        bucket: "test-bucket",
+        mimeType: "image/png",
+        size: 1024,
+        originalFileName: "owner.png",
+        createdBy: owner._id,
+      });
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const ownerRow = list.members.find((m) => m.isOwner);
+
+      expect(ownerRow?.avatarUrl).toBeTruthy();
+      // No StaffMembership was ever created for the Owner in this test — the avatar still
+      // resolves correctly because StaffAvatar has always been keyed by userId, not
+      // membershipId.
+      expect(await staffRepository.findActiveByUserId(String(owner._id))).toBeNull();
+    });
+
+    it("Owner and a Supervisor's avatars are independent StaffAvatar rows, both surfaced correctly", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "owner-avatar-2@example.com",
+        "Business A",
+      );
+      const supervisor = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Sup Ervisor", email: "avatar-supervisor@example.com", role: "SUPERVISOR" },
+      );
+      const staffAvatarRepository = new StaffAvatarRepository();
+      await staffAvatarRepository.create({
+        userId: owner._id,
+        storageKey: `users/${String(owner._id)}/avatar/owner.png`,
+        bucket: "test-bucket",
+        mimeType: "image/png",
+        size: 1024,
+        originalFileName: "owner.png",
+        createdBy: owner._id,
+      });
+      await staffAvatarRepository.create({
+        userId: new mongoose.Types.ObjectId(supervisor.userId),
+        storageKey: `users/${String(supervisor.userId)}/avatar/sup.png`,
+        bucket: "test-bucket",
+        mimeType: "image/png",
+        size: 1024,
+        originalFileName: "sup.png",
+        createdBy: owner._id,
+      });
+
+      const list = await staffService.listStaff(String(owner._id), String(business._id));
+      const ownerRow = list.members.find((m) => m.isOwner);
+      const supervisorRow = list.members.find((m) => m.email === "avatar-supervisor@example.com");
+
+      expect(ownerRow?.avatarUrl).toBeTruthy();
+      expect(supervisorRow?.avatarUrl).toBeTruthy();
+      expect(ownerRow?.avatarUrl).not.toBe(supervisorRow?.avatarUrl);
     });
   });
 });

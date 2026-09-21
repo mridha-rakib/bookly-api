@@ -59,6 +59,12 @@ export type StaffMemberDto = {
   createdAt: string;
   /** Empty for the synthesized Owner row — Owner has no schedule in this phase. */
   schedule: ScheduleDay[];
+  /**
+   * Explicit recurring weekly Weekend/Off days for this staff member — never overlaps
+   * `schedule`. Empty for the synthesized Owner row and for any schedule saved before this
+   * concept existed (never inferred from an absent weekday — see staff-schedule.model.ts).
+   */
+  offDays: DayOfWeek[];
   /** Empty for the synthesized Owner row — Owner has no time off in this phase. */
   timeOff: StaffTimeOffDto[];
   avatarUrl: string | undefined;
@@ -101,6 +107,9 @@ export type UpdateStaffInput = {
 
 export type PutScheduleInput = {
   days: ScheduleDay[];
+  /** Explicit recurring weekly Weekend/Off days. Optional/defaults to [] — omitting it keeps
+   * exactly today's behavior (see putStaffScheduleBodySchema). */
+  offDays?: DayOfWeek[] | undefined;
 };
 
 export type CreateTimeOffInput = {
@@ -823,7 +832,18 @@ export class StaffService {
       endTime: day.endTime,
     }));
 
-    const schedule = await this.staffScheduleRepository.replace(membership._id, business._id, days);
+    // Same defense-in-depth as above for `days`: dedupe, and — beyond the schema's own
+    // WORKING/OFF conflict rejection — a working shift always wins if a caller bypasses the
+    // schema layer directly, so a weekday can never end up in both `days` and `offDays` here.
+    const workingDaySet = new Set(days.map((day) => day.dayOfWeek));
+    const offDays = [...new Set(input.offDays ?? [])].filter((day) => !workingDaySet.has(day));
+
+    const schedule = await this.staffScheduleRepository.replace(
+      membership._id,
+      business._id,
+      days,
+      offDays,
+    );
 
     return this.toScheduleDayDtos(schedule);
   }
@@ -1014,6 +1034,7 @@ export class StaffService {
       // The Owner row is synthesized, never a StaffMembership — it has no schedule/time-off
       // to manage in this phase, and none is ever fabricated here.
       schedule: [],
+      offDays: [],
       timeOff: [],
       avatarUrl,
     };
@@ -1045,6 +1066,7 @@ export class StaffService {
       isOwner: false,
       createdAt: membership.createdAt.toISOString(),
       schedule: this.toScheduleDayDtos(schedule),
+      offDays: this.toOffDaysDto(schedule),
       timeOff: timeOff.map((entry) => this.toTimeOffDto(entry)),
       avatarUrl,
     };
@@ -1060,6 +1082,10 @@ export class StaffService {
       startTime: day.startTime,
       endTime: day.endTime,
     }));
+  }
+
+  private toOffDaysDto(schedule: StaffScheduleDocument | undefined): DayOfWeek[] {
+    return schedule?.offDays ?? [];
   }
 
   private toTimeOffDto(entry: StaffTimeOffDocument): StaffTimeOffDto {
