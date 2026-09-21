@@ -7,6 +7,7 @@ import {
   type BusinessVisitType,
   businessCities,
 } from "../business/business.types.js";
+import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { ServicePricingMode } from "../services/service.types.js";
 import {
   type DiscoverySortOption,
@@ -585,15 +586,34 @@ export class DiscoveryRepository {
       .exec();
   }
 
-  /** Category filter options — derived from the DISTINCT category strings actually present on
-   * currently-visible Businesses (confirmed product decision: no invented taxonomy). */
+  /**
+   * Category filter options — derived from the DISTINCT category strings actually present on
+   * currently-visible Businesses (confirmed product decision: no invented taxonomy — this never
+   * returns "all canonical categories", only ones real visible businesses actually have).
+   *
+   * Canonical-taxonomy compatibility (registration taxonomy audit, Phase 18): two Businesses can
+   * store different literal `category` strings for the same canonical category (a documented
+   * real example: legacy `"HEALTH & FITNESS"` vs the current `"Health & Fitness"`). Group those
+   * by their resolved canonical key so the homepage never shows the same category as two
+   * separate chips — but the VALUE returned for each group is always one real, literal stored
+   * string (never a relabeled/invented one), so this stays a drop-in replacement: whatever this
+   * returns can still be sent straight back as an exact-match `$in` filter value, unchanged.
+   * A `category` string that resolves to no known canonical key is passed through as-is —
+   * never dropped, never invented into a new "platform category".
+   */
   public async listDistinctCategories(): Promise<string[]> {
     const categories = await BusinessModel.distinct("category", {
       status: { $in: PUBLICLY_VISIBLE_STATUSES },
     }).exec();
-    return (categories as string[])
-      .map((c) => c.trim())
-      .filter((c) => c.length > 0)
-      .sort((a, b) => a.localeCompare(b));
+
+    const representativeByGroup = new Map<string, string>();
+    for (const raw of (categories as string[]).map((c) => c.trim()).filter((c) => c.length > 0)) {
+      const groupKey = resolveBusinessCategoryKey(raw) ?? raw;
+      if (!representativeByGroup.has(groupKey)) {
+        representativeByGroup.set(groupKey, raw);
+      }
+    }
+
+    return [...representativeByGroup.values()].sort((a, b) => a.localeCompare(b));
   }
 }

@@ -7,9 +7,13 @@ import { PlatformSettingsService } from "./platform-settings.service.js";
 
 /**
  * Genuinely anonymous — mirrors createPublicContentRoute (no `authenticate` in the chain).
- * Exposes ONLY `maxServicesPerBooking`, so the customer / business booking UIs can mirror the
- * server-authoritative limit (the backend still validates independently on every create).
- * Nothing financial and no category windows are exposed here.
+ * `booking-config` exposes ONLY `maxServicesPerBooking`, so the customer / business booking UIs
+ * can mirror the server-authoritative limit (the backend still validates independently on every
+ * create) — nothing financial and no category windows are exposed there.
+ *
+ * `business-taxonomy` is the ONE canonical, read-only Business Owner registration category +
+ * subcategory tree (see business-taxonomy.ts). GET only, deliberately — there is no admin
+ * create/update/delete for this taxonomy.
  */
 export const createPlatformConfigRoute = (): Router => {
   const router = Router();
@@ -18,6 +22,7 @@ export const createPlatformConfigRoute = (): Router => {
   );
 
   router.get("/booking-config", asyncHandler(controller.getPublicBookingConfig));
+  router.get("/business-taxonomy", asyncHandler(controller.getBusinessTaxonomy));
 
   return router;
 };

@@ -1,5 +1,7 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 
+import { parsePhoneNumberFromString } from "libphonenumber-js";
+
 import { env } from "../../config/env.js";
 import type { PhoneNumber } from "../user/user.types.js";
 import { AuthError } from "./auth.errors.js";
@@ -41,6 +43,48 @@ export const normalizePhoneNumber = (countryCode: string, nationalNumber: string
     countryCode: normalizedCountryCode,
     nationalNumber: normalizedNationalNumber,
     e164: `${normalizedCountryCode}${normalizedNationalNumber}`,
+  };
+};
+
+// Country-aware structural validation on top of normalizePhoneNumber's plain digit-grouping —
+// used only where a malformed number reaching Twilio is the actual bug (professional
+// submitProfile / changeProfessionalPhone), not by every normalizePhoneNumber caller, so this
+// doesn't change behavior for business/staff/client phone fields out of scope for that fix.
+//
+// A calling code alone (e.g. "+1") doesn't uniquely identify a country (NANP alone covers the US,
+// Canada, and over a dozen Caribbean territories), so this deliberately does NOT ask the caller
+// for an ISO country — libphonenumber-js derives the specific numbering plan (and therefore the
+// correct length/prefix rules) directly from the full "+<callingCode><nationalNumber>" string,
+// the same way a real dial would be routed.
+//
+// Uses isValid() (structural validity against the matched country's numbering plan), not a
+// MOBILE-type check: libphonenumber-js's line-type classification is unreliable for a meaningful
+// share of countries (many ranges are ambiguous or unclassified in its metadata), so requiring
+// MOBILE would false-reject legitimate numbers in exactly the countries where we can least afford
+// friction. Rejecting the merely "possible" (right length range, still not a valid number) case
+// that normalizePhoneNumber lets through is deliberate; +88019620260 is a real example — 8 digits
+// is "possible" for Bangladesh but not a valid number.
+export const validateAndNormalizePhoneNumber = (
+  countryCode: string,
+  nationalNumber: string,
+): PhoneNumber => {
+  let candidate: PhoneNumber;
+  try {
+    candidate = normalizePhoneNumber(countryCode, nationalNumber);
+  } catch {
+    throw new AuthError("INVALID_PHONE_NUMBER", 400);
+  }
+
+  const parsed = parsePhoneNumberFromString(candidate.e164);
+
+  if (!parsed || !parsed.isValid()) {
+    throw new AuthError("INVALID_PHONE_NUMBER", 400);
+  }
+
+  return {
+    countryCode: `+${parsed.countryCallingCode}`,
+    nationalNumber: parsed.nationalNumber,
+    e164: parsed.number,
   };
 };
 

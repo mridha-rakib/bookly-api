@@ -6,6 +6,7 @@ import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessService } from "../business/business.service.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
+import type { BusinessOnboardingDraftDocument } from "../business-onboarding/business-onboarding.model.js";
 import type { BusinessOnboardingRepository } from "../business-onboarding/business-onboarding.repository.js";
 import type { BusinessOnboardingService } from "../business-onboarding/business-onboarding.service.js";
 import type { ClientRepository } from "../client/client.repository.js";
@@ -21,6 +22,11 @@ import type { LinkedAccountRepository } from "../linked-account/linked-account.r
 import type { LinkedAccountService } from "../linked-account/linked-account.service.js";
 import type { BusinessRegisteredNotificationPort } from "../notification/business-registered.notifier.js";
 import type { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
+import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
+import {
+  findTaxonomyCategory,
+  resolveLegacySubcategoryLabels,
+} from "../platform-settings/business-taxonomy.js";
 import {
   isSocialRegistrationProvider,
   type RegistrationPortal,
@@ -70,6 +76,7 @@ import {
   pruneRecentTimestamps,
   safeCompare,
   sha256,
+  validateAndNormalizePhoneNumber,
 } from "./auth.utils.js";
 import { type AuthResult, issueAuthSession, type RequestContext } from "./auth-session.js";
 import type { PasswordHasher } from "./password-hasher.js";
@@ -232,12 +239,16 @@ export class AuthService {
       ]);
     }
 
+    // Validated (and thrown on) before any field on `session` is touched — an invalid phone must
+    // leave the session at EMAIL_VERIFIED with nothing persisted, not just skip the phone write.
+    const phone = validateAndNormalizePhoneNumber(input.countryCode, nationalNumber);
+
     session.personalProfile = {
       firstName: input.firstName,
       lastName: input.lastName,
       gender: input.gender,
     };
-    session.phone = normalizePhoneNumber(input.countryCode, nationalNumber);
+    session.phone = phone;
 
     // A social PROFESSIONAL session (GOOGLE / FACEBOOK) has no password: the provider verified the
     // identity and `completeBusinessOwner` will create the User with `authProviders:[<provider>]`.
@@ -320,7 +331,7 @@ export class AuthService {
     this.ensureProfessionalSession(session);
     this.ensureStep(session, ["PROFILE_SUBMITTED", "PHONE_OTP_SENT"]);
 
-    session.phone = normalizePhoneNumber(input.countryCode, input.nationalNumber);
+    session.phone = validateAndNormalizePhoneNumber(input.countryCode, input.nationalNumber);
     await this.registrationSessionRepository.save(session);
 
     return this.sendPhoneOtp({ sessionId: input.sessionId });
@@ -550,6 +561,9 @@ export class AuthService {
             briefDescription: businessDetails.briefDescription,
             category: categorySelection.category,
             subcategories: categorySelection.subcategories,
+            ...(categorySelection.subcategoryKeys
+              ? { subcategoryKeys: categorySelection.subcategoryKeys }
+              : {}),
           },
           dbSession,
         );
@@ -1467,6 +1481,10 @@ export class AuthService {
 
   public async getProgress(sessionId: string) {
     const session = await this.getRegistrationSessionForCompletion(sessionId);
+    const draft = session.businessOnboardingDraftId
+      ? await this.businessOnboardingRepository.findByRegistrationSessionId(session._id)
+      : null;
+
     return {
       sessionId: String(session._id),
       portal: session.portal,
@@ -1498,6 +1516,66 @@ export class AuthService {
       // session created under the old step order, if it was captured earlier) — lets a resumed
       // session pre-select/preserve the existing choice instead of asking again.
       ...(session.businessVisitType ? { businessVisitType: session.businessVisitType } : {}),
+      // Lets a resumed Business Form pre-select the saved category/subcategories instead of
+      // silently discarding them (previously this was never returned at all — see the audit).
+      // Legacy drafts saved before the canonical taxonomy (no `categoryKey`) are resolved
+      // best-effort: the parent category is restored if its label still maps to a canonical
+      // key; pseudo-subcategories from the old free-text system essentially never validly map
+      // (see resolveLegacySubcategoryLabels), so those are intentionally left for the user to
+      // reselect rather than guessed at.
+      ...(draft?.categorySelection
+        ? { categorySelection: this.resolveCategorySelectionForResume(draft.categorySelection) }
+        : {}),
+    };
+  }
+
+  private resolveCategorySelectionForResume(
+    categorySelection: NonNullable<BusinessOnboardingDraftDocument["categorySelection"]>,
+  ):
+    | {
+        categoryKey: string;
+        categoryLabel: string;
+        subcategoryKeys: string[];
+        subcategoryLabels: string[];
+      }
+    | undefined {
+    if (!categorySelection) {
+      return undefined;
+    }
+
+    if (categorySelection.categoryKey) {
+      // New-format draft — already canonical, restore as-is.
+      return {
+        categoryKey: categorySelection.categoryKey,
+        categoryLabel: categorySelection.category,
+        subcategoryKeys: categorySelection.subcategoryKeys ?? [],
+        subcategoryLabels: categorySelection.subcategories,
+      };
+    }
+
+    // Legacy draft (pre-taxonomy): only a free-text category/subcategories pair. Best-effort
+    // resolve the parent category; the old "subcategories" were actually just other top-level
+    // category names reused, so they will almost never validly map — resolveLegacySubcategoryLabels
+    // returns only exact matches to a REAL child of the resolved category, which in practice is
+    // empty, correctly forcing the user to reselect rather than completing with a bogus pairing.
+    const categoryKey = resolveBusinessCategoryKey(categorySelection.category);
+    if (!categoryKey) {
+      return undefined;
+    }
+    const category = findTaxonomyCategory(categoryKey);
+    if (!category) {
+      return undefined;
+    }
+    const matchedSubcategories = resolveLegacySubcategoryLabels(
+      categoryKey,
+      categorySelection.subcategories,
+    );
+
+    return {
+      categoryKey: category.key,
+      categoryLabel: category.label,
+      subcategoryKeys: matchedSubcategories.map((sub) => sub.key),
+      subcategoryLabels: matchedSubcategories.map((sub) => sub.label),
     };
   }
 

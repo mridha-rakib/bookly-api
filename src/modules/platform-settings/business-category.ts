@@ -1,9 +1,11 @@
 /**
  * Canonical business-category identity for platform business rules (this phase).
  *
- * The 8 keys below are the STABLE machine identity used by every business-rule lookup
- * (currently: the no-show eligibility window). The human labels are display-only and must
- * never be used as a lookup key. The list is expected to change in a future phase — callers
+ * The 9 keys below are the STABLE machine identity used by every business-rule lookup
+ * (currently: the no-show eligibility window) AND now double as the parent-category identity
+ * for the canonical registration business taxonomy (see `business-taxonomy.ts`, which owns the
+ * full category+subcategory tree and its exact display labels — this file stays the source of
+ * truth only for the machine keys + the no-show-settings-facing labels). Callers
  * depend on `businessCategoryKeys` / `resolveBusinessCategoryKey`, never on hard-coded strings.
  *
  * `Business.category` historically stores a free-form display string (see business.model.ts).
@@ -11,6 +13,11 @@
  * label variations (case, `&` vs `and`, singular/plural, spacing) onto a canonical key, or
  * returns `null` when it cannot safely decide — callers then fall back to legacy behavior
  * rather than guessing (see BookingCreationService.resolveNoShowEligibilitySnapshot).
+ *
+ * `PROFESSIONAL_SERVICES_CONSULTING_COACHING` was added alongside the canonical business
+ * taxonomy (9th category — "Professional Services/ Consulting & Coaching"); no existing
+ * `Business.category` data can already carry this value, so it needs no legacy alias beyond the
+ * one added below for the pre-existing marketing-page label ("Consulting & Coaching").
  */
 
 export const businessCategoryKeys = [
@@ -22,6 +29,7 @@ export const businessCategoryKeys = [
   "EXPERIENCES_TOURS",
   "ENTERTAINMENT_EVENTS",
   "CREATIVE_EDUCATION",
+  "PROFESSIONAL_SERVICES_CONSULTING_COACHING",
 ] as const;
 
 export type BusinessCategoryKey = (typeof businessCategoryKeys)[number];
@@ -32,9 +40,12 @@ export const BUSINESS_CATEGORY_LABELS: Record<BusinessCategoryKey, string> = {
   SPORTS_ACTIVITIES: "Sports & Activities",
   AUTOMOTIVE: "Automotive",
   PETS_HOME: "Pets & Home",
-  EXPERIENCES_TOURS: "Experiences & Tours",
+  // Canonical taxonomy spells this singular ("Experience & Tours") — the key name is unchanged
+  // (an internal identifier only) so no-show-window rows / stored keys are unaffected.
+  EXPERIENCES_TOURS: "Experience & Tours",
   ENTERTAINMENT_EVENTS: "Entertainment & Events",
   CREATIVE_EDUCATION: "Creative & Education",
+  PROFESSIONAL_SERVICES_CONSULTING_COACHING: "Professional Services/ Consulting & Coaching",
 };
 
 /** lowercase, `&` -> `and`, every run of non-alphanumerics -> single space, trimmed. */
@@ -74,6 +85,9 @@ const ALIASES: Record<string, BusinessCategoryKey> = {
   "entertainment events": "ENTERTAINMENT_EVENTS",
   "creative and education": "CREATIVE_EDUCATION",
   "creative education": "CREATIVE_EDUCATION",
+  // Pre-existing list-your-business marketing-page label (client/src/app/list-your-business) —
+  // a known real variant, not an invented alias.
+  "consulting and coaching": "PROFESSIONAL_SERVICES_CONSULTING_COACHING",
 };
 
 const CANONICAL_KEY_SET = new Set<string>(businessCategoryKeys);

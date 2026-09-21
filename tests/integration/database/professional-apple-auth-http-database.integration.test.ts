@@ -186,8 +186,8 @@ describe("HTTP-level Business Owner Apple auth (GET start + POST callback + comp
     expect(details.status).toBe(200);
     const categories = await agent.post(`${REG}/categories`).send({
       sessionId,
-      selectedCategory: "Wellness",
-      selectedSubcategories: ["Spa"],
+      selectedCategoryKey: "BEAUTY_WELLNESS",
+      selectedSubcategoryKeys: ["BEAUTY_WELLNESS__SPA"],
     });
     expect(categories.status).toBe(200);
 

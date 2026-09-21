@@ -28,6 +28,14 @@ export type BusinessOnboardingDraftDocument = {
   };
   categorySelection?:
     | {
+        /** Canonical machine identity (see platform-settings/business-taxonomy.ts). Absent only
+         * on a draft written before the canonical taxonomy existed — a legacy in-flight
+         * registration that must be resolved/reselected on resume, never trusted as-is. */
+        categoryKey?: string | undefined;
+        subcategoryKeys?: string[] | undefined;
+        /** Canonical display label, derived server-side from `categoryKey` for any NEW
+         * submission. Kept alongside the key (rather than replaced) because completion /
+         * discovery / the Business document all read this display string directly. */
         category: string;
         subcategories: string[];
       }
@@ -72,6 +80,8 @@ const businessOnboardingDraftSchema = new Schema<BusinessOnboardingDraftDocument
       briefDescription: { type: String },
     },
     categorySelection: {
+      categoryKey: { type: String },
+      subcategoryKeys: { type: [String] },
       category: { type: String },
       subcategories: { type: [String] },
     },

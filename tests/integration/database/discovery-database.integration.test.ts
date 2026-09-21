@@ -316,6 +316,25 @@ describe("database-backed Discovery domain (Batch 16)", () => {
     expect(categories).toEqual(["Barber", "Nails"]);
   });
 
+  it("collapses known legacy label variants of the same canonical category into a single chip (registration taxonomy audit, Phase 18)", async () => {
+    // A documented real-world case: the same canonical "Health & Fitness" category stored with
+    // different literal casing/spacing across Businesses registered at different times.
+    await createBusiness({ name: "Legacy", category: "HEALTH & FITNESS" });
+    await createBusiness({ name: "Current", category: "Health & Fitness" });
+    // A category with no canonical mapping must still pass through untouched (never dropped,
+    // never invented into a canonical label it doesn't have).
+    await createBusiness({ name: "Unmapped", category: "Some Random Category" });
+
+    const categories = await discoveryService.listCategories();
+
+    // Exactly one chip for the Health & Fitness group (whichever literal string was first
+    // encountered), plus the untouched unmapped category — never two separate "Health & Fitness"
+    // chips.
+    expect(categories).toHaveLength(2);
+    expect(categories).toContain("Some Random Category");
+    expect(categories.some((c) => c === "HEALTH & FITNESS" || c === "Health & Fitness")).toBe(true);
+  });
+
   // --- Sorting ---------------------------------------------------------------------------------
 
   it("[8] sort: ratingHighToLow puts the highest real rating first, zero-review Businesses last", async () => {
