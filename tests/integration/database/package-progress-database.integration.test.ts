@@ -647,6 +647,244 @@ describe("database-backed Package Deal integration", () => {
     });
   });
 
+  // --- Final-charge financial semantics (no double discount) -----------------------------------
+  //
+  // packagePricing.bundlePriceCents is ALREADY the final discounted price the Owner agreed to
+  // charge (see service.model.ts's own doc comment, and ServiceForm's "Bundle / discounted
+  // price" field) — unlike FIXED pricing's discountPercent, which legitimately reduces an
+  // undiscounted base priceCents. Before the fix, booking-creation.service.ts's
+  // resolvePricingAndTiming computed a nonzero `discountCents` for Package lines too, which
+  // assembleFinancials then subtracted AGAIN from the already-discounted bundlePriceCents,
+  // silently undercharging every discounted Package purchase. These tests pin down the real
+  // financial total end-to-end, not just the per-line amountCents snapshot.
+  describe("Package purchase — final charge equals bundlePriceCents exactly once (no double discount)", () => {
+    const travelAddress = {
+      city: "Larnaca" as const,
+      propertyType: "House" as const,
+      area: "Center",
+      streetName: "Main",
+      streetNumber: "1",
+    };
+
+    it("TEST A: canonical discounted package (16.67%) — service subtotal/total equal bundlePriceCents, discount is not re-applied", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        {},
+        {
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            discountPercent: 16.67,
+            normalPricePerSessionCents: 6_000,
+          },
+        },
+      );
+      const customer = await createCustomer("dblA");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      const { financials } = result.booking;
+      expect(result.booking.serviceLines[0]!.amountCents).toBe(15_000);
+      expect(financials.servicesSubtotalCents).toBe(15_000);
+      expect(financials.serviceDiscountCents).toBe(0);
+      expect(financials.eligiblePlatformFeeBasisCents).toBe(15_000);
+      expect(financials.totalCents).toBe(15_000);
+      expect(financials.depositCents + financials.balanceDueCents).toBe(financials.totalCents);
+    });
+
+    it("TEST B: a larger discount (20%) still does not produce a second deduction", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        {},
+        {
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 14_400,
+            discountPercent: 20,
+            normalPricePerSessionCents: 6_000,
+          },
+        },
+      );
+      const customer = await createCustomer("dblB");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      // NOT 14_400 - round(14_400 * 20%) = 11_520 — that would be the pre-fix double discount.
+      expect(result.booking.financials.totalCents).toBe(14_400);
+    });
+
+    it("TEST C: package + travel fee — total is bundle + travel fee, discount is not subtracted a second time", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        { visitType: "TRAVEL_TO_CUSTOMER" },
+        {
+          servedCities: ["Larnaca"],
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            discountPercent: 16.67,
+            normalPricePerSessionCents: 6_000,
+          },
+        },
+      );
+      await businessTravelSettingsRepository.upsertByBusinessId(business._id, [
+        { city: "Larnaca", active: true, feeCents: 1_000 },
+      ]);
+      const customer = await createCustomer("dblC");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        {
+          ...purchaseInput(service._id, staff[0]!.membership._id),
+          travelAddress,
+          customerCity: "Larnaca",
+        },
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      const { financials } = result.booking;
+      expect(financials.travelFeeCents).toBe(1_000);
+      // 15_000 + 1_000, NOT (15_000 - 2_501) + 1_000.
+      expect(financials.totalCents).toBe(16_000);
+    });
+
+    it("TEST D: package + add-on — pre-travel subtotal is bundle + addon, no second Package discount", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        {},
+        {
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            discountPercent: 16.67,
+            normalPricePerSessionCents: 6_000,
+          },
+        },
+      );
+      const addon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "Extra towel",
+        priceCents: 2_000,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: business._id, addonId: addon._id, serviceId: service._id },
+      ]);
+      const customer = await createCustomer("dblD");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const input = {
+        ...purchaseInput(service._id, staff[0]!.membership._id),
+        serviceLines: [
+          {
+            serviceId: String(service._id),
+            staffMembershipId: String(staff[0]!.membership._id),
+            addonIds: [String(addon._id)],
+            pricingInput: {},
+          },
+        ],
+      };
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        input,
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      const { financials } = result.booking;
+      expect(financials.servicesSubtotalCents).toBe(15_000);
+      expect(financials.addonsSubtotalCents).toBe(2_000);
+      expect(financials.serviceDiscountCents).toBe(0);
+      expect(financials.eligiblePlatformFeeBasisCents).toBe(17_000);
+      expect(financials.totalCents).toBe(17_000);
+    });
+
+    it("TEST E: zero-discount package — total equals bundle exactly", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        {},
+        {
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 18_000,
+            discountPercent: 0,
+            normalPricePerSessionCents: 6_000,
+          },
+        },
+      );
+      const customer = await createCustomer("dblE");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      const { financials } = result.booking;
+      expect(financials.serviceDiscountCents).toBe(0);
+      expect(financials.totalCents).toBe(18_000);
+    });
+
+    it("TEST F: legacy package (no normalPricePerSessionCents) — bundlePriceCents is still the final charge, not bundle-minus-legacy-discount", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(
+        1,
+        {},
+        {
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            discountPercent: 10,
+            // normalPricePerSessionCents intentionally absent — pre-existing/legacy package data.
+          },
+        },
+      );
+      const customer = await createCustomer("dblF");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+      const result = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (result.status !== "confirmed") throw new Error("expected confirmed purchase");
+
+      const { financials } = result.booking;
+      expect(financials.serviceDiscountCents).toBe(0);
+      // NOT 15_000 - 1_500 = 13_500 — legacy packages get the same fix; there is no documented
+      // contract anywhere in the codebase for a different legacy semantics.
+      expect(financials.totalCents).toBe(15_000);
+    });
+  });
+
   // --- Redemption ------------------------------------------------------------------------------
 
   describe("Package session redemption", () => {
@@ -670,7 +908,11 @@ describe("database-backed Package Deal integration", () => {
     it("a PARTIAL venue payment still does not unlock redemption", async () => {
       const { owner, business, staff, customer, progress, purchase } =
         await setUpPurchasedPackage();
-      // Balance due is 45_000 - 3_500 = 41_500 — pay less than that.
+      // Balance due is 45_000 - 3_500 = 41_500 — pay less than that. Asserted explicitly (not
+      // just a comment) because this is exactly the total the pre-fix double-discount bug used
+      // to silently undercharge (see the "final charge equals bundlePriceCents exactly once"
+      // describe block above) — a regression here would previously have gone unnoticed.
+      expect(purchase.financials.balanceDueCents).toBe(41_500);
       await lifecycleService.completeBooking(
         String(owner._id),
         "BUSINESS_OWNER",

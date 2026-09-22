@@ -45,6 +45,12 @@ export type ServicePackagePricing = {
   sessionsInPackage: number;
   bundlePriceCents: number;
   discountPercent?: number | undefined;
+  /** Owner-entered "normal" per-session price, pre-discount. Optional/nullable — absent on
+   * every package Service created before this field existed (see service.schema.ts's
+   * packagePricingSchema superRefine for the bundlePriceCents <= normalTotal invariant this
+   * enables once present). Never used to change what the customer is charged — bundlePriceCents
+   * remains the sole authoritative booking price (booking-creation.service.ts). */
+  normalPricePerSessionCents?: number | undefined;
 };
 
 export type ServiceManualScheduleDay = {
@@ -141,6 +147,7 @@ const packagePricingSchema = new Schema<ServicePackagePricing>(
     sessionsInPackage: { type: Number, required: true, min: 1 },
     bundlePriceCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     discountPercent: { type: Number, min: 0, max: 100 },
+    normalPricePerSessionCents: { type: Number, min: 1, validate: Number.isInteger },
   },
   { _id: false },
 );

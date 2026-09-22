@@ -454,7 +454,7 @@ export class ServiceService {
       fixedPricing: body.fixedPricing,
       hourlyPricing: body.hourlyPricing,
       perPersonPricing: body.perPersonPricing,
-      packagePricing: body.packagePricing,
+      packagePricing: this.resolvePackagePricing(body.packagePricing),
       sessionExpiryAlert: body.sessionExpiryAlert ?? { enabled: false },
       scheduleMode: body.scheduleMode,
       manualSchedule: body.manualSchedule ?? [],
@@ -463,6 +463,29 @@ export class ServiceService {
         (id) => new Types.ObjectId(id),
       ),
     };
+  }
+
+  /**
+   * When the owner has entered `normalPricePerSessionCents`, `discountPercent` is never trusted
+   * verbatim from the request — it's recomputed canonically here from
+   * normalPricePerSessionCents x sessionsInPackage vs bundlePriceCents, rounded to 2 decimal
+   * places, so a stored package can never show a discount inconsistent with its own normal/bundle
+   * prices. Legacy packages (no normalPricePerSessionCents) pass their submitted discountPercent
+   * through unchanged — there's no normal price to compute a canonical value from.
+   */
+  private resolvePackagePricing(
+    packagePricing: ServicePackagePricing | undefined,
+  ): ServicePackagePricing | undefined {
+    if (!packagePricing || packagePricing.normalPricePerSessionCents === undefined) {
+      return packagePricing;
+    }
+
+    const normalTotalCents =
+      packagePricing.normalPricePerSessionCents * packagePricing.sessionsInPackage;
+    const savingsCents = normalTotalCents - packagePricing.bundlePriceCents;
+    const discountPercent = Math.round((savingsCents / normalTotalCents) * 10000) / 100;
+
+    return { ...packagePricing, discountPercent };
   }
 
   private async requireActiveCategory(

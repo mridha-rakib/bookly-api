@@ -1986,16 +1986,23 @@ export class BookingCreationService {
         throw new BookingError("BOOKING_PRICING_INPUT_INVALID", 400);
       }
 
+      // bundlePriceCents is ALREADY the final discounted package price the customer agreed to
+      // pay (see service.model.ts's own doc comment on packagePricing.normalPricePerSessionCents,
+      // and ServiceForm's "Bundle / discounted price" field) — unlike FIXED pricing's priceCents,
+      // which is a pre-discount base price that discountPercent legitimately reduces further.
+      // Applying discountCents here on top of bundlePriceCents would discount the package a
+      // SECOND time (bundlePriceCents was already discounted from the normal total when the
+      // Owner set it). discountPercent is still returned below — unaffected — as the
+      // serviceSnapshot's display/historical metadata; it deliberately does not feed
+      // `discountCents`, so assembleFinancials's `serviceDiscountCents` never touches a Package
+      // line's amount.
       const amountCents = pricing.bundlePriceCents;
-      const discountCents = pricing.discountPercent
-        ? Math.round((amountCents * pricing.discountPercent) / 100)
-        : 0;
 
       return {
         pricingMode: "PACKAGE",
         pricingInputSnapshot: {},
         amountCents,
-        discountCents,
+        discountCents: 0,
         ...(pricing.discountPercent !== undefined
           ? { discountPercent: pricing.discountPercent }
           : {}),

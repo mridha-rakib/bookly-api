@@ -1891,6 +1891,136 @@ describe("database-backed Service integration", () => {
       expect(invalid.status).toBe(400);
     });
 
+    it("computes a canonical discountPercent from normalPricePerSessionCents, ignoring any submitted discountPercent", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+
+      const packageService = await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({
+          serviceCategoryId: category.id,
+          isPackageDeal: true,
+          pricingMode: undefined,
+          fixedPricing: undefined,
+          packageServicesName: "Hair Treatment",
+          name: "3 Session Hair Treatment",
+          packagePricing: {
+            durationMin: 75,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000, // €150.00
+            normalPricePerSessionCents: 6_000, // €60.00/session -> €180.00 normal total
+            discountPercent: 10, // must be ignored/overwritten: real discount is 16.67%
+          },
+        }),
+      );
+
+      expect(packageService.packagePricing?.normalPricePerSessionCents).toBe(6_000);
+      expect(packageService.packagePricing?.discountPercent).toBeCloseTo(16.67, 2);
+    });
+
+    it("rejects a bundlePriceCents greater than the normal total when normalPricePerSessionCents is present", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+      const app = buildServicesApp();
+      const token = await bearerFor(user._id, "BUSINESS_OWNER");
+
+      const invalid = await request(app)
+        .post(`/businesses/${business._id}/services`)
+        .set("Authorization", token)
+        .send(
+          fixedServiceBody({
+            serviceCategoryId: category.id,
+            isPackageDeal: true,
+            pricingMode: undefined,
+            fixedPricing: undefined,
+            packageServicesName: "Hair Treatment",
+            packagePricing: {
+              durationMin: 75,
+              sessionsInPackage: 3,
+              bundlePriceCents: 20_000, // exceeds the €180 normal total below
+              normalPricePerSessionCents: 6_000,
+            },
+          }),
+        );
+      expect(invalid.status).toBe(400);
+    });
+
+    it("accepts a legacy package without normalPricePerSessionCents, leaving its discountPercent untouched", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+
+      const packageService = await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({
+          serviceCategoryId: category.id,
+          isPackageDeal: true,
+          pricingMode: undefined,
+          fixedPricing: undefined,
+          packageServicesName: "Hair Treatment",
+          name: "Legacy Package",
+          packagePricing: {
+            durationMin: 60,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            discountPercent: 10,
+          },
+        }),
+      );
+
+      expect(packageService.packagePricing?.normalPricePerSessionCents).toBeUndefined();
+      expect(packageService.packagePricing?.discountPercent).toBe(10);
+    });
+
+    it("preserves normalPricePerSessionCents through a full-replace update and recomputes discountPercent when it changes", async () => {
+      const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
+      const category = await createCategory(String(user._id), String(business._id));
+
+      const created = await serviceService.createService(
+        String(user._id),
+        String(business._id),
+        fixedServiceBody({
+          serviceCategoryId: category.id,
+          isPackageDeal: true,
+          pricingMode: undefined,
+          fixedPricing: undefined,
+          packageServicesName: "Hair Treatment",
+          name: "3 Session Hair Treatment",
+          packagePricing: {
+            durationMin: 75,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            normalPricePerSessionCents: 6_000,
+          },
+        }),
+      );
+      expect(created.packagePricing?.discountPercent).toBeCloseTo(16.67, 2);
+
+      const updated = await serviceService.updateService(
+        String(user._id),
+        String(business._id),
+        created.id,
+        fixedServiceBody({
+          serviceCategoryId: category.id,
+          isPackageDeal: true,
+          pricingMode: undefined,
+          fixedPricing: undefined,
+          packageServicesName: "Hair Treatment",
+          name: "3 Session Hair Treatment",
+          packagePricing: {
+            durationMin: 75,
+            sessionsInPackage: 3,
+            bundlePriceCents: 15_000,
+            normalPricePerSessionCents: 7_000, // normal total now €210
+          },
+        }) as unknown as UpdateServiceBody,
+      );
+
+      expect(updated.packagePricing?.normalPricePerSessionCents).toBe(7_000);
+      expect(updated.packagePricing?.discountPercent).toBeCloseTo(28.57, 2);
+    });
+
     it("rejects a payload that mixes isPackageDeal=true with FIXED/HOURLY/PER_PERSON fields", async () => {
       const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
       const category = await createCategory(String(user._id), String(business._id));
