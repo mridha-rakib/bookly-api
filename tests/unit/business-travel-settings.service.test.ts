@@ -380,4 +380,58 @@ describe("BusinessTravelSettingsService", () => {
 
     expect(business?.ownerUserId.equals(ownerUserId)).toBe(true);
   });
+
+  it("rejects updating travel settings for an AT_BUSINESS_LOCATION business", async () => {
+    const ownerUserId = new Types.ObjectId();
+    const business = buildBusiness({ ownerUserId, visitType: "AT_BUSINESS_LOCATION" });
+    const { service, travelSettingsRepository } = createService({ business });
+
+    await expect(
+      service.updateBusinessTravelSettings(String(ownerUserId), String(business._id), [
+        { city: "Larnaca", active: true, feeCents: 2000 },
+      ]),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      details: expect.arrayContaining([
+        expect.objectContaining({ code: "BUSINESS_TRAVEL_SETTINGS_NOT_APPLICABLE" }),
+      ]),
+    });
+    expect(travelSettingsRepository.upsertByBusinessId).not.toHaveBeenCalled();
+  });
+
+  it("rejects updates for a legacy 'location' visitType (normalizes to AT_BUSINESS_LOCATION)", async () => {
+    const ownerUserId = new Types.ObjectId();
+    const business = buildBusiness({
+      ownerUserId,
+      visitType: "location" as BusinessDocument["visitType"],
+    });
+    const { service, travelSettingsRepository } = createService({ business });
+
+    await expect(
+      service.updateBusinessTravelSettings(String(ownerUserId), String(business._id), [
+        { city: "Larnaca", active: true, feeCents: 2000 },
+      ]),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(travelSettingsRepository.upsertByBusinessId).not.toHaveBeenCalled();
+  });
+
+  it("allows updates for a legacy 'travel' visitType (normalizes to TRAVEL_TO_CUSTOMER)", async () => {
+    const ownerUserId = new Types.ObjectId();
+    const business = buildBusiness({
+      ownerUserId,
+      visitType: "travel" as BusinessDocument["visitType"],
+    });
+    const { service } = createService({ business });
+
+    const result = await service.updateBusinessTravelSettings(
+      String(ownerUserId),
+      String(business._id),
+      [{ city: "Larnaca", active: true, feeCents: 2000 }],
+    );
+
+    expect(result.cities.find((city) => city.city === "Larnaca")).toMatchObject({
+      active: true,
+      feeCents: 2000,
+    });
+  });
 });

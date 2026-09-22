@@ -7,6 +7,7 @@ import {
   type BusinessCity,
   type BusinessVisitType,
   businessCities,
+  normalizeBusinessVisitType,
 } from "../business/business.types.js";
 import type { BusinessAccessRepository } from "../business/business-access.repository.js";
 import { BusinessTravelSettingsError } from "./business-travel-settings.errors.js";
@@ -82,7 +83,8 @@ export class BusinessTravelSettingsService {
     businessId: string,
     cities: BusinessTravelCitySetting[],
   ): Promise<BusinessTravelSettingsDto> {
-    await this.requireOwnedBusiness(userId, businessId);
+    const business = await this.requireOwnedBusiness(userId, businessId);
+    this.requireTravelToCustomer(business);
     const settings = await this.businessTravelSettingsRepository.upsertByBusinessId(
       businessId,
       this.normalizeCitySettings(cities),
@@ -176,6 +178,17 @@ export class BusinessTravelSettingsService {
     }
 
     return business;
+  }
+
+  /** Travel settings only mean anything for a Business that travels to the customer — an
+   * AT_BUSINESS_LOCATION Business has no relevant city/fee configuration to write. Mirrors the
+   * same visitType check booking creation already applies at charge time (see
+   * BookingCreationService.requireTravelEligibilityAndFee), just enforced at the config-write
+   * boundary too so the write API can't be used to configure settings that could never apply. */
+  private requireTravelToCustomer(business: BusinessDocument): void {
+    if (normalizeBusinessVisitType(business.visitType) !== "TRAVEL_TO_CUSTOMER") {
+      throw new BusinessTravelSettingsError("BUSINESS_TRAVEL_SETTINGS_NOT_APPLICABLE", 400);
+    }
   }
 
   private requireValidObjectId(id: string): void {
