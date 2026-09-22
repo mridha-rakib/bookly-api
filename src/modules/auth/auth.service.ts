@@ -750,6 +750,9 @@ export class AuthService {
         status: user.status,
         emailVerifiedAt: user.emailVerifiedAt?.toISOString(),
         phoneVerifiedAt: user.phoneVerifiedAt?.toISOString(),
+        // Phase 1 — lets Settings render "Update Password" vs. the OAuth-only state without a
+        // separate request. Derived the same way as the phone-change PASSWORD-provider check.
+        hasPassword: resolveAuthProviders(user.authProviders).includes("PASSWORD"),
       },
       profile: profile
         ? {
@@ -867,11 +870,33 @@ export class AuthService {
     return this.getMe(userId);
   }
 
-  public async changeMyPassword(userId: string, input: ChangeMyPasswordBody): Promise<void> {
+  /**
+   * Phase 1 — Business Owner/Supervisor/Staff "Update Password" reuses this exact route/service
+   * for CUSTOMER and SUPER_ADMIN too (see auth.route.ts role gate). OAuth-only accounts (no
+   * PASSWORD provider) are rejected up front rather than falling through to a misleading
+   * "current password incorrect" — the frontend is expected to hide Update Password for those
+   * accounts entirely (via `hasPassword` on getMe), this is defence-in-depth.
+   *
+   * Phase 1 (session hardening) — on success, every OTHER active refresh session for this user is
+   * revoked (mirrors verifyEmailChange's revocation, but preserves the caller's own session where
+   * it can be identified — see TokenService.revokeOtherSessionsForUser). Same semantics for every
+   * role; this intentionally replaces the old CUSTOMER/SUPER_ADMIN "does not revoke" behavior.
+   * Unguarded/unwrapped, matching the existing verifyEmailChange convention: a revocation failure
+   * here propagates as a request error rather than silently reporting success.
+   */
+  public async changeMyPassword(
+    userId: string,
+    input: ChangeMyPasswordBody,
+    currentRefreshToken?: string,
+  ): Promise<void> {
     const user = await this.userRepository.findByIdWithPassword(userId);
 
     if (!user) {
       throw new AuthError("SESSION_EXPIRED", 401);
+    }
+
+    if (!resolveAuthProviders(user.authProviders).includes("PASSWORD")) {
+      throw new AuthError("PASSWORD_NOT_CONFIGURED", 400);
     }
 
     const isValid = await this.passwordHasher.verify(user.passwordHash, input.currentPassword);
@@ -880,8 +905,13 @@ export class AuthService {
       throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
     }
 
+    if (input.newPassword === input.currentPassword) {
+      throw new AuthError("NEW_PASSWORD_SAME_AS_CURRENT", 400);
+    }
+
     const passwordHash = await this.passwordHasher.hash(input.newPassword);
     await this.userRepository.updatePasswordHash(user._id, passwordHash);
+    await this.tokenService.revokeOtherSessionsForUser(user._id, currentRefreshToken);
   }
 
   /**

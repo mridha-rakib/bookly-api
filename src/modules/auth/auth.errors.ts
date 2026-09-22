@@ -26,6 +26,8 @@ const defaultMessages: Record<string, string> = {
   OTP_VERIFICATION_FAILED: "Verification check failed",
   PROVIDER_RATE_LIMITED: "Verification provider rate limit exceeded",
   INVALID_CURRENT_PASSWORD: "Current password is incorrect",
+  NEW_PASSWORD_SAME_AS_CURRENT: "New password must be different from your current password",
+  PASSWORD_NOT_CONFIGURED: "Password sign-in is not configured for this account",
   PHONE_ALREADY_REGISTERED: "This phone number is already registered to another account",
   INVALID_PHONE_NUMBER: "Please enter a valid mobile number",
   CONTACT_UNCHANGED: "That's already your current email or phone number",

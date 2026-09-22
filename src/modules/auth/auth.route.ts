@@ -466,13 +466,18 @@ export const createAuthRoute = (): Router => {
     validateRequest({ body: updateMyProfileBodySchema }),
     asyncHandler(controller.updateMe),
   );
-  // Phase 1 — Super Admin "Change Password" reuses this secure Argon2 verify+rehash path
-  // as-is (no session revocation, matching the existing behavior for CUSTOMER).
+  // Phase 1 — Super Admin "Change Password" reuses this secure Argon2 verify+rehash path.
+  // Phase 1 (Business Settings) extends the same route to BUSINESS_OWNER/SUPERVISOR/STAFF —
+  // acts on request.auth.userId only, never a client-supplied id.
+  // Phase 1 (session hardening) — on success every OTHER active refresh session for this user is
+  // revoked, same semantics for all five roles (see AuthService.changeMyPassword /
+  // TokenService.revokeOtherSessionsForUser). This intentionally replaces the earlier
+  // CUSTOMER/SUPER_ADMIN "does not revoke" behavior.
   router.patch(
     "/me/password",
     authenticate,
     requireActiveUser(),
-    requireRoles(["CUSTOMER", "SUPER_ADMIN"]),
+    requireRoles(["CUSTOMER", "SUPER_ADMIN", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"]),
     loginLimiter,
     validateRequest({ body: changeMyPasswordBodySchema }),
     asyncHandler(controller.changeMyPassword),

@@ -64,6 +64,17 @@ class InMemorySessionRepository {
       }
     }
   }
+
+  public async revokeAllForUserExcept(
+    userId: Types.ObjectId,
+    exceptSessionId: Types.ObjectId,
+  ): Promise<void> {
+    for (const session of this.sessions) {
+      if (session.userId.equals(userId) && !session._id.equals(exceptSessionId)) {
+        session.revokedAt = new Date();
+      }
+    }
+  }
 }
 
 describe("TokenService", () => {
@@ -95,6 +106,78 @@ describe("TokenService", () => {
     );
     await expect(service.rotateRefreshToken(theirs.refreshToken)).resolves.toMatchObject({
       userId: otherUserId,
+    });
+  });
+
+  // Phase 1 (session hardening) — password change revokes every OTHER session for the user
+  // while preserving the one identified by the caller's own refresh token.
+  describe("revokeOtherSessionsForUser", () => {
+    it("preserves the session matching the given current refresh token and revokes the rest", async () => {
+      const repository = new InMemorySessionRepository();
+      const service = new TokenService(repository);
+      const userId = new Types.ObjectId();
+      const current = await service.createRefreshSession({ userId });
+      const other1 = await service.createRefreshSession({ userId });
+      const other2 = await service.createRefreshSession({ userId });
+
+      await service.revokeOtherSessionsForUser(userId, current.refreshToken);
+
+      // Current session still rotates fine.
+      await expect(service.rotateRefreshToken(current.refreshToken)).resolves.toMatchObject({
+        userId,
+      });
+      // The others are revoked (reuse-detection on rotate).
+      await expect(service.rotateRefreshToken(other1.refreshToken)).rejects.toThrow(
+        "REFRESH_TOKEN_REUSED",
+      );
+      await expect(service.rotateRefreshToken(other2.refreshToken)).rejects.toThrow(
+        "REFRESH_TOKEN_REUSED",
+      );
+    });
+
+    it("does not touch another user's sessions", async () => {
+      const repository = new InMemorySessionRepository();
+      const service = new TokenService(repository);
+      const userId = new Types.ObjectId();
+      const otherUserId = new Types.ObjectId();
+      const current = await service.createRefreshSession({ userId });
+      const theirs = await service.createRefreshSession({ userId: otherUserId });
+
+      await service.revokeOtherSessionsForUser(userId, current.refreshToken);
+
+      await expect(service.rotateRefreshToken(theirs.refreshToken)).resolves.toMatchObject({
+        userId: otherUserId,
+      });
+    });
+
+    it("falls back to revoking every session (including the caller's) when no refresh token is given", async () => {
+      const repository = new InMemorySessionRepository();
+      const service = new TokenService(repository);
+      const userId = new Types.ObjectId();
+      const current = await service.createRefreshSession({ userId });
+      const other = await service.createRefreshSession({ userId });
+
+      await service.revokeOtherSessionsForUser(userId, undefined);
+
+      await expect(service.rotateRefreshToken(current.refreshToken)).rejects.toThrow(
+        "REFRESH_TOKEN_REUSED",
+      );
+      await expect(service.rotateRefreshToken(other.refreshToken)).rejects.toThrow(
+        "REFRESH_TOKEN_REUSED",
+      );
+    });
+
+    it("falls back to revoking every session when the given refresh token does not resolve to a live session", async () => {
+      const repository = new InMemorySessionRepository();
+      const service = new TokenService(repository);
+      const userId = new Types.ObjectId();
+      const other = await service.createRefreshSession({ userId });
+
+      await service.revokeOtherSessionsForUser(userId, "a-stale-or-unknown-refresh-token");
+
+      await expect(service.rotateRefreshToken(other.refreshToken)).rejects.toThrow(
+        "REFRESH_TOKEN_REUSED",
+      );
     });
   });
 
