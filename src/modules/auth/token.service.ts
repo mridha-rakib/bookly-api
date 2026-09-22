@@ -114,4 +114,29 @@ export class TokenService {
   public async revokeAllSessionsForUser(userId: Types.ObjectId): Promise<void> {
     await this.sessionRepository.revokeAllForUser(userId);
   }
+
+  /**
+   * Phase 1 (session hardening) — after a password change: revoke every OTHER active refresh
+   * session for this user, preserving the caller's own. `currentRefreshToken` is the raw value
+   * read from the httpOnly refresh cookie on THIS request (never a client-supplied id) — its hash
+   * is looked up the same way `/auth/refresh` resolves a session, so "current" is proven by
+   * possession of the cookie, not asserted by the client. Falls back to revoking every session
+   * (including the caller's) when the cookie is absent or doesn't resolve to a live session for
+   * this user — the safe default rather than leaving anything un-revoked.
+   */
+  public async revokeOtherSessionsForUser(
+    userId: Types.ObjectId,
+    currentRefreshToken?: string,
+  ): Promise<void> {
+    const current = currentRefreshToken
+      ? await this.sessionRepository.findByRefreshTokenHash(sha256(currentRefreshToken))
+      : null;
+
+    if (!current || !current.userId.equals(userId) || current.revokedAt) {
+      await this.sessionRepository.revokeAllForUser(userId);
+      return;
+    }
+
+    await this.sessionRepository.revokeAllForUserExcept(userId, current._id);
+  }
 }

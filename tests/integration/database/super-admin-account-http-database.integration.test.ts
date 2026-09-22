@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { createAuthRoute } from "../../../src/modules/auth/auth.route.js";
+import { sha256 } from "../../../src/modules/auth/auth.utils.js";
 import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -18,11 +19,13 @@ import {
 } from "./mongo-replset-helper.js";
 
 /**
- * Phase 1 — Super Admin Settings → Admin Account. Exercises the real /auth routes end to end
- * (auth middleware, the widened `requireRoles(["CUSTOMER", "SUPER_ADMIN"])` gate on PATCH
- * /auth/me and PATCH /auth/me/password, zod `.strict()` validation, the Argon2 verify+rehash
- * path). The whole point is proving the HTTP authorization boundary and persistence actually
- * hold — services are never called directly.
+ * Phase 1 — Super Admin Settings → Admin Account, plus (Phase 1, Business Settings) Business
+ * Owner/Supervisor/Staff "Update Password". Exercises the real /auth routes end to end (auth
+ * middleware, the `requireRoles(["CUSTOMER", "SUPER_ADMIN"])` gate on PATCH /auth/me, the wider
+ * `requireRoles(["CUSTOMER", "SUPER_ADMIN", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"])` gate on
+ * PATCH /auth/me/password, zod `.strict()` validation, the Argon2 verify+rehash path). The whole
+ * point is proving the HTTP authorization boundary and persistence actually hold — services are
+ * never called directly.
  */
 describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
   let userRepository: UserRepository;
@@ -55,6 +58,42 @@ describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
 
   const bearerFor = async (userId: Types.ObjectId | string, role: UserRole) =>
     `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+
+  const loginPathFor = (role: UserRole): string =>
+    role === "SUPER_ADMIN"
+      ? "/auth/super-admin/login"
+      : role === "CUSTOMER"
+        ? "/auth/customer/login"
+        : "/auth/professional/login";
+
+  const refreshCookieFrom = (response: request.Response): string => {
+    const setCookie = response.headers["set-cookie"] as unknown as string[] | undefined;
+    const cookie = setCookie?.find((value) => value.startsWith("bookly_refresh_token="));
+    if (!cookie) {
+      throw new Error("Expected a bookly_refresh_token Set-Cookie header");
+    }
+    return cookie;
+  };
+
+  /** Pulls the raw refresh-token value out of a `bookly_refresh_token=<value>; Path=...` cookie
+   * header string, mirroring how the app's own getRefreshTokenFromRequest parses it. */
+  const extractCookieValue = (setCookieHeader: string): string => {
+    const [pair] = setCookieHeader.split(";");
+    return (pair ?? "").split("=").slice(1).join("=");
+  };
+
+  /** Logs in for real over HTTP so the resulting refresh session is a genuine SessionModel row
+   * tied to a real refresh-token cookie, exactly like a browser session. */
+  const loginSession = async (app: express.Express, email: string, role: UserRole) => {
+    const response = await request(app)
+      .post(loginPathFor(role))
+      .send({ email, password: CURRENT_PASSWORD });
+    expect(response.status).toBe(200);
+    return {
+      accessToken: response.body.data.accessToken as string,
+      refreshCookie: refreshCookieFrom(response),
+    };
+  };
 
   const createUserWithProfile = async (
     role: UserRole,
@@ -101,6 +140,27 @@ describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
       fullName: "Georgino Mansour",
       defaultLanguage: "EN",
     });
+    // Phase 1 (Business Settings) — lets Settings → Security & 2FA render "Update Password" vs.
+    // the OAuth-only state without a separate request.
+    expect(response.body.data.user).toMatchObject({ hasPassword: true });
+  });
+
+  it("GET /auth/me reports hasPassword: false for an OAuth-only account", async () => {
+    const owner = await userRepository.create({
+      normalizedEmail: `oauth-only-${new Types.ObjectId().toString()}@example.com`,
+      authProviders: ["GOOGLE"],
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      emailVerifiedAt: new Date(),
+    });
+    const app = buildApp();
+
+    const response = await request(app)
+      .get("/auth/me")
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.user).toMatchObject({ hasPassword: false });
   });
 
   // --- Profile update -----------------------------------------------------------------------
@@ -208,33 +268,194 @@ describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
     expect(after?.passwordHash).toBe(before?.passwordHash);
   });
 
-  it("a Super Admin password change does NOT revoke the caller's other sessions (matches CUSTOMER behavior)", async () => {
+  // --- Session hardening (Phase 1 continuation) ------------------------------------------
+  //
+  // Supersedes the old "a Super Admin password change does NOT revoke the caller's other
+  // sessions" contract: password change is now a security-sensitive event that revokes every
+  // OTHER active refresh session for the account, while preserving the session that made the
+  // change (identified by the real refresh-token cookie on the request, never a client-supplied
+  // id). Same semantics for every role — no forking by CUSTOMER/SUPER_ADMIN/BUSINESS_OWNER/
+  // SUPERVISOR/STAFF.
+
+  it("PATCH /auth/me/password revokes another active session but preserves the caller's own (SUPER_ADMIN)", async () => {
     const admin = await createUserWithProfile("SUPER_ADMIN");
     const app = buildApp();
 
-    const login = await request(app)
-      .post("/auth/super-admin/login")
-      .send({ email: admin.normalizedEmail, password: CURRENT_PASSWORD });
-    expect(login.status).toBe(200);
-    const setCookie = login.headers["set-cookie"] as unknown as string[] | undefined;
-    const refreshCookie = setCookie?.[0] ?? "";
-    expect(refreshCookie).toContain("bookly_refresh_token=");
+    // Session A: the one that will perform the password change.
+    const sessionA = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    // Session B: a second, independent device/browser login for the same account.
+    const sessionB = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
 
     const changed = await request(app)
       .patch("/auth/me/password")
-      .set("Authorization", `Bearer ${login.body.data.accessToken}`)
+      .set("Authorization", `Bearer ${sessionA.accessToken}`)
+      .set("Cookie", sessionA.refreshCookie)
       .send({ currentPassword: CURRENT_PASSWORD, newPassword: "yet-another-password" });
     expect(changed.status).toBe(200);
 
-    // The pre-existing refresh session is still valid after the password change.
-    const refreshed = await request(app).post("/auth/refresh").set("Cookie", refreshCookie);
-    expect(refreshed.status).toBe(200);
-    expect(refreshed.body.data.user).toMatchObject({ id: String(admin._id), role: "SUPER_ADMIN" });
+    // Hard-assert the underlying SessionModel state BEFORE calling /auth/refresh — a refresh
+    // rotates (and marks revoked) the row it consumes as a normal side effect, which would
+    // otherwise be indistinguishable from the password-change revocation this test is proving.
+    const sessionRepository = new SessionRepository();
+    const rowA = await sessionRepository.findByRefreshTokenHash(
+      sha256(decodeURIComponent(extractCookieValue(sessionA.refreshCookie))),
+    );
+    expect(rowA?.revokedAt).toBeUndefined();
+    const rowB = await sessionRepository.findByRefreshTokenHash(
+      sha256(decodeURIComponent(extractCookieValue(sessionB.refreshCookie))),
+    );
+    expect(rowB?.revokedAt).toBeInstanceOf(Date);
+
+    // AFTER: Session A (the caller) can still refresh.
+    const refreshA = await request(app).post("/auth/refresh").set("Cookie", sessionA.refreshCookie);
+    expect(refreshA.status).toBe(200);
+    expect(refreshA.body.data.user).toMatchObject({ id: String(admin._id), role: "SUPER_ADMIN" });
+
+    // AFTER: Session B (the other device) is revoked and can no longer refresh.
+    const refreshB = await request(app).post("/auth/refresh").set("Cookie", sessionB.refreshCookie);
+    expect(refreshB.status).toBe(401);
   });
+
+  it("PATCH /auth/me/password revokes multiple other sessions and leaves an unrelated user's session untouched", async () => {
+    const admin = await createUserWithProfile("SUPER_ADMIN");
+    const otherAdmin = await createUserWithProfile("SUPER_ADMIN");
+    const app = buildApp();
+
+    const sessionA = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    const sessionB = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    const sessionC = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    // An unrelated user's own session must never be touched by admin's password change.
+    const otherUserSession = await loginSession(app, otherAdmin.normalizedEmail, "SUPER_ADMIN");
+
+    const changed = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", `Bearer ${sessionA.accessToken}`)
+      .set("Cookie", sessionA.refreshCookie)
+      .send({ currentPassword: CURRENT_PASSWORD, newPassword: "brand-new-password-2" });
+    expect(changed.status).toBe(200);
+
+    const refreshA = await request(app).post("/auth/refresh").set("Cookie", sessionA.refreshCookie);
+    expect(refreshA.status).toBe(200);
+
+    const refreshB = await request(app).post("/auth/refresh").set("Cookie", sessionB.refreshCookie);
+    expect(refreshB.status).toBe(401);
+
+    const refreshC = await request(app).post("/auth/refresh").set("Cookie", sessionC.refreshCookie);
+    expect(refreshC.status).toBe(401);
+
+    // The unrelated user's session is completely unaffected.
+    const refreshOther = await request(app)
+      .post("/auth/refresh")
+      .set("Cookie", otherUserSession.refreshCookie);
+    expect(refreshOther.status).toBe(200);
+    expect(refreshOther.body.data.user).toMatchObject({ id: String(otherAdmin._id) });
+  });
+
+  it("does not revoke any session when the current password is wrong, the new password is unchanged, or the account is OAuth-only", async () => {
+    const app = buildApp();
+
+    // Wrong current password.
+    const admin = await createUserWithProfile("SUPER_ADMIN");
+    const adminSession = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    const sessionRepository = new SessionRepository();
+    const adminSessionHash = sha256(
+      decodeURIComponent(extractCookieValue(adminSession.refreshCookie)),
+    );
+
+    const wrongCurrent = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", `Bearer ${adminSession.accessToken}`)
+      .set("Cookie", adminSession.refreshCookie)
+      .send({ currentPassword: "not-the-current-password", newPassword: "does-not-matter-1" });
+    expect(wrongCurrent.status).toBe(400);
+    // Asserted directly against the SessionModel row (not via /auth/refresh, which would rotate
+    // and consume the cookie as an unrelated side effect of the check itself).
+    expect(
+      (await sessionRepository.findByRefreshTokenHash(adminSessionHash))?.revokedAt,
+    ).toBeUndefined();
+
+    // Same new password as current.
+    const samePassword = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", `Bearer ${adminSession.accessToken}`)
+      .set("Cookie", adminSession.refreshCookie)
+      .send({ currentPassword: CURRENT_PASSWORD, newPassword: CURRENT_PASSWORD });
+    expect(samePassword.status).toBe(400);
+    expect(
+      (await sessionRepository.findByRefreshTokenHash(adminSessionHash))?.revokedAt,
+    ).toBeUndefined();
+
+    // OAuth-only account — PASSWORD_NOT_CONFIGURED, no session to begin with, request itself
+    // must not error trying to revoke anything.
+    const oauthOwner = await userRepository.create({
+      normalizedEmail: `oauth-only-${new Types.ObjectId().toString()}@example.com`,
+      authProviders: ["GOOGLE"],
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      emailVerifiedAt: new Date(),
+    });
+    const oauthRejected = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", await bearerFor(oauthOwner._id, "BUSINESS_OWNER"))
+      .send({ currentPassword: "anything", newPassword: "does-not-matter-2" });
+    expect(oauthRejected.status).toBe(400);
+  });
+
+  it("revoking sessions is idempotent against already-revoked/expired rows (no error)", async () => {
+    const admin = await createUserWithProfile("SUPER_ADMIN");
+    const app = buildApp();
+
+    const sessionA = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+    const sessionB = await loginSession(app, admin.normalizedEmail, "SUPER_ADMIN");
+
+    // Pre-revoke Session B by logging it out, so the password-change revocation runs against a
+    // user who already has a revoked row — this must not throw or change the response.
+    await request(app).post("/auth/logout").set("Cookie", sessionB.refreshCookie);
+
+    const changed = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", `Bearer ${sessionA.accessToken}`)
+      .set("Cookie", sessionA.refreshCookie)
+      .send({ currentPassword: CURRENT_PASSWORD, newPassword: "another-new-password-3" });
+    expect(changed.status).toBe(200);
+
+    const refreshA = await request(app).post("/auth/refresh").set("Cookie", sessionA.refreshCookie);
+    expect(refreshA.status).toBe(200);
+  });
+
+  // Phase 1 (session hardening) — same contract proven across every supported role; parameterized
+  // rather than duplicating the full multi-session assertions per role.
+  it.each(["CUSTOMER", "SUPER_ADMIN", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const)(
+    "PATCH /auth/me/password revokes other sessions but preserves the caller's own for %s",
+    async (role) => {
+      const user = await createUserWithProfile(role);
+      const app = buildApp();
+
+      const sessionA = await loginSession(app, user.normalizedEmail, role);
+      const sessionB = await loginSession(app, user.normalizedEmail, role);
+
+      const changed = await request(app)
+        .patch("/auth/me/password")
+        .set("Authorization", `Bearer ${sessionA.accessToken}`)
+        .set("Cookie", sessionA.refreshCookie)
+        .send({ currentPassword: CURRENT_PASSWORD, newPassword: `${role}-hardened-password` });
+      expect(changed.status).toBe(200);
+
+      const refreshA = await request(app)
+        .post("/auth/refresh")
+        .set("Cookie", sessionA.refreshCookie);
+      expect(refreshA.status).toBe(200);
+
+      const refreshB = await request(app)
+        .post("/auth/refresh")
+        .set("Cookie", sessionB.refreshCookie);
+      expect(refreshB.status).toBe(401);
+    },
+  );
 
   // --- Authorization boundary -----------------------------------------------------------
 
-  it("BUSINESS_OWNER / SUPERVISOR / STAFF cannot use the admin-account mutations (403)", async () => {
+  it("BUSINESS_OWNER / SUPERVISOR / STAFF cannot use the admin-account profile mutation (403)", async () => {
     const app = buildApp();
 
     for (const role of ["BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const) {
@@ -246,13 +467,54 @@ describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
         .set("Authorization", auth)
         .send({ firstName: "Nope" });
       expect(profile.status).toBe(403);
+    }
+  });
 
-      const password = await request(app)
+  // Phase 1 (Business Settings) — PATCH /auth/me/password is deliberately widened beyond
+  // CUSTOMER/SUPER_ADMIN to also allow BUSINESS_OWNER/SUPERVISOR/STAFF (Settings → Security &
+  // 2FA → Update Password). PATCH /auth/me (profile) stays CUSTOMER/SUPER_ADMIN-only, unchanged.
+  it("BUSINESS_OWNER / SUPERVISOR / STAFF can change their own password via the same route", async () => {
+    const app = buildApp();
+
+    for (const role of ["BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const) {
+      const user = await createUserWithProfile(role);
+      const auth = await bearerFor(user._id, role);
+
+      const wrongCurrent = await request(app)
         .patch("/auth/me/password")
         .set("Authorization", auth)
-        .send({ currentPassword: CURRENT_PASSWORD, newPassword: "nope-nope-nope" });
-      expect(password.status).toBe(403);
+        .send({ currentPassword: "not-the-current-password", newPassword: `${role}-new-password` });
+      expect(wrongCurrent.status).toBe(400);
+
+      const response = await request(app)
+        .patch("/auth/me/password")
+        .set("Authorization", auth)
+        .send({ currentPassword: CURRENT_PASSWORD, newPassword: `${role}-new-password` });
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(response.body)).not.toContain("passwordHash");
+
+      const after = await userRepository.findByIdWithPassword(user._id);
+      expect(await passwordHasher.verify(after?.passwordHash, `${role}-new-password`)).toBe(true);
     }
+  });
+
+  it("PATCH /auth/me/password rejects an OAuth-only account with no password configured", async () => {
+    const owner = await userRepository.create({
+      normalizedEmail: `oauth-only-${new Types.ObjectId().toString()}@example.com`,
+      authProviders: ["GOOGLE"],
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      emailVerifiedAt: new Date(),
+    });
+    const app = buildApp();
+
+    const response = await request(app)
+      .patch("/auth/me/password")
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send({ currentPassword: "anything", newPassword: "does-not-matter-1" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.errors?.[0]?.code).toBe("PASSWORD_NOT_CONFIGURED");
   });
 
   it("an unauthenticated request cannot touch the admin-account mutations (401)", async () => {

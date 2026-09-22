@@ -120,6 +120,7 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     rotateRefreshToken: vi.fn(),
     revokeRefreshToken: vi.fn(),
     revokeAllSessionsForUser: vi.fn(),
+    revokeOtherSessionsForUser: vi.fn(),
     ...(overrides["tokenService"] as object | undefined),
   };
   const staffRepository = {
@@ -862,11 +863,48 @@ describe("AuthService.updateMyAvatar", () => {
 });
 
 describe("AuthService.changeMyPassword", () => {
-  it("verifies the current password and stores the new hash", async () => {
+  it("verifies the current password, stores the new hash, and revokes other sessions", async () => {
     const userId = new Types.ObjectId();
-    const { service, userRepository, passwordHasher } = createAuthService({
+    const { service, userRepository, passwordHasher, tokenService } = createAuthService({
       userRepository: {
-        findByIdWithPassword: vi.fn().mockResolvedValue({ _id: userId, passwordHash: "old-hash" }),
+        findByIdWithPassword: vi.fn().mockResolvedValue({
+          _id: userId,
+          passwordHash: "old-hash",
+          authProviders: ["PASSWORD"],
+        }),
+      },
+      passwordHasher: {
+        verify: vi.fn().mockResolvedValue(true),
+        hash: vi.fn().mockResolvedValue("new-hash"),
+      },
+    });
+
+    await service.changeMyPassword(
+      userId.toHexString(),
+      { currentPassword: "old-password", newPassword: "new-password" },
+      "the-current-refresh-token",
+    );
+
+    expect(passwordHasher.verify).toHaveBeenCalledWith("old-hash", "old-password");
+    expect(passwordHasher.hash).toHaveBeenCalledWith("new-password");
+    expect(userRepository.updatePasswordHash).toHaveBeenCalledWith(userId, "new-hash");
+    // Phase 1 (session hardening) — replaces the old CUSTOMER/SUPER_ADMIN "does not revoke"
+    // behavior; the raw refresh token is forwarded so the caller's own session can be preserved.
+    expect(tokenService.revokeOtherSessionsForUser).toHaveBeenCalledWith(
+      userId,
+      "the-current-refresh-token",
+    );
+  });
+
+  it("still revokes other sessions when no refresh cookie was present on the request", async () => {
+    const userId = new Types.ObjectId();
+    const { service, tokenService } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({
+          _id: userId,
+          passwordHash: "old-hash",
+          authProviders: ["PASSWORD"],
+        }),
       },
       passwordHasher: {
         verify: vi.fn().mockResolvedValue(true),
@@ -879,16 +917,18 @@ describe("AuthService.changeMyPassword", () => {
       newPassword: "new-password",
     });
 
-    expect(passwordHasher.verify).toHaveBeenCalledWith("old-hash", "old-password");
-    expect(passwordHasher.hash).toHaveBeenCalledWith("new-password");
-    expect(userRepository.updatePasswordHash).toHaveBeenCalledWith(userId, "new-hash");
+    expect(tokenService.revokeOtherSessionsForUser).toHaveBeenCalledWith(userId, undefined);
   });
 
-  it("rejects an incorrect current password without touching the stored hash", async () => {
+  it("rejects an incorrect current password without touching the stored hash or any session", async () => {
     const userId = new Types.ObjectId();
-    const { service, userRepository } = createAuthService({
+    const { service, userRepository, tokenService } = createAuthService({
       userRepository: {
-        findByIdWithPassword: vi.fn().mockResolvedValue({ _id: userId, passwordHash: "old-hash" }),
+        findByIdWithPassword: vi.fn().mockResolvedValue({
+          _id: userId,
+          passwordHash: "old-hash",
+          authProviders: ["PASSWORD"],
+        }),
       },
       passwordHasher: { verify: vi.fn().mockResolvedValue(false) },
     });
@@ -900,6 +940,53 @@ describe("AuthService.changeMyPassword", () => {
       }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(userRepository.updatePasswordHash).not.toHaveBeenCalled();
+    expect(tokenService.revokeOtherSessionsForUser).not.toHaveBeenCalled();
+  });
+
+  it("rejects a new password identical to the current password without revoking any session", async () => {
+    const userId = new Types.ObjectId();
+    const { service, userRepository, tokenService } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({
+          _id: userId,
+          passwordHash: "old-hash",
+          authProviders: ["PASSWORD"],
+        }),
+      },
+      passwordHasher: { verify: vi.fn().mockResolvedValue(true) },
+    });
+
+    await expect(
+      service.changeMyPassword(userId.toHexString(), {
+        currentPassword: "same-password",
+        newPassword: "same-password",
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(userRepository.updatePasswordHash).not.toHaveBeenCalled();
+    expect(tokenService.revokeOtherSessionsForUser).not.toHaveBeenCalled();
+  });
+
+  it("rejects the request for an OAuth-only account with no password provider, revoking nothing", async () => {
+    const userId = new Types.ObjectId();
+    const { service, userRepository, passwordHasher, tokenService } = createAuthService({
+      userRepository: {
+        findByIdWithPassword: vi.fn().mockResolvedValue({
+          _id: userId,
+          passwordHash: undefined,
+          authProviders: ["GOOGLE"],
+        }),
+      },
+    });
+
+    await expect(
+      service.changeMyPassword(userId.toHexString(), {
+        currentPassword: "anything",
+        newPassword: "new-password",
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(passwordHasher.verify).not.toHaveBeenCalled();
+    expect(userRepository.updatePasswordHash).not.toHaveBeenCalled();
+    expect(tokenService.revokeOtherSessionsForUser).not.toHaveBeenCalled();
   });
 });
 

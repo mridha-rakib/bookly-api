@@ -216,9 +216,13 @@ export class AuthController {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
+    // Phase 1 (session hardening) — the raw refresh cookie value on THIS request lets the
+    // service preserve the caller's own session while revoking every other one; see
+    // TokenService.revokeOtherSessionsForUser.
     await this.authService.changeMyPassword(
       userId,
       request.validated?.body as ChangeMyPasswordBody,
+      getRefreshTokenFromRequest(request),
     );
     sendSuccess(response, 200, "Password changed");
   };

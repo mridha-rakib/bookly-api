@@ -47,6 +47,20 @@ export class SessionRepository {
     );
   }
 
+  /** Phase 1 (session hardening) — used after a password change to revoke every OTHER active
+   * refresh session while preserving the caller's own, already-identified one. Same
+   * `revokedAt`-marking convention as revokeAllForUser (idempotent against already-revoked/
+   * expired rows via the same guard); never touches another user's sessions. */
+  public async revokeAllForUserExcept(
+    userId: Types.ObjectId,
+    exceptSessionId: Types.ObjectId,
+  ): Promise<void> {
+    await SessionModel.updateMany(
+      { userId, _id: { $ne: exceptSessionId }, revokedAt: { $exists: false } },
+      { $set: { revokedAt: new Date() } },
+    );
+  }
+
   public async rotate(
     oldSession: SessionDocument,
     refreshTokenHash: string,
