@@ -116,8 +116,28 @@ const packagePricingSchema = z
     sessionsInPackage: positiveIntSchema,
     bundlePriceCents: centsSchema,
     discountPercent: discountPercentSchema.optional(),
+    // Optional/nullable owner-entered "normal" per-session price — absent on every package
+    // Service created before this field existed. When present, the bundle price can never
+    // exceed sessionsInPackage x this value (no package markups); discountPercent itself is
+    // recomputed canonically from these three fields server-side (see service.service.ts's
+    // buildServiceFields), never trusted verbatim from the request.
+    normalPricePerSessionCents: positiveIntSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.normalPricePerSessionCents === undefined) {
+      return;
+    }
+    const normalTotalCents = value.normalPricePerSessionCents * value.sessionsInPackage;
+    if (value.bundlePriceCents > normalTotalCents) {
+      context.addIssue({
+        code: "custom",
+        path: ["bundlePriceCents"],
+        message:
+          "Bundle price cannot exceed the normal total (normal price per session x sessions)",
+      });
+    }
+  });
 
 // --- Manual schedule -----------------------------------------------------------------------
 
