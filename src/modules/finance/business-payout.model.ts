@@ -71,6 +71,27 @@ export type BusinessPayoutDocument = {
    * reference). */
   providerReference?: string | undefined;
   paidAt?: Date | undefined;
+  /**
+   * Batch — Payout Destination snapshot. A point-in-time copy of the SAFE metadata of the
+   * BusinessPayoutDestination that was current at confirm time, so a payout row stays a faithful
+   * record of where the money was sent even after the Business later edits its bank details.
+   *
+   * All five fields are OPTIONAL purely for backward compatibility with payout rows written
+   * before this existed — no existing field was removed or renamed. Going forward every new
+   * payout has them, because `executePayout` now REJECTS a payout with no configured destination
+   * before it claims any ledger row.
+   *
+   * Deliberately NOT stored: the IBAN, the ciphertext, the IV, the auth tag, the key version.
+   * A payout row is read in many more places than the destination record is, and none of them
+   * needs the account number — the last 4 + country + holder name are enough to reconcile a
+   * transfer against a bank statement. A Super Admin who needs the full IBAN uses the explicit,
+   * rate-limited, audited reveal endpoint against the CURRENT destination record.
+   */
+  destinationId?: Types.ObjectId | undefined;
+  destinationLast4?: string | undefined;
+  destinationCountry?: string | undefined;
+  destinationBankName?: string | undefined;
+  destinationAccountHolderName?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -97,6 +118,13 @@ const businessPayoutSchema = new Schema<BusinessPayoutDocument>(
     initiatedByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     providerReference: { type: String, trim: true },
     paidAt: { type: Date },
+    // Safe destination snapshot — see the doc comment on these fields in the type above. No
+    // ciphertext/IV/auth-tag/key-version, and never the IBAN itself.
+    destinationId: { type: Schema.Types.ObjectId, ref: "BusinessPayoutDestination" },
+    destinationLast4: { type: String },
+    destinationCountry: { type: String, uppercase: true },
+    destinationBankName: { type: String, trim: true },
+    destinationAccountHolderName: { type: String, trim: true },
   },
   { timestamps: true },
 );

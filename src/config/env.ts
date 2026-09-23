@@ -555,6 +555,11 @@ export const env = createEnv({
     AUTH_REFRESH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(30),
     BUSINESS_LINK_OTP_SEND_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
     BUSINESS_LINK_OTP_SEND_PER_EMAIL_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+    // Super Admin "reveal payout IBAN" — the one endpoint in the app that returns a decrypted
+    // bank account number, so it gets its own deliberately small per-IP budget (same
+    // express-rate-limit factory/options shape as authRateLimit, 15-minute window) rather than
+    // relying on the generic global limiter. Never unlimited.
+    SUPER_ADMIN_PAYOUT_REVEAL_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
     // Batch 15B — the public Contact form's message recipient. Optional: when unset, the Contact
     // flow falls back to the same EMAIL_FROM/RESEND_FROM_EMAIL address the OTP provider already
     // sends FROM (see support/contact.controller.ts) rather than requiring a brand-new mandatory
@@ -599,6 +604,26 @@ export const env = createEnv({
           context.addIssue({
             code: "custom",
             message: "GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY is required in production",
+          });
+        }
+      }),
+    // 32-byte AES-256-GCM key, hex-encoded (64 hex chars) — encrypts Business payout-destination
+    // IBANs at rest (modules/payout-destination). Same optional-in-dev / required-in-production
+    // shape as GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY above, but a SEPARATE key: a payout IBAN and
+    // a Google OAuth token have different blast radii and must never share key material.
+    // The `_V1` suffix is the key VERSION — every encrypted record stores `ibanKeyVersion: 1`,
+    // and decryption resolves the key by that stored version (see payout-destination.crypto.ts),
+    // so a future rotation adds `..._V2` here without needing to re-encrypt existing rows.
+    // Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+    PAYOUT_DESTINATION_ENCRYPTION_KEY_V1: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i, "must be a 64-character hex string (32 bytes)")
+      .optional()
+      .superRefine((value, context) => {
+        if (rawNodeEnv === "production" && !value) {
+          context.addIssue({
+            code: "custom",
+            message: "PAYOUT_DESTINATION_ENCRYPTION_KEY_V1 is required in production",
           });
         }
       }),

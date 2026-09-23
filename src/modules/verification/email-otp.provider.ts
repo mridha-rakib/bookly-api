@@ -14,7 +14,8 @@ export type EmailOtpPurpose =
   | "REGISTRATION"
   | "BUSINESS_LINK"
   | "STAFF_TEMP_PASSWORD"
-  | "EMAIL_CHANGE";
+  | "EMAIL_CHANGE"
+  | "PAYOUT_DESTINATION_CHANGE";
 
 export interface EmailOtpProvider {
   /**
@@ -62,6 +63,17 @@ const buildLegacyOtpContent = (
       subject: "Verify your new Bookly email address",
       heading: "Verify your new email address",
       text: `Enter this code in Bookly to confirm your new email address: ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes. If you didn't request this, you can safely ignore this email.`,
+    };
+  }
+
+  if (purpose === "PAYOUT_DESTINATION_CHANGE") {
+    return {
+      subject: "Confirm your Bookly payout bank details change",
+      heading: "Confirm your payout bank details change",
+      // Deliberately carries NO bank details of any kind (no IBAN, no last 4, no account holder
+      // name) — only the code. This email exists purely to prove mailbox control for an
+      // OAuth-only Business Owner who has no password to step up with.
+      text: `Confirm this code to update your payout bank details: ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes. If you didn't request this, ignore this email.`,
     };
   }
 
