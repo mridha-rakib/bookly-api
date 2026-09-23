@@ -171,7 +171,10 @@ function wireStandardOpenSchedule(
     buildSchedule(
       staff._id,
       business._id,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     ),
   ]);
 }
@@ -243,7 +246,7 @@ describe("AvailabilityService — slot generation (AUTO)", () => {
     // separately below).
     harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
       buildSchedule(staff._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "20:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "20:00" }] },
       ]),
     ]);
 
@@ -472,7 +475,7 @@ describe("AvailabilityService — staff intersection", () => {
     // fits; the next candidate (10:00-11:00) would need the shift to extend to 11:00.
     harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
       buildSchedule(staff._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "10:30" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "10:30" }] },
       ]),
     ]);
 
@@ -503,7 +506,7 @@ describe("AvailabilityService — staff intersection", () => {
     );
     harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
       buildSchedule(staff._id, business._id, [
-        { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "18:00" },
+        { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "18:00" }] },
       ]),
     ]);
 
@@ -551,6 +554,248 @@ describe("AvailabilityService — staff intersection", () => {
     expect(result.days[0]!.slots).toEqual([]);
   });
 
+  describe("split-shift Staff intervals (multiple working intervals per day)", () => {
+    it("offers slots inside EACH interval of a split shift, but never bridges the break between them", async () => {
+      const harness = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id);
+      const service = buildFixedService(business._id, [staff._id], {
+        fixedPricing: { priceCents: 2000, durationMin: 60, bookingIntervalMin: 60 },
+      });
+
+      harness.businessRepository.findById.mockResolvedValue(business);
+      harness.serviceRepository.findById.mockResolvedValue(service);
+      harness.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+      // Business is open the whole day; the staff member's OWN schedule is the split shift
+      // under test: 09:00-13:00 and 14:00-17:00, with a 13:00-14:00 break between them.
+      harness.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(business._id, [
+          { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+      harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(staff._id, business._id, [
+          {
+            dayOfWeek: "TUESDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ]),
+      ]);
+
+      const result = await harness.service.getAvailability({
+        businessId: String(business._id),
+        serviceId: String(service._id),
+        fromDate: "2026-08-25",
+        toDate: "2026-08-25",
+      });
+
+      // 12:00-13:00 fits fully inside the first interval; 13:00-14:00 would bridge the
+      // break and must never appear; 14:00-15:00 and later fit the second interval.
+      expect(result.days[0]!.slots.map((s) => s.startAt)).toEqual([
+        "2026-08-25T06:00:00.000Z", // 09:00
+        "2026-08-25T07:00:00.000Z", // 10:00
+        "2026-08-25T08:00:00.000Z", // 11:00
+        "2026-08-25T09:00:00.000Z", // 12:00
+        "2026-08-25T11:00:00.000Z", // 14:00
+        "2026-08-25T12:00:00.000Z", // 15:00
+        "2026-08-25T13:00:00.000Z", // 16:00
+      ]);
+    });
+
+    it("rejects a candidate whose occupied window (duration+buffer+processing) crosses the gap between intervals", async () => {
+      const harness = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id);
+      // 45-minute service with a 30-minute buffer: occupiedMin=75. A 12:30 start would need
+      // to occupy until 13:45, which crosses straight through the 13:00-14:00 break.
+      const service = buildFixedService(business._id, [staff._id], {
+        fixedPricing: {
+          priceCents: 2000,
+          durationMin: 45,
+          bufferAfterMin: 30,
+          bookingIntervalMin: 30,
+        },
+      });
+
+      harness.businessRepository.findById.mockResolvedValue(business);
+      harness.serviceRepository.findById.mockResolvedValue(service);
+      harness.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+      harness.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(business._id, [
+          { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+      harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(staff._id, business._id, [
+          {
+            dayOfWeek: "TUESDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ]),
+      ]);
+
+      const result = await harness.service.getAvailability({
+        businessId: String(business._id),
+        serviceId: String(service._id),
+        fromDate: "2026-08-25",
+        toDate: "2026-08-25",
+      });
+
+      const starts = result.days[0]!.slots.map((s) => s.startAt);
+      // Candidates step every 30min from 09:00 local. 11:30 occupies 11:30-12:45 — fully
+      // inside the first interval [09:00,13:00) — and must be offered.
+      expect(starts).toContain("2026-08-25T08:30:00.000Z"); // 11:30 local
+      // 12:00 would occupy 12:00-13:15, crossing straight through the 13:00-14:00 break —
+      // must NEVER be offered even though 12:00 itself is still inside the first interval.
+      expect(starts).not.toContain("2026-08-25T09:00:00.000Z"); // 12:00 local
+      // 12:30 would occupy 12:30-13:45 — also crosses the break — must never be offered.
+      expect(starts).not.toContain("2026-08-25T09:30:00.000Z"); // 12:30 local
+      // 13:00/13:30 fall entirely inside the break itself (no interval covers them at all).
+      expect(starts).not.toContain("2026-08-25T10:00:00.000Z"); // 13:00 local
+      expect(starts).not.toContain("2026-08-25T10:30:00.000Z"); // 13:30 local
+      // 14:00 is the first candidate that fits inside the second interval and must reappear.
+      expect(starts).toContain("2026-08-25T11:00:00.000Z"); // 14:00 local
+    });
+
+    it("assertSlotIsBookable (the shared write-time gate) rejects a booking that bridges the gap between two intervals", async () => {
+      const harness = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id);
+      const service = buildFixedService(business._id, [staff._id], {
+        fixedPricing: { priceCents: 2000, durationMin: 60 },
+      });
+
+      harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(staff._id, business._id, [
+          {
+            dayOfWeek: "TUESDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ]),
+      ]);
+      harness.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(business._id, [
+          { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+
+      // 12:30-13:30 UTC-local (Europe/Nicosia is UTC+3 in August) bridges the 13:00-14:00 gap.
+      const startAt = new Date("2026-08-25T09:30:00.000Z"); // 12:30 local
+      const endAt = new Date("2026-08-25T10:30:00.000Z"); // 13:30 local
+
+      await expect(
+        harness.service.assertSlotIsBookable({
+          business,
+          service,
+          staffMembership: staff,
+          startAt,
+          endAt,
+          partySize: 1,
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("assertSlotIsBookable accepts a booking that fits entirely inside the second interval of a split shift", async () => {
+      const harness = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id);
+      const service = buildFixedService(business._id, [staff._id], {
+        fixedPricing: { priceCents: 2000, durationMin: 60 },
+      });
+
+      harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(staff._id, business._id, [
+          {
+            dayOfWeek: "TUESDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ]),
+      ]);
+      harness.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(business._id, [
+          { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+
+      const startAt = new Date("2026-08-25T11:00:00.000Z"); // 14:00 local
+      const endAt = new Date("2026-08-25T12:00:00.000Z"); // 15:00 local
+
+      const result = await harness.service.assertSlotIsBookable({
+        business,
+        service,
+        staffMembership: staff,
+        startAt,
+        endAt,
+        partySize: 1,
+      });
+
+      expect(result).toEqual({ capacityMax: 1 });
+    });
+
+    it("a staff member on full-day time off is excluded even when a split shift is configured", async () => {
+      const harness = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id);
+      const service = buildFixedService(business._id, [staff._id], {
+        fixedPricing: { priceCents: 2000, durationMin: 60 },
+      });
+
+      harness.businessRepository.findById.mockResolvedValue(business);
+      harness.serviceRepository.findById.mockResolvedValue(service);
+      harness.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+      harness.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(business._id, [
+          { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+      harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(staff._id, business._id, [
+          {
+            dayOfWeek: "TUESDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ]),
+      ]);
+      harness.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange.mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          membershipId: staff._id,
+          businessId: business._id,
+          type: "ANNUAL_HOLIDAY",
+          startDate: "2026-08-25",
+          endDate: "2026-08-25",
+          createdByUserId: new Types.ObjectId(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        } satisfies StaffTimeOffDocument,
+      ]);
+
+      const result = await harness.service.getAvailability({
+        businessId: String(business._id),
+        serviceId: String(service._id),
+        fromDate: "2026-08-25",
+        toDate: "2026-08-25",
+      });
+
+      expect(result.days[0]!.slots).toEqual([]);
+    });
+  });
+
   it("with two eligible staff, offers a slot with both listed if only one is busy elsewhere", async () => {
     const harness = buildHarness();
     const business = buildBusiness();
@@ -570,10 +815,10 @@ describe("AvailabilityService — staff intersection", () => {
     );
     harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
       buildSchedule(staffA._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "10:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "10:00" }] },
       ]),
       buildSchedule(staffB._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "10:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "10:00" }] },
       ]),
     ]);
 
@@ -1054,10 +1299,10 @@ describe("AvailabilityService — business/service/staff resolution", () => {
     );
     harness.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
       buildSchedule(activeStaff._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "10:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "10:00" }] },
       ]),
       buildSchedule(inactiveStaff._id, business._id, [
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "10:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "10:00" }] },
       ]),
     ]);
 

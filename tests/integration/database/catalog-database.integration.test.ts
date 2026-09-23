@@ -231,7 +231,10 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     await staffScheduleRepository.replace(
       membershipId,
       businessId,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     );
   };
 

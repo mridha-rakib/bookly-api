@@ -79,19 +79,57 @@ describe("staff.schema", () => {
       expect(
         putStaffScheduleBodySchema.safeParse({
           days: [
-            { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" },
-            { dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" },
-            { dayOfWeek: "WEDNESDAY", startTime: "08:30", endTime: "16:00" },
+            { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+            { dayOfWeek: "TUESDAY", intervals: [{ startTime: "10:00", endTime: "18:00" }] },
+            { dayOfWeek: "WEDNESDAY", intervals: [{ startTime: "08:30", endTime: "16:00" }] },
           ],
         }).success,
       ).toBe(true);
     });
 
-    it("rejects a second interval for the same day (one shift per day)", () => {
+    it("accepts a day with an empty intervals array (no hours configured)", () => {
+      expect(
+        putStaffScheduleBodySchema.safeParse({
+          days: [{ dayOfWeek: "MONDAY", intervals: [] }],
+        }).success,
+      ).toBe(true);
+    });
+
+    it("accepts multiple non-overlapping intervals for the same day (split shift)", () => {
       const result = putStaffScheduleBodySchema.safeParse({
         days: [
-          { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "13:00" },
-          { dayOfWeek: "MONDAY", startTime: "15:00", endTime: "19:00" },
+          {
+            dayOfWeek: "MONDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "14:00", endTime: "17:00" },
+            ],
+          },
+        ],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects overlapping intervals within the same day", () => {
+      const result = putStaffScheduleBodySchema.safeParse({
+        days: [
+          {
+            dayOfWeek: "MONDAY",
+            intervals: [
+              { startTime: "09:00", endTime: "13:00" },
+              { startTime: "12:00", endTime: "17:00" },
+            ],
+          },
+        ],
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects a duplicate weekday entry", () => {
+      const result = putStaffScheduleBodySchema.safeParse({
+        days: [
+          { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "13:00" }] },
+          { dayOfWeek: "MONDAY", intervals: [{ startTime: "15:00", endTime: "19:00" }] },
         ],
       });
       expect(result.success).toBe(false);
@@ -100,12 +138,12 @@ describe("staff.schema", () => {
     it("rejects start >= end", () => {
       expect(
         putStaffScheduleBodySchema.safeParse({
-          days: [{ dayOfWeek: "MONDAY", startTime: "17:00", endTime: "09:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "17:00", endTime: "09:00" }] }],
         }).success,
       ).toBe(false);
       expect(
         putStaffScheduleBodySchema.safeParse({
-          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "09:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "09:00" }] }],
         }).success,
       ).toBe(false);
     });
@@ -114,7 +152,7 @@ describe("staff.schema", () => {
       for (const badTime of ["9:00 AM", "9:00", "25:00", "09:60", "noon", ""]) {
         expect(
           putStaffScheduleBodySchema.safeParse({
-            days: [{ dayOfWeek: "MONDAY", startTime: badTime, endTime: "17:00" }],
+            days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: badTime, endTime: "17:00" }] }],
           }).success,
         ).toBe(false);
       }
@@ -123,7 +161,7 @@ describe("staff.schema", () => {
     it("rejects an invalid day of week", () => {
       expect(
         putStaffScheduleBodySchema.safeParse({
-          days: [{ dayOfWeek: "FUNDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "FUNDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
         }).success,
       ).toBe(false);
     });
@@ -131,10 +169,25 @@ describe("staff.schema", () => {
     it("caps at 7 days", () => {
       const eightDays = Array.from({ length: 8 }, () => ({
         dayOfWeek: "MONDAY",
-        startTime: "09:00",
-        endTime: "17:00",
+        intervals: [{ startTime: "09:00", endTime: "17:00" }],
       }));
       expect(putStaffScheduleBodySchema.safeParse({ days: eightDays }).success).toBe(false);
+    });
+
+    it("allows a weekday with only an empty intervals entry to also be in offDays", () => {
+      const result = putStaffScheduleBodySchema.safeParse({
+        days: [{ dayOfWeek: "MONDAY", intervals: [] }],
+        offDays: ["MONDAY"],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects a weekday with a working interval also listed in offDays", () => {
+      const result = putStaffScheduleBodySchema.safeParse({
+        days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
+        offDays: ["MONDAY"],
+      });
+      expect(result.success).toBe(false);
     });
   });
 

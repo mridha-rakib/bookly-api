@@ -247,7 +247,10 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     await staffScheduleRepository.replace(
       membershipId,
       businessId,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     );
   };
 

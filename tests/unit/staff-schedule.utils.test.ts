@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatCanonicalTime12Hour,
+  intervalsOverlap,
   isValidCanonicalTime,
   minutesSinceMidnight,
+  normalizeScheduleIntervals,
   parseTo12HourCanonical,
 } from "../../src/modules/staff/staff-schedule.utils.js";
 
@@ -77,6 +79,83 @@ describe("staff-schedule.utils", () => {
       expect(() => parseTo12HourCanonical(13, 0, "AM")).toThrow();
       expect(() => parseTo12HourCanonical(9, 60, "AM")).toThrow();
       expect(() => parseTo12HourCanonical(9, -1, "AM")).toThrow();
+    });
+  });
+
+  describe("intervalsOverlap", () => {
+    it("detects any shared minute as an overlap", () => {
+      expect(
+        intervalsOverlap(
+          { startTime: "09:00", endTime: "13:00" },
+          { startTime: "12:00", endTime: "17:00" },
+        ),
+      ).toBe(true);
+      expect(
+        intervalsOverlap(
+          { startTime: "09:00", endTime: "13:00" },
+          { startTime: "13:00", endTime: "17:00" },
+        ),
+      ).toBe(false); // exactly-contiguous is not an overlap
+      expect(
+        intervalsOverlap(
+          { startTime: "09:00", endTime: "13:00" },
+          { startTime: "14:00", endTime: "17:00" },
+        ),
+      ).toBe(false);
+    });
+  });
+
+  describe("normalizeScheduleIntervals", () => {
+    it("sorts intervals ascending by start time", () => {
+      const result = normalizeScheduleIntervals([
+        { startTime: "14:00", endTime: "17:00" },
+        { startTime: "09:00", endTime: "13:00" },
+      ]);
+      expect(result).toEqual([
+        { startTime: "09:00", endTime: "13:00" },
+        { startTime: "14:00", endTime: "17:00" },
+      ]);
+    });
+
+    it("merges exactly-contiguous intervals into one", () => {
+      const result = normalizeScheduleIntervals([
+        { startTime: "09:00", endTime: "13:00" },
+        { startTime: "13:00", endTime: "17:00" },
+      ]);
+      expect(result).toEqual([{ startTime: "09:00", endTime: "17:00" }]);
+    });
+
+    it("leaves genuinely separate (gap) intervals apart — a break is preserved, not merged", () => {
+      const result = normalizeScheduleIntervals([
+        { startTime: "09:00", endTime: "13:00" },
+        { startTime: "14:00", endTime: "17:00" },
+      ]);
+      expect(result).toEqual([
+        { startTime: "09:00", endTime: "13:00" },
+        { startTime: "14:00", endTime: "17:00" },
+      ]);
+    });
+
+    it("throws on overlapping intervals rather than silently resolving them", () => {
+      expect(() =>
+        normalizeScheduleIntervals([
+          { startTime: "09:00", endTime: "13:00" },
+          { startTime: "12:00", endTime: "17:00" },
+        ]),
+      ).toThrow();
+    });
+
+    it("is idempotent — normalizing an already-normalized list returns the same result", () => {
+      const once = normalizeScheduleIntervals([
+        { startTime: "09:00", endTime: "13:00" },
+        { startTime: "14:00", endTime: "17:00" },
+      ]);
+      const twice = normalizeScheduleIntervals(once);
+      expect(twice).toEqual(once);
+    });
+
+    it("returns an empty array for an empty input (no hours configured)", () => {
+      expect(normalizeScheduleIntervals([])).toEqual([]);
     });
   });
 });

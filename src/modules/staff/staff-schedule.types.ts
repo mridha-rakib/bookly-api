@@ -16,10 +16,18 @@ export const daysOfWeek = [
 
 export type DayOfWeek = (typeof daysOfWeek)[number];
 
-/** One shift for one day — the confirmed product rule allows at most one per day. */
-export type ScheduleDay = {
-  dayOfWeek: DayOfWeek;
-  /** Canonical 24-hour "HH:mm", e.g. "09:00". Never displayed to users directly. */
+/** One contiguous working interval within a day. Canonical 24-hour "HH:mm", e.g. "09:00".
+ * Never displayed to users directly. */
+export type ScheduleInterval = {
   startTime: string;
   endTime: string;
+};
+
+/** One weekday's working hours — zero or more non-overlapping, sorted, non-contiguous
+ * intervals (split shifts). Product rule: a booking's occupied window must fit entirely
+ * inside exactly ONE interval; gaps between intervals are unavailable (breaks). Empty
+ * `intervals` means "no hours configured yet" — distinct from being in `offDays`. */
+export type ScheduleDay = {
+  dayOfWeek: DayOfWeek;
+  intervals: ScheduleInterval[];
 };

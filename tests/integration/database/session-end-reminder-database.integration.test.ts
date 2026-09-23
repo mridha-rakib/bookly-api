@@ -236,7 +236,10 @@ describe("database-backed Session End Reminder snapshot integration", () => {
     await staffScheduleRepository.replace(
       membershipId,
       businessId,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     );
   };
 

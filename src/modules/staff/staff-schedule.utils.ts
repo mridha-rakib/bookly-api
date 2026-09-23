@@ -1,3 +1,5 @@
+import type { ScheduleInterval } from "./staff-schedule.types.js";
+
 const hhmmPattern = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /** True for a canonical 24-hour "HH:mm" string (zero-padded, 00:00–23:59). */
@@ -78,3 +80,53 @@ export const parseTo12HourCanonical = (
   const hours24 = period === "AM" ? hour12 % 12 : (hour12 % 12) + 12;
   return `${String(hours24).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 };
+
+/**
+ * Server-authoritative normalization for one weekday's `intervals[]` — NEVER trusts
+ * client-side sorting/merging as final. Assumes each interval has already passed canonical
+ * HH:mm validation and start < end (schema's job); this function:
+ *   1. sorts ascending by startTime,
+ *   2. rejects any pair that overlaps (share any minute) — the schema layer surfaces this as
+ *      a validation error rather than silently resolving it,
+ *   3. merges exactly-contiguous pairs (A.endTime === B.startTime) into one interval, so
+ *      "09:00-13:00" + "13:00-17:00" persists as a single "09:00-17:00" interval.
+ * Throws (as a plain Error; callers translate to their own error type) on overlap so this
+ * can be reused by both the Zod schema's superRefine and the service-layer defense-in-depth
+ * pass, matching this module's "no duplicate time math" convention.
+ */
+export const normalizeScheduleIntervals = (intervals: ScheduleInterval[]): ScheduleInterval[] => {
+  const sorted = [...intervals].sort(
+    (a, b) => minutesSinceMidnight(a.startTime) - minutesSinceMidnight(b.startTime),
+  );
+
+  for (let i = 1; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1];
+    const curr = sorted[i];
+    if (!prev || !curr) {
+      continue;
+    }
+    if (minutesSinceMidnight(curr.startTime) < minutesSinceMidnight(prev.endTime)) {
+      throw new Error(
+        `Overlapping intervals: ${prev.startTime}-${prev.endTime} and ${curr.startTime}-${curr.endTime}`,
+      );
+    }
+  }
+
+  const merged: ScheduleInterval[] = [];
+  for (const interval of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && last.endTime === interval.startTime) {
+      last.endTime = interval.endTime;
+    } else {
+      merged.push({ ...interval });
+    }
+  }
+
+  return merged;
+};
+
+/** True if any pair of intervals in the (already-sorted-or-not) list overlaps — share any
+ * minute of the day. Used by schema validation to report the specific conflicting pair. */
+export const intervalsOverlap = (a: ScheduleInterval, b: ScheduleInterval): boolean =>
+  minutesSinceMidnight(a.startTime) < minutesSinceMidnight(b.endTime) &&
+  minutesSinceMidnight(b.startTime) < minutesSinceMidnight(a.endTime);

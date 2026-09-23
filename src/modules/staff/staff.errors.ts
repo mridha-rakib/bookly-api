@@ -17,6 +17,7 @@ const defaultMessages: Record<string, string> = {
   STAFF_TIME_OFF_OVERLAP: "This time off overlaps with an existing entry for this staff member",
   STAFF_REMOVAL_BLOCKED_BY_PACKAGE_ENTITLEMENTS:
     "This is the last eligible staff member for a Package Deal service with customers who still have unused purchased sessions — assign another eligible staff member to that service before removing or deactivating this one",
+  STAFF_SCHEDULE_INVALID: "One or more schedule intervals are invalid",
 };
 
 export class StaffError extends AppError {
