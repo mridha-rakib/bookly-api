@@ -238,7 +238,7 @@ describe("StaffService self-service (Phase 4A) — getMySchedule / listMyAssigne
     } as unknown as StaffRepository;
     const staffScheduleRepository = {
       findByMembershipId: vi.fn().mockResolvedValue({
-        days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+        days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
       }),
     } as unknown as StaffScheduleRepository;
 
@@ -255,7 +255,9 @@ describe("StaffService self-service (Phase 4A) — getMySchedule / listMyAssigne
 
     const schedule = await service.getMySchedule(String(staffUserId), String(business._id));
 
-    expect(schedule).toEqual([{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }]);
+    expect(schedule).toEqual([
+      { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+    ]);
   });
 
   it("getMySchedule 404s when the caller has no active membership at all", async () => {

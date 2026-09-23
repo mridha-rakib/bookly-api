@@ -380,8 +380,12 @@ export class AvailabilityService {
   /**
    * Shared by both the day-builder (evaluateStaffForSlot, below) and the Batch 3 booking-
    * creation write-path guard (assertSlotIsBookable) — a Staff member is working a given
-   * interval only if they are not on time off that business-local day AND their StaffSchedule
-   * has a shift for that weekday whose [startTime, endTime) fully contains [startAt, endAt).
+   * interval only if they are not on full-day time off that business-local day AND their
+   * StaffSchedule has, for that weekday, AT LEAST ONE working interval whose [startTime,
+   * endTime) fully contains [startAt, endAt). A day may now have multiple non-overlapping
+   * intervals (split shifts) — this deliberately does NOT union them into one big window: a
+   * request must fit entirely inside a SINGLE interval, so it can never bridge the gap
+   * (break) between two intervals.
    */
   private isWithinStaffShift(input: {
     staffContext: StaffContext;
@@ -395,16 +399,18 @@ export class AvailabilityService {
       return false;
     }
 
-    const shift = input.staffContext.schedule?.days.find(
-      (day) => day.dayOfWeek === input.dayOfWeek,
+    const day = input.staffContext.schedule?.days.find(
+      (entry) => entry.dayOfWeek === input.dayOfWeek,
     );
-    if (!shift) {
+    if (!day || day.intervals.length === 0) {
       return false;
     }
 
-    const shiftStartAt = businessLocalToUtc(input.timezone, input.date, shift.startTime);
-    const shiftEndAt = businessLocalToUtc(input.timezone, input.date, shift.endTime);
-    return input.startAt >= shiftStartAt && input.endAt <= shiftEndAt;
+    return day.intervals.some((interval) => {
+      const intervalStartAt = businessLocalToUtc(input.timezone, input.date, interval.startTime);
+      const intervalEndAt = businessLocalToUtc(input.timezone, input.date, interval.endTime);
+      return input.startAt >= intervalStartAt && input.endAt <= intervalEndAt;
+    });
   }
 
   private evaluateStaffForSlot(input: {

@@ -22,9 +22,14 @@ import type { StaffCreatableRole, StaffDisplayRole } from "./staff.types.js";
 import { joinStaffName, parseFreeTextPhone, splitStaffName } from "./staff.utils.js";
 import type { StaffAccessEventDocument } from "./staff-access-event.model.js";
 import type { StaffAccessEventRepository } from "./staff-access-event.repository.js";
-import type { StaffScheduleDayDocument, StaffScheduleDocument } from "./staff-schedule.model.js";
+import type {
+  StaffScheduleDayDocument,
+  StaffScheduleDocument,
+  StaffScheduleIntervalDocument,
+} from "./staff-schedule.model.js";
 import type { StaffScheduleRepository } from "./staff-schedule.repository.js";
 import type { DayOfWeek, ScheduleDay } from "./staff-schedule.types.js";
+import { normalizeScheduleIntervals } from "./staff-schedule.utils.js";
 import type { StaffTimeOffDocument } from "./staff-time-off.model.js";
 import type { StaffTimeOffRepository } from "./staff-time-off.repository.js";
 import type { StaffTimeOffType } from "./staff-time-off.types.js";
@@ -819,23 +824,37 @@ export class StaffService {
     const membership = await this.requireActiveMembershipForBusiness(business, staffId);
 
     // Defense in depth beyond the schema's duplicate-day check: dedupe by keeping the last
-    // entry per day, so this can never persist two shifts for the same day even if a caller
-    // bypasses the schema layer directly against the service.
+    // entry per day, so this can never persist two entries for the same weekday even if a
+    // caller bypasses the schema layer directly against the service. The server is also the
+    // sole authority on interval normalization — never trusts client-side sorting/merging —
+    // so every day's intervals are re-sorted, overlap-checked, and contiguous-merged here via
+    // normalizeScheduleIntervals regardless of what shape the client sent.
     const byDay = new Map<DayOfWeek, ScheduleDay>();
     for (const day of input.days) {
       byDay.set(day.dayOfWeek, day);
     }
 
-    const days: StaffScheduleDayDocument[] = [...byDay.values()].map((day) => ({
-      dayOfWeek: day.dayOfWeek,
-      startTime: day.startTime,
-      endTime: day.endTime,
-    }));
+    const days: StaffScheduleDayDocument[] = [...byDay.values()].map((day) => {
+      let intervals: StaffScheduleIntervalDocument[];
+      try {
+        intervals = normalizeScheduleIntervals(day.intervals);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Invalid schedule intervals";
+        throw new StaffError("STAFF_SCHEDULE_INVALID", 422, [
+          { message, code: "STAFF_SCHEDULE_INVALID" },
+        ]);
+      }
+
+      return { dayOfWeek: day.dayOfWeek, intervals };
+    });
 
     // Same defense-in-depth as above for `days`: dedupe, and — beyond the schema's own
-    // WORKING/OFF conflict rejection — a working shift always wins if a caller bypasses the
-    // schema layer directly, so a weekday can never end up in both `days` and `offDays` here.
-    const workingDaySet = new Set(days.map((day) => day.dayOfWeek));
+    // WORKING/OFF conflict rejection — a day with at least one actual working interval always
+    // wins over `offDays` if a caller bypasses the schema layer directly. A day with an empty
+    // `intervals[]` ("no hours configured yet") never counts as working here (rule 6).
+    const workingDaySet = new Set(
+      days.filter((day) => day.intervals.length > 0).map((day) => day.dayOfWeek),
+    );
     const offDays = [...new Set(input.offDays ?? [])].filter((day) => !workingDaySet.has(day));
 
     const schedule = await this.staffScheduleRepository.replace(
@@ -1079,8 +1098,10 @@ export class StaffService {
 
     return schedule.days.map((day: StaffScheduleDayDocument) => ({
       dayOfWeek: day.dayOfWeek,
-      startTime: day.startTime,
-      endTime: day.endTime,
+      intervals: day.intervals.map((interval) => ({
+        startTime: interval.startTime,
+        endTime: interval.endTime,
+      })),
     }));
   }
 

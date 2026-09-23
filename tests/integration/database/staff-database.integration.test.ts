@@ -1222,7 +1222,9 @@ describe("database-backed StaffMembership integration", () => {
       const putResponse = await request(app)
         .put(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
         .set("Authorization", supervisorToken)
-        .send({ days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }] });
+        .send({
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
+        });
       expect(putResponse.status).toBe(200);
 
       const getResponse = await request(app)
@@ -1230,7 +1232,7 @@ describe("database-backed StaffMembership integration", () => {
         .set("Authorization", supervisorToken);
       expect(getResponse.status).toBe(200);
       expect(getResponse.body.data).toEqual([
-        { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" },
+        { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
       ]);
     });
 
@@ -1302,7 +1304,7 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
         {
-          days: [{ dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" }],
+          days: [{ dayOfWeek: "TUESDAY", intervals: [{ startTime: "10:00", endTime: "18:00" }] }],
         },
       );
 
@@ -1314,7 +1316,7 @@ describe("database-backed StaffMembership integration", () => {
         .set("Authorization", staffToken);
       expect(myScheduleResponse.status).toBe(200);
       expect(myScheduleResponse.body.data).toEqual([
-        { dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "10:00", endTime: "18:00" }] },
       ]);
 
       // The Owner has no StaffMembership row at all — /me/schedule 404s rather than
@@ -1395,9 +1397,9 @@ describe("database-backed StaffMembership integration", () => {
         requireMembershipId(staffA),
         {
           days: [
-            { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" },
-            { dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" },
-            { dayOfWeek: "WEDNESDAY", startTime: "08:30", endTime: "16:00" },
+            { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+            { dayOfWeek: "TUESDAY", intervals: [{ startTime: "10:00", endTime: "18:00" }] },
+            { dayOfWeek: "WEDNESDAY", intervals: [{ startTime: "08:30", endTime: "16:00" }] },
           ],
         },
       );
@@ -1408,9 +1410,9 @@ describe("database-backed StaffMembership integration", () => {
         requireMembershipId(staffA),
       );
       expect(reloaded).toEqual([
-        { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" },
-        { dayOfWeek: "TUESDAY", startTime: "10:00", endTime: "18:00" },
-        { dayOfWeek: "WEDNESDAY", startTime: "08:30", endTime: "16:00" },
+        { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "10:00", endTime: "18:00" }] },
+        { dayOfWeek: "WEDNESDAY", intervals: [{ startTime: "08:30", endTime: "16:00" }] },
       ]);
 
       // Staff B's schedule is untouched by Staff A's.
@@ -1447,14 +1449,17 @@ describe("database-backed StaffMembership integration", () => {
         requireMembershipId(staff),
         {
           days: [
-            { dayOfWeek: "MONDAY", startTime: "09:00", endTime: "13:00" },
-            { dayOfWeek: "MONDAY", startTime: "15:00", endTime: "19:00" },
+            { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "13:00" }] },
+            { dayOfWeek: "MONDAY", intervals: [{ startTime: "15:00", endTime: "19:00" }] },
           ],
         },
       );
 
       expect(result).toHaveLength(1);
-      expect(result[0]).toEqual({ dayOfWeek: "MONDAY", startTime: "15:00", endTime: "19:00" });
+      expect(result[0]).toEqual({
+        dayOfWeek: "MONDAY",
+        intervals: [{ startTime: "15:00", endTime: "19:00" }],
+      });
 
       const doc = await StaffScheduleModel.findOne({ membershipId: staff.membershipId }).orFail();
       expect(doc.days).toHaveLength(1);
@@ -1482,7 +1487,7 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
         {
-          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
         },
       );
       const cleared = await staffService.putSchedule(
@@ -1517,13 +1522,17 @@ describe("database-backed StaffMembership integration", () => {
       const malformed = await request(app)
         .put(`/businesses/${business._id}/staff/${staff.membershipId}/schedule`)
         .set("Authorization", token)
-        .send({ days: [{ dayOfWeek: "MONDAY", startTime: "9:00 AM", endTime: "17:00" }] });
+        .send({
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "9:00 AM", endTime: "17:00" }] }],
+        });
       expect(malformed.status).toBe(400);
 
       const reversed = await request(app)
         .put(`/businesses/${business._id}/staff/${staff.membershipId}/schedule`)
         .set("Authorization", token)
-        .send({ days: [{ dayOfWeek: "MONDAY", startTime: "17:00", endTime: "09:00" }] });
+        .send({
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "17:00", endTime: "09:00" }] }],
+        });
       expect(reversed.status).toBe(400);
 
       expect(await StaffScheduleModel.countDocuments()).toBe(0);
@@ -1537,7 +1546,7 @@ describe("database-backed StaffMembership integration", () => {
 
       await expect(
         staffService.putSchedule(String(owner._id), String(business._id), String(owner._id), {
-          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
         }),
       ).rejects.toMatchObject({ statusCode: 404 });
       expect(await StaffScheduleModel.countDocuments()).toBe(0);
@@ -1572,7 +1581,9 @@ describe("database-backed StaffMembership integration", () => {
           String(ownerA._id),
           String(businessA._id),
           requireMembershipId(removedStaff),
-          { days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }] },
+          {
+            days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
+          },
         ),
       ).rejects.toMatchObject({ statusCode: 404 });
 
@@ -1590,7 +1601,9 @@ describe("database-backed StaffMembership integration", () => {
           String(ownerA._id),
           String(businessB._id),
           requireMembershipId(linkedStaff),
-          { days: [{ dayOfWeek: "FRIDAY", startTime: "12:00", endTime: "20:00" }] },
+          {
+            days: [{ dayOfWeek: "FRIDAY", intervals: [{ startTime: "12:00", endTime: "20:00" }] }],
+          },
         ),
       ).rejects.toMatchObject({ statusCode: 404 });
 
@@ -1598,9 +1611,11 @@ describe("database-backed StaffMembership integration", () => {
         String(ownerB._id),
         String(businessB._id),
         requireMembershipId(linkedStaff),
-        { days: [{ dayOfWeek: "FRIDAY", startTime: "12:00", endTime: "20:00" }] },
+        { days: [{ dayOfWeek: "FRIDAY", intervals: [{ startTime: "12:00", endTime: "20:00" }] }] },
       );
-      expect(schedule).toEqual([{ dayOfWeek: "FRIDAY", startTime: "12:00", endTime: "20:00" }]);
+      expect(schedule).toEqual([
+        { dayOfWeek: "FRIDAY", intervals: [{ startTime: "12:00", endTime: "20:00" }] },
+      ]);
     });
 
     it("does not allow mutating a staff member's schedule through a different (non-owning) Business id", async () => {
@@ -1630,7 +1645,7 @@ describe("database-backed StaffMembership integration", () => {
           String(businessB._id),
           requireMembershipId(staff),
           {
-            days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+            days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
           },
         ),
       ).rejects.toMatchObject({ statusCode: 404 }); // ownerA does not manage businessB at all
@@ -1657,7 +1672,7 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
         {
-          days: [{ dayOfWeek: "FRIDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "FRIDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
         },
       );
 
@@ -1667,7 +1682,7 @@ describe("database-backed StaffMembership integration", () => {
 
       expect(ownerRow?.schedule).toEqual([]);
       expect(staffRow?.schedule).toEqual([
-        { dayOfWeek: "FRIDAY", startTime: "09:00", endTime: "17:00" },
+        { dayOfWeek: "FRIDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
       ]);
     });
   });
@@ -1691,7 +1706,7 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
         {
-          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
           offDays: ["SATURDAY", "SUNDAY"],
         },
       );
@@ -1703,7 +1718,9 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
       );
-      expect(workingDays).toEqual([{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }]);
+      expect(workingDays).toEqual([
+        { dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]);
 
       const list = await staffService.listStaff(String(owner._id), String(business._id));
       const staffRow = list.members.find((m) => m.email === "off-days@example.com");
@@ -1776,7 +1793,7 @@ describe("database-backed StaffMembership integration", () => {
         .put(`/businesses/${business._id}/staff/${requireMembershipId(staff)}/schedule`)
         .set("Authorization", token)
         .send({
-          days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }],
+          days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
           offDays: ["MONDAY"],
         });
       expect(response.status).toBe(400);
@@ -1842,7 +1859,7 @@ describe("database-backed StaffMembership integration", () => {
         String(business._id),
         requireMembershipId(staff),
         {
-          days: [{ dayOfWeek: "SUNDAY", startTime: "10:00", endTime: "14:00" }],
+          days: [{ dayOfWeek: "SUNDAY", intervals: [{ startTime: "10:00", endTime: "14:00" }] }],
           offDays: ["SUNDAY"],
         },
       );
@@ -1850,7 +1867,7 @@ describe("database-backed StaffMembership integration", () => {
       const list = await staffService.listStaff(String(owner._id), String(business._id));
       const staffRow = list.members.find((m) => m.email === "off-to-working@example.com");
       expect(staffRow?.schedule).toEqual([
-        { dayOfWeek: "SUNDAY", startTime: "10:00", endTime: "14:00" },
+        { dayOfWeek: "SUNDAY", intervals: [{ startTime: "10:00", endTime: "14:00" }] },
       ]);
       expect(staffRow?.offDays).toEqual([]);
     });
@@ -1872,7 +1889,7 @@ describe("database-backed StaffMembership integration", () => {
         String(owner._id),
         String(business._id),
         requireMembershipId(staff),
-        { days: [{ dayOfWeek: "MONDAY", startTime: "09:00", endTime: "17:00" }] },
+        { days: [{ dayOfWeek: "MONDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }] },
       );
 
       await staffService.putSchedule(
@@ -1914,7 +1931,7 @@ describe("database-backed StaffMembership integration", () => {
       await StaffScheduleModel.collection.insertOne({
         membershipId: new mongoose.Types.ObjectId(requireMembershipId(staff)),
         businessId: business._id,
-        days: [{ dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "17:00" }],
+        days: [{ dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] }],
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -1922,7 +1939,7 @@ describe("database-backed StaffMembership integration", () => {
       const list = await staffService.listStaff(String(owner._id), String(business._id));
       const staffRow = list.members.find((m) => m.email === "legacy-schedule@example.com");
       expect(staffRow?.schedule).toEqual([
-        { dayOfWeek: "TUESDAY", startTime: "09:00", endTime: "17:00" },
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
       ]);
       // Never silently reinterpreted as Weekend/Off for the other 6 weekdays — legacy data
       // stays exactly "unconfigured" until someone explicitly sets an off day.

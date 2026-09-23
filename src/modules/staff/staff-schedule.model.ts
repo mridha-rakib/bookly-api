@@ -2,17 +2,26 @@ import { model, Schema, type Types } from "mongoose";
 
 import { type DayOfWeek, daysOfWeek } from "./staff-schedule.types.js";
 
+/** One contiguous working interval within a day — split shifts (e.g. 09:00-13:00 and
+ * 14:00-17:00) are represented as multiple entries here. Server-normalized: sorted
+ * ascending by startTime, non-overlapping, exactly-contiguous intervals merged (see
+ * staff.service.ts putSchedule / staff-schedule.normalize.ts). */
+export type StaffScheduleIntervalDocument = {
+  startTime: string;
+  endTime: string;
+};
+
 /**
  * One weekly schedule document per StaffMembership (not per-day) — compact by design: at
- * most 7 embedded day entries, each with exactly one shift (confirmed product rule forbids
- * multiple shifts/day, so there is no nested intervals array to overengineer). Keyed by
- * membershipId, not userId, so schedule is always scoped to the Business the membership
- * belongs to — never a bare identity-level record that could leak across businesses.
+ * most 7 embedded day entries, each carrying zero or more non-overlapping working
+ * intervals (split shifts / breaks are just gaps between intervals in the same day — no
+ * separate Break document). Keyed by membershipId, not userId, so schedule is always scoped
+ * to the Business the membership belongs to — never a bare identity-level record that could
+ * leak across businesses.
  */
 export type StaffScheduleDayDocument = {
   dayOfWeek: DayOfWeek;
-  startTime: string;
-  endTime: string;
+  intervals: StaffScheduleIntervalDocument[];
 };
 
 export type StaffScheduleDocument = {
@@ -34,11 +43,18 @@ export type StaffScheduleDocument = {
   updatedAt: Date;
 };
 
+const staffScheduleIntervalSchema = new Schema<StaffScheduleIntervalDocument>(
+  {
+    startTime: { type: String, required: true },
+    endTime: { type: String, required: true },
+  },
+  { _id: false },
+);
+
 const staffScheduleDaySchema = new Schema<StaffScheduleDayDocument>(
   {
     dayOfWeek: { type: String, enum: daysOfWeek, required: true },
-    startTime: { type: String, required: true },
-    endTime: { type: String, required: true },
+    intervals: { type: [staffScheduleIntervalSchema], required: true, default: [] },
   },
   { _id: false },
 );
@@ -54,9 +70,9 @@ const staffScheduleSchema = new Schema<StaffScheduleDocument>(
 );
 
 // One schedule document per membership — the service layer replaces `days` wholesale on
-// every PUT (deduplicated by construction from a Map keyed by dayOfWeek), which is what
-// actually enforces "at most one shift per day"; this index just guarantees at most one
-// schedule document exists per membership at all.
+// every PUT (deduplicated by construction from a Map keyed by dayOfWeek, one entry per
+// weekday holding zero or more normalized intervals); this index just guarantees at most
+// one schedule document exists per membership at all.
 staffScheduleSchema.index({ membershipId: 1 }, { unique: true });
 
 export const StaffScheduleModel = model<StaffScheduleDocument>(

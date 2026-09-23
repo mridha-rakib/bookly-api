@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { staffCreatableRoles } from "./staff.types.js";
 import { daysOfWeek } from "./staff-schedule.types.js";
-import { isValidCanonicalTime } from "./staff-schedule.utils.js";
+import { intervalsOverlap, isValidCanonicalTime } from "./staff-schedule.utils.js";
 import { staffTimeOffTypes } from "./staff-time-off.types.js";
 
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid id");
@@ -69,9 +69,8 @@ const canonicalTimeSchema = z
   .string()
   .refine(isValidCanonicalTime, "Time must be a valid 24-hour HH:mm value");
 
-const scheduleDaySchema = z
+const scheduleIntervalSchema = z
   .object({
-    dayOfWeek: z.enum(daysOfWeek),
     startTime: canonicalTimeSchema,
     endTime: canonicalTimeSchema,
   })
@@ -86,10 +85,43 @@ const scheduleDaySchema = z
     }
   });
 
+// A day may be submitted with zero intervals ("no hours configured") up to a generous cap —
+// there is no meaningful product limit on split-shift count, but an unbounded array is still
+// rejected as a defensive input-size guard.
+const scheduleDaySchema = z
+  .object({
+    dayOfWeek: z.enum(daysOfWeek),
+    intervals: z.array(scheduleIntervalSchema).max(20),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    // Sort a local copy purely to detect overlaps in the raw client input — this is NOT the
+    // authoritative normalization (that happens server-side in staff.service.ts via
+    // normalizeScheduleIntervals); it only decides whether to reject here.
+    const sorted = [...value.intervals].sort((a, b) => (a.startTime < b.startTime ? -1 : 1));
+    for (let i = 0; i < sorted.length; i += 1) {
+      for (let j = i + 1; j < sorted.length; j += 1) {
+        const first = sorted[i];
+        const second = sorted[j];
+        if (!first || !second) {
+          continue;
+        }
+        if (intervalsOverlap(first, second)) {
+          context.addIssue({
+            code: "custom",
+            path: ["intervals"],
+            message: `Overlapping intervals for ${value.dayOfWeek}: ${first.startTime}-${first.endTime} and ${second.startTime}-${second.endTime}`,
+          });
+        }
+      }
+    }
+  });
+
 export const putStaffScheduleBodySchema = z
   .object({
-    // At most one entry per day (enforced further by the service, which also dedupes) —
-    // 7 is the maximum meaningful length since there are 7 days in a week.
+    // At most one entry per weekday (each entry may carry multiple intervals — enforced
+    // further by the service, which also dedupes) — 7 is the maximum meaningful length since
+    // there are 7 days in a week.
     days: z.array(scheduleDaySchema).max(7),
     // Explicit recurring weekly Weekend/Off days — distinct from a weekday simply not yet
     // configured. Defaults to [] so every existing caller (every current test included) that
@@ -98,17 +130,26 @@ export const putStaffScheduleBodySchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const seen = new Set<string>();
+    const seenEntries = new Set<string>();
+    // Only days with at least one actual working interval conflict with `offDays` — an entry
+    // with an empty `intervals[]` just means "no hours configured yet" (rule 6: never
+    // implicitly Off), so it must NOT block that same weekday from also being listed as an
+    // explicit Weekend/Off day.
+    const seenWorking = new Set<string>();
 
     for (const [index, day] of value.days.entries()) {
-      if (seen.has(day.dayOfWeek)) {
+      if (seenEntries.has(day.dayOfWeek)) {
         context.addIssue({
           code: "custom",
           path: ["days", index, "dayOfWeek"],
-          message: `Duplicate schedule entry for ${day.dayOfWeek} — only one shift per day is allowed`,
+          message: `Duplicate schedule entry for ${day.dayOfWeek} — only one entry per weekday is allowed (use multiple intervals within it for split shifts)`,
         });
       }
-      seen.add(day.dayOfWeek);
+      seenEntries.add(day.dayOfWeek);
+
+      if (day.intervals.length > 0) {
+        seenWorking.add(day.dayOfWeek);
+      }
     }
 
     const seenOff = new Set<string>();
@@ -126,7 +167,7 @@ export const putStaffScheduleBodySchema = z
       // A weekday cannot be WORKING and OFF at the same time — a working shift always takes
       // precedence conceptually, but this is rejected outright rather than silently resolved,
       // so a caller never gets a different result than what it explicitly asked for.
-      if (seen.has(dayOfWeek)) {
+      if (seenWorking.has(dayOfWeek)) {
         context.addIssue({
           code: "custom",
           path: ["offDays", index],

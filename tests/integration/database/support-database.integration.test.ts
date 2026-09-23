@@ -293,7 +293,10 @@ describe("database-backed Support domain (Batch 15B)", () => {
     await staffScheduleRepository.replace(
       membership._id,
       business._id,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     );
     await saveCard(customerId);
     await linkCustomerToBusiness(business._id, owner._id, customerId);

@@ -224,7 +224,10 @@ describe("database-backed no-show eligibility window + max services (Batch 21)",
     await staffScheduleRepository.replace(
       membership._id,
       business._id,
-      days.map((dayOfWeek) => ({ dayOfWeek, startTime: "09:00", endTime: "18:00" })),
+      days.map((dayOfWeek) => ({
+        dayOfWeek,
+        intervals: [{ startTime: "09:00", endTime: "18:00" }],
+      })),
     );
 
     return { owner, business, membership, service };
