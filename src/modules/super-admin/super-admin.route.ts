@@ -15,6 +15,7 @@ import {
   requireActiveUser,
   requireRoles,
 } from "../auth/auth.middleware.js";
+import { Argon2PasswordHasher } from "../auth/password-hasher.js";
 import { TokenService } from "../auth/token.service.js";
 import { BookingRepository } from "../booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
@@ -72,6 +73,10 @@ import {
 import { MarketingCampaignService } from "../marketing/marketing-campaign.service.js";
 import { MarketingCampaignRecipientRepository } from "../marketing/marketing-campaign-recipient.repository.js";
 import { MarketingCampaignSourceService } from "../marketing/marketing-campaign-source.service.js";
+import { PayoutDestinationRepository } from "../payout-destination/payout-destination.repository.js";
+import { superAdminPayoutRevealRateLimit } from "../payout-destination/payout-destination.route.js";
+import { PayoutDestinationService } from "../payout-destination/payout-destination.service.js";
+import { PayoutDestinationStepUpRepository } from "../payout-destination/payout-destination-step-up.repository.js";
 import { PlatformSettingsController } from "../platform-settings/platform-settings.controller.js";
 import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
 import { updatePlatformSettingsBodySchema } from "../platform-settings/platform-settings.schema.js";
@@ -110,6 +115,7 @@ import { createSupportEmailProvider } from "../support/support-email.provider.js
 import { SupportMessageRepository } from "../support/support-message.repository.js";
 import { SupportTicketRepository } from "../support/support-ticket.repository.js";
 import { UserRepository } from "../user/user.repository.js";
+import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import {
   superAdminAnalyticsPeriodQuerySchema,
   superAdminBookingIdParamsSchema,
@@ -205,12 +211,26 @@ export const createSuperAdminRoute = (): Router => {
     bookingRepository,
     businessPayoutRepository,
   );
+  const payoutDestinationRepository = new PayoutDestinationRepository();
   const businessPayoutService = new BusinessPayoutService(
     businessRepository,
     financialTransactionService,
     businessPayoutRepository,
+    payoutDestinationRepository,
   );
-  const controller = new SuperAdminFinanceController(financeService, businessPayoutService);
+  const payoutDestinationService = new PayoutDestinationService(
+    businessRepository,
+    userRepository,
+    payoutDestinationRepository,
+    new PayoutDestinationStepUpRepository(),
+    new Argon2PasswordHasher(),
+    createEmailOtpProvider(),
+  );
+  const controller = new SuperAdminFinanceController(
+    financeService,
+    businessPayoutService,
+    payoutDestinationService,
+  );
 
   const businessLifecycleService = new BusinessLifecycleService(businessRepository);
   const businessController = new SuperAdminBusinessController(
@@ -687,6 +707,24 @@ export const createSuperAdminRoute = (): Router => {
     "/businesses/:businessId/finance/payouts",
     validateRequest({ params: financeBusinessParamsSchema, body: executePayoutBodySchema }),
     asyncHandler(controller.executePayout),
+  );
+
+  // --- Per-Business payout destination (bank details) ---
+  // Masked read: same shape the Business Owner sees. No ownership check — the router-wide
+  // SUPER_ADMIN gate is the authorization, exactly as for executePayout above.
+  router.get(
+    "/businesses/:businessId/payout-destination",
+    validateRequest({ params: financeBusinessParamsSchema }),
+    asyncHandler(controller.getBusinessPayoutDestination),
+  );
+  // The ONE decrypt path. Rate-limited with the same express-rate-limit factory the auth/
+  // business-link OTP endpoints use (never unlimited), audited as IBAN_REVEALED, and fail-closed
+  // on any decrypt/tamper/unknown-key-version problem.
+  router.post(
+    "/businesses/:businessId/payout-destination/reveal",
+    superAdminPayoutRevealRateLimit(),
+    validateRequest({ params: financeBusinessParamsSchema }),
+    asyncHandler(controller.revealBusinessPayoutDestination),
   );
 
   return router;

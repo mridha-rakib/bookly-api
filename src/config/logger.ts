@@ -106,6 +106,26 @@ const redactPaths = [
   "*.cvv",
   "number",
   "*.number",
+  // Business Payout Destination (payout-destination module). A payout IBAN is never passed to a
+  // logger by that module — every call site there logs structured safe fields only
+  // (`{ businessId, userId }`) and the reveal response is never logged at all. These paths exist
+  // so that a future caller who logs a request/response object WHOLE still cannot leak one.
+  // `req.body.*` / `request.body.*` are spelled out explicitly because the wildcard `*.iban`
+  // only matches one level deep.
+  "iban",
+  "*.iban",
+  "req.body.iban",
+  "request.body.iban",
+  "ibanCiphertext",
+  "*.ibanCiphertext",
+  "req.body.stepUp",
+  "request.body.stepUp",
+  "otpCode",
+  "*.otpCode",
+  "otpAuthorizationToken",
+  "*.otpAuthorizationToken",
+  "req.body.currentPassword",
+  "request.body.currentPassword",
 ];
 
 const loggerOptions: LoggerOptions = {

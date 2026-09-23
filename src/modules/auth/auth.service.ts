@@ -80,6 +80,7 @@ import {
 } from "./auth.utils.js";
 import { type AuthResult, issueAuthSession, type RequestContext } from "./auth-session.js";
 import type { PasswordHasher } from "./password-hasher.js";
+import { requireCurrentPassword } from "./require-current-password.js";
 import type { TokenService } from "./token.service.js";
 
 const nextStepValues = {
@@ -899,11 +900,7 @@ export class AuthService {
       throw new AuthError("PASSWORD_NOT_CONFIGURED", 400);
     }
 
-    const isValid = await this.passwordHasher.verify(user.passwordHash, input.currentPassword);
-
-    if (!isValid) {
-      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
-    }
+    await requireCurrentPassword(this.passwordHasher, user, input.currentPassword);
 
     if (input.newPassword === input.currentPassword) {
       throw new AuthError("NEW_PASSWORD_SAME_AS_CURRENT", 400);
@@ -953,9 +950,7 @@ export class AuthService {
       return;
     }
 
-    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
-      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
-    }
+    await requireCurrentPassword(this.passwordHasher, user, input.currentPassword);
 
     const bookingRepository = this.requireDeletionDependency(
       this.bookingRepository,
@@ -1178,9 +1173,7 @@ export class AuthService {
       throw new AuthError("SESSION_EXPIRED", 401);
     }
 
-    if (!(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))) {
-      throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
-    }
+    await requireCurrentPassword(this.passwordHasher, user, input.currentPassword);
 
     const newNormalizedEmail = normalizeEmail(input.newEmail);
 
@@ -1333,12 +1326,7 @@ export class AuthService {
     // PASSWORD provider. For every password account the behaviour is byte-identical to before —
     // `currentPassword` is still required and still verified.
     if (resolveAuthProviders(user.authProviders).includes("PASSWORD")) {
-      if (
-        !input.currentPassword ||
-        !(await this.passwordHasher.verify(user.passwordHash, input.currentPassword))
-      ) {
-        throw new AuthError("INVALID_CURRENT_PASSWORD", 400);
-      }
+      await requireCurrentPassword(this.passwordHasher, user, input.currentPassword);
     }
 
     const profile = await this.userRepository.findProfileByUserId(user._id);

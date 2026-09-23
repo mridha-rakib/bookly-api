@@ -3,6 +3,7 @@ import mongoose, { Types } from "mongoose";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { PayoutDestinationRepository } from "../payout-destination/payout-destination.repository.js";
 import type { BusinessPayoutDocument } from "./business-payout.model.js";
 import type {
   BusinessPayoutRepository,
@@ -43,6 +44,9 @@ export class BusinessPayoutService {
     private readonly businessRepository: BusinessRepository,
     private readonly financialTransactionService: BookingFinancialTransactionService,
     private readonly businessPayoutRepository: BusinessPayoutRepository,
+    /** Read-only here. This service NEVER decrypts an IBAN and never writes to the destination
+     * record — it only reads the safe metadata it snapshots onto the payout row. */
+    private readonly payoutDestinationRepository: PayoutDestinationRepository,
   ) {}
 
   public async executePayout(
@@ -63,6 +67,22 @@ export class BusinessPayoutService {
 
     try {
       await dbSession.withTransaction(async () => {
+        // ADDED (destination snapshot) — read the Business's CURRENT payout destination FIRST,
+        // before a single ledger row is read for claiming, so a Business with no configured bank
+        // details is rejected with nothing claimed, nothing mutated and no payout row written.
+        // Read inside the transaction (same session) so the snapshot is consistent with the rest
+        // of the write. Deliberately NO locking/reservation: whatever is current at confirm time
+        // is what gets snapshotted, matching the manual, self-attested nature of this flow.
+        // This is a read of SAFE METADATA only — the IBAN is never decrypted here.
+        const destination = await this.payoutDestinationRepository.findByBusinessId(
+          business._id,
+          dbSession,
+        );
+
+        if (!destination) {
+          throw new FinanceError("PAYOUT_DESTINATION_NOT_CONFIGURED", 409);
+        }
+
         const candidates = await this.financialTransactionService.findUnclaimedForPayout(
           business._id,
           [...BUSINESS_PAYABLE_TYPES],
@@ -99,6 +119,16 @@ export class BusinessPayoutService {
           initiatedByUserId: new Types.ObjectId(superAdminUserId),
           ...(options.providerReference ? { providerReference: options.providerReference } : {}),
           paidAt: new Date(),
+          // ADDED — the safe, non-reversible snapshot. No IBAN, no ciphertext/IV/auth tag/key
+          // version. Every amount field above is computed exactly as before; this block adds
+          // fields and changes none.
+          destinationId: destination._id,
+          destinationLast4: destination.ibanLast4,
+          destinationCountry: destination.ibanCountry,
+          destinationAccountHolderName: destination.accountHolderName,
+          ...(destination.bankName === undefined
+            ? {}
+            : { destinationBankName: destination.bankName }),
         };
 
         payout = await this.businessPayoutRepository.create(input, dbSession);

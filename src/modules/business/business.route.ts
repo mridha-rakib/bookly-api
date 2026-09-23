@@ -24,6 +24,7 @@ import { createBusinessTravelSettingsRoute } from "../business-travel-settings/b
 import { createDashboardAnalyticsRoute } from "../dashboard-analytics/dashboard-analytics.route.js";
 import { createFinanceRoute } from "../finance/finance.route.js";
 import { createIntegrationRoute } from "../integration/integration.route.js";
+import { createPayoutDestinationRoute } from "../payout-destination/payout-destination.route.js";
 import { createServicesRoute } from "../services/service.route.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { createStaffRoute } from "../staff/staff.route.js";
@@ -115,6 +116,12 @@ export const createBusinessRoute = (): Router => {
   // the confirmed policy this reflects) ---
   router.get("/my-profile", asyncHandler(controller.getMyProfile));
   router.use(createFinanceRoute());
+  // Payout Destination — the Business Owner's own bank details for payouts. Same "Business Owner
+  // surface only" precedent as Finance above and mounted the exact same way (inside this
+  // router's existing Owner-only gate, never gated by Business approval status): a Business that
+  // is still PENDING must be able to enter its payout details, and Supervisor/Staff have no
+  // product rule authorizing access. Read/write only — nothing here can move money.
+  router.use(createPayoutDestinationRoute());
   // Analytics tab — same "Business Owner surface only, no product rule for Supervisor/Staff/
   // Customer" precedent as Finance above (see createDashboardAnalyticsRoute's own comment), so
   // it is mounted the exact same way: inside this router's existing Owner-only gate, never

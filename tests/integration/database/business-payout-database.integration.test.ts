@@ -33,6 +33,8 @@ import { FinanceError } from "../../../src/modules/finance/finance.errors.js";
 import { FinanceService } from "../../../src/modules/finance/finance.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { encryptIban } from "../../../src/modules/payout-destination/payout-destination.crypto.js";
+import { PayoutDestinationRepository } from "../../../src/modules/payout-destination/payout-destination.repository.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -78,6 +80,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
   let financialTransactionService: BookingFinancialTransactionService;
   let financeService: FinanceService;
   let businessPayoutRepository: BusinessPayoutRepository;
+  let payoutDestinationRepository: PayoutDestinationRepository;
   let businessPayoutService: BusinessPayoutService;
   let tokenService: TokenService;
   let webhookService: StripeWebhookService;
@@ -121,10 +124,12 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       bookingRepository,
       businessPayoutRepository,
     );
+    payoutDestinationRepository = new PayoutDestinationRepository();
     businessPayoutService = new BusinessPayoutService(
       businessRepository,
       financialTransactionService,
       businessPayoutRepository,
+      payoutDestinationRepository,
     );
     tokenService = new TokenService(new SessionRepository());
     webhookService = new StripeWebhookService(
@@ -219,6 +224,41 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       subcategories: ["Haircut"],
     });
     return { owner, business };
+  };
+
+  /**
+   * Payout Destination fixture. `executePayout` now REQUIRES a configured destination, so every
+   * payout test that is asserting something OTHER than the destination rule configures one first
+   * — which is what keeps those tests proving the amount/ledger behaviour they always proved.
+   *
+   * SYNTHETIC test IBANs only (valid mod-97 checksums, not anybody's real account).
+   */
+  const TEST_IBAN_CY = "CY17002001280000001200527600";
+  const TEST_IBAN_DE = "DE89370400440532013000";
+  const TEST_IBAN_GB = "GB33BUKB20201555555555";
+
+  const configureDestination = async (
+    businessId: Types.ObjectId,
+    actorUserId: Types.ObjectId,
+    iban: string = TEST_IBAN_CY,
+    overrides: { accountHolderName?: string; bankName?: string } = {},
+  ) => {
+    const encrypted = encryptIban(iban, businessId);
+    return payoutDestinationRepository.upsert(
+      businessId,
+      {
+        accountHolderName: overrides.accountHolderName ?? "Test Account Holder",
+        ibanCiphertext: encrypted.ciphertext,
+        ibanIv: encrypted.iv,
+        ibanAuthTag: encrypted.authTag,
+        ibanKeyVersion: encrypted.keyVersion,
+        ibanLast4: iban.slice(-4),
+        ibanCountry: iban.slice(0, 2),
+        ...(overrides.bankName === undefined ? {} : { bankName: overrides.bankName }),
+        lastUpdatedByUserId: actorUserId,
+      },
+      { action: "CREATED", actorUserId, changedAt: new Date(), newLast4: iban.slice(-4) },
+    );
   };
 
   const createStaff = async (businessId: Types.ObjectId) => {
@@ -690,6 +730,11 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       status: "ACTIVE",
     });
 
+    await configureDestination(business._id, owner._id, TEST_IBAN_CY, {
+      accountHolderName: "Payout Flow Holder",
+      bankName: "Test Bank",
+    });
+
     const payout = await businessPayoutService.executePayout(
       String(admin._id),
       String(business._id),
@@ -749,6 +794,8 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       status: "ACTIVE",
     });
 
+    await configureDestination(business._id, owner._id);
+
     const results = await Promise.allSettled([
       businessPayoutService.executePayout(String(admin._id), String(business._id)),
       businessPayoutService.executePayout(String(admin._id), String(business._id)),
@@ -776,16 +823,152 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
   });
 
   it("rejects a payout attempt when there is nothing eligible to pay out", async () => {
-    const { business } = await setupBookableBusiness(8000);
+    const { owner, business } = await setupBookableBusiness(8000);
     const admin = await userRepository.create({
       normalizedEmail: `admin-empty-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: "hash",
       role: "SUPER_ADMIN",
       status: "ACTIVE",
     });
+    // A destination IS configured here, so this still exercises the original
+    // "nothing eligible" rejection rather than the new destination rule.
+    await configureDestination(business._id, owner._id);
     await expect(
       businessPayoutService.executePayout(String(admin._id), String(business._id)),
-    ).rejects.toBeInstanceOf(FinanceError);
+    ).rejects.toMatchObject({ message: expect.stringContaining("pending payable") });
+  });
+
+  // --- Payout Destination snapshot (new) -----------------------------------------------------
+
+  describe("payout destination snapshot", () => {
+    /** Builds a Business with a real, non-zero payable balance, exactly as the pre-existing
+     * payout tests above do — so the amounts these tests assert are produced by the UNCHANGED
+     * calculation path. */
+    const setupWithPayable = async (label: string) => {
+      const { owner, business, membership, service } = await setupBookableBusiness(8000);
+      const customer = await createCustomer(label);
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      // TWO bookings by the SAME customer, exactly as the pre-existing payout tests above do:
+      // the first is a first-time booking (Bookly-owned PLATFORM_FEE), the second a returning
+      // booking whose DEPOSIT is Business-owned — that second one is what creates the payable.
+      for (const time of ["10:00", "14:00"]) {
+        const result = await creationService.finalizeCustomerBooking(
+          String(customer._id),
+          String(business._id),
+          finalizeInput(service._id, membership._id, time),
+        );
+        if (result.status !== "confirmed") throw new Error("expected confirmed");
+        await settleProcessingFee(result.booking._id);
+      }
+
+      const admin = await userRepository.create({
+        normalizedEmail: `admin-${label}-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPER_ADMIN",
+        status: "ACTIVE",
+      });
+
+      return { owner, business, admin };
+    };
+
+    it("rejects executePayout before any ledger row is claimed when no destination is configured", async () => {
+      const { business, admin } = await setupWithPayable("no-destination");
+
+      const payableBefore = await financeService.getBusinessPayableForSuperAdmin(
+        String(business._id),
+      );
+      expect(payableBefore.netCents).toBeGreaterThan(0);
+
+      await expect(
+        businessPayoutService.executePayout(String(admin._id), String(business._id)),
+      ).rejects.toMatchObject({ message: expect.stringContaining("payout bank details") });
+
+      // Nothing was claimed, nothing was mutated, no payout row exists.
+      const payableAfter = await financeService.getBusinessPayableForSuperAdmin(
+        String(business._id),
+      );
+      expect(payableAfter.netCents).toBe(payableBefore.netCents);
+      expect(payableAfter.grossCents).toBe(payableBefore.grossCents);
+
+      const unclaimed = await BookingFinancialTransactionModel.find({
+        businessId: business._id,
+        payoutId: { $exists: true },
+      }).exec();
+      expect(unclaimed).toHaveLength(0);
+
+      const history = await businessPayoutRepository.listByBusinessId({
+        businessId: business._id,
+        page: 1,
+        limit: 20,
+      });
+      expect(history.total).toBe(0);
+    });
+
+    it("stores the safe destination snapshot and no IBAN/ciphertext on a confirmed payout, with amounts unchanged", async () => {
+      const { owner, business, admin } = await setupWithPayable("snapshot");
+
+      const expected = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
+      const destination = await configureDestination(business._id, owner._id, TEST_IBAN_DE, {
+        accountHolderName: "Snapshot Holder",
+        bankName: "Snapshot Bank",
+      });
+
+      const payout = await businessPayoutService.executePayout(
+        String(admin._id),
+        String(business._id),
+      );
+
+      // The amount calculation is byte-identical to the pre-existing preview formula.
+      expect(payout.netPayoutCents).toBe(expected.netCents);
+      expect(payout.grossBusinessOwnedCents).toBe(expected.grossCents);
+      expect(payout.processingFeesCents).toBe(expected.processingFeesCents);
+      expect(payout.refundsCents).toBe(expected.refundsCents);
+
+      expect(String(payout.destinationId)).toBe(String(destination._id));
+      expect(payout.destinationLast4).toBe("3000");
+      expect(payout.destinationCountry).toBe("DE");
+      expect(payout.destinationAccountHolderName).toBe("Snapshot Holder");
+      expect(payout.destinationBankName).toBe("Snapshot Bank");
+
+      // Nothing reversible ever lands on a payout row.
+      const serialized = JSON.stringify(payout);
+      expect(serialized).not.toContain(TEST_IBAN_DE);
+      expect(serialized).not.toContain("ibanCiphertext");
+      expect(serialized).not.toContain("ibanIv");
+      expect(serialized).not.toContain("ibanAuthTag");
+      expect(serialized).not.toContain("ibanKeyVersion");
+    });
+
+    it("does not alter a historical payout's snapshot when the destination is changed afterwards", async () => {
+      const { owner, business, admin } = await setupWithPayable("historical");
+      await configureDestination(business._id, owner._id, TEST_IBAN_DE, {
+        accountHolderName: "Original Holder",
+        bankName: "Original Bank",
+      });
+
+      const payout = await businessPayoutService.executePayout(
+        String(admin._id),
+        String(business._id),
+      );
+      expect(payout.destinationLast4).toBe("3000");
+
+      // The Owner later replaces their bank details entirely.
+      await configureDestination(business._id, owner._id, TEST_IBAN_GB, {
+        accountHolderName: "New Holder",
+        bankName: "New Bank",
+      });
+
+      const reloaded = await businessPayoutRepository.listByBusinessId({
+        businessId: business._id,
+        page: 1,
+        limit: 20,
+      });
+      expect(reloaded.items[0]?.destinationLast4).toBe("3000");
+      expect(reloaded.items[0]?.destinationCountry).toBe("DE");
+      expect(reloaded.items[0]?.destinationAccountHolderName).toBe("Original Holder");
+      expect(reloaded.items[0]?.destinationBankName).toBe("Original Bank");
+    });
   });
 
   // --- 17: Business Owner finance cannot read another Business --------------------------------

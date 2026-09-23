@@ -24,3 +24,7 @@ process.env["DUMMY_PHONE_OTP_CODE"] = "123456";
 process.env["ARGON2_MEMORY_COST"] = "8192";
 process.env["ARGON2_TIME_COST"] = "1";
 process.env["ARGON2_PARALLELISM"] = "1";
+// Payout Destination at-rest encryption (version 1). A throwaway, obviously-fake 32-byte hex key
+// for tests only — never a real key, and never used to protect anything real.
+process.env["PAYOUT_DESTINATION_ENCRYPTION_KEY_V1"] =
+  "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";

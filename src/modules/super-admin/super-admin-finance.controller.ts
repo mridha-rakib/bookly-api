@@ -23,6 +23,7 @@ import type {
   PlatformTransactionsQuery,
 } from "../finance/finance.schema.js";
 import type { FinanceService } from "../finance/finance.service.js";
+import type { PayoutDestinationService } from "../payout-destination/payout-destination.service.js";
 
 /**
  * Mounted under `/super-admin`, gated end-to-end by `requireRoles(["SUPER_ADMIN"])` (see
@@ -36,6 +37,7 @@ export class SuperAdminFinanceController {
   public constructor(
     private readonly financeService: FinanceService,
     private readonly businessPayoutService: BusinessPayoutService,
+    private readonly payoutDestinationService: PayoutDestinationService,
   ) {}
 
   public getPlatformSummary = async (request: Request, response: Response): Promise<void> => {
@@ -133,6 +135,39 @@ export class SuperAdminFinanceController {
     });
 
     sendSuccess(response, 201, "Payout recorded", toBusinessPayoutDto(payout));
+  };
+
+  /** Masked read — identical shape/builder to the Business Owner's own read. A Super Admin sees
+   * no more than the Owner does here; full details require the explicit reveal below. */
+  public getBusinessPayoutDestination = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const params = request.validated?.params as FinanceBusinessParams;
+    const view = await this.payoutDestinationService.getForSuperAdmin(params.businessId);
+    sendSuccess(response, 200, "Business payout destination", view);
+  };
+
+  /**
+   * The one endpoint in the application that returns a decrypted IBAN — for payout purposes
+   * only. SUPER_ADMIN-gated by the router, rate-limited at the route (see
+   * super-admin.route.ts), and audited by the service with an `IBAN_REVEALED` history entry
+   * recording actor + timestamp and no IBAN. The response body is deliberately never logged
+   * anywhere, here or in the service.
+   */
+  public revealBusinessPayoutDestination = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as FinanceBusinessParams;
+
+    const revealed = await this.payoutDestinationService.revealIbanForSuperAdmin(
+      userId,
+      params.businessId,
+    );
+
+    sendSuccess(response, 200, "Payout destination revealed", revealed);
   };
 
   private requireUserId(request: Request): string {
