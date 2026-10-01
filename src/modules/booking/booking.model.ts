@@ -212,6 +212,17 @@ export type BookingFinancials = {
   depositCents: number;
   balanceDueCents: number;
   totalCents: number;
+  /** Future VAT-inclusive online-payment snapshot. All fields are additive and absent on every
+   * pre-VAT/C1 booking; existing depositCents and balanceDueCents retain their historical,
+   * pre-tax semantics. The first five fields are written together only after the future charge
+   * checkpoint succeeds. taxTransactionId is asynchronous under Stripe's basic PaymentIntent
+   * Tax integration and may be attached later after Tax Association reconciliation. */
+  preTaxChargeCents?: number | undefined;
+  taxCents?: number | undefined;
+  chargedAmountCents?: number | undefined;
+  taxCalculationId?: string | undefined;
+  paymentIntentId?: string | undefined;
+  taxTransactionId?: string | undefined;
 };
 
 // --- Promo Code snapshot (Batch 13) --------------------------------------------------------
@@ -679,6 +690,12 @@ const bookingFinancialsSchema = new Schema<BookingFinancials>(
     depositCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     balanceDueCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     totalCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    preTaxChargeCents: { type: Number, min: 0, validate: Number.isInteger },
+    taxCents: { type: Number, min: 0, validate: Number.isInteger },
+    chargedAmountCents: { type: Number, min: 0, validate: Number.isInteger },
+    taxCalculationId: { type: String, trim: true },
+    paymentIntentId: { type: String, trim: true },
+    taxTransactionId: { type: String, trim: true },
   },
   { _id: false },
 );
@@ -732,6 +749,29 @@ bookingFinancialsSchema.pre("validate", function () {
 
   if (financials.balanceDueCents !== financials.totalCents - financials.depositCents) {
     throw new Error("balanceDueCents must equal totalCents - depositCents");
+  }
+
+  const vatSnapshotValues = [
+    financials.preTaxChargeCents,
+    financials.taxCents,
+    financials.chargedAmountCents,
+    financials.taxCalculationId,
+    financials.paymentIntentId,
+  ];
+  const hasAnyVatSnapshotValue = [...vatSnapshotValues, financials.taxTransactionId].some(
+    (value) => value !== undefined,
+  );
+  if (hasAnyVatSnapshotValue && vatSnapshotValues.some((value) => value === undefined)) {
+    throw new Error(
+      "VAT financial snapshot requires preTaxChargeCents, taxCents, chargedAmountCents, taxCalculationId, and paymentIntentId together",
+    );
+  }
+  if (
+    financials.preTaxChargeCents !== undefined &&
+    financials.taxCents !== undefined &&
+    financials.chargedAmountCents !== financials.preTaxChargeCents + financials.taxCents
+  ) {
+    throw new Error("chargedAmountCents must equal preTaxChargeCents + taxCents");
   }
 });
 

@@ -36,6 +36,19 @@ export const bookingFinancialTransactionTypes = [
    */
   "PROCESSING_FEE",
   /**
+   * Cyprus VAT foundation (Checkpoint C1) — the tax principal collected from the customer.
+   * This is a liability, never Bookly revenue and never Business payable. C1 adds the ledger
+   * vocabulary only; no production path posts this type until VAT-inclusive charging is
+   * activated in a later checkpoint.
+   */
+  "TAX_LIABILITY",
+  /**
+   * Append-only reversal of TAX_LIABILITY principal after a Stripe refund. Kept distinct from
+   * REFUND because REFUND reverses pre-tax DEPOSIT/PLATFORM_FEE ownership, while tax principal
+   * belongs to neither owner. C1 adds the type only; no production refund path writes it yet.
+   */
+  "TAX_REVERSAL",
+  /**
    * Batch 13 addition — Bookly's own subsidy of a Promo Code discount on a RETURNING booking.
    * All Promo Codes are Bookly-funded (confirmed rule); when a returning customer's actual
    * online charge is reduced by a promo, the Business is still economically entitled to the
@@ -49,6 +62,18 @@ export const bookingFinancialTransactionTypes = [
   "PROMO_SUBSIDY",
 ] as const;
 export type BookingFinancialTransactionType = (typeof bookingFinancialTransactionTypes)[number];
+
+/** The source types valid for Stripe processing-cost ownership. TAX_LIABILITY is intentionally
+ * included here even though the liability principal has no revenue owner: it means only that
+ * Bookly bears the processing COST attributable to VAT. */
+export const processingFeeSourceTypes = [
+  "PLATFORM_FEE",
+  "DEPOSIT",
+  "CANCELLATION_FEE",
+  "NO_SHOW_FEE",
+  "TAX_LIABILITY",
+] as const;
+export type ProcessingFeeSourceType = (typeof processingFeeSourceTypes)[number];
 
 /**
  * Relative to the amount the customer owes for the Booking — DEBIT increases it (a charge:
