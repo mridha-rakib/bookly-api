@@ -10,7 +10,7 @@ import type {
   CreateBusinessPayoutInput,
 } from "./business-payout.repository.js";
 import { FinanceError } from "./finance.errors.js";
-import { classifySourceOwner } from "./finance-ownership.js";
+import { classifyProcessingFeeOwner, classifySourceOwner } from "./finance-ownership.js";
 
 const BUSINESS_PAYABLE_TYPES = [
   "DEPOSIT",
@@ -167,7 +167,11 @@ export class BusinessPayoutService {
       }
       if (entry.type === "PROCESSING_FEE" || entry.type === "REFUND") {
         const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        return classifySourceOwner(sourceType) === "BUSINESS";
+        return (
+          (entry.type === "PROCESSING_FEE"
+            ? classifyProcessingFeeOwner(sourceType)
+            : classifySourceOwner(sourceType)) === "BUSINESS"
+        );
       }
       return false;
     });
@@ -192,7 +196,7 @@ export class BusinessPayoutService {
         grossCents += entry.amountCents;
       } else if (entry.type === "PROCESSING_FEE") {
         const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        if (classifySourceOwner(sourceType) === "BUSINESS") {
+        if (classifyProcessingFeeOwner(sourceType) === "BUSINESS") {
           processingFeesCents += entry.amountCents;
         }
       } else if (entry.type === "REFUND") {

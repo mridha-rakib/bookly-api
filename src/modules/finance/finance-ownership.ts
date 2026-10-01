@@ -36,6 +36,16 @@ export const classifySourceOwner = (sourceType: string | null): FinancialOwner =
   return "UNKNOWN";
 };
 
+/** Processing-cost ownership is deliberately narrower than principal/revenue ownership.
+ * TAX_LIABILITY principal remains UNKNOWN to `classifySourceOwner` so it can never become
+ * Bookly revenue, while a PROCESSING_FEE sourced from TAX_LIABILITY is a Bookly-borne cost. */
+export const classifyProcessingFeeOwner = (sourceType: string | null): FinancialOwner => {
+  if (sourceType === "TAX_LIABILITY") {
+    return "BOOKLY";
+  }
+  return classifySourceOwner(sourceType);
+};
+
 /** The types whose ownership is intrinsic (never needs `sourceType`) — always the Business's.
  * PROMO_SUBSIDY (Batch 13) joins this set: Bookly's compensating CREDIT for a Promo-discounted
  * returning booking is, by construction, always Business-owned money — never ambiguous, never
@@ -82,7 +92,7 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
       }
     } else if (
       bucket.type === "PROCESSING_FEE" &&
-      classifySourceOwner(bucket.sourceType) === "BUSINESS"
+      classifyProcessingFeeOwner(bucket.sourceType) === "BUSINESS"
     ) {
       processingFeesCents += bucket.totalCents;
     } else if (bucket.type === "REFUND" && classifySourceOwner(bucket.sourceType) === "BUSINESS") {
@@ -114,7 +124,7 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
       grossCents += bucket.totalCents;
     } else if (
       bucket.type === "PROCESSING_FEE" &&
-      classifySourceOwner(bucket.sourceType) === "BOOKLY"
+      classifyProcessingFeeOwner(bucket.sourceType) === "BOOKLY"
     ) {
       processingFeesCents += bucket.totalCents;
     } else if (bucket.type === "REFUND" && classifySourceOwner(bucket.sourceType) === "BOOKLY") {

@@ -87,6 +87,10 @@ describe("BookingFinancialTransactionService", () => {
     ["NO_SHOW_FEE", "DEBIT"],
     ["REFUND", "CREDIT"],
     ["BUSINESS_PAYOUT", "CREDIT"],
+    ["PROCESSING_FEE", "DEBIT"],
+    ["PROMO_SUBSIDY", "CREDIT"],
+    ["TAX_LIABILITY", "DEBIT"],
+    ["TAX_REVERSAL", "CREDIT"],
   ] as const)("rejects %s recorded with the wrong direction", async (type, requiredDirection) => {
     const { service } = createService();
     const wrongDirection = requiredDirection === "DEBIT" ? "CREDIT" : "DEBIT";

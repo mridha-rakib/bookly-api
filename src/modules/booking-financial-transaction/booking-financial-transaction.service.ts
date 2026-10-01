@@ -39,6 +39,8 @@ const fixedDirectionByType: Partial<
   REFUND: "CREDIT",
   BUSINESS_PAYOUT: "CREDIT",
   PROCESSING_FEE: "DEBIT",
+  TAX_LIABILITY: "DEBIT",
+  TAX_REVERSAL: "CREDIT",
   // Batch 13 — mirrors BUSINESS_PAYOUT's own convention: money arriving to settle/close a
   // position (here, Bookly making the Business whole for a promo shortfall), never a second
   // debit against what the customer owes.

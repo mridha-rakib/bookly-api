@@ -20,6 +20,7 @@ import {
 } from "./finance.types.js";
 import {
   BUSINESS_PAYABLE_TYPES,
+  classifyProcessingFeeOwner,
   classifySourceOwner,
   combineBooklyOwnedBuckets,
   combineBusinessOwnedBuckets,
@@ -452,7 +453,11 @@ export class FinanceService {
         promoSubsidyAmountCents += entry.amountCents;
       } else if (entry.type === "PROCESSING_FEE" || entry.type === "REFUND") {
         const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        if (classifySourceOwner(sourceType) === "BUSINESS") {
+        const owner =
+          entry.type === "PROCESSING_FEE"
+            ? classifyProcessingFeeOwner(sourceType)
+            : classifySourceOwner(sourceType);
+        if (owner === "BUSINESS") {
           if (entry.type === "PROCESSING_FEE") {
             processingFeesCents += entry.amountCents;
           } else {

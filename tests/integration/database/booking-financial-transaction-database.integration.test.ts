@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { processingFeeIdempotencyKey } from "../../../src/modules/payment/processing-fee-allocation.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -137,6 +138,37 @@ describe("database-backed BookingFinancialTransaction integration", () => {
     await expect(
       service.record(baseInput({ idempotencyKey: "no-show-charge:booking-2" })),
     ).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("allows two fee components for one PaymentIntent while rejecting replay of either component", async () => {
+    const paymentIntentId = "pi_split_fee";
+    const shared = {
+      type: "PROCESSING_FEE" as const,
+      direction: "DEBIT" as const,
+      providerReference: paymentIntentId,
+      status: "SUCCEEDED" as const,
+    };
+    const preTax = baseInput({
+      ...shared,
+      amountCents: 84,
+      idempotencyKey: processingFeeIdempotencyKey(paymentIntentId, "pretax"),
+      metadata: { sourceType: "DEPOSIT" },
+    });
+    const tax = baseInput({
+      ...shared,
+      amountCents: 16,
+      idempotencyKey: processingFeeIdempotencyKey(paymentIntentId, "tax"),
+      metadata: { sourceType: "TAX_LIABILITY" },
+    });
+
+    await service.record(preTax);
+    await service.record(tax);
+    expect(
+      await BookingFinancialTransactionModel.countDocuments({ providerReference: paymentIntentId }),
+    ).toBe(2);
+
+    await expect(service.record(preTax)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.record(tax)).rejects.toMatchObject({ statusCode: 409 });
   });
 
   it("updateStatus is the only allowed mutation, and only from PENDING", async () => {
