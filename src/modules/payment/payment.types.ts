@@ -86,7 +86,7 @@ export interface PaymentGateway {
     email: string;
     name: string;
     metadata: Record<string, string>;
-  }): Promise<{ stripeCustomerId: string }>;
+  }): Promise<{ stripeCustomerId: string; replacedStaleCustomer?: boolean }>;
 
   createSetupIntent(input: { stripeCustomerId: string }): Promise<CreateSetupIntentResult>;
 
