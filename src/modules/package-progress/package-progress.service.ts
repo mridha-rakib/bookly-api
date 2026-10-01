@@ -64,15 +64,27 @@ export class PackageProgressService {
     packageProgressId: string,
   ): Promise<PackageProgressDto> {
     const progress = await this.requireOwnedPackage(customerUserId, packageProgressId);
-    const originBooking = await this.bookingRepository.findById(
-      progress.businessId,
-      progress.originBookingId,
+    // One customer-scoped batch query resolves both the settlement source (origin Booking) and
+    // every persisted session summary. It remains O(1) queries regardless of package length and
+    // refuses any malformed session id whose Booking belongs to another customer.
+    const bookingIds = Array.from(
+      new Set([
+        String(progress.originBookingId),
+        ...progress.sessions.map((entry) => String(entry.bookingId)),
+      ]),
     );
+    const bookings = await this.bookingRepository.findManyByIdsForCustomer(
+      progress.businessId,
+      bookingIds,
+      customerUserId,
+    );
+    const bookingsById = new Map(bookings.map((booking) => [String(booking._id), booking]));
+    const originBooking = bookingsById.get(String(progress.originBookingId));
     const settlement = originBooking
       ? computePackageBalanceSettlement(originBooking)
       : { balanceSettled: false, outstandingBalanceCents: 0 };
 
-    return toPackageProgressDto(progress, settlement);
+    return toPackageProgressDto(progress, settlement, bookingsById);
   }
 
   private async requireOwnedPackage(
