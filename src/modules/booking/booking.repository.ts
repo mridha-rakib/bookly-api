@@ -87,6 +87,27 @@ export class BookingRepository {
     return BookingModel.find({ _id: { $in: bookingIds }, businessId }).exec();
   }
 
+  /**
+   * Customer-owned variant of `findManyByIds`, for a read model that starts from another
+   * customer-owned aggregate (currently PackageProgress). Keeping the customer predicate in the
+   * database query means a corrupt PackageProgress entry can never make an unrelated customer's
+   * Booking visible merely because its id was present in the entitlement's session history.
+   */
+  public async findManyByIdsForCustomer(
+    businessId: Types.ObjectId | string,
+    bookingIds: Array<Types.ObjectId | string>,
+    customerUserId: Types.ObjectId | string,
+  ): Promise<BookingDocument[]> {
+    if (bookingIds.length === 0) {
+      return [];
+    }
+    return BookingModel.find({
+      _id: { $in: bookingIds },
+      businessId,
+      "customer.customerUserId": customerUserId,
+    }).exec();
+  }
+
   /** Batch 8 (Super Admin Finance) — cross-business batched lookup, the same "no actor scoping,
    * never an HTTP caller directly" contract as `findByIdOnly` above extended to a batch: a
    * platform-wide transaction log legitimately spans many Businesses, so a single-Business-

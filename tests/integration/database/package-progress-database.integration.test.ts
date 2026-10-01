@@ -29,6 +29,7 @@ import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outb
 import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
+import { PackageProgressService } from "../../../src/modules/package-progress/package-progress.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
@@ -88,6 +89,12 @@ describe("database-backed Package Deal integration", () => {
   let addonServiceAssignmentRepository: AddonServiceAssignmentRepository;
   let businessTravelSettingsRepository: BusinessTravelSettingsRepository;
   let taxGateway: FakeTaxGateway;
+
+  const getPackageDetail = (customerUserId: Types.ObjectId, packageProgressId: Types.ObjectId) =>
+    new PackageProgressService(packageProgressRepository, bookingRepository).getForCustomer(
+      String(customerUserId),
+      String(packageProgressId),
+    );
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -916,6 +923,153 @@ describe("database-backed Package Deal integration", () => {
     });
   });
 
+  // --- Package detail read model ---------------------------------------------------------------
+
+  describe("Package detail session summaries", () => {
+    it("returns the purchased session with its historical schedule and professional summary", async () => {
+      const { customer, progress, purchase, staff } = await setUpPurchasedPackage();
+
+      const detail = await getPackageDetail(customer._id, progress._id);
+
+      expect(detail).toMatchObject({
+        id: String(progress._id),
+        totalSessions: 5,
+        remainingSessions: 4,
+        completedSessions: 0,
+        status: "AWAITING_BALANCE",
+      });
+      expect(detail.sessions).toEqual([
+        expect.objectContaining({
+          sessionIndex: 1,
+          bookingId: String(purchase._id),
+          status: "SCHEDULED",
+          booking: expect.objectContaining({
+            status: "UPCOMING",
+            schedule: {
+              startAt: purchase.schedule.startAt.toISOString(),
+              endAt: purchase.schedule.endAt.toISOString(),
+            },
+            professional: expect.objectContaining({
+              membershipId: String(staff[0]!.membership._id),
+            }),
+          }),
+        }),
+      ]);
+    });
+
+    it("returns independently scheduled sessions in session-index order with their own professionals", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(2);
+      const customer = await createCustomer("detail-multiple");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      const purchase = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (purchase.status !== "confirmed") throw new Error("expected confirmed purchase");
+      await settleOriginBalance(owner, business, purchase.booking._id);
+      const progress = await PackageProgressModel.findOne({ originBookingId: purchase.booking._id })
+        .orFail()
+        .exec();
+      const session2 = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[1]!.membership._id, DATE_2, "11:00"),
+      );
+
+      const detail = await getPackageDetail(customer._id, progress._id);
+
+      expect(detail.sessions.map((session) => session.sessionIndex)).toEqual([1, 2]);
+      expect(detail.sessions[0]).toMatchObject({
+        bookingId: String(purchase.booking._id),
+        booking: { professional: { membershipId: String(staff[0]!.membership._id) } },
+      });
+      expect(detail.sessions[1]).toMatchObject({
+        bookingId: String(session2._id),
+        booking: {
+          schedule: { startAt: session2.schedule.startAt.toISOString() },
+          professional: { membershipId: String(staff[1]!.membership._id) },
+        },
+      });
+    });
+
+    it("retains cancelled and completed session history while leaving available entitlement as a counter", async () => {
+      const { business, staff, customer, progress } = await setUpSettledPackage();
+      const session2 = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[0]!.membership._id),
+      );
+      await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(session2._id),
+        undefined,
+      );
+
+      const detail = await getPackageDetail(customer._id, progress._id);
+      expect(detail.remainingSessions).toBe(4);
+      expect(
+        detail.sessions.find((session) => session.bookingId === String(session2._id)),
+      ).toMatchObject({
+        sessionIndex: 2,
+        status: "CANCELLED",
+        booking: { status: "CANCELLED_BY_CUSTOMER" },
+      });
+      // Only persisted Booking/session history is returned: unused entitlement never receives a
+      // fabricated Booking id or placeholder summary.
+      expect(detail.sessions).toHaveLength(2);
+    });
+
+    it("preserves both Booking attempts when an on-time cancellation restores and reuses a logical session index", async () => {
+      const { business, staff, customer, progress } = await setUpSettledPackage();
+      const firstAttempt = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[0]!.membership._id),
+      );
+      await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(firstAttempt._id),
+        undefined,
+      );
+      const replacement = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[0]!.membership._id, DATE_2, "11:00"),
+      );
+
+      const detail = await getPackageDetail(customer._id, progress._id);
+      const secondSessionAttempts = detail.sessions.filter((session) => session.sessionIndex === 2);
+      expect(secondSessionAttempts).toMatchObject([
+        { bookingId: String(firstAttempt._id), status: "CANCELLED" },
+        { bookingId: String(replacement._id), status: "SCHEDULED" },
+      ]);
+    });
+
+    it("degrades a missing or cross-customer Booking relation without leaking or fabricating it", async () => {
+      const { customer, progress, purchase } = await setUpPurchasedPackage();
+      await BookingModel.deleteOne({ _id: purchase._id }).exec();
+
+      const detail = await getPackageDetail(customer._id, progress._id);
+      expect(detail.sessions[0]).toEqual({
+        sessionIndex: 1,
+        bookingId: String(purchase._id),
+        status: "SCHEDULED",
+        booking: null,
+      });
+
+      const intruder = await createCustomer("detail-intruder");
+      await expect(getPackageDetail(intruder._id, progress._id)).rejects.toMatchObject({
+        statusCode: 404,
+      });
+    });
+  });
+
   // --- Redemption ------------------------------------------------------------------------------
 
   describe("Package session redemption", () => {
@@ -1336,6 +1490,13 @@ describe("database-backed Package Deal integration", () => {
       expect(after.remainingSessions).toBe(3); // NOT restored
       const entry = after.sessions.find((s) => String(s.bookingId) === String(session2._id));
       expect(entry?.status).toBe("FORFEITED");
+      const detail = await getPackageDetail(customer._id, progress._id);
+      expect(
+        detail.sessions.find((session) => session.bookingId === String(session2._id)),
+      ).toMatchObject({
+        status: "FORFEITED",
+        booking: { status: "LATE_CANCELLATION" },
+      });
       void owner;
     });
 
@@ -1420,6 +1581,14 @@ describe("database-backed Package Deal integration", () => {
       expect(after.completedSessions).toBe(2);
       const entry = after.sessions.find((s) => String(s.bookingId) === String(session2._id));
       expect(entry?.status).toBe("COMPLETED");
+      const detail = await getPackageDetail(customer._id, progress._id);
+      expect(detail.completedSessions).toBe(2);
+      expect(
+        detail.sessions.find((session) => session.bookingId === String(session2._id)),
+      ).toMatchObject({
+        status: "COMPLETED",
+        booking: { status: "COMPLETED" },
+      });
     });
 
     it("cancelling the original purchase (session 1) also RESTORES it to the balance, same as any other session", async () => {
