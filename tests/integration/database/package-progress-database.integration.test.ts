@@ -946,6 +946,7 @@ describe("database-backed Package Deal integration", () => {
           booking: expect.objectContaining({
             status: "UPCOMING",
             schedule: {
+              timezone: TIMEZONE,
               startAt: purchase.schedule.startAt.toISOString(),
               endAt: purchase.schedule.endAt.toISOString(),
             },

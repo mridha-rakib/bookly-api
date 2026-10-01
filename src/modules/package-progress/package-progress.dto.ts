@@ -13,7 +13,7 @@ export type PackageProgressSessionDto = {
   status: "SCHEDULED" | "COMPLETED" | "CANCELLED" | "FORFEITED";
   booking: {
     status: BookingStatus;
-    schedule: { startAt: string; endAt: string };
+    schedule: { timezone: string; startAt: string; endAt: string };
     professional: { membershipId: string; displayName?: string | undefined };
   } | null;
 };
@@ -59,6 +59,7 @@ const toPackageProgressSessionDto = (
     booking: {
       status: booking.status,
       schedule: {
+        timezone: booking.schedule.timezone,
         startAt: booking.schedule.startAt.toISOString(),
         endAt: booking.schedule.endAt.toISOString(),
       },
