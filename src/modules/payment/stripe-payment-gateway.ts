@@ -34,9 +34,21 @@ export class StripePaymentGateway implements PaymentGateway {
     email: string;
     name: string;
     metadata: Record<string, string>;
-  }): Promise<{ stripeCustomerId: string }> {
+  }): Promise<{ stripeCustomerId: string; replacedStaleCustomer?: boolean }> {
     if (input.existingStripeCustomerId) {
-      return { stripeCustomerId: input.existingStripeCustomerId };
+      try {
+        const customer = await this.client.customers.retrieve(input.existingStripeCustomerId);
+        if (!customer.deleted) {
+          return { stripeCustomerId: input.existingStripeCustomerId };
+        }
+      } catch (error) {
+        if (!this.isMissingStripeCustomer(error)) {
+          const stripeError = this.asStripeError(error);
+          throw new PaymentError("PAYMENT_FAILED", 502, [
+            { message: this.safeDeclineMessage(stripeError), code: "PAYMENT_FAILED" },
+          ]);
+        }
+      }
     }
 
     const customer = await this.wrap(() =>
@@ -46,7 +58,10 @@ export class StripePaymentGateway implements PaymentGateway {
         metadata: input.metadata,
       }),
     );
-    return { stripeCustomerId: customer.id };
+    return {
+      stripeCustomerId: customer.id,
+      ...(input.existingStripeCustomerId ? { replacedStaleCustomer: true } : {}),
+    };
   }
 
   public async createSetupIntent(input: {
@@ -305,6 +320,17 @@ export class StripePaymentGateway implements PaymentGateway {
       };
     }
     return undefined;
+  }
+
+  private isMissingStripeCustomer(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "type" in error &&
+      "code" in error &&
+      (error as { type?: unknown }).type === "StripeInvalidRequestError" &&
+      (error as { code?: unknown }).code === "resource_missing"
+    );
   }
 
   private toStripeRefundReason(reason: string): Stripe.RefundCreateParams.Reason {

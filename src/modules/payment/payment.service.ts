@@ -34,11 +34,6 @@ export class PaymentService {
   public async ensureStripeCustomer(
     userId: Types.ObjectId | string,
   ): Promise<{ stripeCustomerId: string }> {
-    const existing = await this.profileRepository.findByUserId(userId);
-    if (existing) {
-      return { stripeCustomerId: existing.stripeCustomerId };
-    }
-
     const [user, profile] = await Promise.all([
       this.userRepository.findById(userId),
       this.userRepository.findProfileByUserId(userId),
@@ -47,8 +42,9 @@ export class PaymentService {
       throw new PaymentError("PAYMENT_CUSTOMER_NOT_FOUND", 404);
     }
 
-    const { stripeCustomerId } = await this.gateway.getOrCreateCustomer({
-      existingStripeCustomerId: undefined,
+    const existing = await this.profileRepository.findByUserId(userId);
+    const resolved = await this.gateway.getOrCreateCustomer({
+      existingStripeCustomerId: existing?.stripeCustomerId,
       email: user.normalizedEmail,
       name: profile
         ? [profile.firstName, profile.lastName].filter(Boolean).join(" ")
@@ -56,7 +52,30 @@ export class PaymentService {
       metadata: { booklyUserId: String(userId) },
     });
 
-    const created = await this.profileRepository.createIfMissing(userId, stripeCustomerId);
+    if (existing) {
+      if (!resolved.replacedStaleCustomer) {
+        return { stripeCustomerId: resolved.stripeCustomerId };
+      }
+
+      const repaired = await this.profileRepository.replaceStaleStripeCustomer({
+        userId,
+        staleStripeCustomerId: existing.stripeCustomerId,
+        replacementStripeCustomerId: resolved.stripeCustomerId,
+      });
+      if (repaired) {
+        return { stripeCustomerId: repaired.stripeCustomerId };
+      }
+
+      // A concurrent request already repaired this profile. Its Customer is authoritative;
+      // the extra Customer created by this losing request is harmless and never referenced.
+      const current = await this.profileRepository.findByUserId(userId);
+      if (current) {
+        return { stripeCustomerId: current.stripeCustomerId };
+      }
+      throw new PaymentError("PAYMENT_CUSTOMER_NOT_FOUND", 404);
+    }
+
+    const created = await this.profileRepository.createIfMissing(userId, resolved.stripeCustomerId);
     // A concurrent racer may have won createIfMissing's upsert with a DIFFERENT stripeCustomerId
     // than the one just created here (two simultaneous first-time SetupIntent requests) — the
     // now-orphaned Stripe Customer this call created is harmless (never referenced again) and

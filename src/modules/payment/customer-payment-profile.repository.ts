@@ -14,6 +14,12 @@ export type UpsertPaymentMethodInput = {
   cardExpYear: number;
 };
 
+export type ReplaceStaleStripeCustomerInput = {
+  userId: Types.ObjectId | string;
+  staleStripeCustomerId: string;
+  replacementStripeCustomerId: string;
+};
+
 export class CustomerPaymentProfileRepository {
   public async findByUserId(
     userId: Types.ObjectId | string,
@@ -52,6 +58,34 @@ export class CustomerPaymentProfileRepository {
           cardLast4: input.cardLast4,
           cardExpMonth: input.cardExpMonth,
           cardExpYear: input.cardExpYear,
+        },
+      },
+      { returnDocument: "after", runValidators: true },
+    ).exec();
+  }
+
+  /**
+   * Repairs a profile whose Stripe Customer no longer exists in the configured account. The
+   * stored default payment method belongs to that missing Customer too, so it must never remain
+   * selectable after the Customer id changes. The old values are only cleared after Stripe has
+   * successfully created the replacement Customer.
+   *
+   * Matching the stale id makes concurrent repair attempts safe: one wins; a loser reads the
+   * winner's current profile instead of overwriting it.
+   */
+  public async replaceStaleStripeCustomer(
+    input: ReplaceStaleStripeCustomerInput,
+  ): Promise<CustomerPaymentProfileDocument | null> {
+    return CustomerPaymentProfileModel.findOneAndUpdate(
+      { userId: input.userId, stripeCustomerId: input.staleStripeCustomerId },
+      {
+        $set: { stripeCustomerId: input.replacementStripeCustomerId },
+        $unset: {
+          defaultPaymentMethodId: "",
+          cardBrand: "",
+          cardLast4: "",
+          cardExpMonth: "",
+          cardExpYear: "",
         },
       },
       { returnDocument: "after", runValidators: true },
