@@ -44,6 +44,8 @@ import { PackageProgressService } from "../package-progress/package-progress.ser
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../payment/payment.service.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
+import { StripeTaxGateway } from "../payment/stripe-tax-gateway.js";
+import { CyprusTaxService } from "../payment/tax.service.js";
 import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
 import { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import { PromoRepository } from "../promo/promo.repository.js";
@@ -109,6 +111,8 @@ const buildController = (): BookingController => {
     new CustomerPaymentProfileRepository(),
     userRepository,
   );
+  // Checkpoint B (Cyprus VAT, compute-only) — see CyprusTaxService's own doc comment.
+  const taxService = new CyprusTaxService(new StripeTaxGateway());
   const financialTransactionService = new BookingFinancialTransactionService(
     new BookingFinancialTransactionRepository(),
   );
@@ -177,6 +181,7 @@ const buildController = (): BookingController => {
     bookingCreatedNotifier,
     appointmentReminderScheduler,
     packageProgressRepository,
+    taxService,
   );
 
   const lifecycleService = new BookingLifecycleService(

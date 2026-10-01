@@ -21,6 +21,7 @@ import { computePackageBalanceSettlement } from "../package-progress/package-pro
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import type { PromoApplicationService, ResolvedPromo } from "../promo/promo-application.service.js";
@@ -103,10 +104,14 @@ export type BookingCreationPreview = {
     depositBeforePromoCents: number;
     discountCents: number;
   };
+  /** Checkpoint B (Cyprus VAT, compute-only) — present only when a `taxService` is configured.
+   * `computedTax.dueNowWithTaxCents` is NOT what will actually be charged in this checkpoint
+   * (that remains `amountDueNowCents` above, unchanged) — see ComputedTax's own doc comment. */
+  computedTax?: ComputedTax;
 };
 
 export type FinalizeBookingResult =
-  | { status: "confirmed"; booking: BookingDocument }
+  | { status: "confirmed"; booking: BookingDocument; computedTax?: ComputedTax }
   | { status: "requires_action"; clientSecret: string; paymentIntentId: string };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -224,7 +229,35 @@ export class BookingCreationService {
     // redeemPackageSession). Absent in every pre-existing suite that constructs this service
     // directly without exercising Package Deals.
     private readonly packageProgressRepository?: PackageProgressRepository,
+    // Optional trailing dep (same rationale as every other optional dep above — the many
+    // pre-existing integration test suites that construct this service directly, without VAT in
+    // scope, must keep working unmodified). Checkpoint B (Cyprus VAT, compute-only): when
+    // present, every customer-facing charge point below also COMPUTES (never charges) Cyprus VAT
+    // via Stripe Tax. Absent in production would be a real bug — booking.route.ts's composition
+    // root always wires the real CyprusTaxService; optionality here exists purely for
+    // test-construction compatibility, matching this constructor's existing pattern.
+    private readonly taxService?: Pick<CyprusTaxService, "computeForCharge">,
   ) {}
+
+  /**
+   * Checkpoint B (Cyprus VAT, compute-only) — the single call site every customer-facing charge
+   * point below goes through. Returns `undefined` (never a guessed zero) when no `taxService` was
+   * injected — the many pre-existing test suites that construct this class directly without VAT
+   * in scope. `amountCents` must already be the final, canonical online charge amount
+   * (`customerChargeNowCents` — post-clamp, post-promo); this never re-derives it. Propagates
+   * `TaxError` untouched for a positive amount Stripe Tax fails to calculate — the caller must
+   * never proceed as though the booking were tax-free (locked rule: never invent VAT).
+   */
+  private async computeCyprusTax(
+    amountCents: number,
+    reference: string,
+    idempotencyKey?: string | undefined,
+  ): Promise<ComputedTax | undefined> {
+    if (!this.taxService) {
+      return undefined;
+    }
+    return this.taxService.computeForCharge({ amountCents, reference, idempotencyKey });
+  }
 
   /**
    * Product-limit enforcement for how many service lines one booking may contain — the
@@ -418,6 +451,18 @@ export class BookingCreationService {
         })
       : undefined;
 
+    // Checkpoint B (Cyprus VAT, compute-only) — the SAME canonical amount the customer would
+    // actually be charged (post-clamp, post-promo), never the pre-promo deposit. Read-only, like
+    // the rest of this preview: no PaymentIntent, no persistence, and (per this checkpoint's own
+    // scope) the ACTUAL amount due now below is still `amountDueNowCents`, unchanged.
+    const amountDueNowCents = resolvedPromo
+      ? resolvedPromo.customerChargeNowCents
+      : financials.depositCents;
+    const computedTax = await this.computeCyprusTax(
+      amountDueNowCents,
+      `preview-${new Types.ObjectId().toHexString()}`,
+    );
+
     return {
       finalizable: true,
       isFirstBooking,
@@ -441,9 +486,8 @@ export class BookingCreationService {
       // returning — never platformFeeCents, which is 0 for a returning customer even though a
       // real deposit is still due (see BookingFinancials's own doc comment). Batch 13: when a
       // valid promo is supplied, this becomes the promo-discounted amount instead.
-      amountDueNowCents: resolvedPromo
-        ? resolvedPromo.customerChargeNowCents
-        : financials.depositCents,
+      amountDueNowCents,
+      ...(computedTax ? { computedTax } : {}),
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
       ...(resolvedPromo
@@ -586,6 +630,24 @@ export class BookingCreationService {
       return { status: "confirmed", booking };
     }
 
+    // Checkpoint B (Cyprus VAT, compute-only) — computed from the SAME authoritative
+    // `customerChargeNowCents` finalize just derived above (never trusts a prior preview call,
+    // exactly like the rest of this method), BEFORE the real charge below. `TaxError` propagates
+    // untouched: the claim is released and the booking is never charged/persisted with an unknown
+    // tax outcome (locked rule: never invent VAT). The live PaymentIntent amount immediately
+    // below is UNCHANGED in this checkpoint — still `customerChargeNowCents` only.
+    let computedTax: ComputedTax | undefined;
+    try {
+      computedTax = await this.computeCyprusTax(
+        customerChargeNowCents,
+        String(bookingId),
+        `${input.idempotencyKey}:tax`,
+      );
+    } catch (error) {
+      await this.claimRepository.release(input.idempotencyKey);
+      throw error;
+    }
+
     let paymentResult: PaymentIntentResult | undefined;
 
     // Batch 6.5: the deposit is charged online for EVERY BOOKLY_MANAGED booking, first or
@@ -652,7 +714,7 @@ export class BookingCreationService {
         resolvedPromo,
         customerChargeNowCents,
       });
-      return { status: "confirmed", booking };
+      return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
       if (paymentResult) {
         // Batch 13 — refunds the amount ACTUALLY charged to Stripe (post-promo), never the
@@ -743,6 +805,10 @@ export class BookingCreationService {
     );
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
     const line = lines[0] as ResolvedServiceLine;
+    const computedTax = await this.computeCyprusTax(
+      financials.depositCents,
+      `preview-${new Types.ObjectId().toHexString()}`,
+    );
 
     return {
       finalizable: true,
@@ -768,6 +834,7 @@ export class BookingCreationService {
       amountDueNowCents: financials.depositCents,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
+      ...(computedTax ? { computedTax } : {}),
     };
   }
 
@@ -866,6 +933,22 @@ export class BookingCreationService {
     };
 
     const customerChargeNowCents = financials.depositCents;
+
+    // Checkpoint B (Cyprus VAT, compute-only) — see finalizeCustomerBooking's identical comment
+    // for the full rationale. PaymentIntent amount immediately below is UNCHANGED in this
+    // checkpoint.
+    let computedTax: ComputedTax | undefined;
+    try {
+      computedTax = await this.computeCyprusTax(
+        customerChargeNowCents,
+        String(bookingId),
+        `${input.idempotencyKey}:tax`,
+      );
+    } catch (error) {
+      await this.claimRepository.release(input.idempotencyKey);
+      throw error;
+    }
+
     let paymentResult: PaymentIntentResult | undefined;
 
     if (customerChargeNowCents > 0) {
@@ -961,7 +1044,7 @@ export class BookingCreationService {
         resolvedPromo: undefined,
         customerChargeNowCents,
       });
-      return { status: "confirmed", booking };
+      return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
       // The Booking never came into being — the entitlement pointing at it must not survive
       // either (never called once a session may already have been redeemed against this row,
@@ -1235,6 +1318,23 @@ export class BookingCreationService {
     }
 
     const customerChargeNowCents = financials.depositCents;
+
+    // Checkpoint B (Cyprus VAT, compute-only) — see finalizeCustomerBooking's identical comment
+    // for the full rationale. A redemption's base session is always $0 (nothing to tax there);
+    // this only ever calculates against real Add-on/travel-fee extras. PaymentIntent amount
+    // immediately below is UNCHANGED in this checkpoint.
+    let computedTax: ComputedTax | undefined;
+    try {
+      computedTax = await this.computeCyprusTax(
+        customerChargeNowCents,
+        String(bookingId),
+        `${input.idempotencyKey}:tax`,
+      );
+    } catch (error) {
+      await this.claimRepository.release(input.idempotencyKey);
+      throw error;
+    }
+
     let paymentResult: PaymentIntentResult | undefined;
 
     if (customerChargeNowCents > 0) {
@@ -1408,7 +1508,7 @@ export class BookingCreationService {
     await this.dispatchBookingCreatedNotifications(created, business);
     await this.dispatchAppointmentReminderScheduling(created);
 
-    return { status: "confirmed", booking: created };
+    return { status: "confirmed", booking: created, ...(computedTax ? { computedTax } : {}) };
   }
 
   private requirePackageProgressRepository(): void {
