@@ -30,6 +30,7 @@ import { BookingCancelledNotifier } from "../../../src/modules/notification/book
 import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -40,6 +41,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -69,6 +71,7 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
   let paymentGateway: FakePaymentGateway;
   let paymentService: PaymentService;
   let financialTransactionService: BookingFinancialTransactionService;
+  let taxGateway: FakeTaxGateway;
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -89,6 +92,7 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     cancellationPolicyRepository = new BusinessCancellationPolicyRepository();
     bookingRepository = new BookingRepository();
     paymentGateway = new FakePaymentGateway();
+    taxGateway = new FakeTaxGateway();
     paymentService = new PaymentService(
       paymentGateway,
       new CustomerPaymentProfileRepository(),
@@ -139,6 +143,12 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       paymentService,
       financialTransactionService,
       promoApplicationService,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new CyprusTaxService(taxGateway),
     );
 
     lifecycleService = new BookingLifecycleService(
@@ -336,6 +346,37 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
   });
 
   // --- First-booking activation charge --------------------------------------------------------
+
+  it("returns the VAT-inclusive preview contract while finalization still charges pre-tax", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+    const customer = await createCustomer("vat-preview");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const input = finalizeInput(service._id, membership._id);
+    taxGateway.queueNextTax(380);
+
+    const preview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      input,
+    );
+
+    expect(taxGateway.calls.at(-1)?.amountCents).toBe(2_000);
+    expect(preview).toMatchObject({
+      preTaxChargeCents: 2_000,
+      taxCents: 380,
+      dueNowCents: 2_380,
+      balanceDueCents: 8_000,
+    });
+
+    const result = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      input,
+    );
+    expect(result.status).toBe("confirmed");
+    expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(2_000);
+  });
 
   it("first-booking finalize charges the activation fee, persists the Booking, and activates the Client", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);

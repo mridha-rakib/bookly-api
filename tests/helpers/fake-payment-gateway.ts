@@ -26,6 +26,7 @@ import type {
  * configuration into one another.
  */
 export class FakePaymentGateway implements PaymentGateway {
+  public paymentIntentInputs: CreatePaymentIntentInput[] = [];
   private customers = new Map<string, { email: string; name: string }>();
   private paymentMethods = new Map<string, PaymentMethodSummary>();
   private setupIntents = new Map<string, SetupIntentStatusResult & { customerId: string }>();
@@ -121,6 +122,7 @@ export class FakePaymentGateway implements PaymentGateway {
   public async createAndConfirmPaymentIntent(
     input: CreatePaymentIntentInput,
   ): Promise<PaymentIntentResult> {
+    this.paymentIntentInputs.push(input);
     const existing = this.idempotentPaymentIntents.get(input.idempotencyKey);
     if (existing) {
       return existing;

@@ -31,6 +31,7 @@ import { PackageProgressModel } from "../../../src/modules/package-progress/pack
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -42,6 +43,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -85,6 +87,7 @@ describe("database-backed Package Deal integration", () => {
   let addonRepository: AddonRepository;
   let addonServiceAssignmentRepository: AddonServiceAssignmentRepository;
   let businessTravelSettingsRepository: BusinessTravelSettingsRepository;
+  let taxGateway: FakeTaxGateway;
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -113,6 +116,7 @@ describe("database-backed Package Deal integration", () => {
       new CustomerPaymentProfileRepository(),
       userRepository,
     );
+    taxGateway = new FakeTaxGateway();
     financialTransactionService = new BookingFinancialTransactionService(
       new BookingFinancialTransactionRepository(),
     );
@@ -164,6 +168,7 @@ describe("database-backed Package Deal integration", () => {
       undefined, // bookingCreatedNotifier
       undefined, // appointmentReminderScheduler
       packageProgressRepository,
+      new CyprusTaxService(taxGateway),
     );
 
     lifecycleService = new BookingLifecycleService(
@@ -479,6 +484,29 @@ describe("database-backed Package Deal integration", () => {
   // --- Purchase --------------------------------------------------------------------------------
 
   describe("Package purchase", () => {
+    it("previews the actual online package deposit with Stripe VAT and keeps venue balance pre-tax", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness();
+      const customer = await createCustomer("preview-buyer");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      taxGateway.queueNextTax(665);
+
+      const preview = await creationService.previewPackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+
+      expect(taxGateway.calls.at(-1)?.amountCents).toBe(3_500);
+      expect(preview).toMatchObject({
+        preTaxChargeCents: 3_500,
+        taxCents: 665,
+        dueNowCents: 4_165,
+        balanceDueCents: 41_500,
+      });
+      expect(preview.financials.balanceDueCents).toBe(41_500);
+    });
+
     it("charges the full bundle price as a normal deposit, creates session 1, and creates the entitlement", async () => {
       const { business, staff, service, customer, purchase, progress } =
         await setUpPurchasedPackage();
