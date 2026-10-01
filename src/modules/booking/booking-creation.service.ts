@@ -21,6 +21,7 @@ import { computePackageBalanceSettlement } from "../package-progress/package-pro
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import { TaxError } from "../payment/tax.errors.js";
 import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
@@ -91,12 +92,17 @@ export type BookingCreationPreview = {
     amountCents: number;
   }>;
   financials: BookingFinancials;
-  amountDueNowCents: number;
+  /** C2 customer-disclosure contract. These four integer-cent values are one atomic,
+   * server-authoritative quote: the client formats them but never calculates between them. */
+  preTaxChargeCents: number;
+  taxCents: number;
+  dueNowCents: number;
+  balanceDueCents: number;
   requiresSavedCard: boolean;
   hasSavedCard: boolean;
-  /** Batch 13 — present only when a valid `promoCode` was supplied. `amountDueNowCents` above
-   * already reflects the discount (== `promo.chargeCents`); this breakdown is what the frontend
-   * displays as "Deposit before promo / Promo discount / Due now" — never recomputed in React. */
+  /** Batch 13 — present only when a valid `promoCode` was supplied. `preTaxChargeCents` above
+   * already reflects the discount (== `promo.chargeCents`); this breakdown lets the frontend
+   * show the pre-promo deposit and discount without recomputing the taxable amount in React. */
   promo?: {
     code: string;
     type: "PERCENTAGE" | "FIXED";
@@ -104,10 +110,6 @@ export type BookingCreationPreview = {
     depositBeforePromoCents: number;
     discountCents: number;
   };
-  /** Checkpoint B (Cyprus VAT, compute-only) — present only when a `taxService` is configured.
-   * `computedTax.dueNowWithTaxCents` is NOT what will actually be charged in this checkpoint
-   * (that remains `amountDueNowCents` above, unchanged) — see ComputedTax's own doc comment. */
-  computedTax?: ComputedTax;
 };
 
 export type FinalizeBookingResult =
@@ -257,6 +259,28 @@ export class BookingCreationService {
       return undefined;
     }
     return this.taxService.computeForCharge({ amountCents, reference, idempotencyKey });
+  }
+
+  /** Maps the one accepted Stripe Tax result into C2's public preview vocabulary. Production
+   * always wires `taxService`; failing when it is absent prevents a positive-charge preview from
+   * silently masquerading as VAT-free. `dueNowCents` is Stripe's `amount_total` verbatim. */
+  private toPreviewFinancialCommitment(
+    preTaxChargeCents: number,
+    balanceDueCents: number,
+    computedTax: ComputedTax | undefined,
+  ): Pick<
+    BookingCreationPreview,
+    "preTaxChargeCents" | "taxCents" | "dueNowCents" | "balanceDueCents"
+  > {
+    if (!computedTax || computedTax.preTaxAmountCents !== preTaxChargeCents) {
+      throw new TaxError("TAX_CALCULATION_FAILED", 502);
+    }
+    return {
+      preTaxChargeCents: computedTax.preTaxAmountCents,
+      taxCents: computedTax.taxCents,
+      dueNowCents: computedTax.dueNowWithTaxCents,
+      balanceDueCents,
+    };
   }
 
   /**
@@ -454,13 +478,18 @@ export class BookingCreationService {
     // Checkpoint B (Cyprus VAT, compute-only) — the SAME canonical amount the customer would
     // actually be charged (post-clamp, post-promo), never the pre-promo deposit. Read-only, like
     // the rest of this preview: no PaymentIntent, no persistence, and (per this checkpoint's own
-    // scope) the ACTUAL amount due now below is still `amountDueNowCents`, unchanged.
-    const amountDueNowCents = resolvedPromo
+    // scope) the ACTUAL PaymentIntent amount in finalize remains this same pre-tax value.
+    const customerChargeNowCents = resolvedPromo
       ? resolvedPromo.customerChargeNowCents
       : financials.depositCents;
     const computedTax = await this.computeCyprusTax(
-      amountDueNowCents,
+      customerChargeNowCents,
       `preview-${new Types.ObjectId().toHexString()}`,
+    );
+    const financialCommitment = this.toPreviewFinancialCommitment(
+      customerChargeNowCents,
+      financials.balanceDueCents,
+      computedTax,
     );
 
     return {
@@ -486,8 +515,7 @@ export class BookingCreationService {
       // returning — never platformFeeCents, which is 0 for a returning customer even though a
       // real deposit is still due (see BookingFinancials's own doc comment). Batch 13: when a
       // valid promo is supplied, this becomes the promo-discounted amount instead.
-      amountDueNowCents,
-      ...(computedTax ? { computedTax } : {}),
+      ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
       ...(resolvedPromo
@@ -809,6 +837,11 @@ export class BookingCreationService {
       financials.depositCents,
       `preview-${new Types.ObjectId().toHexString()}`,
     );
+    const financialCommitment = this.toPreviewFinancialCommitment(
+      financials.depositCents,
+      financials.balanceDueCents,
+      computedTax,
+    );
 
     return {
       finalizable: true,
@@ -831,10 +864,9 @@ export class BookingCreationService {
         },
       ],
       financials,
-      amountDueNowCents: financials.depositCents,
+      ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
-      ...(computedTax ? { computedTax } : {}),
     };
   }
 

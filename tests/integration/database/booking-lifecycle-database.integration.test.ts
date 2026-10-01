@@ -29,6 +29,7 @@ import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outb
 import { BookingRescheduledCustomerNotifier } from "../../../src/modules/notification/booking-rescheduled-customer.notifier.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -39,6 +40,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -109,6 +111,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
   let paymentService: PaymentService;
   let financialTransactionService: BookingFinancialTransactionService;
   let fakeIntegration: FakeIntegrationService;
+  let taxGateway: FakeTaxGateway;
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -135,6 +138,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       new CustomerPaymentProfileRepository(),
       userRepository,
     );
+    taxGateway = new FakeTaxGateway();
     financialTransactionService = new BookingFinancialTransactionService(
       new BookingFinancialTransactionRepository(),
     );
@@ -180,6 +184,12 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       paymentService,
       financialTransactionService,
       promoApplicationService,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new CyprusTaxService(taxGateway),
     );
 
     lifecycleService = new BookingLifecycleService(
@@ -460,7 +470,10 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     expect(preview.isFirstBooking).toBe(true);
     expect(preview.financials.servicesSubtotalCents).toBe(2000);
     expect(preview.financials.platformFeeCents).toBeGreaterThan(0);
-    expect(preview.amountDueNowCents).toBe(preview.financials.platformFeeCents);
+    expect(preview.preTaxChargeCents).toBe(preview.financials.depositCents);
+    expect(preview.taxCents).toBe(Math.round(preview.preTaxChargeCents * 0.19));
+    expect(preview.dueNowCents).toBe(preview.preTaxChargeCents + preview.taxCents);
+    expect(preview.balanceDueCents).toBe(preview.financials.balanceDueCents);
     expect(preview.requiresSavedCard).toBe(true);
     expect(preview.hasSavedCard).toBe(false);
 

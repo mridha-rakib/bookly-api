@@ -27,6 +27,7 @@ import { BusinessPayoutRepository } from "../../../src/modules/finance/business-
 import { FinanceService } from "../../../src/modules/finance/finance.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -41,6 +42,7 @@ import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhoo
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -74,6 +76,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
   let promoRepository: PromoRepository;
   let promoRedemptionRepository: PromoRedemptionRepository;
   let tokenService: TokenService;
+  let taxGateway: FakeTaxGateway;
 
   beforeAll(async () => {
     await connectIsolatedDatabase();
@@ -101,6 +104,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     financialTransactionService = new BookingFinancialTransactionService(
       new BookingFinancialTransactionRepository(),
     );
+    taxGateway = new FakeTaxGateway();
     const businessPayoutRepository = new BusinessPayoutRepository();
     financeService = new FinanceService(
       businessRepository,
@@ -157,6 +161,12 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       paymentService,
       financialTransactionService,
       promoApplicationService,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      new CyprusTaxService(taxGateway),
     );
 
     tokenService = new TokenService(new SessionRepository());
@@ -677,6 +687,19 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
 
+    const preview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "FREE"),
+    );
+    expect(preview).toMatchObject({
+      preTaxChargeCents: 0,
+      taxCents: 0,
+      dueNowCents: 0,
+      balanceDueCents: 6_400,
+    });
+    expect(taxGateway.calls).toHaveLength(0);
+
     const result = await creationService.finalizeCustomerBooking(
       String(customer._id),
       String(business._id),
@@ -926,12 +949,12 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     await createPromo({
       code: "PREVIEWONLY",
       type: "PERCENTAGE",
-      value: 20,
+      value: 25,
       totalUsageLimit: 5,
       createdByUserId: superAdmin._id,
     });
 
-    const { owner, business, membership, service } = await setupBookableBusiness(8000);
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     const customer = await createCustomer("preview");
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
@@ -942,8 +965,12 @@ describe("database-backed Promo Code system (Batch 13)", () => {
         String(business._id),
         finalizeInput(service._id, membership._id, "PREVIEWONLY"),
       );
-      expect(preview.promo?.discountCents).toBe(320); // 20% of €16
-      expect(preview.amountDueNowCents).toBe(1280);
+      expect(preview.promo?.depositBeforePromoCents).toBe(2_000);
+      expect(preview.promo?.discountCents).toBe(500);
+      expect(preview.preTaxChargeCents).toBe(1_500);
+      expect(preview.taxCents).toBe(285);
+      expect(preview.dueNowCents).toBe(1_785);
+      expect(taxGateway.calls.at(-1)?.amountCents).toBe(1_500);
     }
 
     const promo = await promoRepository.findByNormalizedCode("PREVIEWONLY");
