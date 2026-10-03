@@ -8,6 +8,7 @@ import {
   packageSessionOutcomeForBookingStatus,
 } from "../package-progress/package-progress.rules.js";
 import type { PaymentService } from "../payment/payment.service.js";
+import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
 import type { BookingDocument, BookingEventHistoryEntry } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
 
@@ -206,7 +207,16 @@ export class NoShowResolutionService {
         userId: booking.customer.customerUserId,
         amountCents,
         idempotencyKey,
-        metadata: { bookingId: String(booking._id), purpose: "NO_SHOW_FEE" },
+        metadata: buildPaymentIntentMetadata({
+          bookingId: String(booking._id),
+          businessId: String(booking.businessId),
+          businessClientId: String(booking.customer.businessClientId),
+          purpose: "NO_SHOW_FEE",
+          preTaxChargeCents: amountCents,
+          taxCents: 0,
+          chargedAmountCents: amountCents,
+          taxMode: "PRE_ACTIVATION",
+        }),
       });
       providerReference = result.paymentIntentId;
       succeeded = result.status === "succeeded";

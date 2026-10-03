@@ -12,6 +12,7 @@ import type {
   PaymentMethodSummary,
   RefundResult,
   SetupIntentStatusResult,
+  TaxAssociationResult,
 } from "./payment.types.js";
 import { getStripeClient } from "./stripe-client.js";
 
@@ -217,6 +218,32 @@ export class StripePaymentGateway implements PaymentGateway {
     };
   }
 
+  public async findTaxAssociation(paymentIntentId: string): Promise<TaxAssociationResult | null> {
+    try {
+      // Stripe documents simplified PaymentIntent Tax as public preview and requires this
+      // request-level version. Do not pin/bump the global Stripe client: existing non-tax
+      // PaymentIntent behavior must remain on the account/default version until activation.
+      const association = await this.client.tax.associations.find(
+        { payment_intent: paymentIntentId },
+        { apiVersion: "2025-05-28.preview" },
+      );
+      const attempts = association.tax_transaction_attempts ?? [];
+      const paymentAttempt = attempts.find((attempt) => attempt.source === paymentIntentId);
+      return {
+        taxCalculationId: association.calculation,
+        ...(paymentAttempt?.committed
+          ? { taxTransactionId: paymentAttempt.committed.transaction }
+          : {}),
+        ...(paymentAttempt?.errored ? { terminalErrorReason: paymentAttempt.errored.reason } : {}),
+      };
+    } catch (error) {
+      // Stripe returns resource_missing while its association is eventually consistent. The
+      // caller deliberately treats null as retryable rather than consuming reconciliation.
+      if (this.isMissingTaxAssociation(error)) return null;
+      throw error;
+    }
+  }
+
   public constructWebhookEvent(rawBody: Buffer, signature: string): Stripe.Event {
     if (!env.STRIPE_WEBHOOK_SECRET) {
       throw new PaymentError("PAYMENT_PROVIDER_NOT_CONFIGURED", 503);
@@ -323,6 +350,17 @@ export class StripePaymentGateway implements PaymentGateway {
   }
 
   private isMissingStripeCustomer(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "type" in error &&
+      "code" in error &&
+      (error as { type?: unknown }).type === "StripeInvalidRequestError" &&
+      (error as { code?: unknown }).code === "resource_missing"
+    );
+  }
+
+  private isMissingTaxAssociation(error: unknown): boolean {
     return (
       typeof error === "object" &&
       error !== null &&

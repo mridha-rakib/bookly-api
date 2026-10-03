@@ -326,6 +326,32 @@ export class BookingRepository {
     ).exec();
   }
 
+  /** Future simplified-PI Tax reconciliation writes only the provider's immutable transaction
+   * id, and only when the Booking already contains the matching activation snapshot. This keeps
+   * an eventual Stripe association from attaching itself to the wrong Booking after retries. */
+  public async setTaxTransactionIdIfMatching(input: {
+    bookingId: Types.ObjectId | string;
+    businessId: Types.ObjectId | string;
+    paymentIntentId: string;
+    taxCalculationId: string;
+    taxTransactionId: string;
+  }): Promise<BookingDocument | null> {
+    return BookingModel.findOneAndUpdate(
+      {
+        _id: input.bookingId,
+        businessId: input.businessId,
+        "financials.paymentIntentId": input.paymentIntentId,
+        "financials.taxCalculationId": input.taxCalculationId,
+        $or: [
+          { "financials.taxTransactionId": { $exists: false } },
+          { "financials.taxTransactionId": input.taxTransactionId },
+        ],
+      },
+      { $set: { "financials.taxTransactionId": input.taxTransactionId } },
+      { returnDocument: "after", runValidators: true },
+    ).exec();
+  }
+
   /**
    * Proves the `{businessId, "schedule.startAt"}` index shape (the future Calendar/All
    * Bookings query) end to end. Inclusive of both bounds, ascending by start time. Range

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BookingFinancialTransactionDocument } from "../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import type { PaymentGateway } from "../../src/modules/payment/payment.types.js";
+import { buildPaymentIntentMetadata } from "../../src/modules/payment/payment-intent-metadata.js";
 import { StripeWebhookService } from "../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import type { StripeWebhookEventRepository } from "../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 
@@ -42,6 +43,7 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
       claim: vi.fn(async () => true),
       markProcessed: vi.fn(async () => undefined),
       markFailed: vi.fn(async () => undefined),
+      markRetryable: vi.fn(async () => undefined),
     } as unknown as StripeWebhookEventRepository;
 
     gateway = {
@@ -63,6 +65,7 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
       createRefund: async () => ({ refundId: "re_1", status: "succeeded" }),
       retrieveBalanceTransactionFee: async () => ({ feeCents: 55, currency: "EUR" }),
       retrieveProcessingFeeForPaymentIntent: async () => ({ feeCents: 87, currency: "EUR" }),
+      findTaxAssociation: async () => null,
       constructWebhookEvent: () => {
         throw new Error("not used");
       },
@@ -88,14 +91,20 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     return new StripeWebhookService(gateway, eventRepository, financialTransactionService);
   };
 
-  const paymentIntentSucceededEvent = (paymentIntentId: string, bookingId: string) =>
+  const paymentIntentSucceededEvent = (
+    paymentIntentId: string,
+    bookingId: string,
+    overrides: { amount?: number; metadata?: Record<string, string> } = {},
+  ) =>
     ({
       id: `evt_${paymentIntentId}`,
       type: "payment_intent.succeeded",
       data: {
         object: {
           id: paymentIntentId,
-          metadata: { bookingId },
+          amount: overrides.amount ?? 2000,
+          currency: "eur",
+          metadata: overrides.metadata ?? { bookingId },
         },
       },
     }) as unknown as Parameters<StripeWebhookService["process"]>[0];
@@ -146,6 +155,24 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     expect(processingFeeEntry?.["idempotencyKey"]).toBe("processing-fee:pi_test_1");
   });
 
+  it("does not consume an early success webhook; a retry after its source row exists completes once", async () => {
+    const bookingId = new Types.ObjectId();
+    const eventualEntry = makeEntry({
+      bookingId,
+      providerReference: "pi_test_1",
+      status: "SUCCEEDED",
+    });
+    const service = buildService(undefined);
+    const event = paymentIntentSucceededEvent("pi_test_1", String(bookingId));
+
+    await expect(service.process(event)).rejects.toThrow("source ledger row");
+    expect(eventRepository.markRetryable).toHaveBeenCalledOnce();
+    financialTransactionService.listForBooking = vi.fn(async () => [eventualEntry]);
+
+    await expect(service.process(event)).resolves.toBe(true);
+    expect(recordedEntries.filter((entry) => entry["type"] === "PROCESSING_FEE")).toHaveLength(1);
+  });
+
   it("never records a duplicate PROCESSING_FEE entry on true webhook redelivery (the ledger's real unique idempotencyKey index rejects the second insert)", async () => {
     const bookingId = new Types.ObjectId();
     const alreadySettled = makeEntry({
@@ -179,22 +206,21 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     expect(recordedEntries.filter((entry) => entry["type"] === "PROCESSING_FEE")).toHaveLength(1);
   });
 
-  it("never throws when the balance transaction is not yet available (returns null) — the primary settlement still succeeds", async () => {
+  it("keeps the event retryable when the balance transaction is not yet available", async () => {
     const bookingId = new Types.ObjectId();
     const pending = makeEntry({ bookingId, providerReference: "pi_test_1", status: "PENDING" });
     gateway.retrieveProcessingFeeForPaymentIntent = async () => null;
     const service = buildService(pending);
 
-    const handled = await service.process(
-      paymentIntentSucceededEvent("pi_test_1", String(bookingId)),
-    );
-
-    expect(handled).toBe(true);
+    await expect(
+      service.process(paymentIntentSucceededEvent("pi_test_1", String(bookingId))),
+    ).rejects.toThrow("balance transaction");
     expect(settleStatusCalls).toEqual([{ id: pending._id, status: "SUCCEEDED" }]);
     expect(recordedEntries.find((entry) => entry["type"] === "PROCESSING_FEE")).toBeUndefined();
+    expect(eventRepository.markRetryable).toHaveBeenCalledOnce();
   });
 
-  it("swallows a Stripe error from the fee lookup without failing the whole webhook", async () => {
+  it("keeps the event retryable when Stripe fee lookup fails", async () => {
     const bookingId = new Types.ObjectId();
     const pending = makeEntry({ bookingId, providerReference: "pi_test_1", status: "PENDING" });
     gateway.retrieveProcessingFeeForPaymentIntent = async () => {
@@ -202,11 +228,48 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     };
     const service = buildService(pending);
 
-    const handled = await service.process(
-      paymentIntentSucceededEvent("pi_test_1", String(bookingId)),
-    );
-
-    expect(handled).toBe(true);
+    await expect(
+      service.process(paymentIntentSucceededEvent("pi_test_1", String(bookingId))),
+    ).rejects.toThrow("processing fee");
     expect(settleStatusCalls).toEqual([{ id: pending._id, status: "SUCCEEDED" }]);
+    expect(eventRepository.markRetryable).toHaveBeenCalledOnce();
+  });
+
+  it("does not post a fee when Stripe currencies are not comparable", async () => {
+    const bookingId = new Types.ObjectId();
+    const settled = makeEntry({ bookingId, providerReference: "pi_test_1", status: "SUCCEEDED" });
+    gateway.retrieveProcessingFeeForPaymentIntent = async () => ({ feeCents: 87, currency: "USD" });
+    const service = buildService(settled);
+
+    // Investigation failures are acknowledged to Stripe, but remain durably visible as FAILED.
+    await expect(
+      service.process(paymentIntentSucceededEvent("pi_test_1", String(bookingId))),
+    ).resolves.toBe(true);
+    expect(recordedEntries.find((entry) => entry["type"] === "PROCESSING_FEE")).toBeUndefined();
+    expect(eventRepository.markFailed).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when C3 metadata amount or ownership does not match its source row", async () => {
+    const bookingId = new Types.ObjectId();
+    const settled = makeEntry({ bookingId, providerReference: "pi_test_1", status: "SUCCEEDED" });
+    const service = buildService(settled);
+    const metadata = buildPaymentIntentMetadata({
+      bookingId: String(bookingId),
+      businessId: String(settled.businessId),
+      businessClientId: String(settled.businessClientId),
+      purpose: "BOOKING_DEPOSIT",
+      preTaxChargeCents: 2000,
+      taxCents: 0,
+      chargedAmountCents: 2000,
+      taxMode: "PRE_ACTIVATION",
+    });
+
+    await expect(
+      service.process(
+        paymentIntentSucceededEvent("pi_test_1", String(bookingId), { amount: 2001, metadata }),
+      ),
+    ).resolves.toBe(true);
+    expect(recordedEntries.find((entry) => entry["type"] === "PROCESSING_FEE")).toBeUndefined();
+    expect(eventRepository.markFailed).toHaveBeenCalledOnce();
   });
 });

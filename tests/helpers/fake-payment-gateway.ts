@@ -12,6 +12,7 @@ import type {
   PaymentMethodSummary,
   RefundResult,
   SetupIntentStatusResult,
+  TaxAssociationResult,
 } from "../../src/modules/payment/payment.types.js";
 
 /**
@@ -198,6 +199,10 @@ export class FakePaymentGateway implements PaymentGateway {
       return fee;
     }
     return { feeCents: 55, currency: "EUR" };
+  }
+
+  public async findTaxAssociation(_paymentIntentId: string): Promise<TaxAssociationResult | null> {
+    return null;
   }
 
   public constructWebhookEvent(_rawBody: Buffer, _signature: string): Stripe.Event {

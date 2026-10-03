@@ -21,6 +21,7 @@ import { computePackageBalanceSettlement } from "../package-progress/package-pro
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
 import { TaxError } from "../payment/tax.errors.js";
 import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
@@ -690,11 +691,17 @@ export class BookingCreationService {
           userId: customerUserId,
           amountCents: customerChargeNowCents,
           idempotencyKey: input.idempotencyKey,
-          metadata: {
+          metadata: buildPaymentIntentMetadata({
             bookingId: String(bookingId),
             businessId: String(business._id),
+            businessClientId: String(client._id),
             purpose: "BOOKING_DEPOSIT",
-          },
+            preTaxChargeCents: customerChargeNowCents,
+            taxCents: computedTax?.taxCents ?? 0,
+            chargedAmountCents: customerChargeNowCents,
+            taxCalculationId: computedTax?.taxCalculationId,
+            taxMode: "PRE_ACTIVATION",
+          }),
         });
       } catch (error) {
         await this.claimRepository.release(input.idempotencyKey);
@@ -989,11 +996,17 @@ export class BookingCreationService {
           userId: customerUserId,
           amountCents: customerChargeNowCents,
           idempotencyKey: input.idempotencyKey,
-          metadata: {
+          metadata: buildPaymentIntentMetadata({
             bookingId: String(bookingId),
             businessId: String(business._id),
+            businessClientId: String(client._id),
             purpose: "PACKAGE_PURCHASE",
-          },
+            preTaxChargeCents: customerChargeNowCents,
+            taxCents: computedTax?.taxCents ?? 0,
+            chargedAmountCents: customerChargeNowCents,
+            taxCalculationId: computedTax?.taxCalculationId,
+            taxMode: "PRE_ACTIVATION",
+          }),
         });
       } catch (error) {
         await this.claimRepository.release(input.idempotencyKey);
@@ -1375,11 +1388,17 @@ export class BookingCreationService {
           userId: customerUserId,
           amountCents: customerChargeNowCents,
           idempotencyKey: input.idempotencyKey,
-          metadata: {
+          metadata: buildPaymentIntentMetadata({
             bookingId: String(bookingId),
             businessId: String(business._id),
+            businessClientId: String(client._id),
             purpose: "PACKAGE_SESSION_EXTRAS",
-          },
+            preTaxChargeCents: customerChargeNowCents,
+            taxCents: computedTax?.taxCents ?? 0,
+            chargedAmountCents: customerChargeNowCents,
+            taxCalculationId: computedTax?.taxCalculationId,
+            taxMode: "PRE_ACTIVATION",
+          }),
         });
       } catch (error) {
         await this.claimRepository.release(input.idempotencyKey);
