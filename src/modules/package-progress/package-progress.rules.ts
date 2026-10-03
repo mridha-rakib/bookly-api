@@ -1,5 +1,6 @@
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingStatus } from "../booking/booking.types.js";
+import type { PackageProgressDocument } from "./package-progress.model.js";
 
 /**
  * Pure, side-effect-free Package classification rules (Phase 4B corrections) — mirrors
@@ -56,6 +57,28 @@ export type PackageBalanceSettlement = {
   balanceSettled: boolean;
   outstandingBalanceCents: number;
 };
+
+export type PackageProgressStatus = "ACTIVE" | "AWAITING_BALANCE" | "DEPLETED" | "VOIDED";
+
+/** One shared derived status for customer Package detail and Business Booking detail. */
+export const derivePackageProgressStatus = (
+  progress: Pick<PackageProgressDocument, "remainingSessions" | "voidedAt">,
+  settlement: PackageBalanceSettlement,
+): PackageProgressStatus =>
+  progress.voidedAt
+    ? "VOIDED"
+    : progress.remainingSessions <= 0
+      ? "DEPLETED"
+      : !settlement.balanceSettled
+        ? "AWAITING_BALANCE"
+        : "ACTIVE";
+
+/** Informational mirror of the existing redemption guards: settlement alone never creates an
+ * entitlement, and completion of session 1 is deliberately irrelevant. */
+export const isPackageSchedulingUnlocked = (
+  progress: Pick<PackageProgressDocument, "remainingSessions" | "voidedAt">,
+  settlement: PackageBalanceSettlement,
+): boolean => derivePackageProgressStatus(progress, settlement) === "ACTIVE";
 
 /**
  * Approved payment/unlock model: the Package purchase (session 1) charges the SAME online

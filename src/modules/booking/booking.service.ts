@@ -12,6 +12,8 @@ import {
 } from "../catalog/catalog.dto.js";
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
+import type { PackageProgressDocument } from "../package-progress/package-progress.model.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
@@ -69,7 +71,49 @@ export class BookingService {
     private readonly addonServiceAssignmentRepository: AddonServiceAssignmentRepository,
     private readonly clientRepository: ClientRepository,
     private readonly bookingRepository: BookingRepository,
+    private readonly packageProgressRepository?: Pick<
+      PackageProgressRepository,
+      "findManyByIdsForCustomerAndBusiness"
+    >,
   ) {}
+
+  /** Read context for Business Booking Detail only. Normal Bookings perform no extra query.
+   * Package ids are deduplicated and loaded in one business+customer-scoped query; origin
+   * Bookings are then loaded in one customer-scoped batch for authoritative settlement. */
+  public async getPackageProgressContextsForBusinessBooking(
+    booking: BookingDocument,
+  ): Promise<Array<{ progress: PackageProgressDocument; originBooking?: BookingDocument }>> {
+    if (!this.packageProgressRepository || !booking.customer.customerUserId) return [];
+
+    const packageIds = Array.from(
+      new Set(
+        booking.serviceLines
+          .map((line) => line.pricingInput.packageProgressId)
+          .filter((id): id is Types.ObjectId => Boolean(id))
+          .map(String),
+      ),
+    );
+    if (packageIds.length === 0) return [];
+
+    const progresses = await this.packageProgressRepository.findManyByIdsForCustomerAndBusiness(
+      packageIds,
+      booking.businessId,
+      booking.customer.customerUserId,
+    );
+    if (progresses.length === 0) return [];
+
+    const originBookings = await this.bookingRepository.findManyByIdsForCustomer(
+      booking.businessId,
+      Array.from(new Set(progresses.map((progress) => String(progress.originBookingId)))),
+      booking.customer.customerUserId,
+    );
+    const originById = new Map(originBookings.map((origin) => [String(origin._id), origin]));
+
+    return progresses.map((progress) => {
+      const originBooking = originById.get(String(progress.originBookingId));
+      return { progress, ...(originBooking ? { originBooking } : {}) };
+    });
+  }
 
   // --- Authorization foundation -----------------------------------------------------------
 

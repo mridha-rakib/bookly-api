@@ -1,4 +1,10 @@
 import type { BusinessVisitType } from "../business/business.types.js";
+import type { PackageProgressDocument } from "../package-progress/package-progress.model.js";
+import {
+  computePackageBalanceSettlement,
+  derivePackageProgressStatus,
+  isPackageSchedulingUnlocked,
+} from "../package-progress/package-progress.rules.js";
 import type { BookingDocument } from "./booking.model.js";
 
 /**
@@ -49,6 +55,35 @@ export type BookingDetailDto = {
   fulfilment: BookingDocument["fulfilment"];
   serviceLines: BookingServiceLineDto[];
   financials: BookingDocument["financials"];
+  /** Business-readable derived facts only; no duplicate persisted payment state. */
+  paymentSummary: {
+    actualOnlinePaidCents: number;
+    originalVenueBalanceCents: number;
+    venuePaidCents: number;
+    outstandingVenueBalanceCents: number;
+    venueSettlementStatus:
+      | "NOT_REQUIRED"
+      | "NOT_RECORDED"
+      | "NOT_PAID"
+      | "PARTIALLY_PAID"
+      | "PAID_IN_FULL";
+  };
+  /** Array-shaped for safe degradation if legacy/corrupt data ever contains multiple linked
+   * Package lines. Current creation flows guarantee exactly one line per Package Booking. */
+  packageSessions: Array<{
+    serviceId: string;
+    packageName: string;
+    packageProgressId: string;
+    sessionIndex: number;
+    sessionsInPackage: number;
+    isOriginSession: boolean;
+    packageStatus: "ACTIVE" | "AWAITING_BALANCE" | "DEPLETED" | "VOIDED";
+    remainingSessions: number;
+    completedSessions: number;
+    balanceSettled: boolean;
+    outstandingBalanceCents: number;
+    schedulingUnlocked: boolean;
+  }>;
   schedule: { timezone: string; startAt: string; endAt: string };
   customerRescheduleCount: number;
   cancellationOutcome?: BookingDocument["cancellationOutcome"];
@@ -88,6 +123,86 @@ export type BookingDetailDto = {
     | undefined;
   createdAt: string;
   updatedAt: string;
+};
+
+export type BookingPackageProgressContext = {
+  progress: PackageProgressDocument;
+  originBooking?: BookingDocument | undefined;
+};
+
+const toPaymentSummary = (booking: BookingDocument): BookingDetailDto["paymentSummary"] => {
+  const actualOnlinePaidCents =
+    booking.source === "MANUAL"
+      ? 0
+      : (booking.promo?.chargeCents ?? booking.financials.depositCents);
+  const originalVenueBalanceCents = Math.max(0, booking.financials.balanceDueCents);
+  const venuePaidCents =
+    booking.completionPayment?.paid === true
+      ? Math.min(originalVenueBalanceCents, booking.completionPayment.amountCents ?? 0)
+      : 0;
+  const outstandingVenueBalanceCents = Math.max(0, originalVenueBalanceCents - venuePaidCents);
+
+  let venueSettlementStatus: BookingDetailDto["paymentSummary"]["venueSettlementStatus"];
+  if (originalVenueBalanceCents <= 0) venueSettlementStatus = "NOT_REQUIRED";
+  else if (!booking.completionPayment) venueSettlementStatus = "NOT_RECORDED";
+  else if (!booking.completionPayment.paid) venueSettlementStatus = "NOT_PAID";
+  else if (outstandingVenueBalanceCents > 0) venueSettlementStatus = "PARTIALLY_PAID";
+  else venueSettlementStatus = "PAID_IN_FULL";
+
+  return {
+    actualOnlinePaidCents,
+    originalVenueBalanceCents,
+    venuePaidCents,
+    outstandingVenueBalanceCents,
+    venueSettlementStatus,
+  };
+};
+
+const toPackageSessionDtos = (
+  booking: BookingDocument,
+  contexts: readonly BookingPackageProgressContext[],
+): BookingDetailDto["packageSessions"] => {
+  const contextById = new Map(
+    contexts.map((context) => [String(context.progress._id), context] as const),
+  );
+
+  return booking.serviceLines.flatMap((line) => {
+    const packageProgressId = line.pricingInput.packageProgressId;
+    const sessionIndex = line.pricingInput.sessionIndex;
+    const sessionsInPackage = line.pricingInput.sessionsInPackage;
+    if (!packageProgressId || !sessionIndex || !sessionsInPackage) return [];
+
+    const context = contextById.get(String(packageProgressId));
+    // Preserve the line-level identity in serviceLines, but never manufacture aggregate payment
+    // facts if the scoped PackageProgress or its authoritative origin Booking is unavailable.
+    if (!context?.originBooking) return [];
+    const relationshipMatches =
+      String(context.progress.serviceId) === String(line.serviceId) &&
+      context.progress.sessions.some(
+        (entry) =>
+          String(entry.bookingId) === String(booking._id) && entry.sessionIndex === sessionIndex,
+      );
+    if (!relationshipMatches) return [];
+
+    const settlement = computePackageBalanceSettlement(context.originBooking);
+    const packageStatus = derivePackageProgressStatus(context.progress, settlement);
+    return [
+      {
+        serviceId: String(line.serviceId),
+        packageName: context.progress.purchaseSnapshot.name,
+        packageProgressId: String(packageProgressId),
+        sessionIndex,
+        sessionsInPackage,
+        isOriginSession: String(context.progress.originBookingId) === String(booking._id),
+        packageStatus,
+        remainingSessions: context.progress.remainingSessions,
+        completedSessions: context.progress.completedSessions,
+        balanceSettled: settlement.balanceSettled,
+        outstandingBalanceCents: settlement.outstandingBalanceCents,
+        schedulingUnlocked: isPackageSchedulingUnlocked(context.progress, settlement),
+      },
+    ];
+  });
 };
 
 /** Batch — the compact historical location a list row needs (address display + Get Directions),
@@ -230,7 +345,10 @@ const staffNamesForBooking = (booking: BookingDocument): string[] => {
   return names;
 };
 
-export const toBookingDetailDto = (booking: BookingDocument): BookingDetailDto => ({
+export const toBookingDetailDto = (
+  booking: BookingDocument,
+  packageProgressContexts: readonly BookingPackageProgressContext[] = [],
+): BookingDetailDto => ({
   id: String(booking._id),
   businessId: String(booking.businessId),
   reference: booking.reference,
@@ -247,6 +365,8 @@ export const toBookingDetailDto = (booking: BookingDocument): BookingDetailDto =
   fulfilment: booking.fulfilment,
   serviceLines: booking.serviceLines.map(toServiceLineDto),
   financials: booking.financials,
+  paymentSummary: toPaymentSummary(booking),
+  packageSessions: toPackageSessionDtos(booking, packageProgressContexts),
   schedule: {
     timezone: booking.schedule.timezone,
     startAt: booking.schedule.startAt.toISOString(),

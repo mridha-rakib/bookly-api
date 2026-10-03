@@ -47,6 +47,22 @@ export class PackageProgressRepository {
     return PackageProgressModel.findOne({ _id: id, businessId, customerUserId }).exec();
   }
 
+  /** Bounded Booking-detail enrichment for one already-authorized Business Booking. Every
+   * requested id is constrained by the Booking's own business/customer pair in the SAME query,
+   * so a corrupt or malicious service-line link cannot disclose another entitlement. */
+  public async findManyByIdsForCustomerAndBusiness(
+    ids: Array<Types.ObjectId | string>,
+    businessId: Types.ObjectId | string,
+    customerUserId: Types.ObjectId | string,
+  ): Promise<PackageProgressDocument[]> {
+    if (ids.length === 0) return [];
+    return PackageProgressModel.find({
+      _id: { $in: ids },
+      businessId,
+      customerUserId,
+    }).exec();
+  }
+
   /** Cross-business "My Packages" list — mirrors BookingRepository.listForCustomer's own
    * cross-business, customerUserId-scoped shape. */
   public async listForCustomer(

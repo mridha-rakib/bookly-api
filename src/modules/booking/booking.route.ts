@@ -146,6 +146,7 @@ const buildController = (): BookingController => {
     addonServiceAssignmentRepository,
     clientRepository,
     bookingRepository,
+    packageProgressRepository,
   );
 
   const platformSettingsService = new PlatformSettingsService(new PlatformSettingsRepository());
