@@ -7,6 +7,7 @@ import {
   toBookingListItemDto,
 } from "../../src/modules/booking/booking.dto.js";
 import type { BookingDocument } from "../../src/modules/booking/booking.model.js";
+import type { PackageProgressDocument } from "../../src/modules/package-progress/package-progress.model.js";
 
 /**
  * Batch 6 — the frontend Business Owner booking screens (List/Calendar/Detail) read these
@@ -75,6 +76,12 @@ const buildBooking = (overrides: Partial<BookingDocument> = {}): BookingDocument
   } as unknown as BookingDocument;
 };
 
+const requireFirstLine = (booking: BookingDocument): BookingDocument["serviceLines"][number] => {
+  const line = booking.serviceLines[0];
+  if (!line) throw new Error("Test fixture requires one service line");
+  return line;
+};
+
 describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
   it("toBookingListItemDto exposes businessClientId, staffNames, platformFeeCents, depositCents", () => {
     const booking = buildBooking();
@@ -141,5 +148,233 @@ describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
       amountCents: 4000,
       recordedAt: recordedAt.toISOString(),
     });
+  });
+
+  it("derives actual online payment from the real promo charge, including a full discount", () => {
+    expect(toBookingDetailDto(buildBooking()).paymentSummary.actualOnlinePaidCents).toBe(1000);
+    expect(
+      toBookingDetailDto(buildBooking({ source: "MANUAL" })).paymentSummary.actualOnlinePaidCents,
+    ).toBe(0);
+
+    const partialPromo = toBookingDetailDto(
+      buildBooking({
+        promo: {
+          promoId: new Types.ObjectId(),
+          code: "SAVE5",
+          type: "FIXED",
+          value: 500,
+          discountCents: 500,
+          chargeCents: 500,
+          fundingOwner: "BOOKLY",
+          appliedAt: new Date("2026-08-20T10:00:00.000Z"),
+        },
+      }),
+    );
+    expect(partialPromo.financials.depositCents).toBe(1000);
+    expect(partialPromo.paymentSummary.actualOnlinePaidCents).toBe(500);
+
+    const fullPromo = toBookingDetailDto(
+      buildBooking({
+        promo: {
+          promoId: new Types.ObjectId(),
+          code: "FREE",
+          type: "PERCENTAGE",
+          value: 100,
+          discountCents: 1000,
+          chargeCents: 0,
+          fundingOwner: "BOOKLY",
+          appliedAt: new Date("2026-08-20T10:00:00.000Z"),
+        },
+      }),
+    );
+    expect(fullPromo.paymentSummary.actualOnlinePaidCents).toBe(0);
+  });
+
+  it("derives every venue settlement state without mutating the original balance", () => {
+    expect(toBookingDetailDto(buildBooking()).paymentSummary).toMatchObject({
+      originalVenueBalanceCents: 4000,
+      venuePaidCents: 0,
+      outstandingVenueBalanceCents: 4000,
+      venueSettlementStatus: "NOT_RECORDED",
+    });
+
+    const recordedAt = new Date("2026-08-25T13:00:00.000Z");
+    const recordedBy = new Types.ObjectId();
+    const notPaid = toBookingDetailDto(
+      buildBooking({ completionPayment: { paid: false, recordedAt, recordedBy } }),
+    );
+    expect(notPaid.paymentSummary.venueSettlementStatus).toBe("NOT_PAID");
+    expect(notPaid.paymentSummary.outstandingVenueBalanceCents).toBe(4000);
+
+    const partial = toBookingDetailDto(
+      buildBooking({
+        completionPayment: { paid: true, amountCents: 1500, recordedAt, recordedBy },
+      }),
+    );
+    expect(partial.paymentSummary.venueSettlementStatus).toBe("PARTIALLY_PAID");
+    expect(partial.paymentSummary.outstandingVenueBalanceCents).toBe(2500);
+
+    const full = toBookingDetailDto(
+      buildBooking({
+        completionPayment: { paid: true, amountCents: 4000, recordedAt, recordedBy },
+      }),
+    );
+    expect(full.paymentSummary.venueSettlementStatus).toBe("PAID_IN_FULL");
+    expect(full.paymentSummary.outstandingVenueBalanceCents).toBe(0);
+  });
+
+  it("returns no package summary for a normal booking", () => {
+    expect(toBookingDetailDto(buildBooking()).packageSessions).toEqual([]);
+  });
+
+  it("maps authoritative origin identity, counters, balance gate, and later-session identity", () => {
+    const packageProgressId = new Types.ObjectId();
+    const origin = buildBooking();
+    const originLine = requireFirstLine(origin);
+    originLine.serviceSnapshot.pricingMode = "PACKAGE";
+    originLine.pricingInput = {
+      packageProgressId,
+      sessionIndex: 1,
+      sessionsInPackage: 3,
+    };
+    const progress = {
+      _id: packageProgressId,
+      businessId: origin.businessId,
+      customerUserId: origin.customer.customerUserId,
+      businessClientId: origin.customer.businessClientId,
+      serviceId: originLine.serviceId,
+      totalSessions: 3,
+      remainingSessions: 2,
+      completedSessions: 0,
+      sessions: [{ sessionIndex: 1, bookingId: origin._id, status: "SCHEDULED" }],
+      originBookingId: origin._id,
+      purchaseSnapshot: {
+        name: "Three-session package",
+        bundlePriceCents: 5000,
+        durationMin: 30,
+        sessionsInPackage: 3,
+      },
+      createdAt: origin.createdAt,
+      updatedAt: origin.updatedAt,
+    } as PackageProgressDocument;
+
+    const awaiting = toBookingDetailDto(origin, [{ progress, originBooking: origin }]);
+    expect(awaiting.packageSessions[0]).toMatchObject({
+      isOriginSession: true,
+      sessionIndex: 1,
+      sessionsInPackage: 3,
+      packageStatus: "AWAITING_BALANCE",
+      remainingSessions: 2,
+      completedSessions: 0,
+      balanceSettled: false,
+      outstandingBalanceCents: 4000,
+      schedulingUnlocked: false,
+    });
+
+    const settledOrigin = buildBooking({
+      _id: origin._id,
+      completionPayment: {
+        paid: true,
+        amountCents: 4000,
+        recordedAt: new Date("2026-08-25T13:00:00.000Z"),
+        recordedBy: new Types.ObjectId(),
+      },
+    });
+    const later = buildBooking({ businessId: origin.businessId, customer: origin.customer });
+    const laterLine = requireFirstLine(later);
+    laterLine.serviceId = originLine.serviceId;
+    laterLine.serviceSnapshot.pricingMode = "PACKAGE";
+    laterLine.pricingInput = {
+      packageProgressId,
+      sessionIndex: 2,
+      sessionsInPackage: 3,
+    };
+    progress.sessions.push({ sessionIndex: 2, bookingId: later._id, status: "SCHEDULED" });
+    const laterDto = toBookingDetailDto(later, [{ progress, originBooking: settledOrigin }]);
+    expect(laterDto.packageSessions[0]).toMatchObject({
+      isOriginSession: false,
+      sessionIndex: 2,
+      packageStatus: "ACTIVE",
+      balanceSettled: true,
+      schedulingUnlocked: true,
+    });
+    expect(settledOrigin.status).toBe("UPCOMING");
+
+    const partialOrigin = buildBooking({
+      _id: origin._id,
+      status: "COMPLETED",
+      completionPayment: {
+        paid: true,
+        amountCents: 1000,
+        recordedAt: new Date("2026-08-25T13:00:00.000Z"),
+        recordedBy: new Types.ObjectId(),
+      },
+    });
+    expect(
+      toBookingDetailDto(origin, [{ progress, originBooking: partialOrigin }]).packageSessions[0],
+    ).toMatchObject({
+      packageStatus: "AWAITING_BALANCE",
+      balanceSettled: false,
+      outstandingBalanceCents: 3000,
+      schedulingUnlocked: false,
+    });
+
+    progress.remainingSessions = 0;
+    expect(
+      toBookingDetailDto(origin, [{ progress, originBooking: settledOrigin }]).packageSessions[0],
+    ).toMatchObject({ packageStatus: "DEPLETED", schedulingUnlocked: false });
+
+    progress.voidedAt = new Date("2026-08-26T10:00:00.000Z");
+    expect(
+      toBookingDetailDto(origin, [{ progress, originBooking: settledOrigin }]).packageSessions[0],
+    ).toMatchObject({ packageStatus: "VOIDED", schedulingUnlocked: false });
+  });
+
+  it("degrades safely when a package link cannot be resolved in the scoped aggregate read", () => {
+    const booking = buildBooking();
+    requireFirstLine(booking).pricingInput = {
+      packageProgressId: new Types.ObjectId(),
+      sessionIndex: 1,
+      sessionsInPackage: 3,
+    };
+    const dto = toBookingDetailDto(booking, []);
+    expect(dto.serviceLines[0]?.packageProgressId).toBeDefined();
+    expect(dto.packageSessions).toEqual([]);
+  });
+
+  it("rejects a same-customer aggregate that does not contain this Booking relationship", () => {
+    const packageProgressId = new Types.ObjectId();
+    const booking = buildBooking();
+    const bookingLine = requireFirstLine(booking);
+    bookingLine.pricingInput = {
+      packageProgressId,
+      sessionIndex: 2,
+      sessionsInPackage: 3,
+    };
+    const unrelatedProgress = {
+      _id: packageProgressId,
+      businessId: booking.businessId,
+      customerUserId: booking.customer.customerUserId,
+      businessClientId: booking.customer.businessClientId,
+      serviceId: bookingLine.serviceId,
+      totalSessions: 3,
+      remainingSessions: 1,
+      completedSessions: 1,
+      sessions: [{ sessionIndex: 2, bookingId: new Types.ObjectId(), status: "SCHEDULED" }],
+      originBookingId: new Types.ObjectId(),
+      purchaseSnapshot: {
+        name: "Other package",
+        bundlePriceCents: 5000,
+        durationMin: 30,
+        sessionsInPackage: 3,
+      },
+      createdAt: booking.createdAt,
+      updatedAt: booking.updatedAt,
+    } as PackageProgressDocument;
+
+    expect(
+      toBookingDetailDto(booking, [{ progress: unrelatedProgress, originBooking: buildBooking() }])
+        .packageSessions,
+    ).toEqual([]);
   });
 });

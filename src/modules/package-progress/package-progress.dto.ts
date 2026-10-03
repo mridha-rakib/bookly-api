@@ -1,6 +1,7 @@
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingStatus } from "../booking/booking.types.js";
 import type { PackageProgressDocument } from "./package-progress.model.js";
+import { derivePackageProgressStatus } from "./package-progress.rules.js";
 
 /** A customer-safe, historical summary for one persisted Package session Booking. The staff
  * name comes from the Booking's immutable staffSnapshot, never a current staff-profile lookup,
@@ -113,13 +114,7 @@ export const toPackageProgressDto = (
   settlement: PackageProgressSettlement,
   bookingsById: ReadonlyMap<string, BookingDocument> = new Map(),
 ): PackageProgressDto => {
-  const status: PackageProgressDto["status"] = progress.voidedAt
-    ? "VOIDED"
-    : progress.remainingSessions <= 0
-      ? "DEPLETED"
-      : !settlement.balanceSettled
-        ? "AWAITING_BALANCE"
-        : "ACTIVE";
+  const status = derivePackageProgressStatus(progress, settlement);
 
   return {
     id: String(progress._id),

@@ -107,8 +107,10 @@ export class BookingController {
       params.businessId,
       params.bookingId,
     );
+    const packageProgressContexts =
+      await this.bookingService.getPackageProgressContextsForBusinessBooking(booking);
 
-    sendSuccess(response, 200, "Booking", toBookingDetailDto(booking));
+    sendSuccess(response, 200, "Booking", toBookingDetailDto(booking, packageProgressContexts));
   };
 
   public listForBusiness = async (request: Request, response: Response): Promise<void> => {
