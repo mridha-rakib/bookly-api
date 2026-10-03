@@ -1,7 +1,8 @@
 import express, { Router } from "express";
-
+import { BookingRepository } from "../booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
 import { StripeWebhookController } from "./stripe-webhook.controller.js";
 import { StripeWebhookService } from "./stripe-webhook.service.js";
@@ -26,6 +27,7 @@ export const createStripeWebhookRoute = (): Router => {
     gateway,
     eventRepository,
     financialTransactionService,
+    new PaymentTaxAssociationReconciler(gateway, new BookingRepository()),
   );
   const controller = new StripeWebhookController(webhookService);
 

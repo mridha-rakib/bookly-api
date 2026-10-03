@@ -80,6 +80,15 @@ export type BalanceTransactionFee = {
   currency: string;
 };
 
+/** Minimal, provider-neutral view of Stripe's asynchronous Tax Association. A missing
+ * association is not an error: the activation reconciler must retry it after PI success. */
+export type TaxAssociationResult = {
+  taxCalculationId: string;
+  taxTransactionId?: string | undefined;
+  /** Stripe reported a terminal attempt error; this needs investigation, not blind retry. */
+  terminalErrorReason?: string | undefined;
+};
+
 export interface PaymentGateway {
   getOrCreateCustomer(input: {
     existingStripeCustomerId: string | undefined;
@@ -119,6 +128,10 @@ export interface PaymentGateway {
   retrieveProcessingFeeForPaymentIntent(
     paymentIntentId: string,
   ): Promise<BalanceTransactionFee | null>;
+
+  /** Stripe SDK 22.5.0: `stripe.tax.associations.find({ payment_intent })`, called with the
+   * request-scoped public-preview API version required by simplified PI Tax integration. */
+  findTaxAssociation(paymentIntentId: string): Promise<TaxAssociationResult | null>;
 
   /** Verifies the Stripe-Signature header against the RAW request body and returns the parsed
    * event — throws PAYMENT_WEBHOOK_SIGNATURE_INVALID on any mismatch. Never trust an

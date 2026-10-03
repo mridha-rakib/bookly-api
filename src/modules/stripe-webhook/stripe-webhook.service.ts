@@ -3,6 +3,12 @@ import type Stripe from "stripe";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { PaymentGateway } from "../payment/payment.types.js";
+import {
+  type ParsedPaymentIntentMetadata,
+  type PaymentIntentPurpose,
+  parsePaymentIntentMetadata,
+} from "../payment/payment-intent-metadata.js";
+import type { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
 import type { StripeWebhookEventRepository } from "./stripe-webhook-event.repository.js";
 
 const HANDLED_EVENT_TYPES = new Set([
@@ -11,6 +17,13 @@ const HANDLED_EVENT_TYPES = new Set([
   "setup_intent.succeeded",
   "charge.refunded",
 ]);
+
+/** A 5xx is intentional for this class: Stripe must redeliver when durable domain state or a
+ * provider settlement dependency has not caught up yet. */
+class RetryableWebhookError extends Error {}
+/** Corrupt correlation data is retained as FAILED for investigation and acknowledged, rather
+ * than retried indefinitely or silently accepted. */
+class InvestigationWebhookError extends Error {}
 
 /**
  * Batch 4, Phase 10 — only the events this codebase actually acts on (per the brief's own
@@ -32,6 +45,7 @@ export class StripeWebhookService {
     private readonly gateway: PaymentGateway,
     private readonly eventRepository: StripeWebhookEventRepository,
     private readonly financialTransactionService: BookingFinancialTransactionService,
+    private readonly taxAssociationReconciler?: PaymentTaxAssociationReconciler,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -75,16 +89,29 @@ export class StripeWebhookService {
       await this.eventRepository.markProcessed(event.id);
       return true;
     } catch (error) {
-      await this.eventRepository.markFailed(
-        event.id,
-        error instanceof Error ? error.message : "Unknown error",
-      );
+      const message = error instanceof Error ? error.message : "Unknown error";
+      if (error instanceof InvestigationWebhookError) {
+        await this.eventRepository.markFailed(event.id, message);
+        return true;
+      }
+      await this.eventRepository.markRetryable(event.id, message);
       throw error;
     }
   }
 
   private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent): Promise<void> {
-    const bookingId = paymentIntent.metadata?.["bookingId"];
+    let metadata: ParsedPaymentIntentMetadata | undefined;
+    try {
+      metadata = parsePaymentIntentMetadata(paymentIntent.metadata);
+    } catch (error) {
+      throw new InvestigationWebhookError(
+        error instanceof Error ? error.message : "Invalid PaymentIntent metadata",
+      );
+    }
+
+    // Legacy PIs predate the C3 contract. Preserve their existing pre-tax reconciliation path;
+    // strict metadata/amount validation applies only when a PI explicitly declares c3-prep-v1.
+    const bookingId = metadata?.bookingId ?? paymentIntent.metadata?.["bookingId"];
     if (!bookingId) {
       return;
     }
@@ -92,8 +119,10 @@ export class StripeWebhookService {
     const entries = await this.financialTransactionService.listForBooking(bookingId);
     const matched = entries.find((entry) => entry.providerReference === paymentIntent.id);
     if (!matched) {
-      return;
+      throw new RetryableWebhookError("PaymentIntent source ledger row is not persisted yet");
     }
+
+    if (metadata) this.validateMetadataAgainstSource(paymentIntent, metadata, matched);
 
     if (matched.status === "PENDING") {
       await this.financialTransactionService.settleStatus(matched._id, "SUCCEEDED");
@@ -110,23 +139,48 @@ export class StripeWebhookService {
     // always attempts capture once a matching entry is found (by `providerReference`,
     // any status) — `recordProcessingFee`'s own unique `idempotencyKey` is what actually
     // guards against duplicate recording on webhook redelivery, not this branch.
-    await this.recordProcessingFee(matched, paymentIntent.id);
+    await this.recordProcessingFee(matched, paymentIntent);
+    if (metadata && this.taxAssociationReconciler) {
+      const taxAssociation = await this.taxAssociationReconciler.reconcile(
+        paymentIntent.id,
+        metadata,
+      );
+      if (taxAssociation.status === "pending") {
+        throw new RetryableWebhookError(taxAssociation.reason);
+      }
+      if (taxAssociation.status === "investigation") {
+        throw new InvestigationWebhookError(taxAssociation.reason);
+      }
+    }
   }
 
   private async recordProcessingFee(
     settledEntry: BookingFinancialTransactionDocument,
-    paymentIntentId: string,
+    paymentIntent: Stripe.PaymentIntent,
   ): Promise<void> {
     let fee: Awaited<ReturnType<PaymentGateway["retrieveProcessingFeeForPaymentIntent"]>>;
     try {
-      fee = await this.gateway.retrieveProcessingFeeForPaymentIntent(paymentIntentId);
+      fee = await this.gateway.retrieveProcessingFeeForPaymentIntent(paymentIntent.id);
     } catch {
-      // Best-effort enrichment — the primary charge already settled correctly above regardless.
+      throw new RetryableWebhookError("Stripe processing fee is temporarily unavailable");
+    }
+
+    if (!fee) {
+      throw new RetryableWebhookError("Stripe balance transaction is not available yet");
+    }
+    if (fee.feeCents <= 0) {
       return;
     }
 
-    if (!fee || fee.feeCents <= 0) {
-      return;
+    const piCurrency = paymentIntent.currency?.toUpperCase();
+    if (
+      !piCurrency ||
+      piCurrency !== settledEntry.currency ||
+      fee.currency.toUpperCase() !== settledEntry.currency
+    ) {
+      throw new InvestigationWebhookError(
+        `Processing-fee currency mismatch (pi=${piCurrency ?? "missing"}, booking=${settledEntry.currency}, balance=${fee.currency})`,
+      );
     }
 
     try {
@@ -140,8 +194,8 @@ export class StripeWebhookService {
         amountCents: fee.feeCents,
         currency: settledEntry.currency,
         status: "SUCCEEDED",
-        providerReference: paymentIntentId,
-        idempotencyKey: `processing-fee:${paymentIntentId}`,
+        providerReference: paymentIntent.id,
+        idempotencyKey: `processing-fee:${paymentIntent.id}`,
         // Batch 8 — records WHICH underlying payment this processing fee belongs to, the sole
         // mechanism FinanceOwnership uses to decide who bears it ("the owner of the underlying
         // payment bears its Stripe processing fee" — see finance-ownership.ts). Without this,
@@ -153,6 +207,40 @@ export class StripeWebhookService {
       // Duplicate key on retry (already recorded) — safe to ignore, matches the idempotent
       // spirit of every other webhook handler in this class.
     }
+  }
+
+  private validateMetadataAgainstSource(
+    paymentIntent: Stripe.PaymentIntent,
+    metadata: ParsedPaymentIntentMetadata,
+    source: BookingFinancialTransactionDocument,
+  ): void {
+    if (paymentIntent.amount !== metadata.chargedAmountCents) {
+      throw new InvestigationWebhookError("PaymentIntent amount does not match immutable metadata");
+    }
+    if (
+      String(source.businessId) !== metadata.businessId ||
+      String(source.businessClientId) !== metadata.businessClientId ||
+      !this.sourceTypeMatchesPurpose(source.type, metadata.purpose)
+    ) {
+      throw new InvestigationWebhookError(
+        "PaymentIntent metadata ownership does not match source ledger row",
+      );
+    }
+  }
+
+  private sourceTypeMatchesPurpose(
+    sourceType: BookingFinancialTransactionDocument["type"],
+    purpose: PaymentIntentPurpose,
+  ): boolean {
+    if (
+      purpose === "BOOKING_DEPOSIT" ||
+      purpose === "PACKAGE_PURCHASE" ||
+      purpose === "PACKAGE_SESSION_EXTRAS"
+    ) {
+      return sourceType === "DEPOSIT" || sourceType === "PLATFORM_FEE";
+    }
+    if (purpose === "CANCELLATION_FEE") return sourceType === "CANCELLATION_FEE";
+    return sourceType === "NO_SHOW_FEE";
   }
 
   private async handlePaymentIntentFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {

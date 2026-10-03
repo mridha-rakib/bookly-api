@@ -16,7 +16,10 @@ export type StripeWebhookEventDocument = {
   _id: Types.ObjectId;
   eventId: string;
   type: string;
-  status: "RECEIVED" | "PROCESSED" | "FAILED";
+  /** RETRYABLE is deliberately distinct from FAILED: a missing ledger row or Stripe's delayed
+   * balance transaction must be retried, while corrupt provider correlation needs investigation
+   * without an infinite delivery loop. */
+  status: "RECEIVED" | "PROCESSED" | "RETRYABLE" | "FAILED";
   error?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
@@ -28,7 +31,7 @@ const stripeWebhookEventSchema = new Schema<StripeWebhookEventDocument>(
     type: { type: String, required: true, trim: true },
     status: {
       type: String,
-      enum: ["RECEIVED", "PROCESSED", "FAILED"],
+      enum: ["RECEIVED", "PROCESSED", "RETRYABLE", "FAILED"],
       required: true,
       default: "RECEIVED",
     },

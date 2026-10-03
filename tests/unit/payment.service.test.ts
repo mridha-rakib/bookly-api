@@ -55,6 +55,7 @@ describe("PaymentService", () => {
       createRefund: async () => ({ refundId: "re_1", status: "succeeded" }),
       retrieveBalanceTransactionFee: async () => null,
       retrieveProcessingFeeForPaymentIntent: async () => null,
+      findTaxAssociation: async () => null,
       constructWebhookEvent: () => {
         throw new Error("not used");
       },
