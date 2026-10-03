@@ -82,6 +82,17 @@ const requireFirstLine = (booking: BookingDocument): BookingDocument["serviceLin
   return line;
 };
 
+const packageLine = (
+  sessionIndex: number,
+  sessionsInPackage = 3,
+  packageProgressId = new Types.ObjectId(),
+): BookingDocument["serviceLines"][number] => ({
+  ...requireFirstLine(buildBooking()),
+  serviceId: new Types.ObjectId(),
+  serviceSnapshot: { name: "Treatment package", pricingMode: "PACKAGE", durationMin: 30 },
+  pricingInput: { packageProgressId, sessionIndex, sessionsInPackage },
+});
+
 describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
   it("toBookingListItemDto exposes businessClientId, staffNames, platformFeeCents, depositCents", () => {
     const booking = buildBooking();
@@ -92,6 +103,52 @@ describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
     expect(dto.platformFeeCents).toBe(1000);
     expect(dto.depositCents).toBe(1000);
     expect(dto.totalCents).toBe(5000);
+    expect(dto.packageSessions).toEqual([]);
+  });
+
+  it("maps compact package identity from every valid package-linked line without using the first line", () => {
+    const normalLine = requireFirstLine(buildBooking());
+    const linkedLine = packageLine(2);
+    const booking = buildBooking({
+      status: "CANCELLED_BY_CUSTOMER",
+      serviceLines: [normalLine, linkedLine],
+    });
+
+    expect(toBookingListItemDto(booking).packageSessions).toEqual([
+      {
+        packageProgressId: String(linkedLine.pricingInput.packageProgressId),
+        sessionIndex: 2,
+        sessionsInPackage: 3,
+      },
+    ]);
+    expect(toBookingCalendarEntryDto(booking).packageSessions).toEqual(
+      toBookingListItemDto(booking).packageSessions,
+    );
+  });
+
+  it("retains origin, later, completed, and reused session identity per Booking", () => {
+    const packageProgressId = new Types.ObjectId();
+    const bookings = [
+      buildBooking({ serviceLines: [packageLine(1, 3, packageProgressId)] }),
+      buildBooking({ serviceLines: [packageLine(2, 3, packageProgressId)] }),
+      buildBooking({ status: "COMPLETED", serviceLines: [packageLine(2, 3, packageProgressId)] }),
+    ];
+
+    expect(bookings.map((booking) => toBookingListItemDto(booking).packageSessions[0])).toEqual([
+      { packageProgressId: String(packageProgressId), sessionIndex: 1, sessionsInPackage: 3 },
+      { packageProgressId: String(packageProgressId), sessionIndex: 2, sessionsInPackage: 3 },
+      { packageProgressId: String(packageProgressId), sessionIndex: 2, sessionsInPackage: 3 },
+    ]);
+    expect(String(bookings[1]?._id)).not.toBe(String(bookings[2]?._id));
+  });
+
+  it("does not invent modern identity for a legacy package line without complete linkage", () => {
+    const legacyLine = packageLine(1);
+    legacyLine.pricingInput = { sessionsInPackage: 3 };
+    const booking = buildBooking({ serviceLines: [legacyLine] });
+
+    expect(toBookingListItemDto(booking).packageSessions).toEqual([]);
+    expect(toBookingCalendarEntryDto(booking).packageSessions).toEqual([]);
   });
 
   it("toBookingListItemDto dedupes staff names across multiple lines with the same staff", () => {

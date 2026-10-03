@@ -150,6 +150,11 @@ describe("database-backed Dashboard Overview", () => {
     startAt: Date;
     status?: CreateBookingInput["status"];
     staffFirstName?: string;
+    packageSession?: {
+      packageProgressId: Types.ObjectId;
+      sessionIndex: number;
+      sessionsInPackage: number;
+    };
   }): CreateBookingInput => ({
     businessId: input.businessId,
     reference: generateBookingReference(),
@@ -172,8 +177,12 @@ describe("database-backed Dashboard Overview", () => {
     serviceLines: [
       {
         serviceId: new Types.ObjectId(),
-        serviceSnapshot: { name: "Haircut", pricingMode: "FIXED", durationMin: 30 },
-        pricingInput: {},
+        serviceSnapshot: {
+          name: "Haircut",
+          pricingMode: input.packageSession ? "PACKAGE" : "FIXED",
+          durationMin: 30,
+        },
+        pricingInput: input.packageSession ?? {},
         responsibleStaffMembershipId: input.staffMembershipId,
         staffSnapshot: { firstName: input.staffFirstName ?? "Basel" },
         addons: [],
@@ -311,6 +320,40 @@ describe("database-backed Dashboard Overview", () => {
     expect(overview.scope).toBe("FULL");
     expect(overview.todayBookingsCount).toBe(1);
     expect(overview.financials).not.toBeNull();
+  });
+
+  it("exposes compact package identity in both overview schedule presentations", async () => {
+    const { owner, business } = await createBusiness();
+    const { membership } = await createStaffMember(business._id, "STAFF");
+    const client = await createClient(business._id);
+    const packageProgressId = new Types.ObjectId();
+
+    const booking = await bookingRepository.create(
+      buildBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+        startAt: todayAt("09:00"),
+        packageSession: { packageProgressId, sessionIndex: 2, sessionsInPackage: 3 },
+      }),
+    );
+
+    const overview = await service.getOverview(
+      String(owner._id),
+      "BUSINESS_OWNER",
+      String(business._id),
+    );
+    const expected = [
+      { packageProgressId: String(packageProgressId), sessionIndex: 2, sessionsInPackage: 3 },
+    ];
+
+    expect(
+      overview.schedule.find((row) => row.bookingId === String(booking._id))?.packageSessions,
+    ).toEqual(expected);
+    expect(
+      overview.timeline.find((row) => row.bookingId === String(booking._id))?.packageSessions,
+    ).toEqual(expected);
   });
 
   // --- Scoped-down: Staff -----------------------------------------------------------------------

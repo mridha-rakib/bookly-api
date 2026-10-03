@@ -1,3 +1,4 @@
+import type { BookingPackageSessionIdentityDto } from "../booking/booking.dto.js";
 import type { BookingCurrency, BookingStatus } from "../booking/booking.types.js";
 import type {
   BookingFinancialTransactionStatus,
@@ -39,6 +40,7 @@ export type DashboardOverviewScheduleRow = {
   remainingFeeCents: number;
   staffName: string;
   leadType: DashboardOverviewLeadType;
+  packageSessions: BookingPackageSessionIdentityDto[];
 };
 
 /** One entry of the "Today's Schedule" timeline card — mirrors `initialTimelineEvents`' own
@@ -49,6 +51,7 @@ export type DashboardOverviewTimelineEntry = {
   customerName: string;
   detail: string;
   durationMin: number;
+  packageSessions: BookingPackageSessionIdentityDto[];
 };
 
 /** One row of the "Recent activity" feed — mirrors `initialActivityFeed`'s own `{text, time}`

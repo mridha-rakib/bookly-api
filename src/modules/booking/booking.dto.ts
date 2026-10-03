@@ -224,6 +224,44 @@ export type BookingListFulfilmentLocationDto = {
   location?: { lat: number; lng: number } | undefined;
 };
 
+/** Compact, immutable package appointment identity for list/calendar surfaces. Derived only
+ * from the Booking's own service-line snapshot; it deliberately contains no PackageProgress
+ * aggregate, entitlement, settlement, or financial fields. Array-shaped so a malformed or
+ * future multi-package-line Booking is never represented by an arbitrary first line. */
+export type BookingPackageSessionIdentityDto = {
+  packageProgressId: string;
+  sessionIndex: number;
+  sessionsInPackage: number;
+};
+
+export const toBookingPackageSessionIdentityDtos = (
+  booking: BookingDocument,
+): BookingPackageSessionIdentityDto[] =>
+  booking.serviceLines.flatMap((line) => {
+    const { packageProgressId, sessionIndex, sessionsInPackage } = line.pricingInput;
+    if (
+      line.serviceSnapshot.pricingMode !== "PACKAGE" ||
+      !packageProgressId ||
+      typeof sessionIndex !== "number" ||
+      typeof sessionsInPackage !== "number" ||
+      !Number.isInteger(sessionIndex) ||
+      !Number.isInteger(sessionsInPackage) ||
+      sessionIndex < 1 ||
+      sessionsInPackage < 1 ||
+      sessionIndex > sessionsInPackage
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        packageProgressId: String(packageProgressId),
+        sessionIndex,
+        sessionsInPackage,
+      },
+    ];
+  });
+
 const toFulfilmentLocationDto = (
   fulfilment: BookingDocument["fulfilment"],
 ): BookingListFulfilmentLocationDto | undefined => {
@@ -280,6 +318,7 @@ export type BookingListItemDto = {
    * must branch on `source` first, exactly like every other MANUAL-vs-BOOKLY_MANAGED display
    * rule in this codebase. */
   platformFeeCents: number;
+  packageSessions: BookingPackageSessionIdentityDto[];
 };
 
 export type BookingCalendarEntryDto = {
@@ -294,6 +333,7 @@ export type BookingCalendarEntryDto = {
   customerName: string;
   totalCents: number;
   currency: string;
+  packageSessions: BookingPackageSessionIdentityDto[];
   /** Batch 21 — lets the calendar action menu offer/disable "Start No-show" truthfully. The
    * backend still re-checks it on submit. Absent for legacy bookings. */
   noShowEligibilitySnapshot?:
@@ -439,6 +479,7 @@ export const toBookingListItemDto = (booking: BookingDocument): BookingListItemD
   currency: booking.financials.currency,
   fulfilmentLocation: toFulfilmentLocationDto(booking.fulfilment),
   platformFeeCents: booking.financials.platformFeeCents,
+  packageSessions: toBookingPackageSessionIdentityDtos(booking),
 });
 
 export const toBookingCalendarEntryDto = (booking: BookingDocument): BookingCalendarEntryDto => ({
@@ -459,6 +500,7 @@ export const toBookingCalendarEntryDto = (booking: BookingDocument): BookingCale
     .join(" "),
   totalCents: booking.financials.totalCents,
   currency: booking.financials.currency,
+  packageSessions: toBookingPackageSessionIdentityDtos(booking),
   noShowEligibilitySnapshot: booking.noShowEligibilitySnapshot
     ? {
         opensAfterMinutes: booking.noShowEligibilitySnapshot.opensAfterMinutes,
