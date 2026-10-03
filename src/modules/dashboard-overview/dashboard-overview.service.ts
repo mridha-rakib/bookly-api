@@ -7,6 +7,7 @@ import {
   utcToBusinessLocalDate,
   utcToBusinessLocalTime,
 } from "../../common/time/business-clock.js";
+import { toBookingPackageSessionIdentityDtos } from "../booking/booking.dto.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
@@ -258,6 +259,7 @@ export class DashboardOverviewService {
       remainingFeeCents: booking.financials.balanceDueCents,
       staffName,
       leadType: this.leadType(booking),
+      packageSessions: toBookingPackageSessionIdentityDtos(booking),
     };
   }
 
@@ -277,6 +279,7 @@ export class DashboardOverviewService {
       customerName: this.fullName(booking),
       detail: firstLine?.serviceSnapshot.name ?? "—",
       durationMin,
+      packageSessions: toBookingPackageSessionIdentityDtos(booking),
     };
   }
 
