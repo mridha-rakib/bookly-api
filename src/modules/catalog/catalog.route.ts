@@ -20,6 +20,7 @@ import { BusinessBookingSettingsRepository } from "../business-booking-settings/
 import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
@@ -112,6 +113,7 @@ export const createCatalogRoute = (): Router => {
     businessMediaRepository,
     staffAvatarService,
     storageService,
+    new PackageProgressRepository(),
   );
   const controller = new CatalogController(catalogService);
 

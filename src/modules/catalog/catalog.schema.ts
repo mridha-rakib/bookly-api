@@ -20,6 +20,7 @@ export const catalogAvailabilityQuerySchema = z
     staffMembershipId: z.union([objectIdSchema, z.literal(ANY_STAFF)]).optional(),
     partySize: z.coerce.number().int().min(1).max(1000).optional(),
     customerCity: z.enum(businessCities).optional(),
+    packageProgressId: objectIdSchema.optional(),
   })
   .strict();
 

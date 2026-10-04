@@ -30,7 +30,7 @@ export class CatalogController {
     const result = await this.catalogService.getServiceAvailability(
       params.businessId,
       params.serviceId,
-      query,
+      { ...query, customerUserId: request.auth?.userId },
     );
 
     sendSuccess(response, 200, "Availability", result);

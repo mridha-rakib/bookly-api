@@ -70,6 +70,10 @@ export type GetAvailabilityInput = {
   partySize?: number | undefined;
   /** Required when Business.visitType is TRAVEL_TO_CUSTOMER. */
   customerCity?: BusinessCity | undefined;
+  /** Package-owned availability is authorized separately by CatalogService; fulfilment/city is
+   * validated from the immutable entitlement by redemption preview/finalize instead of live
+   * Business travel settings. */
+  skipTravelEligibility?: boolean | undefined;
 };
 
 type ServiceSchedulingConfig = {
@@ -143,7 +147,7 @@ export class AvailabilityService {
     const partySize = input.partySize ?? 1;
     this.requireValidPartySize(partySize, config);
 
-    if (business.visitType === "TRAVEL_TO_CUSTOMER") {
+    if (business.visitType === "TRAVEL_TO_CUSTOMER" && !input.skipTravelEligibility) {
       await this.requireServedCity(business, service, input.customerCity);
     }
 

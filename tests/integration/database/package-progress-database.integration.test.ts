@@ -15,6 +15,7 @@ import { BookingFinancialTransactionRepository } from "../../../src/modules/book
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { cancellationTiers } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.model.js";
@@ -475,6 +476,44 @@ describe("database-backed Package Deal integration", () => {
     const fixture = await setUpPurchasedPackage();
     await settleOriginBalance(fixture.owner, fixture.business, fixture.purchase._id);
     return fixture;
+  };
+
+  const setUpSettledTravelPackage = async () => {
+    const { owner, business, staff, service } = await setupTravelPackageBusiness();
+    const customer = await createCustomer("travel-buyer");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const travelAddress = {
+      city: "Larnaca" as const,
+      propertyType: "House" as const,
+      area: "Center",
+      streetName: "Main",
+      streetNumber: "1",
+    };
+    const result = await creationService.finalizePackagePurchase(
+      String(customer._id),
+      String(business._id),
+      {
+        ...purchaseInput(service._id, staff[0]!.membership._id),
+        customerCity: "Larnaca",
+        travelAddress,
+      },
+    );
+    if (result.status !== "confirmed") throw new Error("expected confirmed travel purchase");
+    await settleOriginBalance(owner, business, result.booking._id);
+    const progress = await PackageProgressModel.findOne({ originBookingId: result.booking._id })
+      .orFail()
+      .exec();
+    return {
+      owner,
+      business,
+      staff,
+      service,
+      customer,
+      purchase: result.booking,
+      progress,
+      travelAddress,
+    };
   };
 
   /** Unwraps a "confirmed" FinalizeBookingResult, failing loudly on requires_action (no test in
@@ -1422,6 +1461,245 @@ describe("database-backed Package Deal integration", () => {
       // basis (same rule as every other booking), but IS included in totalCents/balanceDue.
       expect(booking.financials.depositCents).toBe(500);
       expect(booking.financials.balanceDueCents).toBe(700);
+    });
+  });
+
+  describe("Package redemption preview and fulfilment entitlement", () => {
+    it("does not quote awaiting-balance or depleted entitlements", async () => {
+      const awaiting = await setUpPurchasedPackage();
+      await expect(
+        creationService.previewPackageRedemption(
+          String(awaiting.customer._id),
+          String(awaiting.business._id),
+          String(awaiting.progress._id),
+          {},
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+
+      const depleted = await setUpSettledPackage();
+      for (let index = 0; index < depleted.progress.remainingSessions; index += 1) {
+        await packageProgressRepository.claimSession(depleted.progress._id);
+      }
+      await expect(
+        creationService.previewPackageRedemption(
+          String(depleted.customer._id),
+          String(depleted.business._id),
+          String(depleted.progress._id),
+          {},
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("quotes an at-business redemption with no extras as a true zero-charge booking", async () => {
+      const { business, customer, progress } = await setUpSettledPackage();
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        { addonIds: [] },
+      );
+
+      expect(preview).toMatchObject({
+        taxMode: "PRE_ACTIVATION",
+        packageBaseCents: 0,
+        addonsSubtotalCents: 0,
+        travelFeeCents: 0,
+        totalCents: 0,
+        customerChargeNowCents: 0,
+        balanceDueCents: 0,
+        requiresSavedCard: false,
+      });
+    });
+
+    it("uses the same add-on/deposit/balance formula for at-business preview and finalize", async () => {
+      const { business, staff, service, customer, progress } = await setUpSettledPackage();
+      const addon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "Hot towel",
+        priceCents: 1_000,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: business._id, addonId: addon._id, serviceId: service._id },
+      ]);
+      const selections = { addonIds: [String(addon._id)] };
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        selections,
+      );
+      expect(preview).toMatchObject({
+        addonsSubtotalCents: 1_000,
+        totalCents: 1_000,
+        customerChargeNowCents: 500,
+        balanceDueCents: 500,
+      });
+
+      const booking = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        { ...redeemInput(staff[0]!.membership._id), ...selections },
+      );
+      expect(booking.financials.depositCents).toBe(preview.customerChargeNowCents);
+      expect(booking.financials.balanceDueCents).toBe(preview.balanceDueCents);
+    });
+
+    it("quotes travel plus add-on and persists a different complete address for this session", async () => {
+      const { business, staff, service, customer, progress } = await setUpSettledTravelPackage();
+      const addon = await addonRepository.create({
+        businessId: business._id,
+        status: "ACTIVE",
+        name: "Aromatherapy",
+        priceCents: 1_000,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: business._id, addonId: addon._id, serviceId: service._id },
+      ]);
+      const travelAddress = {
+        city: "Larnaca" as const,
+        propertyType: "Apartment" as const,
+        area: "Mackenzie",
+        streetName: "Beach Avenue",
+        streetNumber: "22",
+        floorUnit: "3rd floor",
+        aptRoom: "5B",
+        additionalDirections: "Blue gate; ring twice.",
+      };
+      const selections = {
+        addonIds: [String(addon._id)],
+        customerCity: "Larnaca" as const,
+        travelAddress,
+      };
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        selections,
+      );
+      expect(preview).toMatchObject({
+        addonsSubtotalCents: 1_000,
+        travelFeeCents: 1_200,
+        totalCents: 2_200,
+        customerChargeNowCents: 500,
+        balanceDueCents: 1_700,
+      });
+
+      const booking = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        { ...redeemInput(staff[0]!.membership._id), ...selections },
+      );
+      expect(booking.fulfilment).toMatchObject({
+        mode: "TRAVEL_TO_CUSTOMER",
+        travelAddress,
+      });
+      expect(booking.financials.depositCents).toBe(preview.customerChargeNowCents);
+    });
+
+    it("rejects a city outside the purchased travel entitlement", async () => {
+      const { business, customer, progress } = await setUpSettledTravelPackage();
+      await expect(
+        creationService.previewPackageRedemption(
+          String(customer._id),
+          String(business._id),
+          String(progress._id),
+          {
+            customerCity: "Limassol",
+            travelAddress: {
+              city: "Limassol",
+              propertyType: "House",
+              area: "Center",
+              streetName: "Main",
+              streetNumber: "2",
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("travel purchase remains travel with its snapshotted city/fee after live mode and city config change", async () => {
+      const { business, staff, service, customer, progress, travelAddress } =
+        await setUpSettledTravelPackage();
+      await BusinessModel.updateOne(
+        { _id: business._id },
+        { $set: { visitType: "AT_BUSINESS_LOCATION" } },
+      ).exec();
+      await ServiceModel.updateOne({ _id: service._id }, { $set: { servedCities: [] } }).exec();
+      await businessTravelSettingsRepository.upsertByBusinessId(business._id, [
+        { city: "Larnaca", active: false, feeCents: 9_999 },
+      ]);
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        { customerCity: "Larnaca", travelAddress },
+      );
+      expect(preview.fulfilment.mode).toBe("TRAVEL_TO_CUSTOMER");
+      expect(preview.travelFeeCents).toBe(1_200);
+
+      const booking = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        {
+          ...redeemInput(staff[0]!.membership._id),
+          customerCity: "Larnaca",
+          travelAddress,
+        },
+      );
+      expect(booking.fulfilment.mode).toBe("TRAVEL_TO_CUSTOMER");
+    });
+
+    it("at-business purchase does not silently convert after the Business changes to travel", async () => {
+      const { business, staff, customer, progress } = await setUpSettledPackage();
+      await BusinessModel.updateOne(
+        { _id: business._id },
+        { $set: { visitType: "TRAVEL_TO_CUSTOMER" } },
+      ).exec();
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        {},
+      );
+      expect(preview.fulfilment.mode).toBe("AT_BUSINESS_LOCATION");
+
+      const booking = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[0]!.membership._id),
+      );
+      expect(booking.fulfilment.mode).toBe("AT_BUSINESS_LOCATION");
+    });
+
+    it("legacy progress falls back to the origin Booking's historical fulfilment", async () => {
+      const { business, customer, progress, travelAddress } = await setUpSettledTravelPackage();
+      await PackageProgressModel.updateOne(
+        { _id: progress._id },
+        { $unset: { "purchaseSnapshot.fulfilmentEntitlement": 1 } },
+      ).exec();
+      await BusinessModel.updateOne(
+        { _id: business._id },
+        { $set: { visitType: "AT_BUSINESS_LOCATION" } },
+      ).exec();
+
+      const preview = await creationService.previewPackageRedemption(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        { customerCity: "Larnaca", travelAddress },
+      );
+      expect(preview.fulfilment.mode).toBe("TRAVEL_TO_CUSTOMER");
+      expect(preview.travelFeeCents).toBe(1_200);
     });
   });
 

@@ -226,6 +226,26 @@ export class BookingService {
 
   // --- Domain validation building blocks ---------------------------------------------------
 
+  /** Resolves the live Service used for an already-purchased Package without requiring a staff
+   * selection. Pricing preview needs the Service only for add-on validation; staff eligibility
+   * remains independently authoritative at finalization. */
+  public async requirePackageRedemptionService(
+    business: BusinessDocument,
+    serviceId: string,
+  ): Promise<ServiceDocument> {
+    if (!Types.ObjectId.isValid(serviceId)) {
+      throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
+    }
+    const service = await this.serviceRepository.findById(business._id, serviceId);
+    if (!service) {
+      throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
+    }
+    if (service.status === "ARCHIVED") {
+      throw new BookingError("BOOKING_SERVICE_ARCHIVED", 409);
+    }
+    return service;
+  }
+
   /**
    * Validates that a responsible provider for a Booking Service line is real: a Service
    * belonging to this Business, not archived; a StaffMembership belonging to this Business,
@@ -373,8 +393,9 @@ export class BookingService {
   public validateFulfilmentSnapshot(
     business: BusinessDocument,
     fulfilment: BookingFulfilment,
+    modeOverride?: BookingFulfilment["mode"],
   ): void {
-    const expectedMode = normalizeBusinessVisitType(business.visitType);
+    const expectedMode = modeOverride ?? normalizeBusinessVisitType(business.visitType);
 
     if (fulfilment.mode !== expectedMode) {
       throw new BookingError("BOOKING_FULFILMENT_MODE_MISMATCH", 409);

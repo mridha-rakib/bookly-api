@@ -1,5 +1,12 @@
 import { model, Schema, type Types } from "mongoose";
 
+import {
+  type BusinessCity,
+  type BusinessVisitType,
+  businessCities,
+  businessVisitTypes,
+} from "../business/business.types.js";
+
 /**
  * The Package Deal entitlement — "purchased sessions -> used sessions -> remaining sessions"
  * for exactly ONE Package Deal Service a Customer bought at a Business (confirmed rule: a
@@ -60,6 +67,21 @@ export type PackageProgressPurchaseSnapshot = {
   durationMin: number;
   sessionsInPackage: number;
   discountPercent?: number | undefined;
+  /** The fulfilment capability the customer bought. Operational scheduling remains live, but
+   * a later Business mode/city/fee edit must neither convert nor strand this entitlement. */
+  fulfilmentEntitlement?: PackageFulfilmentEntitlement | undefined;
+};
+
+export type PackageTravelCityEntitlement = {
+  city: BusinessCity;
+  feeCents: number;
+};
+
+export type PackageFulfilmentEntitlement = {
+  mode: BusinessVisitType;
+  /** Present only for TRAVEL_TO_CUSTOMER. These were all eligible at purchase time and their
+   * per-visit prices are contractual package terms, not mutable operational availability. */
+  travelCities?: PackageTravelCityEntitlement[] | undefined;
 };
 
 export type PackageProgressDocument = {
@@ -97,6 +119,25 @@ const purchaseSnapshotSchema = new Schema<PackageProgressPurchaseSnapshot>(
     durationMin: { type: Number, required: true, min: 1 },
     sessionsInPackage: { type: Number, required: true, min: 1, validate: Number.isInteger },
     discountPercent: { type: Number, min: 0, max: 100 },
+    fulfilmentEntitlement: {
+      type: new Schema<PackageFulfilmentEntitlement>(
+        {
+          mode: { type: String, enum: businessVisitTypes, required: true },
+          travelCities: {
+            type: [
+              new Schema<PackageTravelCityEntitlement>(
+                {
+                  city: { type: String, enum: businessCities, required: true },
+                  feeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+                },
+                { _id: false },
+              ),
+            ],
+          },
+        },
+        { _id: false },
+      ),
+    },
   },
   { _id: false },
 );

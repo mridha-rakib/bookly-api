@@ -23,6 +23,7 @@ import type {
   ListCustomerBookingsQuery,
   MarkNoShowBody,
   PackagePurchaseBody,
+  PackageRedemptionPreviewBody,
   RedeemPackageSessionBody,
   RescheduleBookingBody,
   VoidPackageBody,
@@ -332,6 +333,19 @@ export class BookingController {
     }
 
     sendSuccess(response, 201, "Package purchased", toBookingDetailDto(result.booking));
+  };
+
+  public previewPackageRedemption = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    const body = request.validated?.body as PackageRedemptionPreviewBody;
+    const preview = await this.creationService.previewPackageRedemption(
+      userId,
+      params.businessId,
+      params.packageProgressId,
+      body,
+    );
+    sendSuccess(response, 200, "Package redemption preview", preview);
   };
 
   public redeemPackageSession = async (request: Request, response: Response): Promise<void> => {

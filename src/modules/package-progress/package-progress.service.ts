@@ -55,7 +55,13 @@ export class PackageProgressService {
       const settlement = originBooking
         ? computePackageBalanceSettlement(originBooking)
         : { balanceSettled: false, outstandingBalanceCents: 0 };
-      return toPackageProgressDto(pkg, settlement);
+      return toPackageProgressDto(
+        pkg,
+        settlement,
+        originBooking
+          ? new Map([[String(originBooking._id), originBooking]])
+          : new Map<string, BookingDocument>(),
+      );
     });
   }
 

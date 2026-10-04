@@ -1,5 +1,6 @@
 import mongoose, { Types } from "mongoose";
 import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
+import { AvailabilityError } from "../availability/availability.errors.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
@@ -15,7 +16,15 @@ import type { BusinessTravelSettingsRepository } from "../business-travel-settin
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
 import type { IntegrationService } from "../integration/integration.service.js";
+import {
+  buildPackageFulfilmentEntitlement,
+  resolvePackageFulfilmentEntitlement,
+} from "../package-progress/package-fulfilment-entitlement.js";
 import { PackageProgressError } from "../package-progress/package-progress.errors.js";
+import type {
+  PackageFulfilmentEntitlement,
+  PackageProgressDocument,
+} from "../package-progress/package-progress.model.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { computePackageBalanceSettlement } from "../package-progress/package-progress.rules.js";
 import { PaymentError } from "../payment/payment.errors.js";
@@ -111,6 +120,40 @@ export type BookingCreationPreview = {
     depositBeforePromoCents: number;
     discountCents: number;
   };
+};
+
+export type PackageRedemptionPreview = {
+  finalizable: true;
+  taxMode: "PRE_ACTIVATION";
+  fulfilment: BookingFulfilment;
+  packageBaseCents: 0;
+  addonsSubtotalCents: number;
+  travelFeeCents: number;
+  subtotalCents: number;
+  totalCents: number;
+  depositCents: number;
+  customerChargeNowCents: number;
+  balanceDueCents: number;
+  currency: "EUR";
+  requiresSavedCard: boolean;
+  hasSavedCard: boolean;
+};
+
+type PackageRedemptionSelections = {
+  addonIds?: string[] | undefined;
+  travelAddress?: CreateBookingInput["travelAddress"];
+  customerCity?: CreateBookingInput["customerCity"];
+};
+
+type PackageRedemptionPricingContext = {
+  business: BusinessDocument;
+  progress: PackageProgressDocument;
+  originBooking: BookingDocument;
+  service: ServiceDocument;
+  fulfilmentEntitlement: PackageFulfilmentEntitlement;
+  fulfilment: BookingFulfilment;
+  addons: BookingServiceLineAddon[];
+  financials: BookingFinancials;
 };
 
 export type FinalizeBookingResult =
@@ -383,7 +426,6 @@ export class BookingCreationService {
       lines,
       input.customerCity,
     );
-
     const financials = this.assembleFinancials("MANUAL", lines, travelFeeCents, false);
     this.bookingService.validateManualBookingHasNoBooklyFee("MANUAL", {
       platformFeeCents: financials.platformFeeCents,
@@ -602,7 +644,6 @@ export class BookingCreationService {
       lines,
       input.customerCity,
     );
-
     const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
     const isFirstBooking = !client.activatedAt;
     const financials = this.assembleFinancials(
@@ -921,6 +962,15 @@ export class BookingCreationService {
       lines,
       input.customerCity,
     );
+    const packageTravelSettings =
+      fulfilment.mode === "TRAVEL_TO_CUSTOMER"
+        ? await this.businessTravelSettingsRepository.findByBusinessId(business._id)
+        : null;
+    const fulfilmentEntitlement = buildPackageFulfilmentEntitlement(
+      { fulfilment },
+      line.service,
+      packageTravelSettings,
+    );
 
     const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
     const isFirstBooking = !client.activatedAt;
@@ -1053,6 +1103,7 @@ export class BookingCreationService {
           durationMin: packagePricing.durationMin,
           sessionsInPackage: packagePricing.sessionsInPackage,
           discountPercent: packagePricing.discountPercent,
+          fulfilmentEntitlement,
         },
       });
     } catch (error) {
@@ -1112,6 +1163,40 @@ export class BookingCreationService {
     }
   }
 
+  /** Authoritative, side-effect-free quote used by both at-business and travel redemption. It
+   * deliberately exposes the current pre-activation charge only; VAT calculation remains dark
+   * until PaymentIntent amount and disclosure can switch atomically in the activation checkpoint. */
+  public async previewPackageRedemption(
+    customerUserId: string,
+    businessId: string,
+    packageProgressId: string,
+    input: PackageRedemptionSelections,
+  ): Promise<PackageRedemptionPreview> {
+    const { fulfilment, financials } = await this.computePackageRedemptionPricing(
+      customerUserId,
+      businessId,
+      packageProgressId,
+      input,
+    );
+    const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
+    return {
+      finalizable: true,
+      taxMode: "PRE_ACTIVATION",
+      fulfilment,
+      packageBaseCents: 0,
+      addonsSubtotalCents: financials.addonsSubtotalCents,
+      travelFeeCents: financials.travelFeeCents,
+      subtotalCents: financials.totalCents,
+      totalCents: financials.totalCents,
+      depositCents: financials.depositCents,
+      customerChargeNowCents: financials.depositCents,
+      balanceDueCents: financials.balanceDueCents,
+      currency: "EUR",
+      requiresSavedCard: financials.depositCents > 0,
+      hasSavedCard: cardStatus.hasSavedCard,
+    };
+  }
+
   /**
    * Redeems ONE remaining session of an already-purchased Package. The base session itself is
    * ALWAYS $0 (its price was already collected at purchase) — approved rule — but a selected
@@ -1144,37 +1229,13 @@ export class BookingCreationService {
   ): Promise<FinalizeBookingResult> {
     this.requirePackageProgressRepository();
     this.requireIdempotencyKey(input.idempotencyKey);
-    const business = await this.requireBusiness(businessId);
-
-    const progress = await (
-      this.packageProgressRepository as PackageProgressRepository
-    ).findByIdForCustomerAndBusiness(packageProgressId, business._id, customerUserId);
-    if (!progress) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
-    }
-    if (progress.voidedAt) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_VOIDED", 409);
-    }
-    if (progress.remainingSessions <= 0) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
-    }
-
-    // Approved payment/unlock model: sessions 2..N never redeem until the origin (purchase)
-    // Booking's own venue balance has been recorded as FULLY settled — reusing that Booking's
-    // OWN authoritative `financials.balanceDueCents`/`completionPayment` (never a second,
-    // separately-tracked payment-status field; see package-progress.rules.ts's own doc comment).
-    // Re-fetched live on every call — client state can never unlock this.
-    const originBooking = await this.bookingRepository.findById(
-      business._id,
-      progress.originBookingId,
+    const pricing = await this.computePackageRedemptionPricing(
+      customerUserId,
+      businessId,
+      packageProgressId,
+      input,
     );
-    if (!originBooking) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
-    }
-    const settlement = computePackageBalanceSettlement(originBooking);
-    if (!settlement.balanceSettled) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_BALANCE_NOT_SETTLED", 409);
-    }
+    const { business, progress, service, fulfilment, addons, financials } = pricing;
 
     const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
     if (existingClaim) {
@@ -1187,12 +1248,13 @@ export class BookingCreationService {
 
     const startAt = this.parseStartAt(input.startAt);
 
-    const { service, staffMembership } = await this.bookingService.validateResponsibleStaff(
-      business,
-      String(progress.serviceId),
-      input.staffMembershipId,
-    );
-    if (!service.isPackageDeal || !service._id.equals(progress.serviceId)) {
+    const { service: staffValidatedService, staffMembership } =
+      await this.bookingService.validateResponsibleStaff(
+        business,
+        String(progress.serviceId),
+        input.staffMembershipId,
+      );
+    if (!staffValidatedService._id.equals(service._id)) {
       throw new PackageProgressError("PACKAGE_PROGRESS_SERVICE_MISMATCH", 409);
     }
     // Approved Service-status rule: ACTIVE and INACTIVE both still allow redeeming an
@@ -1231,24 +1293,6 @@ export class BookingCreationService {
       endAt,
       partySize: 1,
     });
-
-    const fulfilment = await this.resolveFulfilment(business, {
-      serviceLines: [],
-      startAt: input.startAt,
-      travelAddress: input.travelAddress,
-      customerCity: input.customerCity,
-      idempotencyKey: input.idempotencyKey,
-    });
-    this.bookingService.validateFulfilmentSnapshot(business, fulfilment);
-
-    // Approved Add-on rule: the Package base is $0, but a selected Add-on is still real,
-    // separately payable money — reuses resolveAddonSnapshots verbatim (same validation,
-    // pricing, and "must be assigned to this Service" rule any normal booking already enforces).
-    const addons = await this.bookingService.resolveAddonSnapshots(
-      business,
-      String(service._id),
-      input.addonIds ?? [],
-    );
 
     const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
     const customer = this.buildCustomerSnapshot(client);
@@ -1301,44 +1345,6 @@ export class BookingCreationService {
       partySize: 1,
       endAt,
     };
-
-    // Approved travel-fee rule: reuse the EXISTING served-city validation AND the EXISTING
-    // per-city fee lookup verbatim — a Package base session is $0, but a real travel fee for
-    // THIS visit is still owed, exactly like any other TRAVEL_TO_CUSTOMER booking (never a new
-    // formula, never bundled for "all future visits").
-    const travelFeeCents = await this.requireTravelEligibilityAndFee(
-      business,
-      [resolvedLine],
-      input.customerCity,
-    );
-
-    // Base service is always $0; Add-ons and travel fee are real, separately payable money —
-    // reusing the EXACT existing deposit/balance formula (assembleFinancials, unmodified) only
-    // when there is genuinely something to charge. When there is nothing extra (the common
-    // case), financials stay all-zero — deliberately NOT routed through assembleFinancials even
-    // then, since calculateBookingDepositCents floors at DEPOSIT_MIN_CENTS even for a €0 basis
-    // (the exact double-charge the Package Deal audit found and this guard exists to prevent).
-    const addonsSubtotalCents = addons.reduce((sum, addon) => sum + addon.priceCents, 0);
-    const hasPayableExtra = addonsSubtotalCents > 0 || travelFeeCents > 0;
-    // A redeeming customer is by definition already activated (they own an existing purchased
-    // Package) — never re-litigate first-vs-returning here; persistCustomerBooking's own
-    // markActivated call below is idempotent regardless (a no-op "loser" for an already-active
-    // Client), so passing false is simply the correct, already-known answer, not a shortcut.
-    const isFirstBooking = false;
-    const financials: BookingFinancials = hasPayableExtra
-      ? this.assembleFinancials("BOOKLY_MANAGED", [resolvedLine], travelFeeCents, isFirstBooking)
-      : {
-          currency: "EUR",
-          servicesSubtotalCents: 0,
-          addonsSubtotalCents: 0,
-          serviceDiscountCents: 0,
-          travelFeeCents: 0,
-          eligiblePlatformFeeBasisCents: 0,
-          platformFeeCents: 0,
-          depositCents: 0,
-          balanceDueCents: 0,
-          totalCents: 0,
-        };
 
     if (financials.depositCents > 0) {
       const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
@@ -1568,6 +1574,161 @@ export class BookingCreationService {
         "PackageProgressRepository must be injected to use Package purchase/redemption",
       );
     }
+  }
+
+  /** Single package-redemption pricing authority. Preview and finalization both call this exact
+   * function with customer selections only; no client money value is accepted. */
+  private async computePackageRedemptionPricing(
+    customerUserId: string,
+    businessId: string,
+    packageProgressId: string,
+    input: PackageRedemptionSelections,
+  ): Promise<PackageRedemptionPricingContext> {
+    this.requirePackageProgressRepository();
+    const business = await this.requireBusiness(businessId);
+    const progress = await (
+      this.packageProgressRepository as PackageProgressRepository
+    ).findByIdForCustomerAndBusiness(packageProgressId, business._id, customerUserId);
+    if (!progress) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+    if (progress.voidedAt) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_VOIDED", 409);
+    }
+    if (progress.remainingSessions <= 0) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
+    }
+
+    const originBooking = await this.bookingRepository.findById(
+      business._id,
+      progress.originBookingId,
+    );
+    if (!originBooking) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    }
+    if (!computePackageBalanceSettlement(originBooking).balanceSettled) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_BALANCE_NOT_SETTLED", 409);
+    }
+
+    const service = await this.bookingService.requirePackageRedemptionService(
+      business,
+      String(progress.serviceId),
+    );
+    if (
+      !service.isPackageDeal ||
+      !service._id.equals(progress.serviceId) ||
+      !service.packagePricing
+    ) {
+      throw new PackageProgressError("PACKAGE_PROGRESS_SERVICE_MISMATCH", 409);
+    }
+
+    const fulfilmentEntitlement = resolvePackageFulfilmentEntitlement(progress, originBooking);
+    const { fulfilment, travelFeeCents } = this.resolvePackageRedemptionFulfilment(
+      business,
+      fulfilmentEntitlement,
+      input,
+    );
+    this.bookingService.validateFulfilmentSnapshot(
+      business,
+      fulfilment,
+      fulfilmentEntitlement.mode,
+    );
+
+    const addons = await this.bookingService.resolveAddonSnapshots(
+      business,
+      String(service._id),
+      input.addonIds ?? [],
+    );
+    const addonsSubtotalCents = addons.reduce((sum, addon) => sum + addon.priceCents, 0);
+    const financials: BookingFinancials =
+      addonsSubtotalCents > 0 || travelFeeCents > 0
+        ? this.assembleFinancials(
+            "BOOKLY_MANAGED",
+            [{ amountCents: 0, discountCents: 0, addons }],
+            travelFeeCents,
+            false,
+          )
+        : {
+            currency: "EUR",
+            servicesSubtotalCents: 0,
+            addonsSubtotalCents: 0,
+            serviceDiscountCents: 0,
+            travelFeeCents: 0,
+            eligiblePlatformFeeBasisCents: 0,
+            platformFeeCents: 0,
+            depositCents: 0,
+            balanceDueCents: 0,
+            totalCents: 0,
+          };
+
+    return {
+      business,
+      progress,
+      originBooking,
+      service,
+      fulfilmentEntitlement,
+      fulfilment,
+      addons,
+      financials,
+    };
+  }
+
+  private resolvePackageRedemptionFulfilment(
+    business: BusinessDocument,
+    entitlement: PackageFulfilmentEntitlement,
+    input: PackageRedemptionSelections,
+  ): { fulfilment: BookingFulfilment; travelFeeCents: number } {
+    if (entitlement.mode === "AT_BUSINESS_LOCATION") {
+      const city = business.address.city;
+      if (!businessCities.includes(city as BusinessCity)) {
+        throw new BookingError("BOOKING_FULFILMENT_SNAPSHOT_INVALID", 500);
+      }
+      return {
+        fulfilment: {
+          mode: "AT_BUSINESS_LOCATION",
+          businessLocation: {
+            city: city as BusinessCity,
+            area: business.address.area,
+            streetName: business.address.streetName,
+            streetNumber: business.address.streetNumber,
+            floorUnit: business.address.floorUnit,
+            aptRoom: business.address.aptRoom,
+            location: resolveValidCoordinate(business.location),
+          },
+        },
+        travelFeeCents: 0,
+      };
+    }
+
+    if (!input.customerCity) {
+      throw new AvailabilityError("AVAILABILITY_CITY_REQUIRED", 400);
+    }
+    if (!input.travelAddress || input.travelAddress.city !== input.customerCity) {
+      throw new BookingError("BOOKING_FULFILMENT_SNAPSHOT_INVALID", 400);
+    }
+    const cityEntitlement = entitlement.travelCities?.find(
+      (entry) => entry.city === input.customerCity,
+    );
+    if (!cityEntitlement) {
+      throw new AvailabilityError("AVAILABILITY_CITY_NOT_SERVED", 409);
+    }
+
+    return {
+      fulfilment: {
+        mode: "TRAVEL_TO_CUSTOMER",
+        travelAddress: {
+          city: input.travelAddress.city,
+          propertyType: input.travelAddress.propertyType,
+          area: input.travelAddress.area,
+          streetName: input.travelAddress.streetName,
+          streetNumber: input.travelAddress.streetNumber,
+          floorUnit: input.travelAddress.floorUnit,
+          aptRoom: input.travelAddress.aptRoom,
+          additionalDirections: input.travelAddress.additionalDirections,
+        },
+      },
+      travelFeeCents: cityEntitlement.feeCents,
+    };
   }
 
   private requirePackagePurchaseShape(input: CreateBookingInput): void {
@@ -2341,7 +2502,7 @@ export class BookingCreationService {
    */
   private assembleFinancials(
     source: BookingSource,
-    lines: ResolvedServiceLine[],
+    lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
     travelFeeCents: number,
     isFirstBooking: boolean,
   ): BookingFinancials {

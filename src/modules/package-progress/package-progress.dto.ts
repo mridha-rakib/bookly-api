@@ -1,5 +1,6 @@
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingStatus } from "../booking/booking.types.js";
+import { resolvePackageFulfilmentEntitlement } from "./package-fulfilment-entitlement.js";
 import type { PackageProgressDocument } from "./package-progress.model.js";
 import { derivePackageProgressStatus } from "./package-progress.rules.js";
 
@@ -104,6 +105,10 @@ export type PackageProgressDto = {
     sessionsInPackage: number;
     discountPercent?: number | undefined;
   };
+  fulfilmentEntitlement: {
+    mode: "AT_BUSINESS_LOCATION" | "TRAVEL_TO_CUSTOMER";
+    travelCities?: Array<{ city: string; feeCents: number }> | undefined;
+  } | null;
   voidedAt?: string | undefined;
   createdAt: string;
   updatedAt: string;
@@ -115,6 +120,10 @@ export const toPackageProgressDto = (
   bookingsById: ReadonlyMap<string, BookingDocument> = new Map(),
 ): PackageProgressDto => {
   const status = derivePackageProgressStatus(progress, settlement);
+  const originBooking = bookingsById.get(String(progress.originBookingId));
+  const fulfilmentEntitlement = originBooking
+    ? resolvePackageFulfilmentEntitlement(progress, originBooking)
+    : null;
 
   return {
     id: String(progress._id),
@@ -153,6 +162,14 @@ export const toPackageProgressDto = (
       sessionsInPackage: progress.purchaseSnapshot.sessionsInPackage,
       discountPercent: progress.purchaseSnapshot.discountPercent,
     },
+    fulfilmentEntitlement: fulfilmentEntitlement
+      ? {
+          mode: fulfilmentEntitlement.mode,
+          ...(fulfilmentEntitlement.travelCities
+            ? { travelCities: fulfilmentEntitlement.travelCities.map((entry) => ({ ...entry })) }
+            : {}),
+        }
+      : null,
     voidedAt: progress.voidedAt?.toISOString(),
     createdAt: progress.createdAt.toISOString(),
     updatedAt: progress.updatedAt.toISOString(),

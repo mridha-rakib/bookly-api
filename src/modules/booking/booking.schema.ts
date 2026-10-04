@@ -101,6 +101,16 @@ export const redeemPackageSessionBodySchema = z
   })
   .strict();
 
+/** Read-only authoritative quote. Schedule and professional are intentionally absent because
+ * neither affects package-redemption pricing in the current product. */
+export const packageRedemptionPreviewBodySchema = z
+  .object({
+    addonIds: z.array(objectIdSchema).max(50).default([]),
+    travelAddress: travelAddressBodySchema.optional(),
+    customerCity: z.enum(businessCities).optional(),
+  })
+  .strict();
+
 /**
  * Whole-Package refund/void (approved rule) — the only body field is an optional customer-
  * supplied reason, passed through unmodified to the SAME cancellation path a normal
@@ -244,6 +254,7 @@ export type CreateCustomerBookingPreviewBody = z.infer<
 >;
 export type PackagePurchaseBody = z.infer<typeof packagePurchaseBodySchema>;
 export type RedeemPackageSessionBody = z.infer<typeof redeemPackageSessionBodySchema>;
+export type PackageRedemptionPreviewBody = z.infer<typeof packageRedemptionPreviewBodySchema>;
 export type VoidPackageBody = z.infer<typeof voidPackageBodySchema>;
 export type RescheduleBookingBody = z.infer<typeof rescheduleBookingBodySchema>;
 export type CancelBookingBody = z.infer<typeof cancelBookingBodySchema>;

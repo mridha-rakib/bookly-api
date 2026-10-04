@@ -77,6 +77,7 @@ import {
   listCustomerBookingsQuerySchema,
   markNoShowBodySchema,
   packagePurchaseBodySchema,
+  packageRedemptionPreviewBodySchema,
   redeemPackageSessionBodySchema,
   rescheduleBookingBodySchema,
   voidPackageBodySchema,
@@ -411,6 +412,19 @@ export const createBusinessBookingRoute = (): Router => {
     requireApprovedBusiness(businessRepository),
     validateRequest({ params: bookingBusinessParamsSchema, body: packagePurchaseBodySchema }),
     asyncHandler(controller.finalizePackagePurchase),
+  );
+
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/redemption-preview",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    requireApprovedBusiness(businessRepository),
+    validateRequest({
+      params: packageProgressBusinessParamsSchema,
+      body: packageRedemptionPreviewBodySchema,
+    }),
+    asyncHandler(controller.previewPackageRedemption),
   );
 
   router.post(

@@ -15,6 +15,7 @@ import type { BusinessOpeningHoursDay } from "../business-hours/business-hours.m
 import type { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import type { BusinessMediaDocument } from "../business-media/business-media.model.js";
 import type { BusinessMediaRepository } from "../business-media/business-media.repository.js";
+import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { DayOfWeek } from "../staff/staff-schedule.types.js";
@@ -59,6 +60,7 @@ export class CatalogService {
     private readonly businessMediaRepository: BusinessMediaRepository,
     private readonly staffAvatarService: Pick<StaffAvatarService, "getAvatarUrlsByUserIds">,
     private readonly storageService: Pick<StorageService, "getObjectUrl">,
+    private readonly packageProgressRepository?: PackageProgressRepository,
   ) {}
 
   /** The venue page's single combined read: Business header + every bookable (ACTIVE) Service +
@@ -244,9 +246,26 @@ export class CatalogService {
       staffMembershipId?: string | undefined;
       partySize?: number | undefined;
       customerCity?: BusinessCity | undefined;
+      packageProgressId?: string | undefined;
+      customerUserId?: string | undefined;
     },
   ): Promise<AvailabilityResult> {
-    await this.requireBusiness(businessId);
+    const business = await this.requireBusiness(businessId);
+    let packageOwned = false;
+    if (input.packageProgressId) {
+      if (!this.packageProgressRepository || !input.customerUserId) {
+        throw new CatalogError("CATALOG_SERVICE_NOT_FOUND", 404);
+      }
+      const progress = await this.packageProgressRepository.findByIdForCustomerAndBusiness(
+        input.packageProgressId,
+        business._id,
+        input.customerUserId,
+      );
+      if (!progress || String(progress.serviceId) !== serviceId) {
+        throw new CatalogError("CATALOG_SERVICE_NOT_FOUND", 404);
+      }
+      packageOwned = true;
+    }
     return this.availabilityService.getAvailability({
       businessId,
       serviceId,
@@ -256,6 +275,7 @@ export class CatalogService {
       toDate: input.toDate,
       partySize: input.partySize,
       customerCity: input.customerCity,
+      skipTravelEligibility: packageOwned,
     });
   }
 
