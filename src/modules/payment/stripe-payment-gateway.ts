@@ -9,7 +9,9 @@ import type {
   CreateSetupIntentResult,
   PaymentGateway,
   PaymentIntentResult,
+  PaymentIntentSnapshot,
   PaymentMethodSummary,
+  ProviderLookupResult,
   RefundResult,
   SetupIntentStatusResult,
   TaxAssociationResult,
@@ -92,6 +94,8 @@ export class StripePaymentGateway implements PaymentGateway {
         typeof setupIntent.payment_method === "string"
           ? setupIntent.payment_method
           : setupIntent.payment_method?.id,
+      customerId:
+        typeof setupIntent.customer === "string" ? setupIntent.customer : setupIntent.customer?.id,
     };
   }
 
@@ -106,6 +110,10 @@ export class StripePaymentGateway implements PaymentGateway {
 
     return {
       paymentMethodId: paymentMethod.id,
+      customerId:
+        typeof paymentMethod.customer === "string"
+          ? paymentMethod.customer
+          : paymentMethod.customer?.id,
       brand: paymentMethod.card.brand,
       last4: paymentMethod.card.last4,
       expMonth: paymentMethod.card.exp_month,
@@ -163,6 +171,7 @@ export class StripePaymentGateway implements PaymentGateway {
             payment_intent: input.paymentIntentId,
             ...(input.amountCents !== undefined ? { amount: input.amountCents } : {}),
             ...(input.reason ? { reason: this.toStripeRefundReason(input.reason) } : {}),
+            ...(input.metadata ? { metadata: input.metadata } : {}),
           },
           { idempotencyKey: input.idempotencyKey },
         ),
@@ -177,7 +186,79 @@ export class StripePaymentGateway implements PaymentGateway {
           : refund.status === "failed"
             ? "failed"
             : "pending",
+      paymentIntentId:
+        typeof refund.payment_intent === "string"
+          ? refund.payment_intent
+          : refund.payment_intent?.id,
+      amountCents: refund.amount,
+      currency: refund.currency.toUpperCase(),
+      metadata: refund.metadata ?? undefined,
     };
+  }
+
+  public async retrievePaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot> {
+    const paymentIntent = await this.wrap(() =>
+      this.client.paymentIntents.retrieve(paymentIntentId, {
+        expand: ["latest_charge.balance_transaction"],
+      }),
+    );
+    return this.toPaymentIntentSnapshot(paymentIntent);
+  }
+
+  public async findPaymentIntentByMetadata(
+    paymentAttemptId: string,
+  ): Promise<ProviderLookupResult<PaymentIntentSnapshot>> {
+    const escaped = paymentAttemptId.replaceAll("'", "\\'");
+    const result = await this.wrap(() =>
+      this.client.paymentIntents.search({
+        query: `metadata['booklyPaymentAttemptId']:'${escaped}'`,
+        limit: 2,
+      }),
+    );
+    if (result.data.length === 0) return { outcome: "NOT_FOUND" };
+    if (result.data.length > 1) return { outcome: "AMBIGUOUS" };
+    return {
+      outcome: "FOUND_ONE",
+      value: this.toPaymentIntentSnapshot(result.data[0] as Stripe.PaymentIntent),
+    };
+  }
+
+  public async retrieveRefund(refundId: string): Promise<RefundResult> {
+    const refund = await this.wrap(
+      () => this.client.refunds.retrieve(refundId),
+      "PAYMENT_REFUND_FAILED",
+    );
+    return this.toRefundResult(refund);
+  }
+
+  public async findRefundByMetadata(input: {
+    refundOperationId: string;
+    paymentIntentId: string;
+  }): Promise<ProviderLookupResult<RefundResult>> {
+    const matches: Stripe.Refund[] = [];
+    let startingAfter: string | undefined;
+    do {
+      const page = await this.wrap(
+        () =>
+          this.client.refunds.list({
+            payment_intent: input.paymentIntentId,
+            limit: 100,
+            ...(startingAfter ? { starting_after: startingAfter } : {}),
+          }),
+        "PAYMENT_REFUND_FAILED",
+      );
+      for (const refund of page.data) {
+        if (refund.metadata?.["booklyRefundOperationId"] === input.refundOperationId) {
+          matches.push(refund);
+          if (matches.length > 1) return { outcome: "AMBIGUOUS" };
+        }
+      }
+      startingAfter = page.has_more ? page.data.at(-1)?.id : undefined;
+      if (page.has_more && !startingAfter) return { outcome: "AMBIGUOUS" };
+    } while (startingAfter);
+
+    if (matches.length === 0) return { outcome: "NOT_FOUND" };
+    return { outcome: "FOUND_ONE", value: this.toRefundResult(matches[0] as Stripe.Refund) };
   }
 
   public async retrieveBalanceTransactionFee(
@@ -291,6 +372,42 @@ export class StripePaymentGateway implements PaymentGateway {
       paymentIntentId: paymentIntent.id,
       status: "failed",
       failureMessage: "The payment could not be completed.",
+    };
+  }
+
+  private toPaymentIntentSnapshot(paymentIntent: Stripe.PaymentIntent): PaymentIntentSnapshot {
+    return {
+      ...this.toPaymentIntentResult(paymentIntent),
+      amountCents: paymentIntent.amount,
+      amountRefundedCents:
+        typeof paymentIntent.latest_charge === "object" && paymentIntent.latest_charge
+          ? paymentIntent.latest_charge.amount_refunded
+          : 0,
+      currency: paymentIntent.currency.toUpperCase(),
+      customerId:
+        typeof paymentIntent.customer === "string"
+          ? paymentIntent.customer
+          : paymentIntent.customer?.id,
+      metadata: paymentIntent.metadata,
+    };
+  }
+
+  private toRefundResult(refund: Stripe.Refund): RefundResult {
+    return {
+      refundId: refund.id,
+      status:
+        refund.status === "succeeded"
+          ? "succeeded"
+          : refund.status === "failed" || refund.status === "canceled"
+            ? "failed"
+            : "pending",
+      paymentIntentId:
+        typeof refund.payment_intent === "string"
+          ? refund.payment_intent
+          : refund.payment_intent?.id,
+      amountCents: refund.amount,
+      currency: refund.currency.toUpperCase(),
+      metadata: refund.metadata ?? undefined,
     };
   }
 

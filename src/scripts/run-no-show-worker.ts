@@ -13,6 +13,8 @@ import { NoShowNotifier } from "../modules/notification/no-show.notifier.js";
 import { PackageProgressRepository } from "../modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../modules/payment/payment.service.js";
+import { PaymentAttemptRepository } from "../modules/payment/payment-attempt.repository.js";
+import { RefundOperationRepository } from "../modules/payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../modules/payment/stripe-payment-gateway.js";
 import { UserRepository } from "../modules/user/user.repository.js";
 
@@ -39,6 +41,8 @@ const buildService = (): NoShowResolutionService => {
     new StripePaymentGateway(),
     new CustomerPaymentProfileRepository(),
     new UserRepository(),
+    new PaymentAttemptRepository(),
+    new RefundOperationRepository(),
   );
   const financialTransactionService = new BookingFinancialTransactionService(
     new BookingFinancialTransactionRepository(),

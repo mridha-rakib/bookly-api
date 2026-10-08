@@ -407,11 +407,20 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     const entries = await financialTransactionService.listForBooking(bookingId);
     for (const entry of entries) {
       if (!entry.providerReference || entry.status !== "SUCCEEDED") continue;
+      const providerInput = paymentGateway.paymentIntentInputs.find(
+        (input) => input.metadata["bookingId"] === String(bookingId),
+      );
       await webhookService.process({
         id: `evt_${entry.providerReference}`,
         type: "payment_intent.succeeded",
         data: {
-          object: { id: entry.providerReference, metadata: { bookingId: String(bookingId) } },
+          object: {
+            id: entry.providerReference,
+            amount: entry.amountCents,
+            currency: entry.currency.toLowerCase(),
+            customer: providerInput?.stripeCustomerId,
+            metadata: providerInput?.metadata ?? { bookingId: String(bookingId) },
+          },
         },
       } as unknown as Parameters<StripeWebhookService["process"]>[0]);
     }

@@ -107,6 +107,14 @@ export type PackageProgressDocument = {
    * (redeemPackageSession's own guard checks this). Never set for a partially-used Package —
    * this is a hard block, not a soft status a later action can clear. */
   voidedAt?: Date | undefined;
+  voidRefundSettlement?:
+    | {
+        status: "PENDING" | "SUCCEEDED" | "FAILED";
+        amountCents: number;
+        refundOperationId?: Types.ObjectId | undefined;
+        providerRefundId?: string | undefined;
+      }
+    | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -174,6 +182,21 @@ const packageProgressSchema = new Schema<PackageProgressDocument>(
     originBookingId: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
     purchaseSnapshot: { type: purchaseSnapshotSchema, required: true },
     voidedAt: { type: Date },
+    voidRefundSettlement: {
+      type: new Schema(
+        {
+          status: {
+            type: String,
+            enum: ["PENDING", "SUCCEEDED", "FAILED"],
+            required: true,
+          },
+          amountCents: { type: Number, required: true, min: 1, validate: Number.isInteger },
+          refundOperationId: { type: Schema.Types.ObjectId, ref: "RefundOperation" },
+          providerRefundId: { type: String, trim: true },
+        },
+        { _id: false },
+      ),
+    },
   },
   { timestamps: true },
 );

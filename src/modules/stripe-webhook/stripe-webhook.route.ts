@@ -2,7 +2,10 @@ import express, { Router } from "express";
 import { BookingRepository } from "../booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
+import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
 import { StripeWebhookController } from "./stripe-webhook.controller.js";
 import { StripeWebhookService } from "./stripe-webhook.service.js";
@@ -23,11 +26,16 @@ export const createStripeWebhookRoute = (): Router => {
   const financialTransactionService = new BookingFinancialTransactionService(
     new BookingFinancialTransactionRepository(),
   );
+  const bookingRepository = new BookingRepository();
   const webhookService = new StripeWebhookService(
     gateway,
     eventRepository,
     financialTransactionService,
-    new PaymentTaxAssociationReconciler(gateway, new BookingRepository()),
+    new PaymentTaxAssociationReconciler(gateway, bookingRepository),
+    new PaymentAttemptRepository(),
+    new RefundOperationRepository(),
+    new PackageProgressRepository(),
+    bookingRepository,
   );
   const controller = new StripeWebhookController(webhookService);
 

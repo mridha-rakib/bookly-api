@@ -41,6 +41,16 @@ export type AvailabilitySlot = {
   source: "AUTO" | "MANUAL";
 };
 
+/** A generated candidate that cannot be selected because an existing confirmed reservation
+ * occupies the required staff interval. This deliberately exposes no booking/customer identity
+ * and does not classify schedule, time-off, or working-hours failures as "BOOKED". */
+export type AvailabilityBlockedSlot = {
+  startAt: string;
+  endAt: string;
+  status: "BOOKED";
+  source: "AUTO" | "MANUAL";
+};
+
 export type AvailabilityDay = {
   date: string;
   /** True if the Business/Service configuration allows ANY slot that day before staff/
@@ -48,6 +58,9 @@ export type AvailabilityDay = {
    * booked" (both render as `slots: []`, but only the latter is `isOpen: true`). */
   isOpen: boolean;
   slots: AvailabilitySlot[];
+  /** Additive public metadata. Non-booking unavailability remains hidden rather than being
+   * mislabeled; consumers that do not render occupied candidates can continue using `slots`. */
+  blockedSlots?: AvailabilityBlockedSlot[] | undefined;
 };
 
 export type AvailabilityResult = {
@@ -335,12 +348,14 @@ export class AvailabilityService {
     const source: "AUTO" | "MANUAL" = service.scheduleMode === "MANUAL" ? "MANUAL" : "AUTO";
 
     const slots: AvailabilitySlot[] = [];
+    const blockedSlots: AvailabilityBlockedSlot[] = [];
 
     for (const startHHmm of candidates) {
       const startAt = businessLocalToUtc(business.timezone, date, startHHmm);
       const endAt = new Date(startAt.getTime() + occupiedMin * 60_000);
 
       const eligible: { staffId: string; remainingCapacity: number }[] = [];
+      let isBooked = false;
 
       for (const staffContext of context.staffContexts) {
         const outcome = this.evaluateStaffForSlot({
@@ -356,8 +371,10 @@ export class AvailabilityService {
           reservations: context.reservations,
         });
 
-        if (outcome) {
+        if (outcome.status === "AVAILABLE") {
           eligible.push(outcome);
+        } else if (outcome.status === "BOOKED") {
+          isBooked = true;
         }
       }
 
@@ -371,6 +388,13 @@ export class AvailabilityService {
             : {}),
           source,
         });
+      } else if (isBooked) {
+        blockedSlots.push({
+          startAt: startAt.toISOString(),
+          endAt: endAt.toISOString(),
+          status: "BOOKED",
+          source,
+        });
       }
     }
 
@@ -378,7 +402,12 @@ export class AvailabilityService {
       this.applyGapEliminationOrdering(slots, context.reservations, date);
     }
 
-    return { date, isOpen: true, slots };
+    return {
+      date,
+      isOpen: true,
+      slots,
+      ...(blockedSlots.length > 0 ? { blockedSlots } : {}),
+    };
   }
 
   /**
@@ -428,11 +457,13 @@ export class AvailabilityService {
     config: ServiceSchedulingConfig;
     partySize: number;
     reservations: BookingSlotReservationDocument[];
-  }): { staffId: string; remainingCapacity: number } | null {
+  }):
+    | { status: "AVAILABLE"; staffId: string; remainingCapacity: number }
+    | { status: "BOOKED" | "UNAVAILABLE" } {
     const { staffContext } = input;
 
     if (!this.isWithinStaffShift(input)) {
-      return null;
+      return { status: "UNAVAILABLE" };
     }
 
     const staffReservations = input.reservations.filter(
@@ -452,18 +483,23 @@ export class AvailabilityService {
     if (exactMatch) {
       const remaining = exactMatch.capacityMax - exactMatch.capacityUsed;
       return remaining >= input.partySize
-        ? { staffId: String(staffContext.membership._id), remainingCapacity: remaining }
-        : null;
+        ? {
+            status: "AVAILABLE",
+            staffId: String(staffContext.membership._id),
+            remainingCapacity: remaining,
+          }
+        : { status: "BOOKED" };
     }
 
     const blockingOverlap = intervals.some(
       (entry) => entry.startAt < input.endAt && entry.endAt > input.startAt,
     );
     if (blockingOverlap) {
-      return null;
+      return { status: "BOOKED" };
     }
 
     return {
+      status: "AVAILABLE",
       staffId: String(staffContext.membership._id),
       remainingCapacity: input.config.capacityMax,
     };

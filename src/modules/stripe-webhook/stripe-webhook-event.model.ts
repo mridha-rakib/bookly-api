@@ -19,7 +19,13 @@ export type StripeWebhookEventDocument = {
   /** RETRYABLE is deliberately distinct from FAILED: a missing ledger row or Stripe's delayed
    * balance transaction must be retried, while corrupt provider correlation needs investigation
    * without an infinite delivery loop. */
-  status: "RECEIVED" | "PROCESSED" | "RETRYABLE" | "FAILED";
+  status: "RECEIVED" | "PROCESSING" | "PROCESSED" | "RETRYABLE" | "FAILED";
+  payload?: Record<string, unknown> | undefined;
+  processingStartedAt?: Date | undefined;
+  leaseExpiresAt?: Date | undefined;
+  processingLeaseToken?: string | undefined;
+  attemptCount: number;
+  nextAttemptAt?: Date | undefined;
   error?: string | undefined;
   createdAt: Date;
   updatedAt: Date;
@@ -31,16 +37,24 @@ const stripeWebhookEventSchema = new Schema<StripeWebhookEventDocument>(
     type: { type: String, required: true, trim: true },
     status: {
       type: String,
-      enum: ["RECEIVED", "PROCESSED", "RETRYABLE", "FAILED"],
+      enum: ["RECEIVED", "PROCESSING", "PROCESSED", "RETRYABLE", "FAILED"],
       required: true,
       default: "RECEIVED",
     },
     error: { type: String, trim: true, maxlength: 2000 },
+    payload: { type: Schema.Types.Mixed },
+    processingStartedAt: { type: Date },
+    leaseExpiresAt: { type: Date },
+    processingLeaseToken: { type: String, trim: true },
+    attemptCount: { type: Number, required: true, min: 0, default: 0 },
+    nextAttemptAt: { type: Date },
   },
   { timestamps: true },
 );
 
 stripeWebhookEventSchema.index({ eventId: 1 }, { unique: true });
+stripeWebhookEventSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+stripeWebhookEventSchema.index({ status: 1, leaseExpiresAt: 1, createdAt: 1 });
 
 export const StripeWebhookEventModel = model<StripeWebhookEventDocument>(
   "StripeWebhookEvent",

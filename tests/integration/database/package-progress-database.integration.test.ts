@@ -11,8 +11,10 @@ import { BookingService } from "../../../src/modules/booking/booking.service.js"
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
@@ -33,6 +35,7 @@ import { PackageProgressRepository } from "../../../src/modules/package-progress
 import { PackageProgressService } from "../../../src/modules/package-progress/package-progress.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
@@ -673,6 +676,43 @@ describe("database-backed Package Deal integration", () => {
       expect(await PackageProgressModel.countDocuments({ businessId: business._id }).exec()).toBe(
         0,
       );
+    });
+
+    it("rolls back PackageProgress, origin Booking, reservation, and debit ledger after an in-transaction failure", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness();
+      const customer = await createCustomer("transaction-abort");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      const input = purchaseInput(service._id, staff[0]!.membership._id);
+      const originalRecord = financialTransactionService.record.bind(financialTransactionService);
+      financialTransactionService.record = async (...args) => {
+        if (args[0].direction === "DEBIT") throw new Error("injected ledger failure");
+        return originalRecord(...args);
+      };
+      paymentGateway.queueNextRefundOutcome("pending");
+
+      await expect(
+        creationService.finalizePackagePurchase(String(customer._id), String(business._id), input),
+      ).rejects.toThrow("injected ledger failure");
+
+      expect(await PackageProgressModel.countDocuments({ businessId: business._id })).toBe(0);
+      expect(await BookingModel.countDocuments({ businessId: business._id })).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments({ businessId: business._id })).toBe(
+        0,
+      );
+      expect(
+        await BookingFinancialTransactionModel.countDocuments({
+          businessId: business._id,
+          direction: "DEBIT",
+        }),
+      ).toBe(0);
+      expect(
+        await PaymentAttemptModel.findOne({ logicalIdempotencyKey: input.idempotencyKey }),
+      ).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        persistenceStatus: "FAILED",
+        compensationStatus: "REFUND_PENDING",
+      });
     });
 
     it("a requires_action charge returns a clientSecret and persists nothing", async () => {
@@ -1899,6 +1939,10 @@ describe("database-backed Package Deal integration", () => {
         "Customer changed their mind",
       );
       expect(voided.voidedAt).toBeTruthy();
+      expect(voided.voidRefundSettlement).toMatchObject({
+        status: "SUCCEEDED",
+        amountCents: 3_500,
+      });
 
       const cancelledPurchase = await bookingRepository.findById(business._id, purchase._id);
       expect(cancelledPurchase?.status).toBe("CANCELLED_BY_CUSTOMER");
@@ -1980,6 +2024,10 @@ describe("database-backed Package Deal integration", () => {
         "Still unused",
       );
       expect(voided.voidedAt).toBeTruthy();
+      expect(voided.voidRefundSettlement).toMatchObject({
+        status: "SUCCEEDED",
+        amountCents: 3_500,
+      });
     });
 
     it("rejects voiding an already-voided Package (no double refund)", async () => {
@@ -2050,6 +2098,10 @@ describe("database-backed Package Deal integration", () => {
         "Refund will fail",
       );
       expect(voided.voidedAt).toBeTruthy();
+      expect(voided.voidRefundSettlement).toMatchObject({
+        status: "FAILED",
+        amountCents: 3_500,
+      });
 
       const ledger = await financialTransactionService.listForBooking(purchase._id);
       const refund = ledger.find((e) => e.type === "REFUND");

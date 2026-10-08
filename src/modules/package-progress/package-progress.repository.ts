@@ -35,6 +35,12 @@ export class PackageProgressRepository {
     return PackageProgressModel.findOne({ _id: id, customerUserId }).exec();
   }
 
+  public async findByIdInternal(
+    id: Types.ObjectId | string,
+  ): Promise<PackageProgressDocument | null> {
+    return PackageProgressModel.findById(id).exec();
+  }
+
   /** Business-scoped Customer-owned read — the redemption endpoint's own lookup
    * (`/:businessId/bookings/packages/:packageProgressId/sessions`), scoped by BOTH businessId
    * AND customerUserId in the same query so a packageProgressId that exists but belongs to a
@@ -171,12 +177,36 @@ export class PackageProgressRepository {
    */
   public async voidPackage(
     id: Types.ObjectId,
+    refundSettlement?: PackageProgressDocument["voidRefundSettlement"],
     session?: ClientSession,
   ): Promise<PackageProgressDocument | null> {
     return PackageProgressModel.findOneAndUpdate(
       { _id: id, voidedAt: { $exists: false } },
-      { $set: { voidedAt: new Date() } },
+      {
+        $set: {
+          voidedAt: new Date(),
+          ...(refundSettlement ? { voidRefundSettlement: refundSettlement } : {}),
+        },
+      },
       { returnDocument: "after", ...(session ? { session } : {}) },
+    ).exec();
+  }
+
+  public async settleVoidRefund(
+    refundOperationId: Types.ObjectId | string,
+    status: "SUCCEEDED" | "FAILED",
+    providerRefundId?: string,
+  ): Promise<void> {
+    await PackageProgressModel.updateOne(
+      { "voidRefundSettlement.refundOperationId": refundOperationId },
+      {
+        $set: {
+          "voidRefundSettlement.status": status,
+          ...(providerRefundId
+            ? { "voidRefundSettlement.providerRefundId": providerRefundId }
+            : {}),
+        },
+      },
     ).exec();
   }
 

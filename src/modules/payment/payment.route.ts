@@ -14,6 +14,8 @@ import { CustomerPaymentProfileRepository } from "./customer-payment-profile.rep
 import { PaymentController } from "./payment.controller.js";
 import { confirmSavedPaymentMethodBodySchema } from "./payment.schema.js";
 import { PaymentService } from "./payment.service.js";
+import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import { RefundOperationRepository } from "./refund-operation.repository.js";
 import { StripePaymentGateway } from "./stripe-payment-gateway.js";
 
 /** Customer-only, cross-business (a saved card belongs to the Customer identity, never one
@@ -31,6 +33,8 @@ export const createPaymentRoute = (): Router => {
     new StripePaymentGateway(),
     new CustomerPaymentProfileRepository(),
     userRepository,
+    new PaymentAttemptRepository(),
+    new RefundOperationRepository(),
   );
   const controller = new PaymentController(paymentService);
 

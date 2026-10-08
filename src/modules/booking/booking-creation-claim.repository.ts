@@ -1,5 +1,6 @@
 import type { Types } from "mongoose";
 
+import { BookingError } from "./booking.errors.js";
 import {
   type BookingCreationClaimDocument,
   BookingCreationClaimModel,
@@ -31,14 +32,18 @@ export class BookingCreationClaimRepository {
       const existing = await BookingCreationClaimModel.findOne({
         idempotencyKey: input.idempotencyKey,
       }).orFail();
+      if (
+        String(existing.businessId) !== String(input.businessId) ||
+        String(existing.actorUserId) !== String(input.actorUserId)
+      ) {
+        throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+      }
       return { isNew: false, bookingId: existing.bookingId };
     }
   }
 
-  /** Only ever called when the transactional creation that followed a fresh `claim()` failed —
-   * a failed attempt must not permanently occupy this idempotency key (see the model's own
-   * comment). Never called for an `isNew: false` result (that claim belongs to a prior,
-   * possibly-successful attempt this caller has no right to invalidate). */
+  /** Called only for failures that have no durable provider money operation. Charge-bearing
+   * failures retain their claim as part of PaymentAttempt resume/compensation correlation. */
   public async release(idempotencyKey: string): Promise<void> {
     await BookingCreationClaimModel.deleteOne({ idempotencyKey }).exec();
   }

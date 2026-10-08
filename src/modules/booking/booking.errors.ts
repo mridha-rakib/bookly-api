@@ -41,6 +41,8 @@ const defaultMessages: Record<string, string> = {
   BOOKING_CUSTOMER_CLIENT_CONTACT_CONFLICT:
     "A client record with matching contact details already exists at this business but is not linked to your account. Please contact the business directly to complete your first booking.",
   BOOKING_IDEMPOTENCY_KEY_REQUIRED: "An idempotency key is required to create a booking",
+  BOOKING_IDEMPOTENCY_CONFLICT:
+    "This booking key was already used by a different customer or business",
   BOOKING_TRANSACTION_UNAVAILABLE:
     "The database does not support the transactions this operation requires",
   BOOKING_INVALID_STATUS_TRANSITION: "This booking cannot move to the requested status right now",

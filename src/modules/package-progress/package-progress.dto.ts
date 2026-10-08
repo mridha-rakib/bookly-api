@@ -110,6 +110,14 @@ export type PackageProgressDto = {
     travelCities?: Array<{ city: string; feeCents: number }> | undefined;
   } | null;
   voidedAt?: string | undefined;
+  voidRefundSettlement?:
+    | {
+        status: "PENDING" | "SUCCEEDED" | "FAILED";
+        amountCents: number;
+        refundOperationId?: string | undefined;
+        providerRefundId?: string | undefined;
+      }
+    | undefined;
   createdAt: string;
   updatedAt: string;
 };
@@ -171,6 +179,16 @@ export const toPackageProgressDto = (
         }
       : null,
     voidedAt: progress.voidedAt?.toISOString(),
+    voidRefundSettlement: progress.voidRefundSettlement
+      ? {
+          status: progress.voidRefundSettlement.status,
+          amountCents: progress.voidRefundSettlement.amountCents,
+          refundOperationId: progress.voidRefundSettlement.refundOperationId
+            ? String(progress.voidRefundSettlement.refundOperationId)
+            : undefined,
+          providerRefundId: progress.voidRefundSettlement.providerRefundId,
+        }
+      : undefined,
     createdAt: progress.createdAt.toISOString(),
     updatedAt: progress.updatedAt.toISOString(),
   };

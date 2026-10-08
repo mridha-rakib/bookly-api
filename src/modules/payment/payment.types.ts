@@ -12,6 +12,7 @@ import type Stripe from "stripe";
 
 export type PaymentMethodSummary = {
   paymentMethodId: string;
+  customerId?: string | undefined;
   brand: string;
   last4: string;
   expMonth: number;
@@ -26,6 +27,7 @@ export type CreateSetupIntentResult = {
 export type SetupIntentStatusResult = {
   status: "succeeded" | "requires_action" | "requires_payment_method" | "processing" | "canceled";
   paymentMethodId?: string | undefined;
+  customerId?: string | undefined;
 };
 
 export type CreatePaymentIntentInput = {
@@ -50,6 +52,7 @@ export type CreatePaymentIntentInput = {
 
 export type PaymentIntentResult = {
   paymentIntentId: string;
+  paymentAttemptId?: string | undefined;
   status: "succeeded" | "requires_action" | "processing" | "failed";
   clientSecret?: string | undefined;
   /** A short, safe-to-display summary (e.g. "Your card was declined") — never the raw Stripe
@@ -62,17 +65,36 @@ export type PaymentIntentResult = {
   balanceTransactionId?: string | undefined;
 };
 
+export type PaymentIntentSnapshot = PaymentIntentResult & {
+  amountCents: number;
+  amountRefundedCents: number;
+  currency: string;
+  customerId?: string | undefined;
+  metadata: Record<string, string>;
+};
+
+export type ProviderLookupResult<T> =
+  | { outcome: "FOUND_ONE"; value: T }
+  | { outcome: "NOT_FOUND" }
+  | { outcome: "AMBIGUOUS" };
+
 export type CreateRefundInput = {
   paymentIntentId: string;
   /** Omit for a full refund. */
   amountCents?: number | undefined;
   idempotencyKey: string;
   reason?: string | undefined;
+  metadata?: Record<string, string> | undefined;
 };
 
 export type RefundResult = {
   refundId: string;
+  refundOperationId?: string | undefined;
   status: "succeeded" | "pending" | "failed";
+  paymentIntentId?: string | undefined;
+  amountCents?: number | undefined;
+  currency?: string | undefined;
+  metadata?: Record<string, string> | undefined;
 };
 
 export type BalanceTransactionFee = {
@@ -112,7 +134,20 @@ export interface PaymentGateway {
 
   createAndConfirmPaymentIntent(input: CreatePaymentIntentInput): Promise<PaymentIntentResult>;
 
+  retrievePaymentIntent?(paymentIntentId: string): Promise<PaymentIntentSnapshot>;
+
+  findPaymentIntentByMetadata?(
+    paymentAttemptId: string,
+  ): Promise<ProviderLookupResult<PaymentIntentSnapshot>>;
+
   createRefund(input: CreateRefundInput): Promise<RefundResult>;
+
+  retrieveRefund?(refundId: string): Promise<RefundResult>;
+
+  findRefundByMetadata?(input: {
+    refundOperationId: string;
+    paymentIntentId: string;
+  }): Promise<ProviderLookupResult<RefundResult>>;
 
   retrieveBalanceTransactionFee(
     balanceTransactionId: string,

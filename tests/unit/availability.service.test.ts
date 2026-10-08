@@ -518,6 +518,7 @@ describe("AvailabilityService — staff intersection", () => {
     });
 
     expect(result.days[0]!.slots).toEqual([]);
+    expect(result.days[0]!.blockedSlots).toBeUndefined();
   });
 
   it("excludes a staff member on time off that day, even with a matching schedule", async () => {
@@ -830,6 +831,7 @@ describe("AvailabilityService — staff intersection", () => {
     });
 
     expect(result.days[0]!.slots).toHaveLength(1);
+    expect(result.days[0]!.blockedSlots).toBeUndefined();
     expect(new Set(result.days[0]!.slots[0]!.eligibleStaffMembershipIds)).toEqual(
       new Set([String(staffA._id), String(staffB._id)]),
     );
@@ -886,6 +888,14 @@ describe("AvailabilityService — reservation conflicts", () => {
     });
 
     expect(result.days[0]!.slots.map((s) => s.startAt)).toEqual(["2026-08-25T07:00:00.000Z"]);
+    expect(result.days[0]!.blockedSlots).toEqual([
+      {
+        startAt: "2026-08-25T06:00:00.000Z",
+        endAt: "2026-08-25T07:00:00.000Z",
+        status: "BOOKED",
+        source: "AUTO",
+      },
+    ]);
   });
 });
 

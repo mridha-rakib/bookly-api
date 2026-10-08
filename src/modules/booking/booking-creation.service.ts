@@ -25,7 +25,10 @@ import type {
   PackageFulfilmentEntitlement,
   PackageProgressDocument,
 } from "../package-progress/package-progress.model.js";
-import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import type {
+  CreatePackageProgressInput,
+  PackageProgressRepository,
+} from "../package-progress/package-progress.repository.js";
 import { computePackageBalanceSettlement } from "../package-progress/package-progress.rules.js";
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
@@ -599,10 +602,10 @@ export class BookingCreationService {
    *  6. Whenever the deposit is nonzero (essentially always, for BOOKLY_MANAGED — Batch 6.5:
    *     charged for EVERY booking, first or returning, never gated on `isFirstBooking`): charge
    *     the deposit ON-session, saving the card for future off-session use in the same call.
-   *     `requires_action` releases the claim (nothing to compensate — no reservation/Booking
-   *     exists yet) and returns a clientSecret for the frontend to complete 3DS, then retry this
-   *     same call with the same idempotencyKey. A hard failure releases the claim and throws —
-   *     no Booking, no charge.
+   *     `requires_action` retains the claim and durable PaymentAttempt, returns a clientSecret
+   *     for the frontend to complete 3DS, then retries this same call with the same
+   *     idempotencyKey and PaymentIntent. A hard provider failure also remains durably anchored
+   *     so an ambiguous response cannot be mistaken for permission to create another charge.
    *  7. Reserve every line, then — inside the SAME transaction — attempt `markActivated`
    *     UNCONDITIONALLY (CAS-gated, safe/idempotent either way) and use its REAL result as the
    *     single source of truth for who economically keeps this deposit (closes a genuine
@@ -611,11 +614,9 @@ export class BookingCreationService {
    *     step-3 snapshot turns out to have guessed wrong. Then persist the Booking with the
    *     TRUE financials, write the PLATFORM_FEE (won activation) or DEPOSIT (didn't) ledger
    *     entry accordingly, all inside one MongoDB transaction (session-threaded throughout).
-   *  8. If step 7 fails AFTER a successful charge (a genuine post-payment reservation conflict,
-   *     or any other persistence failure) — refund the just-collected deposit (best-effort,
-   *     itself ledgered), release the claim, and throw. The customer is never left charged
-   *     without a Booking, and a fresh retry with the same idempotencyKey gets a clean new
-   *     charge attempt rather than being stuck.
+   *  8. If step 7 fails AFTER a successful charge, retain the claim and durable PaymentAttempt,
+   *     record compensation-required, and create/resume a durable RefundOperation. The same
+   *     logical key can never create a replacement PI merely because the response was lost.
    */
   public async finalizeCustomerBooking(
     customerUserId: string,
@@ -628,11 +629,16 @@ export class BookingCreationService {
 
     const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
     if (existingClaim) {
-      const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
-        existingClaim.bookingId,
-      );
-      return { status: "confirmed", booking };
+      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
+      if (booking) return { status: "confirmed", booking };
+      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
+      if (!attempt) {
+        const pendingBooking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          existingClaim.bookingId,
+        );
+        return { status: "confirmed", booking: pendingBooking };
+      }
     }
 
     const startAt = this.parseStartAt(input.startAt);
@@ -684,7 +690,7 @@ export class BookingCreationService {
       actorRole: "CUSTOMER",
     };
 
-    const bookingId = new Types.ObjectId();
+    const bookingId = existingClaim?.bookingId ?? new Types.ObjectId();
     const claimResult = await this.claimRepository.claim({
       idempotencyKey: input.idempotencyKey,
       businessId: business._id,
@@ -692,7 +698,7 @@ export class BookingCreationService {
       bookingId,
     });
 
-    if (!claimResult.isNew) {
+    if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
         { business, idempotencyKey: input.idempotencyKey },
         claimResult.bookingId,
@@ -714,7 +720,7 @@ export class BookingCreationService {
         `${input.idempotencyKey}:tax`,
       );
     } catch (error) {
-      await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
       throw error;
     }
 
@@ -727,30 +733,24 @@ export class BookingCreationService {
     // may fully cover the deposit (rule #7: never a fake €0 charge, but the saved-card
     // requirement above still applies unconditionally either way).
     if (customerChargeNowCents > 0) {
-      try {
-        paymentResult = await this.paymentService.chargeBookingDeposit({
-          userId: customerUserId,
-          amountCents: customerChargeNowCents,
-          idempotencyKey: input.idempotencyKey,
-          metadata: buildPaymentIntentMetadata({
-            bookingId: String(bookingId),
-            businessId: String(business._id),
-            businessClientId: String(client._id),
-            purpose: "BOOKING_DEPOSIT",
-            preTaxChargeCents: customerChargeNowCents,
-            taxCents: computedTax?.taxCents ?? 0,
-            chargedAmountCents: customerChargeNowCents,
-            taxCalculationId: computedTax?.taxCalculationId,
-            taxMode: "PRE_ACTIVATION",
-          }),
-        });
-      } catch (error) {
-        await this.claimRepository.release(input.idempotencyKey);
-        throw error;
-      }
+      paymentResult = await this.paymentService.chargeBookingDeposit({
+        userId: customerUserId,
+        amountCents: customerChargeNowCents,
+        idempotencyKey: input.idempotencyKey,
+        metadata: buildPaymentIntentMetadata({
+          bookingId: String(bookingId),
+          businessId: String(business._id),
+          businessClientId: String(client._id),
+          purpose: "BOOKING_DEPOSIT",
+          preTaxChargeCents: customerChargeNowCents,
+          taxCents: computedTax?.taxCents ?? 0,
+          chargedAmountCents: customerChargeNowCents,
+          taxCalculationId: computedTax?.taxCalculationId,
+          taxMode: "PRE_ACTIVATION",
+        }),
+      });
 
       if (paymentResult.status === "requires_action") {
-        await this.claimRepository.release(input.idempotencyKey);
         return {
           status: "requires_action",
           clientSecret: paymentResult.clientSecret as string,
@@ -759,7 +759,6 @@ export class BookingCreationService {
       }
 
       if (paymentResult.status !== "succeeded") {
-        await this.claimRepository.release(input.idempotencyKey);
         throw new PaymentError(
           "PAYMENT_FAILED",
           402,
@@ -770,7 +769,17 @@ export class BookingCreationService {
       }
     }
 
+    const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
+      paymentResult?.paymentAttemptId,
+    );
     try {
+      if (persistenceLeaseToken === null) {
+        const booking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          bookingId,
+        );
+        return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
+      }
       const booking = await this.persistCustomerBooking({
         bookingId,
         business,
@@ -789,20 +798,28 @@ export class BookingCreationService {
         paymentResult,
         resolvedPromo,
         customerChargeNowCents,
+        persistenceLeaseToken,
       });
       return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
       if (paymentResult) {
+        const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
+          paymentResult.paymentAttemptId,
+          error,
+          persistenceLeaseToken ?? undefined,
+        );
         // Batch 13 — refunds the amount ACTUALLY charged to Stripe (post-promo), never the
         // pre-promo `financials.depositCents` entitlement: Stripe can only refund what it
         // actually collected.
-        await this.compensateFailedBookingAfterPayment(
-          business,
-          bookingId,
-          client,
-          customerChargeNowCents,
-          paymentResult,
-        );
+        if (ownsCompensation) {
+          await this.compensateFailedBookingAfterPayment(
+            business,
+            bookingId,
+            client,
+            customerChargeNowCents,
+            paymentResult,
+          );
+        }
       } else {
         await this.claimRepository.release(input.idempotencyKey);
       }
@@ -923,11 +940,8 @@ export class BookingCreationService {
    * finalizeCustomerBooking (same idempotency-claim/payment/activation/ledger machinery,
    * reused via persistCustomerBooking, completely unmodified), then creates the linked
    * PackageProgress entitlement with `remainingSessions = sessionsInPackage - 1`. The
-   * entitlement is written BEFORE persistCustomerBooking (both keyed off pre-generated ids,
-   * the same "pre-generate then link" pattern this class already uses for bookingId) so a
-   * failure in the Booking write can be cleanly compensated by deleting the just-created,
-   * not-yet-referenced-by-anything-else entitlement row — never leaving a paid Booking with
-   * no entitlement, and never leaving an entitlement with no origin Booking.
+   * entitlement and origin Booking are written in the SAME Mongo transaction so neither can
+   * become durably visible without the other.
    */
   public async finalizePackagePurchase(
     customerUserId: string,
@@ -941,11 +955,16 @@ export class BookingCreationService {
 
     const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
     if (existingClaim) {
-      const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
-        existingClaim.bookingId,
-      );
-      return { status: "confirmed", booking };
+      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
+      if (booking) return { status: "confirmed", booking };
+      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
+      if (!attempt) {
+        const pendingBooking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          existingClaim.bookingId,
+        );
+        return { status: "confirmed", booking: pendingBooking };
+      }
     }
 
     const startAt = this.parseStartAt(input.startAt);
@@ -994,7 +1013,7 @@ export class BookingCreationService {
       actorRole: "CUSTOMER",
     };
 
-    const bookingId = new Types.ObjectId();
+    const bookingId = existingClaim?.bookingId ?? new Types.ObjectId();
     const packageProgressId = new Types.ObjectId();
 
     const claimResult = await this.claimRepository.claim({
@@ -1004,7 +1023,7 @@ export class BookingCreationService {
       bookingId,
     });
 
-    if (!claimResult.isNew) {
+    if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
         { business, idempotencyKey: input.idempotencyKey },
         claimResult.bookingId,
@@ -1034,37 +1053,31 @@ export class BookingCreationService {
         `${input.idempotencyKey}:tax`,
       );
     } catch (error) {
-      await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
       throw error;
     }
 
     let paymentResult: PaymentIntentResult | undefined;
 
     if (customerChargeNowCents > 0) {
-      try {
-        paymentResult = await this.paymentService.chargeBookingDeposit({
-          userId: customerUserId,
-          amountCents: customerChargeNowCents,
-          idempotencyKey: input.idempotencyKey,
-          metadata: buildPaymentIntentMetadata({
-            bookingId: String(bookingId),
-            businessId: String(business._id),
-            businessClientId: String(client._id),
-            purpose: "PACKAGE_PURCHASE",
-            preTaxChargeCents: customerChargeNowCents,
-            taxCents: computedTax?.taxCents ?? 0,
-            chargedAmountCents: customerChargeNowCents,
-            taxCalculationId: computedTax?.taxCalculationId,
-            taxMode: "PRE_ACTIVATION",
-          }),
-        });
-      } catch (error) {
-        await this.claimRepository.release(input.idempotencyKey);
-        throw error;
-      }
+      paymentResult = await this.paymentService.chargeBookingDeposit({
+        userId: customerUserId,
+        amountCents: customerChargeNowCents,
+        idempotencyKey: input.idempotencyKey,
+        metadata: buildPaymentIntentMetadata({
+          bookingId: String(bookingId),
+          businessId: String(business._id),
+          businessClientId: String(client._id),
+          purpose: "PACKAGE_PURCHASE",
+          preTaxChargeCents: customerChargeNowCents,
+          taxCents: computedTax?.taxCents ?? 0,
+          chargedAmountCents: customerChargeNowCents,
+          taxCalculationId: computedTax?.taxCalculationId,
+          taxMode: "PRE_ACTIVATION",
+        }),
+      });
 
       if (paymentResult.status === "requires_action") {
-        await this.claimRepository.release(input.idempotencyKey);
         return {
           status: "requires_action",
           clientSecret: paymentResult.clientSecret as string,
@@ -1073,7 +1086,6 @@ export class BookingCreationService {
       }
 
       if (paymentResult.status !== "succeeded") {
-        await this.claimRepository.release(input.idempotencyKey);
         throw new PaymentError(
           "PAYMENT_FAILED",
           402,
@@ -1084,43 +1096,39 @@ export class BookingCreationService {
       }
     }
 
-    try {
-      await (this.packageProgressRepository as PackageProgressRepository).create({
-        _id: packageProgressId,
-        businessId: business._id,
-        customerUserId: new Types.ObjectId(customerUserId),
-        businessClientId: client._id,
-        serviceId: line.service._id,
-        totalSessions: packagePricing.sessionsInPackage,
-        remainingSessions: packagePricing.sessionsInPackage - 1,
-        completedSessions: 0,
-        sessions: [{ sessionIndex: 1, bookingId, status: "SCHEDULED" }],
-        originBookingId: bookingId,
-        purchaseSnapshot: {
-          name: line.service.name,
-          packageServicesName: line.service.packageServicesName,
-          bundlePriceCents: packagePricing.bundlePriceCents,
-          durationMin: packagePricing.durationMin,
-          sessionsInPackage: packagePricing.sessionsInPackage,
-          discountPercent: packagePricing.discountPercent,
-          fulfilmentEntitlement,
-        },
-      });
-    } catch (error) {
-      await this.claimRepository.release(input.idempotencyKey);
-      if (paymentResult) {
-        await this.compensateFailedBookingAfterPayment(
-          business,
-          bookingId,
-          client,
-          customerChargeNowCents,
-          paymentResult,
-        );
-      }
-      throw error;
-    }
+    const packageProgressCreate: CreatePackageProgressInput = {
+      _id: packageProgressId,
+      businessId: business._id,
+      customerUserId: new Types.ObjectId(customerUserId),
+      businessClientId: client._id,
+      serviceId: line.service._id,
+      totalSessions: packagePricing.sessionsInPackage,
+      remainingSessions: packagePricing.sessionsInPackage - 1,
+      completedSessions: 0,
+      sessions: [{ sessionIndex: 1, bookingId, status: "SCHEDULED" }],
+      originBookingId: bookingId,
+      purchaseSnapshot: {
+        name: line.service.name,
+        packageServicesName: line.service.packageServicesName,
+        bundlePriceCents: packagePricing.bundlePriceCents,
+        durationMin: packagePricing.durationMin,
+        sessionsInPackage: packagePricing.sessionsInPackage,
+        discountPercent: packagePricing.discountPercent,
+        fulfilmentEntitlement,
+      },
+    };
 
+    const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
+      paymentResult?.paymentAttemptId,
+    );
     try {
+      if (persistenceLeaseToken === null) {
+        const booking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          bookingId,
+        );
+        return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
+      }
       const booking = await this.persistCustomerBooking({
         bookingId,
         business,
@@ -1139,23 +1147,26 @@ export class BookingCreationService {
         paymentResult,
         resolvedPromo: undefined,
         customerChargeNowCents,
+        packageProgressCreate,
+        persistenceLeaseToken,
       });
       return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
-      // The Booking never came into being — the entitlement pointing at it must not survive
-      // either (never called once a session may already have been redeemed against this row,
-      // which cannot happen here since this row was only just created above, in this same call).
-      await (this.packageProgressRepository as PackageProgressRepository)
-        .deleteById(packageProgressId)
-        .catch(() => {});
       if (paymentResult) {
-        await this.compensateFailedBookingAfterPayment(
-          business,
-          bookingId,
-          client,
-          customerChargeNowCents,
-          paymentResult,
+        const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
+          paymentResult.paymentAttemptId,
+          error,
+          persistenceLeaseToken ?? undefined,
         );
+        if (ownsCompensation) {
+          await this.compensateFailedBookingAfterPayment(
+            business,
+            bookingId,
+            client,
+            customerChargeNowCents,
+            paymentResult,
+          );
+        }
       } else {
         await this.claimRepository.release(input.idempotencyKey);
       }
@@ -1239,11 +1250,16 @@ export class BookingCreationService {
 
     const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
     if (existingClaim) {
-      const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
-        existingClaim.bookingId,
-      );
-      return { status: "confirmed", booking };
+      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
+      if (booking) return { status: "confirmed", booking };
+      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
+      if (!attempt) {
+        const pendingBooking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          existingClaim.bookingId,
+        );
+        return { status: "confirmed", booking: pendingBooking };
+      }
     }
 
     const startAt = this.parseStartAt(input.startAt);
@@ -1353,14 +1369,14 @@ export class BookingCreationService {
       }
     }
 
-    const bookingId = new Types.ObjectId();
+    const bookingId = existingClaim?.bookingId ?? new Types.ObjectId();
     const claimResult = await this.claimRepository.claim({
       idempotencyKey: input.idempotencyKey,
       businessId: business._id,
       actorUserId: new Types.ObjectId(customerUserId),
       bookingId,
     });
-    if (!claimResult.isNew) {
+    if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
         { business, idempotencyKey: input.idempotencyKey },
         claimResult.bookingId,
@@ -1382,37 +1398,31 @@ export class BookingCreationService {
         `${input.idempotencyKey}:tax`,
       );
     } catch (error) {
-      await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
       throw error;
     }
 
     let paymentResult: PaymentIntentResult | undefined;
 
     if (customerChargeNowCents > 0) {
-      try {
-        paymentResult = await this.paymentService.chargeBookingDeposit({
-          userId: customerUserId,
-          amountCents: customerChargeNowCents,
-          idempotencyKey: input.idempotencyKey,
-          metadata: buildPaymentIntentMetadata({
-            bookingId: String(bookingId),
-            businessId: String(business._id),
-            businessClientId: String(client._id),
-            purpose: "PACKAGE_SESSION_EXTRAS",
-            preTaxChargeCents: customerChargeNowCents,
-            taxCents: computedTax?.taxCents ?? 0,
-            chargedAmountCents: customerChargeNowCents,
-            taxCalculationId: computedTax?.taxCalculationId,
-            taxMode: "PRE_ACTIVATION",
-          }),
-        });
-      } catch (error) {
-        await this.claimRepository.release(input.idempotencyKey);
-        throw error;
-      }
+      paymentResult = await this.paymentService.chargeBookingDeposit({
+        userId: customerUserId,
+        amountCents: customerChargeNowCents,
+        idempotencyKey: input.idempotencyKey,
+        metadata: buildPaymentIntentMetadata({
+          bookingId: String(bookingId),
+          businessId: String(business._id),
+          businessClientId: String(client._id),
+          purpose: "PACKAGE_SESSION_EXTRAS",
+          preTaxChargeCents: customerChargeNowCents,
+          taxCents: computedTax?.taxCents ?? 0,
+          chargedAmountCents: customerChargeNowCents,
+          taxCalculationId: computedTax?.taxCalculationId,
+          taxMode: "PRE_ACTIVATION",
+        }),
+      });
 
       if (paymentResult.status === "requires_action") {
-        await this.claimRepository.release(input.idempotencyKey);
         return {
           status: "requires_action",
           clientSecret: paymentResult.clientSecret as string,
@@ -1421,7 +1431,6 @@ export class BookingCreationService {
       }
 
       if (paymentResult.status !== "succeeded") {
-        await this.claimRepository.release(input.idempotencyKey);
         throw new PaymentError(
           "PAYMENT_FAILED",
           402,
@@ -1434,8 +1443,19 @@ export class BookingCreationService {
 
     const dbSession = await mongoose.startSession();
     let created: BookingDocument | undefined;
+    let succeededTransactionId: Types.ObjectId | undefined;
+    const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
+      paymentResult?.paymentAttemptId,
+    );
 
     try {
+      if (persistenceLeaseToken === null) {
+        const booking = await this.awaitIdempotentBooking(
+          { business, idempotencyKey: input.idempotencyKey },
+          bookingId,
+        );
+        return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
+      }
       await dbSession.withTransaction(async () => {
         const afterClaim = await (
           this.packageProgressRepository as PackageProgressRepository
@@ -1520,7 +1540,7 @@ export class BookingCreationService {
         // BOOKLY_MANAGED deposit (never PLATFORM_FEE here: isFirstBooking is always false for a
         // redemption, matching the confirmed "already activated" reasoning above).
         if (customerChargeNowCents > 0) {
-          await this.financialTransactionService.record(
+          const transaction = await this.financialTransactionService.record(
             {
               businessId: business._id,
               bookingId,
@@ -1536,19 +1556,38 @@ export class BookingCreationService {
             },
             dbSession,
           );
+          succeededTransactionId = transaction._id;
         }
+
+        const completed = await this.paymentService.markPaymentCompleted(
+          paymentResult?.paymentAttemptId,
+          {
+            bookingId,
+            packageProgressId: progress._id,
+            ...(succeededTransactionId ? { succeededTransactionId } : {}),
+          },
+          persistenceLeaseToken ?? undefined,
+          dbSession,
+        );
+        if (!completed) throw new Error("Payment persistence lease was lost");
       });
     } catch (error) {
-      await this.claimRepository.release(input.idempotencyKey);
       if (paymentResult) {
-        await this.compensateFailedBookingAfterPayment(
-          business,
-          bookingId,
-          client,
-          customerChargeNowCents,
-          paymentResult,
+        const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
+          paymentResult.paymentAttemptId,
+          error,
+          persistenceLeaseToken ?? undefined,
         );
-      }
+        if (ownsCompensation) {
+          await this.compensateFailedBookingAfterPayment(
+            business,
+            bookingId,
+            client,
+            customerChargeNowCents,
+            paymentResult,
+          );
+        }
+      } else await this.claimRepository.release(input.idempotencyKey);
       if (this.isTransactionUnsupported(error)) {
         throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
       }
@@ -1568,12 +1607,13 @@ export class BookingCreationService {
     return { status: "confirmed", booking: created, ...(computedTax ? { computedTax } : {}) };
   }
 
-  private requirePackageProgressRepository(): void {
+  private requirePackageProgressRepository(): PackageProgressRepository {
     if (!this.packageProgressRepository) {
       throw new Error(
         "PackageProgressRepository must be injected to use Package purchase/redemption",
       );
     }
+    return this.packageProgressRepository;
   }
 
   /** Single package-redemption pricing authority. Preview and finalization both call this exact
@@ -1876,9 +1916,12 @@ export class BookingCreationService {
     paymentResult: PaymentIntentResult | undefined;
     resolvedPromo: ResolvedPromo | undefined;
     customerChargeNowCents: number;
+    packageProgressCreate?: CreatePackageProgressInput | undefined;
+    persistenceLeaseToken: string | undefined;
   }): Promise<BookingDocument> {
     const dbSession = await mongoose.startSession();
     let created: BookingDocument | undefined;
+    let succeededTransactionId: Types.ObjectId | undefined;
 
     try {
       await dbSession.withTransaction(async () => {
@@ -2037,6 +2080,13 @@ export class BookingCreationService {
           dbSession,
         );
 
+        if (params.packageProgressCreate) {
+          await this.requirePackageProgressRepository().create(
+            params.packageProgressCreate,
+            dbSession,
+          );
+        }
+
         if (hasDepositObligation) {
           // The SAME deposit charge — the ledger TYPE alone records who economically owns it
           // (see BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first
@@ -2056,7 +2106,7 @@ export class BookingCreationService {
           // snapshot (chargeCents: 0) and the PromoRedemption audit row remain the complete,
           // truthful record of what happened.
           if (params.customerChargeNowCents > 0) {
-            await this.financialTransactionService.record(
+            const transaction = await this.financialTransactionService.record(
               {
                 businessId: params.business._id,
                 bookingId: params.bookingId,
@@ -2074,6 +2124,7 @@ export class BookingCreationService {
               },
               dbSession,
             );
+            succeededTransactionId = transaction._id;
           }
 
           // Batch 13 — a RETURNING booking's Promo shortfall: the Business is still owed the
@@ -2103,9 +2154,25 @@ export class BookingCreationService {
             );
           }
         }
+
+        const completed = await this.paymentService.markPaymentCompleted(
+          params.paymentResult?.paymentAttemptId,
+          {
+            bookingId: params.bookingId,
+            ...(params.packageProgressCreate
+              ? { packageProgressId: params.packageProgressCreate._id }
+              : {}),
+            ...(succeededTransactionId ? { succeededTransactionId } : {}),
+          },
+          params.persistenceLeaseToken,
+          dbSession,
+        );
+        if (!completed) throw new Error("Payment persistence lease was lost");
       });
     } catch (error) {
-      await this.claimRepository.release(params.idempotencyKey);
+      if (!params.paymentResult?.paymentAttemptId) {
+        await this.claimRepository.release(params.idempotencyKey);
+      }
 
       if (this.isTransactionUnsupported(error)) {
         throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
@@ -2128,11 +2195,10 @@ export class BookingCreationService {
 
   /**
    * The saga's compensating action: a real charge succeeded but the Booking could not be
-   * persisted (a genuine post-payment reservation conflict, or any other failure). Refunds the
-   * just-collected charge — best-effort; a refund failure is itself ledgered as FAILED and
-   * logged, never allowed to mask or replace the ORIGINAL error the caller is about to throw
-   * (the customer must see "your booking could not be completed", not a refund-plumbing detail).
-   * The claim is always released so a fresh retry gets a clean new charge attempt.
+   * persisted (a genuine post-payment reservation conflict, or any other failure). It first
+   * records compensation-required, then creates/resumes a durable RefundOperation. Provider or
+   * local persistence ambiguity remains recoverable by the money-recovery worker and never
+   * masks the original booking error.
    */
   private async compensateFailedBookingAfterPayment(
     business: BusinessDocument,
@@ -2144,11 +2210,19 @@ export class BookingCreationService {
     try {
       const refund = await this.paymentService.refund({
         paymentIntentId: paymentResult.paymentIntentId,
+        amountCents,
+        currency: "EUR",
         idempotencyKey: `refund:${paymentResult.paymentIntentId}:compensation`,
         reason: "requested_by_customer",
+        domainReason: "BOOKING_PERSISTENCE_COMPENSATION",
+        sourcePaymentAttemptId: paymentResult.paymentAttemptId,
+        bookingId,
+        businessId: business._id,
+        businessClientId: client._id,
+        customerUserId: client.linkState === "LINKED" ? client.linkedUserId : undefined,
       });
 
-      await this.financialTransactionService.record({
+      const ledger = await this.financialTransactionService.record({
         businessId: business._id,
         bookingId,
         businessClientId: client._id,
@@ -2159,7 +2233,7 @@ export class BookingCreationService {
         currency: "EUR",
         status: refund.status === "succeeded" ? "SUCCEEDED" : "PENDING",
         providerReference: refund.refundId,
-        idempotencyKey: `refund:${paymentResult.paymentIntentId}:compensation`,
+        idempotencyKey: `refund-operation:${refund.refundOperationId ?? refund.refundId}:ledger`,
         // Batch 8 — this refund unwinds a charge whose own ledger entry never durably
         // persisted (persistCustomerBooking's transaction rolled back before writing it), so
         // there is no sourceTransactionId to link to. Deliberately NOT attributed to either
@@ -2168,6 +2242,9 @@ export class BookingCreationService {
         // reversing against either party's total.
         metadata: { sourceType: "COMPENSATION" },
       });
+      if (refund.status === "succeeded") {
+        await this.paymentService.markRefundLedgerSucceeded(refund.refundOperationId, ledger._id);
+      }
     } catch {
       // Best-effort — a failed compensation is a real operational issue (an uncollectable/
       // orphan charge) that must be resolved by manual reconciliation using the

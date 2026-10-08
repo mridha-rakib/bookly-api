@@ -35,6 +35,8 @@
     "worker:sms:once": "tsx src/scripts/run-sms-worker.ts --once",
     "worker:marketing": "tsx src/scripts/run-marketing-campaign-worker.ts",
     "worker:marketing:once": "tsx src/scripts/run-marketing-campaign-worker.ts --once",
+    "worker:money-recovery": "tsx src/scripts/run-money-recovery-worker.ts",
+    "worker:money-recovery:once": "tsx src/scripts/run-money-recovery-worker.ts --once",
     "prepare": "node scripts/prepare-husky.mjs"
   },
   "lint-staged": {

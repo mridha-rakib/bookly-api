@@ -654,7 +654,14 @@ export class BookingLifecycleService {
       progress.originBookingId,
     );
     let refundOutcome:
-      | { booking: BookingDocument; refundSucceeded: boolean; refundedAmountCents: number }
+      | {
+          booking: BookingDocument;
+          refundSucceeded: boolean;
+          refundedAmountCents: number;
+          settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED";
+          refundOperationId?: string | undefined;
+          providerRefundId?: string | undefined;
+        }
       | undefined;
     if (upfrontPayment && upfrontPayment.amountCents > 0) {
       const currentOrigin = await this.bookingRepository.findByIdForCustomer(
@@ -662,11 +669,32 @@ export class BookingLifecycleService {
         customerUserId,
       );
       if (currentOrigin) {
-        refundOutcome = await this.executeBusinessCancellationRefund(currentOrigin, upfrontPayment);
+        refundOutcome = await this.executeBusinessCancellationRefund(
+          currentOrigin,
+          upfrontPayment,
+          {
+            domainReason: "PACKAGE_VOID",
+            packageProgressId: progress._id,
+          },
+        );
       }
     }
 
-    const voided = await this.packageProgressRepository.voidPackage(progress._id);
+    const voided = await this.packageProgressRepository.voidPackage(
+      progress._id,
+      refundOutcome
+        ? {
+            status: refundOutcome.settlementStatus,
+            amountCents: refundOutcome.refundedAmountCents,
+            ...(refundOutcome.refundOperationId
+              ? { refundOperationId: new Types.ObjectId(refundOutcome.refundOperationId) }
+              : {}),
+            ...(refundOutcome.providerRefundId
+              ? { providerRefundId: refundOutcome.providerRefundId }
+              : {}),
+          }
+        : undefined,
+    );
     if (!voided) {
       throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
     }
@@ -942,6 +970,10 @@ export class BookingLifecycleService {
       providerReference?: string | undefined;
       amountCents: number;
     },
+    options: {
+      domainReason?: "BUSINESS_CANCELLATION" | "PACKAGE_VOID";
+      packageProgressId?: Types.ObjectId | undefined;
+    } = {},
   ): Promise<{
     booking: BookingDocument;
     /** The real, authoritative outcome of THIS refund attempt — never re-derived afterward from
@@ -950,10 +982,14 @@ export class BookingLifecycleService {
      * refund must pass this straight through as the notifier's `refundOutcome`. */
     refundSucceeded: boolean;
     refundedAmountCents: number;
+    settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED";
+    refundOperationId?: string | undefined;
+    providerRefundId?: string | undefined;
   }> {
     const idempotencyKey = `business-cancel-refund:${String(booking._id)}`;
-    let settlementStatus: "SUCCEEDED" | "FAILED" = "FAILED";
+    let settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED" = "PENDING";
     let refundId: string | undefined;
+    let refundOperationId: string | undefined;
 
     try {
       if (!upfrontPayment.providerReference) {
@@ -962,16 +998,40 @@ export class BookingLifecycleService {
       const refund = await this.paymentService.refund({
         paymentIntentId: upfrontPayment.providerReference,
         amountCents: upfrontPayment.amountCents,
+        currency: booking.financials.currency,
         idempotencyKey,
         reason: "requested_by_customer",
+        domainReason: options.domainReason ?? "BUSINESS_CANCELLATION",
+        sourceFinancialTransactionId: upfrontPayment._id,
+        bookingId: booking._id,
+        packageProgressId: options.packageProgressId,
+        businessId: booking.businessId,
+        businessClientId: booking.customer.businessClientId,
+        customerUserId: booking.customer.customerUserId,
       });
       refundId = refund.refundId;
-      settlementStatus = refund.status === "succeeded" ? "SUCCEEDED" : "FAILED";
+      refundOperationId = refund.refundOperationId;
+      settlementStatus =
+        refund.status === "succeeded"
+          ? "SUCCEEDED"
+          : refund.status === "failed"
+            ? "FAILED"
+            : "PENDING";
     } catch {
       // Best-effort — never thrown: the cancellation itself already succeeded.
+      const operation = await this.paymentService.findRefundOperation(idempotencyKey);
+      refundOperationId = operation ? String(operation._id) : undefined;
+      settlementStatus = operation
+        ? operation.providerStatus === "SUCCEEDED"
+          ? "SUCCEEDED"
+          : operation.providerStatus === "FAILED"
+            ? "FAILED"
+            : "PENDING"
+        : "FAILED";
+      refundId = operation?.providerRefundId;
     }
 
-    await this.financialTransactionService.record({
+    const refundLedger = await this.financialTransactionService.record({
       businessId: booking.businessId,
       bookingId: booking._id,
       businessClientId: booking.customer.businessClientId,
@@ -980,14 +1040,19 @@ export class BookingLifecycleService {
       direction: "CREDIT",
       amountCents: upfrontPayment.amountCents,
       currency: booking.financials.currency,
-      status: settlementStatus === "SUCCEEDED" ? "SUCCEEDED" : "FAILED",
+      status: settlementStatus,
       ...(refundId ? { providerReference: refundId } : {}),
-      idempotencyKey: `${idempotencyKey}:ledger`,
+      idempotencyKey: refundOperationId
+        ? `refund-operation:${refundOperationId}:ledger`
+        : `${idempotencyKey}:ledger`,
       metadata: {
         sourceType: upfrontPayment.type,
         sourceTransactionId: String(upfrontPayment._id),
       },
     });
+    if (settlementStatus === "SUCCEEDED") {
+      await this.paymentService.markRefundLedgerSucceeded(refundOperationId, refundLedger._id);
+    }
 
     const updated = await this.bookingRepository.updateCancellationSettlement(
       booking._id,
@@ -998,6 +1063,9 @@ export class BookingLifecycleService {
       booking: updated ?? booking,
       refundSucceeded: settlementStatus === "SUCCEEDED",
       refundedAmountCents: upfrontPayment.amountCents,
+      settlementStatus,
+      refundOperationId,
+      providerRefundId: refundId,
     };
   }
 

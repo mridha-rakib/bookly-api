@@ -86,6 +86,12 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
           ...input,
         } as unknown as BookingFinancialTransactionDocument;
       }),
+      findByIdempotencyKey: vi.fn(async (idempotencyKey: string) => {
+        const existing = recordedEntries.find(
+          (entry) => entry["idempotencyKey"] === idempotencyKey,
+        );
+        return (existing as unknown as BookingFinancialTransactionDocument | undefined) ?? null;
+      }),
     } as unknown as BookingFinancialTransactionService;
 
     return new StripeWebhookService(gateway, eventRepository, financialTransactionService);
@@ -233,6 +239,21 @@ describe("StripeWebhookService — PROCESSING_FEE capture (Batch 7)", () => {
     ).rejects.toThrow("processing fee");
     expect(settleStatusCalls).toEqual([{ id: pending._id, status: "SUCCEEDED" }]);
     expect(eventRepository.markRetryable).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the event retryable when processing-fee persistence fails before an idempotent row exists", async () => {
+    const bookingId = new Types.ObjectId();
+    const settled = makeEntry({ bookingId, providerReference: "pi_test_1", status: "SUCCEEDED" });
+    const service = buildService(settled);
+    financialTransactionService.record = vi.fn(async () => {
+      throw new Error("database unavailable");
+    });
+
+    await expect(
+      service.process(paymentIntentSucceededEvent("pi_test_1", String(bookingId))),
+    ).rejects.toThrow("ledger persistence");
+    expect(eventRepository.markRetryable).toHaveBeenCalledOnce();
+    expect(eventRepository.markProcessed).not.toHaveBeenCalled();
   });
 
   it("does not post a fee when Stripe currencies are not comparable", async () => {

@@ -40,9 +40,14 @@ describe("PaymentService", () => {
         gatewayCalls.push("createSetupIntent");
         return { setupIntentId: "seti_1", clientSecret: "seti_1_secret" };
       },
-      retrieveSetupIntent: async () => ({ status: "succeeded", paymentMethodId: "pm_1" }),
+      retrieveSetupIntent: async () => ({
+        status: "succeeded",
+        paymentMethodId: "pm_1",
+        customerId: "cus_existing",
+      }),
       getPaymentMethodSummary: async () => ({
         paymentMethodId: "pm_1",
+        customerId: "cus_existing",
         brand: "visa",
         last4: "4242",
         expMonth: 12,
@@ -203,5 +208,80 @@ describe("PaymentService", () => {
     await expect(service.confirmSavedPaymentMethod("u1", "seti_bad")).rejects.toMatchObject({
       statusCode: 400,
     });
+  });
+
+  it("rejects a SetupIntent owned by another Stripe Customer without persisting card metadata", async () => {
+    let saved = false;
+    const profileRepository = makeMockProfileRepository({
+      findByUserId: async () => ({ userId: "u1", stripeCustomerId: "cus_expected" }),
+      savePaymentMethod: async () => {
+        saved = true;
+        return null;
+      },
+    });
+    gateway.retrieveSetupIntent = async () => ({
+      status: "succeeded",
+      paymentMethodId: "pm_other",
+      customerId: "cus_other",
+    });
+    const service = new PaymentService(gateway, profileRepository, makeMockUserRepository());
+
+    await expect(service.confirmSavedPaymentMethod("u1", "seti_other")).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    expect(saved).toBe(false);
+  });
+
+  it("rejects a succeeded SetupIntent with no Stripe Customer", async () => {
+    let saved = false;
+    const profileRepository = makeMockProfileRepository({
+      findByUserId: async () => ({ userId: "u1", stripeCustomerId: "cus_expected" }),
+      savePaymentMethod: async () => {
+        saved = true;
+        return null;
+      },
+    });
+    gateway.retrieveSetupIntent = async () => ({
+      status: "succeeded",
+      paymentMethodId: "pm_1",
+    });
+    const service = new PaymentService(gateway, profileRepository, makeMockUserRepository());
+
+    await expect(
+      service.confirmSavedPaymentMethod("u1", "seti_missing_customer"),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    expect(saved).toBe(false);
+  });
+
+  it("rejects a PaymentMethod whose Stripe Customer does not match the SetupIntent customer", async () => {
+    let saved = false;
+    const profileRepository = makeMockProfileRepository({
+      findByUserId: async () => ({ userId: "u1", stripeCustomerId: "cus_expected" }),
+      savePaymentMethod: async () => {
+        saved = true;
+        return null;
+      },
+    });
+    gateway.retrieveSetupIntent = async () => ({
+      status: "succeeded",
+      paymentMethodId: "pm_other",
+      customerId: "cus_expected",
+    });
+    gateway.getPaymentMethodSummary = async () => ({
+      paymentMethodId: "pm_other",
+      customerId: "cus_other",
+      brand: "visa",
+      last4: "4242",
+      expMonth: 12,
+      expYear: 2030,
+    });
+    const service = new PaymentService(gateway, profileRepository, makeMockUserRepository());
+
+    await expect(service.confirmSavedPaymentMethod("u1", "seti_other")).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    expect(saved).toBe(false);
   });
 });

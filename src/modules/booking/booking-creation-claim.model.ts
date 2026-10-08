@@ -12,10 +12,10 @@ import { model, Schema, type Types } from "mongoose";
  * transaction (see BookingCreationService.createManualBooking), so a losing concurrent request
  * with the same key can immediately resolve to the winner's `bookingId` without waiting on or
  * inspecting the transaction. If the subsequent transactional creation fails for any reason
- * (a genuine validation error, a reservation conflict, a transient transaction error), the
- * caller deletes this claim row in the same failure path — an idempotency key must never be
- * permanently "poisoned" by an attempt that never produced a real Booking (see
- * BookingCreationService's own comment on this).
+ * (a genuine validation error, a reservation conflict, a transient transaction error), a
+ * no-payment flow deletes the claim. A charge-bearing flow deliberately retains it and links
+ * the same logical key/booking id through PaymentAttempt so an ambiguous retry cannot create a
+ * second provider operation.
  */
 export type BookingCreationClaimDocument = {
   _id: Types.ObjectId;

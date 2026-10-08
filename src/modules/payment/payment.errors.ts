@@ -12,6 +12,11 @@ const defaultMessages: Record<string, string> = {
   PAYMENT_REFUND_FAILED: "The refund could not be completed",
   PAYMENT_WEBHOOK_SIGNATURE_INVALID: "Webhook signature verification failed",
   PAYMENT_IDEMPOTENCY_KEY_REQUIRED: "An idempotency key is required for this payment operation",
+  PAYMENT_IDEMPOTENCY_CONFLICT: "This payment key was already used with different payment details",
+  PAYMENT_REFUND_IDEMPOTENCY_CONFLICT:
+    "This refund key was already used with different refund details",
+  PAYMENT_PROVIDER_CORRELATION_MISMATCH:
+    "The payment provider response does not match the expected operation",
 };
 
 export class PaymentError extends AppError {

@@ -309,7 +309,7 @@ export class BookingRepository {
    */
   public async updateCancellationSettlement(
     bookingId: Types.ObjectId | string,
-    settlementStatus: "SUCCEEDED" | "FAILED",
+    settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED",
     settlementProviderReference: string | undefined,
   ): Promise<BookingDocument | null> {
     return BookingModel.findOneAndUpdate(
