@@ -80,12 +80,11 @@ export class ClientRepository {
   }
 
   /**
-   * Batch 4 — the ONLY writer of activation state. Atomically gated on `activatedAt` not
-   * already being set (`$exists: false`), so a concurrent double-activation attempt (e.g. two
-   * near-simultaneous finalize retries) can only ever win once — the loser's update matches
-   * zero documents and returns null, which the caller (BookingCreationService) treats as
-   * "already activated, nothing to do," never as an error. Never called from anywhere except
-   * the moment an activation charge has genuinely succeeded.
+   * LEGACY (pre-P1) activation marker writer — no production caller remains. Financial
+   * first/returning classification is owned by BusinessClient.financialRelationship (see
+   * FinancialRelationshipRepository, which also stamps this legacy `activatedAt` marker when a
+   * FIRST operation is consumed). Kept only for analytics fixtures; never call it from a money
+   * path — on a pre-P1 row it would make lazy relationship initialization read CONSUMED.
    */
   public async markActivated(
     clientId: Types.ObjectId | string,

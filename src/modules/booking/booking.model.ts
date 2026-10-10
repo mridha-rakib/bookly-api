@@ -32,6 +32,8 @@ import {
   DEPOSIT_MIN_CENTS,
   MAX_CUSTOMER_RESCHEDULE_COUNT,
 } from "./booking.types.js";
+import type { FinancialContractV2 } from "./financial-contract.js";
+import { financialContractSchema } from "./financial-contract.model.js";
 
 // --- Actor / customer -------------------------------------------------------------------
 //
@@ -478,6 +480,12 @@ export type BookingDocument = {
   cancellationOutcome?: BookingCancellationOutcome | undefined;
   completionPayment?: BookingCompletionPayment | undefined;
   promo?: BookingPromoSnapshot | undefined;
+  /** P1 — the immutable Financial Contract V2 this customer booking / package purchase origin
+   * Booking was classified and priced under (copied from its BookingCreationClaim). Absent on
+   * legacy, MANUAL and package Session 2+ Bookings. Note `financials.eligiblePlatformFeeBasisCents`
+   * keeps its legacy meaning (cancellation/no-show basis); a FIRST package's upfront basis is
+   * `financialContract.eligibleBasisCents` (bundle price only). */
+  financialContract?: FinancialContractV2 | undefined;
   notes?: string | undefined;
   // No hard-delete/archive path is modeled: a Booking is never removed once created — its
   // status changes, but the record (and every snapshot on it) persists indefinitely as the
@@ -733,13 +741,21 @@ bookingFinancialsSchema.pre("validate", function () {
     );
   }
 
+  // P1: a FIRST upfront is clamp(20%, €5, €35) but never above its eligible basis, so a nonzero
+  // platform fee below €5 is legitimate only as that cap-to-basis case, where it EQUALS the FIRST
+  // basis: normal = eligiblePlatformFeeBasisCents; package = the bundle price, i.e.
+  // servicesSubtotalCents - serviceDiscountCents (a package line never carries a discount).
+  const capToBasisFee =
+    financials.platformFeeCents === financials.eligiblePlatformFeeBasisCents ||
+    financials.platformFeeCents ===
+      financials.servicesSubtotalCents - financials.serviceDiscountCents;
   if (
     financials.platformFeeCents !== 0 &&
-    (financials.platformFeeCents < DEPOSIT_MIN_CENTS ||
-      financials.platformFeeCents > DEPOSIT_MAX_CENTS)
+    (financials.platformFeeCents > DEPOSIT_MAX_CENTS ||
+      (financials.platformFeeCents < DEPOSIT_MIN_CENTS && !capToBasisFee))
   ) {
     throw new Error(
-      `A nonzero platformFeeCents must be within [${DEPOSIT_MIN_CENTS}, ${DEPOSIT_MAX_CENTS}]`,
+      `A nonzero platformFeeCents must be within [${DEPOSIT_MIN_CENTS}, ${DEPOSIT_MAX_CENTS}], or capped at its eligible basis when that basis is below ${DEPOSIT_MIN_CENTS}`,
     );
   }
 
@@ -949,6 +965,7 @@ const bookingSchema = new Schema<BookingDocument>(
     cancellationOutcome: { type: bookingCancellationOutcomeSchema },
     completionPayment: { type: bookingCompletionPaymentSchema },
     promo: { type: bookingPromoSnapshotSchema },
+    financialContract: { type: financialContractSchema },
     notes: { type: String, trim: true, maxlength: 2000 },
   },
   { timestamps: true },

@@ -499,7 +499,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
 
   // --- Concurrency: two concurrent finalize calls for the SAME first-time customer+business -----
 
-  it("[race] concurrent first-booking finalize attempts: exactly one gets platformFeeCents, the other still gets a real Business-owned deposit", async () => {
+  it("[race] P1: concurrent first-booking finalize attempts — exactly one FIRST winner; the other is never charged as a guess", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     const customer = await createCustomer("race");
     await saveCard(customer._id);
@@ -527,9 +527,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
         > => r.status === "fulfilled" && r.value.status === "confirmed",
       )
       .map((r) => r.value);
-
-    // Both are genuinely different bookings (different requested times) — both should succeed.
-    expect(confirmed).toHaveLength(2);
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
 
     const platformFeeBookings = confirmed.filter(
       (r) => r.status === "confirmed" && r.booking.financials.platformFeeCents > 0,
@@ -538,15 +536,23 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       (r) => r.status === "confirmed" && r.booking.financials.platformFeeCents === 0,
     );
 
-    // Exactly ONE of the two concurrent bookings may economically be "first" — never both,
-    // never neither (the CAS-gated markActivated result is authoritative, not the pre-charge
-    // read).
+    // P1 (replaces the Batch 6.5 "charge both, decide ownership after the money moved"
+    // behaviour): the first claim is atomic BEFORE any charge, so exactly ONE operation is FIRST.
+    // The other either lost the claim while the winner was unresolved — rejected as
+    // BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS with NO PaymentIntent — or only arrived after the
+    // winner was CONSUMED and is a genuine RETURNING booking.
     expect(platformFeeBookings).toHaveLength(1);
-    expect(depositOnlyBookings).toHaveLength(1);
+    expect(depositOnlyBookings.length + rejected.length).toBe(1);
+    for (const r of rejected) {
+      expect(r.reason).toMatchObject({
+        statusCode: 409,
+        details: [{ code: "BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS" }],
+      });
+    }
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(confirmed.length);
 
-    // The "losing" booking still charged a REAL deposit online — never €0 — and that deposit is
-    // ledgered as DEPOSIT (Business-owned), never silently dropped or double-counted as
-    // platform revenue.
+    // A RETURNING booking (if the loser arrived late) still charged a REAL deposit online —
+    // never €0 (P3 not implemented) — ledgered as Business-owned DEPOSIT.
     for (const r of depositOnlyBookings) {
       if (r.status !== "confirmed") continue;
       expect(r.booking.financials.depositCents).toBe(2000);
@@ -563,11 +569,14 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       expect(platformFeeEntry?.amountCents).toBe(2000);
     }
 
-    // Exactly one BusinessClient activation happened, attributed to whichever booking actually
-    // won it.
+    // The one relationship is CONSUMED by the winner (the legacy activatedAt marker agrees).
     const client = await clientRepository.findByBusinessIdAndLinkedUserId(
       business._id,
       customer._id,
+    );
+    expect(client?.financialRelationship?.state).toBe("CONSUMED");
+    expect(String(client?.financialRelationship?.consumed?.bookingId)).toBe(
+      String(client?.activatedByBookingId),
     );
     expect(client?.activatedAt).toBeDefined();
     const winnerId = String(client?.activatedByBookingId);

@@ -15,6 +15,8 @@ import type { BusinessCancellationPolicyRepository } from "../business-cancellat
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import type { BusinessClientDocument } from "../client/client.model.js";
 import type { ClientRepository } from "../client/client.repository.js";
+import { FinancialRelationshipRepository } from "../client/financial-relationship.repository.js";
+import { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { IntegrationService } from "../integration/integration.service.js";
 import {
   buildPackageFulfilmentEntitlement,
@@ -33,7 +35,12 @@ import { computePackageBalanceSettlement } from "../package-progress/package-pro
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
-import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
+import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
+import {
+  buildPaymentIntentMetadata,
+  type PaymentIntentPurpose,
+} from "../payment/payment-intent-metadata.js";
+import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import { TaxError } from "../payment/tax.errors.js";
 import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
@@ -62,6 +69,13 @@ import type { BookingActorRole, BookingSource } from "./booking.types.js";
 import { generateBookingReference } from "./booking.utils.js";
 import type { CreateBookingInput, CreateManualBookingInput } from "./booking-creation.types.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
+import {
+  calculateFirstUpfrontCents,
+  FINANCIAL_CONTRACT_VERSION,
+  type FinancialContractProductKind,
+  type FinancialContractV2,
+  type RelationshipClassification,
+} from "./financial-contract.js";
 
 /**
  * Stage B mailing observer for Triggers 2/3/4. Optional + trailing so every existing
@@ -157,6 +171,13 @@ type PackageRedemptionPricingContext = {
   fulfilment: BookingFulfilment;
   addons: BookingServiceLineAddon[];
   financials: BookingFinancials;
+};
+
+/** P1 — the authoritative classification-derived money terms for one logical operation. */
+type EstablishedFinancialTerms = {
+  financials: BookingFinancials;
+  resolvedPromo: ResolvedPromo | undefined;
+  contract: FinancialContractV2;
 };
 
 export type FinalizeBookingResult =
@@ -286,7 +307,25 @@ export class BookingCreationService {
     // root always wires the real CyprusTaxService; optionality here exists purely for
     // test-construction compatibility, matching this constructor's existing pattern.
     private readonly taxService?: Pick<CyprusTaxService, "computeForCharge">,
-  ) {}
+    // P1 — the customer↔business financial relationship (the ONLY first/returning authority).
+    // Optional trailing dep for the same test-construction reason as every dep above; when
+    // absent it is assembled from the same repositories, so no construction site can end up
+    // classifying from a different source.
+    financialRelationshipService?: FinancialRelationshipService,
+  ) {
+    this.relationships =
+      financialRelationshipService ??
+      new FinancialRelationshipService(
+        new FinancialRelationshipRepository(),
+        new PaymentAttemptRepository(),
+        new RefundOperationRepository(),
+        bookingRepository,
+        claimRepository,
+        clientRepository,
+      );
+  }
+
+  private readonly relationships: FinancialRelationshipService;
 
   /**
    * Checkpoint B (Cyprus VAT, compute-only) — the single call site every customer-facing charge
@@ -429,7 +468,9 @@ export class BookingCreationService {
       lines,
       input.customerCity,
     );
-    const financials = this.assembleFinancials("MANUAL", lines, travelFeeCents, false);
+    // A MANUAL booking never touches the customer↔business financial relationship (it can never
+    // claim or consume first status) and carries no Bookly fee/deposit — rule E.
+    const financials = this.assembleFinancials("MANUAL", lines, travelFeeCents);
     this.bookingService.validateManualBookingHasNoBooklyFee("MANUAL", {
       platformFeeCents: financials.platformFeeCents,
       depositCents: financials.depositCents,
@@ -492,13 +533,16 @@ export class BookingCreationService {
       business._id,
       customerUserId,
     );
-    const isFirstBooking = !existingClient?.activatedAt;
+    // P1 — a read-only ESTIMATE from the same relationship authority finalize claims against
+    // (never `activatedAt` directly); finalize remains authoritative.
+    const classification = this.relationships.peekClassification(existingClient);
+    const isFirstBooking = classification === "FIRST";
 
-    const financials = this.assembleFinancials(
-      "BOOKLY_MANAGED",
+    const { financials } = this.assembleCustomerFinancials(
       lines,
       travelFeeCents,
-      isFirstBooking,
+      classification,
+      undefined,
     );
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
 
@@ -592,31 +636,28 @@ export class BookingCreationService {
    *     the Customer's BusinessClient row (see resolveOrCreateCustomerClient — this is exactly
    *     the gap Batch 3 flagged and deferred for TRAVEL_TO_CUSTOMER; AT_BUSINESS_LOCATION with
    *     no existing Client row remains a genuine, still-unresolved product gap — see the report).
-   *  3. Read `isFirstBooking` (`BusinessClient.activatedAt`) as an OPTIMISTIC snapshot and
-   *     assemble financials from it — this is only a pre-charge estimate; step 7 below
-   *     determines the TRUE, race-safe outcome atomically and corrects it if needed.
-   *  4. Require a saved card regardless of activation state (confirmed rule: "returning
+   *  3. Require a saved card regardless of classification (confirmed rule: "returning
    *     customers also need a saved card").
-   *  5. Claim the idempotency key (pre-generated bookingId, same pattern as Batch 3's
+   *  4. Claim the idempotency key (pre-generated bookingId, same pattern as Batch 3's
    *     `persistBooking`).
-   *  6. Whenever the deposit is nonzero (essentially always, for BOOKLY_MANAGED — Batch 6.5:
-   *     charged for EVERY booking, first or returning, never gated on `isFirstBooking`): charge
-   *     the deposit ON-session, saving the card for future off-session use in the same call.
-   *     `requires_action` retains the claim and durable PaymentAttempt, returns a clientSecret
-   *     for the frontend to complete 3DS, then retries this same call with the same
-   *     idempotencyKey and PaymentIntent. A hard provider failure also remains durably anchored
-   *     so an ambiguous response cannot be mistaken for permission to create another charge.
-   *  7. Reserve every line, then — inside the SAME transaction — attempt `markActivated`
-   *     UNCONDITIONALLY (CAS-gated, safe/idempotent either way) and use its REAL result as the
-   *     single source of truth for who economically keeps this deposit (closes a genuine
-   *     concurrency race two truly-simultaneous finalize calls could otherwise hit — see
-   *     persistCustomerBooking's own comment), correcting `financials.platformFeeCents` if the
-   *     step-3 snapshot turns out to have guessed wrong. Then persist the Booking with the
-   *     TRUE financials, write the PLATFORM_FEE (won activation) or DEPOSIT (didn't) ledger
-   *     entry accordingly, all inside one MongoDB transaction (session-threaded throughout).
+   *  5. P1 — establishFinancialTerms: atomically claim/resume the customer↔business first
+   *     relationship (ELIGIBLE -> FIRST_PENDING) BEFORE any money moves, or classify RETURNING
+   *     from a CONSUMED relationship; a competing unresolved first operation gets
+   *     BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS with nothing charged. Then record the immutable
+   *     Financial Contract V2 on the claim (a resumed operation must match it or fail closed).
+   *  6. Whenever the contract's online charge is nonzero: charge it ON-session, saving the card
+   *     for future off-session use in the same call. A FIRST charge binds its PaymentAttempt to
+   *     the relationship claim before dispatch. `requires_action` retains the claim, the durable
+   *     PaymentAttempt and FIRST_PENDING, returns a clientSecret for 3DS, then the same
+   *     idempotencyKey resumes the same PaymentIntent and first claim. A definitive failure
+   *     releases FIRST_PENDING; an ambiguous one keeps it protected for reconciliation.
+   *  7. Reserve every line, persist the Booking, write the PLATFORM_FEE (FIRST) or DEPOSIT
+   *     (RETURNING, unchanged pre-P3) ledger row, and — for FIRST — consume the relationship
+   *     (FIRST_PENDING -> CONSUMED), all inside ONE MongoDB transaction.
    *  8. If step 7 fails AFTER a successful charge, retain the claim and durable PaymentAttempt,
-   *     record compensation-required, and create/resume a durable RefundOperation. The same
-   *     logical key can never create a replacement PI merely because the response was lost.
+   *     record compensation-required, and create/resume a durable RefundOperation; a FIRST
+   *     relationship moves to RESTORATION_PENDING and only returns to ELIGIBLE once that exact
+   *     full refund is confirmed. The same logical key can never create a replacement PI.
    */
   public async finalizeCustomerBooking(
     customerUserId: string,
@@ -651,36 +692,11 @@ export class BookingCreationService {
       input.customerCity,
     );
     const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
-    const isFirstBooking = !client.activatedAt;
-    const financials = this.assembleFinancials(
-      "BOOKLY_MANAGED",
-      lines,
-      travelFeeCents,
-      isFirstBooking,
-    );
 
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
     if (!cardStatus.hasSavedCard) {
       throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
     }
-
-    // Batch 13 — re-validated here from scratch (never trusts a prior preview call). Resolves
-    // BEFORE any charge, using the same optimistic `isFirstBooking` snapshot the rest of this
-    // method already relies on for the pre-charge amount; `persistCustomerBooking`'s transaction
-    // re-checks scope eligibility against the REAL, race-resolved outcome before ever consuming
-    // the redemption (see PromoApplicationService.claimRedemption's own comment).
-    const resolvedPromo = input.promoCode
-      ? await this.promoApplicationService.resolve({
-          code: input.promoCode,
-          business,
-          customerUserId,
-          isFirstBooking,
-          depositBeforePromoCents: financials.depositCents,
-        })
-      : undefined;
-    const customerChargeNowCents = resolvedPromo
-      ? resolvedPromo.customerChargeNowCents
-      : financials.depositCents;
 
     const cancellationPolicySnapshot = await this.resolveCancellationPolicySnapshot(business);
     const noShowEligibilitySnapshot = await this.resolveNoShowEligibilitySnapshot(business);
@@ -706,49 +722,120 @@ export class BookingCreationService {
       return { status: "confirmed", booking };
     }
 
-    // Checkpoint B (Cyprus VAT, compute-only) — computed from the SAME authoritative
-    // `customerChargeNowCents` finalize just derived above (never trusts a prior preview call,
-    // exactly like the rest of this method), BEFORE the real charge below. `TaxError` propagates
-    // untouched: the claim is released and the booking is never charged/persisted with an unknown
-    // tax outcome (locked rule: never invent VAT). The live PaymentIntent amount immediately
-    // below is UNCHANGED in this checkpoint — still `customerChargeNowCents` only.
-    let computedTax: ComputedTax | undefined;
+    let terms: EstablishedFinancialTerms;
     try {
-      computedTax = await this.computeCyprusTax(
-        customerChargeNowCents,
-        String(bookingId),
-        `${input.idempotencyKey}:tax`,
-      );
+      terms = await this.establishFinancialTerms({
+        business,
+        client,
+        customerUserId,
+        idempotencyKey: input.idempotencyKey,
+        bookingId,
+        productKind: "NORMAL_BOOKING",
+        existingContract: existingClaim?.financialContract,
+        lines,
+        travelFeeCents,
+        promoCode: input.promoCode,
+      });
     } catch (error) {
       if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
       throw error;
     }
 
+    return this.chargeAndPersistContract({
+      customerUserId,
+      business,
+      client,
+      existingClaim: Boolean(existingClaim),
+      purpose: "BOOKING_DEPOSIT",
+      terms,
+      persist: (paymentResult, persistenceLeaseToken) =>
+        this.persistCustomerBooking({
+          bookingId,
+          business,
+          customer,
+          createdBy,
+          fulfilment,
+          lines,
+          financials: terms.financials,
+          cancellationPolicySnapshot,
+          noShowEligibilitySnapshot,
+          startAt,
+          notes: input.notes,
+          idempotencyKey: input.idempotencyKey,
+          client,
+          contract: terms.contract,
+          paymentResult,
+          resolvedPromo: terms.resolvedPromo,
+          customerChargeNowCents: terms.contract.onlineChargeCents,
+          persistenceLeaseToken,
+        }),
+    });
+  }
+
+  /**
+   * Shared tail of normal-booking and package-purchase finalize, after the contract exists:
+   * Cyprus VAT compute (dark), the upfront charge, and transactional persistence — with P1
+   * relationship-aware failure handling at every money boundary:
+   *  - before/at the charge, a definitive failure releases a FIRST claim (unbound -> released
+   *    now; bound -> only if the PaymentAttempt is terminally FAILED);
+   *  - `requires_action`/ambiguous keeps FIRST_PENDING for the same logical retry;
+   *  - after a successful charge, failed persistence runs P0 compensation and moves a FIRST
+   *    relationship to RESTORATION_PENDING (and on to ELIGIBLE only on the exact full refund).
+   */
+  private async chargeAndPersistContract(params: {
+    customerUserId: string;
+    business: BusinessDocument;
+    client: BusinessClientDocument;
+    existingClaim: boolean;
+    purpose: Extract<PaymentIntentPurpose, "BOOKING_DEPOSIT" | "PACKAGE_PURCHASE">;
+    terms: { contract: FinancialContractV2 };
+    persist: (
+      paymentResult: PaymentIntentResult | undefined,
+      persistenceLeaseToken: string | undefined,
+    ) => Promise<BookingDocument>;
+  }): Promise<FinalizeBookingResult> {
+    const { business, client, terms } = params;
+    const { contract } = terms;
+    const isFirst = contract.classification === "FIRST";
+    const idempotencyKey = contract.idempotencyKey;
+    const customerChargeNowCents = contract.onlineChargeCents;
+
+    // Checkpoint B (Cyprus VAT, compute-only) — computed from the contract's authoritative
+    // online charge BEFORE the real charge below. `TaxError` propagates untouched: the claim is
+    // released and the booking is never charged/persisted with an unknown tax outcome (locked
+    // rule: never invent VAT). The live PaymentIntent amount stays the pre-tax online charge.
+    let computedTax: ComputedTax | undefined;
+    try {
+      computedTax = await this.computeCyprusTax(
+        customerChargeNowCents,
+        String(contract.bookingId),
+        `${idempotencyKey}:tax`,
+      );
+    } catch (error) {
+      if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
+      if (!params.existingClaim) await this.claimRepository.release(idempotencyKey);
+      throw error;
+    }
+
     let paymentResult: PaymentIntentResult | undefined;
 
-    // Batch 6.5: the deposit is charged online for EVERY BOOKLY_MANAGED booking, first or
-    // returning — never gated on `isFirstBooking` (that only decides who economically keeps
-    // it, resolved below, atomically, inside persistCustomerBooking's own transaction).
-    // Batch 13: the ACTUAL Stripe charge amount/gate uses `customerChargeNowCents` — a Promo
-    // may fully cover the deposit (rule #7: never a fake €0 charge, but the saved-card
-    // requirement above still applies unconditionally either way).
+    // Batch 13: the ACTUAL Stripe charge amount/gate is the contract's online charge — a Promo
+    // may fully cover the upfront, and a FIRST zero basis is a zero obligation (never a fake €0
+    // PaymentIntent; the saved-card requirement still applies either way).
     if (customerChargeNowCents > 0) {
-      paymentResult = await this.paymentService.chargeBookingDeposit({
-        userId: customerUserId,
-        amountCents: customerChargeNowCents,
-        idempotencyKey: input.idempotencyKey,
-        metadata: buildPaymentIntentMetadata({
-          bookingId: String(bookingId),
-          businessId: String(business._id),
-          businessClientId: String(client._id),
-          purpose: "BOOKING_DEPOSIT",
-          preTaxChargeCents: customerChargeNowCents,
-          taxCents: computedTax?.taxCents ?? 0,
-          chargedAmountCents: customerChargeNowCents,
-          taxCalculationId: computedTax?.taxCalculationId,
-          taxMode: "PRE_ACTIVATION",
-        }),
-      });
+      try {
+        paymentResult = await this.chargeContractUpfront({
+          customerUserId: params.customerUserId,
+          business,
+          client,
+          contract,
+          purpose: params.purpose,
+          computedTax,
+        });
+      } catch (error) {
+        if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
+        throw error;
+      }
 
       if (paymentResult.status === "requires_action") {
         return {
@@ -759,6 +846,7 @@ export class BookingCreationService {
       }
 
       if (paymentResult.status !== "succeeded") {
+        if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
         throw new PaymentError(
           "PAYMENT_FAILED",
           402,
@@ -775,31 +863,12 @@ export class BookingCreationService {
     try {
       if (persistenceLeaseToken === null) {
         const booking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
-          bookingId,
+          { business, idempotencyKey },
+          contract.bookingId,
         );
         return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
       }
-      const booking = await this.persistCustomerBooking({
-        bookingId,
-        business,
-        customer,
-        createdBy,
-        fulfilment,
-        lines,
-        financials,
-        cancellationPolicySnapshot,
-        noShowEligibilitySnapshot,
-        startAt,
-        notes: input.notes,
-        idempotencyKey: input.idempotencyKey,
-        client,
-        isFirstBooking,
-        paymentResult,
-        resolvedPromo,
-        customerChargeNowCents,
-        persistenceLeaseToken,
-      });
+      const booking = await params.persist(paymentResult, persistenceLeaseToken);
       return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
       if (paymentResult) {
@@ -814,14 +883,18 @@ export class BookingCreationService {
         if (ownsCompensation) {
           await this.compensateFailedBookingAfterPayment(
             business,
-            bookingId,
+            contract.bookingId,
             client,
             customerChargeNowCents,
             paymentResult,
           );
         }
+        // FIRST_PENDING -> RESTORATION_PENDING (-> ELIGIBLE if the exact refund already
+        // confirmed). Derived from durable state, so a lease-loss/duplicate caller is harmless.
+        if (isFirst) await this.relationships.reconcileQuietly(client._id);
       } else {
-        await this.claimRepository.release(input.idempotencyKey);
+        await this.claimRepository.release(idempotencyKey);
+        if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
       }
       throw error;
     }
@@ -889,15 +962,19 @@ export class BookingCreationService {
       business._id,
       customerUserId,
     );
-    const isFirstBooking = !existingClient?.activatedAt;
-    const financials = this.assembleFinancials(
-      "BOOKLY_MANAGED",
+    // P1 — estimate only (see previewCustomerBooking). A FIRST package quote uses the bundle
+    // price alone as its upfront basis.
+    const classification = this.relationships.peekClassification(existingClient);
+    const isFirstBooking = classification === "FIRST";
+    const line = lines[0] as ResolvedServiceLine;
+    const { financials } = this.assembleCustomerFinancials(
       lines,
       travelFeeCents,
-      isFirstBooking,
+      classification,
+      (line.service.packagePricing as NonNullable<ServiceDocument["packagePricing"]>)
+        .bundlePriceCents,
     );
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
-    const line = lines[0] as ResolvedServiceLine;
     const computedTax = await this.computeCyprusTax(
       financials.depositCents,
       `preview-${new Types.ObjectId().toHexString()}`,
@@ -937,11 +1014,12 @@ export class BookingCreationService {
 
   /**
    * The real Package purchase: books and pays for session 1 exactly like
-   * finalizeCustomerBooking (same idempotency-claim/payment/activation/ledger machinery,
-   * reused via persistCustomerBooking, completely unmodified), then creates the linked
-   * PackageProgress entitlement with `remainingSessions = sessionsInPackage - 1`. The
-   * entitlement and origin Booking are written in the SAME Mongo transaction so neither can
-   * become durably visible without the other.
+   * finalizeCustomerBooking (same idempotency-claim / relationship-claim / Financial Contract V2
+   * / payment / ledger machinery, reused via establishFinancialTerms, chargeAndPersistContract and
+   * persistCustomerBooking), then creates the linked PackageProgress entitlement with
+   * `remainingSessions = sessionsInPackage - 1`. The entitlement, origin Booking, ledger row and
+   * (for FIRST) relationship consumption are written in the SAME Mongo transaction so none can
+   * become durably visible without the others.
    */
   public async finalizePackagePurchase(
     customerUserId: string,
@@ -992,13 +1070,6 @@ export class BookingCreationService {
     );
 
     const client = await this.resolveOrCreateCustomerClient(business, customerUserId, fulfilment);
-    const isFirstBooking = !client.activatedAt;
-    const financials = this.assembleFinancials(
-      "BOOKLY_MANAGED",
-      lines,
-      travelFeeCents,
-      isFirstBooking,
-    );
 
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
     if (!cardStatus.hasSavedCard) {
@@ -1040,60 +1111,26 @@ export class BookingCreationService {
       packageProgressId,
     };
 
-    const customerChargeNowCents = financials.depositCents;
-
-    // Checkpoint B (Cyprus VAT, compute-only) — see finalizeCustomerBooking's identical comment
-    // for the full rationale. PaymentIntent amount immediately below is UNCHANGED in this
-    // checkpoint.
-    let computedTax: ComputedTax | undefined;
+    // P1 — shares the SAME customer↔business relationship as a normal booking: whichever
+    // qualifying operation consumes it first is the first; a FIRST package's upfront basis is
+    // the bundle price only. Package promo remains unsupported.
+    let terms: EstablishedFinancialTerms;
     try {
-      computedTax = await this.computeCyprusTax(
-        customerChargeNowCents,
-        String(bookingId),
-        `${input.idempotencyKey}:tax`,
-      );
+      terms = await this.establishFinancialTerms({
+        business,
+        client,
+        customerUserId,
+        idempotencyKey: input.idempotencyKey,
+        bookingId,
+        productKind: "PACKAGE_PURCHASE",
+        existingContract: existingClaim?.financialContract,
+        lines,
+        travelFeeCents,
+        packageBundlePriceCents: packagePricing.bundlePriceCents,
+      });
     } catch (error) {
       if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
       throw error;
-    }
-
-    let paymentResult: PaymentIntentResult | undefined;
-
-    if (customerChargeNowCents > 0) {
-      paymentResult = await this.paymentService.chargeBookingDeposit({
-        userId: customerUserId,
-        amountCents: customerChargeNowCents,
-        idempotencyKey: input.idempotencyKey,
-        metadata: buildPaymentIntentMetadata({
-          bookingId: String(bookingId),
-          businessId: String(business._id),
-          businessClientId: String(client._id),
-          purpose: "PACKAGE_PURCHASE",
-          preTaxChargeCents: customerChargeNowCents,
-          taxCents: computedTax?.taxCents ?? 0,
-          chargedAmountCents: customerChargeNowCents,
-          taxCalculationId: computedTax?.taxCalculationId,
-          taxMode: "PRE_ACTIVATION",
-        }),
-      });
-
-      if (paymentResult.status === "requires_action") {
-        return {
-          status: "requires_action",
-          clientSecret: paymentResult.clientSecret as string,
-          paymentIntentId: paymentResult.paymentIntentId,
-        };
-      }
-
-      if (paymentResult.status !== "succeeded") {
-        throw new PaymentError(
-          "PAYMENT_FAILED",
-          402,
-          paymentResult.failureMessage
-            ? [{ message: paymentResult.failureMessage, code: "PAYMENT_FAILED" }]
-            : undefined,
-        );
-      }
     }
 
     const packageProgressCreate: CreatePackageProgressInput = {
@@ -1118,60 +1155,36 @@ export class BookingCreationService {
       },
     };
 
-    const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
-      paymentResult?.paymentAttemptId,
-    );
-    try {
-      if (persistenceLeaseToken === null) {
-        const booking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
+    return this.chargeAndPersistContract({
+      customerUserId,
+      business,
+      client,
+      existingClaim: Boolean(existingClaim),
+      purpose: "PACKAGE_PURCHASE",
+      terms,
+      persist: (paymentResult, persistenceLeaseToken) =>
+        this.persistCustomerBooking({
           bookingId,
-        );
-        return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
-      }
-      const booking = await this.persistCustomerBooking({
-        bookingId,
-        business,
-        customer,
-        createdBy,
-        fulfilment,
-        lines,
-        financials,
-        cancellationPolicySnapshot,
-        noShowEligibilitySnapshot,
-        startAt,
-        notes: input.notes,
-        idempotencyKey: input.idempotencyKey,
-        client,
-        isFirstBooking,
-        paymentResult,
-        resolvedPromo: undefined,
-        customerChargeNowCents,
-        packageProgressCreate,
-        persistenceLeaseToken,
-      });
-      return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
-    } catch (error) {
-      if (paymentResult) {
-        const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
-          paymentResult.paymentAttemptId,
-          error,
-          persistenceLeaseToken ?? undefined,
-        );
-        if (ownsCompensation) {
-          await this.compensateFailedBookingAfterPayment(
-            business,
-            bookingId,
-            client,
-            customerChargeNowCents,
-            paymentResult,
-          );
-        }
-      } else {
-        await this.claimRepository.release(input.idempotencyKey);
-      }
-      throw error;
-    }
+          business,
+          customer,
+          createdBy,
+          fulfilment,
+          lines,
+          financials: terms.financials,
+          cancellationPolicySnapshot,
+          noShowEligibilitySnapshot,
+          startAt,
+          notes: input.notes,
+          idempotencyKey: input.idempotencyKey,
+          client,
+          contract: terms.contract,
+          paymentResult,
+          resolvedPromo: undefined,
+          customerChargeNowCents: terms.contract.onlineChargeCents,
+          packageProgressCreate,
+          persistenceLeaseToken,
+        }),
+    });
   }
 
   /** Authoritative, side-effect-free quote used by both at-business and travel redemption. It
@@ -1682,11 +1695,12 @@ export class BookingCreationService {
     const addonsSubtotalCents = addons.reduce((sum, addon) => sum + addon.priceCents, 0);
     const financials: BookingFinancials =
       addonsSubtotalCents > 0 || travelFeeCents > 0
-        ? this.assembleFinancials(
+        ? // Session 2+ is never a first/returning consumer: its extras use the unchanged legacy
+          // deposit path and never read or write the financial relationship (P7 owns cleanup).
+          this.assembleFinancials(
             "BOOKLY_MANAGED",
             [{ amountCents: 0, discountCents: 0, addons }],
             travelFeeCents,
-            false,
           )
         : {
             currency: "EUR",
@@ -1894,9 +1908,13 @@ export class BookingCreationService {
   }
 
   /**
-   * Reserve-all-lines + persist the Booking + (if a payment was actually taken) write the
-   * PLATFORM_FEE ledger entry and mark the Client activated — all inside ONE transaction, the
-   * same pattern as `persistBooking` (Manual), extended with the two payment-specific writes.
+   * Reserve-all-lines + persist the Booking (+ PackageProgress for a purchase) + write the upfront
+   * ledger row typed by the Financial Contract V2 (PLATFORM_FEE for FIRST, DEPOSIT for RETURNING)
+   * + for FIRST consume the customer↔business relationship (FIRST_PENDING -> CONSUMED) + fence
+   * the PaymentAttempt completion — all inside ONE transaction, the same pattern as
+   * `persistBooking` (Manual). If the relationship consume CAS fails (ownership lost), the whole
+   * transaction aborts: no Booking ever commits without consuming the first claim it was
+   * charged under.
    */
   private async persistCustomerBooking(params: {
     bookingId: Types.ObjectId;
@@ -1912,13 +1930,14 @@ export class BookingCreationService {
     notes: string | undefined;
     idempotencyKey: string;
     client: BusinessClientDocument;
-    isFirstBooking: boolean;
+    contract: FinancialContractV2;
     paymentResult: PaymentIntentResult | undefined;
     resolvedPromo: ResolvedPromo | undefined;
     customerChargeNowCents: number;
     packageProgressCreate?: CreatePackageProgressInput | undefined;
     persistenceLeaseToken: string | undefined;
   }): Promise<BookingDocument> {
+    const isFirst = params.contract.classification === "FIRST";
     const dbSession = await mongoose.startSession();
     let created: BookingDocument | undefined;
     let succeededTransactionId: Types.ObjectId | undefined;
@@ -1966,45 +1985,18 @@ export class BookingCreationService {
           reservationId: reservationsByLineIndex.get(index) as Types.ObjectId,
         }));
 
-        // Batch 6.5 — CLOSES A REAL CONCURRENCY RACE: `params.isFirstBooking` was read BEFORE
-        // this transaction (and before the Stripe charge), so two truly concurrent finalize
-        // calls for the same brand-new Customer+Business can both read "first booking" and both
-        // genuinely charge the deposit. Only ONE may actually WIN activation — attempting
-        // `markActivated` here, unconditionally, inside this same transaction, using its REAL
-        // (CAS-gated) result as the single source of truth for who economically keeps this
-        // deposit, is what makes that outcome correct regardless of the race: the winner gets
-        // platformFeeCents = depositCents (Bookly's activation revenue, ledgered PLATFORM_FEE);
-        // the loser's own deposit is still real, still charged, still fully theirs to keep as a
-        // Business-owned prepayment (platformFeeCents = 0, ledgered DEPOSIT) — never silently
-        // dropped, never double-counted as platform revenue. See
-        // ClientRepository.markActivated's own CAS comment for why a "loser" call is a safe,
-        // idempotent no-op (returns null), never an error.
-        // Batch 13 — `hasDepositObligation` (not `paymentResult` truthiness) now gates
-        // activation-resolution and ledger-writing: a Promo may reduce the ACTUAL Stripe charge
-        // to €0 while a real deposit ENTITLEMENT still exists (`financials.depositCents > 0`),
-        // and that entitlement must still resolve first/returning + write its ledger entry
-        // exactly as if it had been charged in full. Identical to the prior `paymentResult`
-        // gate for every non-promo booking, since `customerChargeNowCents === depositCents`
-        // whenever no promo was used (so `paymentResult` is defined exactly when
-        // `hasDepositObligation` is true) — a strictly backward-compatible generalization.
+        // P1 — first/returning was decided atomically BEFORE the charge (the relationship claim)
+        // and frozen in the Financial Contract V2, so there is no post-charge race left to
+        // resolve here: the previous `markActivated`-decides-the-ledger-after-money-moved
+        // pattern is gone. A concurrent competing first operation never reached a charge.
+        // Batch 13 — `hasDepositObligation` (not `paymentResult` truthiness) gates ledger-
+        // writing: a Promo may reduce the ACTUAL Stripe charge to €0 while a real upfront
+        // ENTITLEMENT still exists (`financials.depositCents > 0`).
         const hasDepositObligation = params.financials.depositCents > 0;
+        const financials = params.financials;
 
-        let reallyFirstBooking = false;
-        if (hasDepositObligation) {
-          const activation = await this.clientRepository.markActivated(
-            params.client._id,
-            params.bookingId,
-            dbSession,
-          );
-          reallyFirstBooking = Boolean(activation);
-        }
-
-        // Batch 13 — an ALL_FIRST_BOOKINGS promo must honor the REAL, race-resolved
-        // first/returning outcome, never the pre-charge optimistic snapshot the amount was
-        // computed from. A mismatch here means the customer was charged assuming eligibility
-        // that the activation race just disproved — this throws (never silently drops the
-        // promo or silently changes the charged amount), which the caller's existing
-        // post-payment compensation/refund path already handles correctly.
+        // Batch 13 — an ALL_FIRST_BOOKINGS promo re-validates against the authoritative
+        // classification (unchanged pre-P2 promo economics).
         if (params.resolvedPromo) {
           await this.promoApplicationService.claimRedemption(
             {
@@ -2012,19 +2004,11 @@ export class BookingCreationService {
               bookingId: params.bookingId,
               businessId: params.business._id,
               customerUserId: params.createdBy.actorUserId,
-              isFirstBooking: reallyFirstBooking,
+              isFirstBooking: isFirst,
             },
             dbSession,
           );
         }
-
-        const financials: BookingFinancials =
-          reallyFirstBooking === params.isFirstBooking
-            ? params.financials
-            : {
-                ...params.financials,
-                platformFeeCents: reallyFirstBooking ? params.financials.depositCents : 0,
-              };
 
         created = await this.bookingRepository.create(
           {
@@ -2076,6 +2060,7 @@ export class BookingCreationService {
                   },
                 }
               : {}),
+            financialContract: params.contract,
           },
           dbSession,
         );
@@ -2112,7 +2097,9 @@ export class BookingCreationService {
                 bookingId: params.bookingId,
                 businessClientId: params.client._id,
                 customerUserId: params.createdBy.actorUserId,
-                type: reallyFirstBooking ? "PLATFORM_FEE" : "DEPOSIT",
+                // FIRST upfront is always Bookly's PLATFORM_FEE; RETURNING keeps the pre-P3
+                // Business-owned DEPOSIT — exactly as the contract recorded before the charge.
+                type: params.contract.upfrontLedgerType,
                 direction: "DEBIT",
                 amountCents: params.customerChargeNowCents,
                 currency: params.financials.currency,
@@ -2132,11 +2119,7 @@ export class BookingCreationService {
           // Business-owned economic deposit remains [the full amount]"). Never written for a
           // FIRST booking's promo — there Bookly simply collects less PLATFORM_FEE and no other
           // party needs compensating (see PROMO_SUBSIDY's own type-level doc comment).
-          if (
-            params.resolvedPromo &&
-            !reallyFirstBooking &&
-            params.resolvedPromo.promoDiscountCents > 0
-          ) {
+          if (params.resolvedPromo && !isFirst && params.resolvedPromo.promoDiscountCents > 0) {
             await this.financialTransactionService.record(
               {
                 businessId: params.business._id,
@@ -2153,6 +2136,24 @@ export class BookingCreationService {
               dbSession,
             );
           }
+        }
+
+        // P1 — FIRST_PENDING -> CONSUMED in this SAME transaction, fenced on this exact logical
+        // operation and its bound PaymentAttempt (none for a zero-upfront FIRST). Losing the
+        // claim aborts the whole transaction (the caller then compensates any charge).
+        if (isFirst) {
+          const consumed = await this.relationships.consumeFirst(
+            params.client._id,
+            {
+              idempotencyKey: params.idempotencyKey,
+              bookingId: params.bookingId,
+              productKind: params.contract.productKind,
+              paymentAttemptId: params.paymentResult?.paymentAttemptId,
+              financialTransactionId: succeededTransactionId,
+            },
+            dbSession,
+          );
+          if (!consumed) throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
         }
 
         const completed = await this.paymentService.markPaymentCompleted(
@@ -2566,22 +2567,16 @@ export class BookingCreationService {
   }
 
   /**
-   * Batch 6.5 correction — see BookingFinancials's own updated doc comment for the full
-   * deposit-vs-platform-fee rationale. `isFirstBooking` no longer decides WHETHER a deposit is
-   * charged (a MANUAL Booking never charges one — rule E; every BOOKLY_MANAGED Booking always
-   * does, first or returning) — it decides only whether Bookly economically claims that SAME
-   * deposit as platform/activation revenue (`platformFeeCents = depositCents`) or the deposit
-   * is a Business-owned service prepayment instead (`platformFeeCents = 0`, `depositCents`
-   * unchanged). Previously this method took a `chargePlatformFee: boolean` that ALSO gated
-   * `depositCents` to 0 for a returning customer — that conflation was the exact bug this batch
-   * corrects; `depositCents` is now computed unconditionally for BOOKLY_MANAGED, entirely
-   * independent of `isFirstBooking`.
+   * The non-FIRST financial snapshot: MANUAL (no deposit — rule E), package Session 2+ extras,
+   * and the current pre-P3 RETURNING deposit (legacy clamp(20%, €5, €35) on the legacy basis,
+   * Business-owned, `platformFeeCents = 0`). A FIRST upfront is never computed here — see
+   * assembleCustomerFinancials, which is the only path that can produce a nonzero
+   * platformFeeCents, from the relationship's authoritative classification.
    */
   private assembleFinancials(
     source: BookingSource,
     lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
     travelFeeCents: number,
-    isFirstBooking: boolean,
   ): BookingFinancials {
     const servicesSubtotalCents = lines.reduce((sum, line) => sum + line.amountCents, 0);
     const addonsSubtotalCents = lines.reduce(
@@ -2599,10 +2594,9 @@ export class BookingCreationService {
         ? 0
         : this.bookingService.calculateBookingDepositCents(eligiblePlatformFeeBasisCents);
 
-    // Bookly's own economic claim on that SAME deposit — nonzero ONLY on the customer's first
-    // eligible booking at this Business (confirmed rule, Batch 6.5). Never a second,
-    // independently-computed amount — always exactly `depositCents` or exactly 0.
-    const platformFeeCents = source === "BOOKLY_MANAGED" && isFirstBooking ? depositCents : 0;
+    // Bookly's own economic claim — only ever set for a FIRST operation, by
+    // assembleCustomerFinancials. Every snapshot built here is Business-owned or MANUAL.
+    const platformFeeCents = 0;
 
     // Customer-facing total deliberately excludes platformFeeCents (see this service's own
     // module doc comment and the Batch 3 final report): the platform fee is Bookly's own cut of
@@ -2626,6 +2620,194 @@ export class BookingCreationService {
       balanceDueCents,
       totalCents,
     };
+  }
+
+  /**
+   * P1 — customer booking / package purchase financials from the relationship classification.
+   *
+   *  - RETURNING keeps the CURRENT (pre-P3) behaviour exactly: the legacy deposit on the legacy
+   *    basis (services + add-ons − service discount), charged online, Business-owned.
+   *  - FIRST uses the canonical first upfront (calculateFirstUpfrontCents — 20%, €5 floor, €35
+   *    cap, never above the basis) on the FIRST basis: normal = services + eligible add-ons −
+   *    service discount; package = `Service.packagePricing.bundlePriceCents` ONLY (add-ons and
+   *    travel never expand Bookly's first upfront). Bookly-owned: platformFeeCents = upfront.
+   *
+   * Travel is excluded from every basis. Add-ons/travel remain in totalCents/balanceDueCents as
+   * the Business-collected balance. `eligiblePlatformFeeBasisCents` keeps its validated legacy
+   * meaning (it is the cancellation/no-show basis); the FIRST basis is returned separately and
+   * recorded in the Financial Contract V2.
+   */
+  private assembleCustomerFinancials(
+    lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
+    travelFeeCents: number,
+    classification: RelationshipClassification,
+    packageBundlePriceCents: number | undefined,
+  ): { financials: BookingFinancials; eligibleBasisCents: number } {
+    const returning = this.assembleFinancials("BOOKLY_MANAGED", lines, travelFeeCents);
+    if (classification === "RETURNING") {
+      return { financials: returning, eligibleBasisCents: returning.eligiblePlatformFeeBasisCents };
+    }
+
+    const eligibleBasisCents = packageBundlePriceCents ?? returning.eligiblePlatformFeeBasisCents;
+    const upfrontCents = calculateFirstUpfrontCents(eligibleBasisCents);
+    return {
+      financials: {
+        ...returning,
+        depositCents: upfrontCents,
+        platformFeeCents: upfrontCents,
+        balanceDueCents: returning.totalCents - upfrontCents,
+      },
+      eligibleBasisCents,
+    };
+  }
+
+  /**
+   * P1 — the authoritative classification + immutable Financial Contract V2 for one logical
+   * operation, established AFTER the BookingCreationClaim exists and BEFORE any tax compute or
+   * provider charge. The relationship claim (ELIGIBLE -> FIRST_PENDING) happens first; a
+   * competing first operation gets BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS here with nothing
+   * charged. Any later failure in this stage is a proven pre-money failure and releases a FIRST
+   * claim this operation holds.
+   */
+  private async establishFinancialTerms(params: {
+    business: BusinessDocument;
+    client: BusinessClientDocument;
+    customerUserId: string;
+    idempotencyKey: string;
+    bookingId: Types.ObjectId;
+    productKind: FinancialContractProductKind;
+    existingContract: FinancialContractV2 | undefined;
+    lines: ResolvedServiceLine[];
+    travelFeeCents: number;
+    packageBundlePriceCents?: number | undefined;
+    promoCode?: string | undefined;
+  }): Promise<EstablishedFinancialTerms> {
+    const customerUserId = new Types.ObjectId(params.customerUserId);
+    const classification = await this.relationships.resolveForFinalize({
+      client: params.client,
+      identity: {
+        idempotencyKey: params.idempotencyKey,
+        bookingId: params.bookingId,
+        customerUserId,
+        productKind: params.productKind,
+      },
+      existingContract: params.existingContract,
+    });
+
+    try {
+      const { financials, eligibleBasisCents } = this.assembleCustomerFinancials(
+        params.lines,
+        params.travelFeeCents,
+        classification,
+        params.packageBundlePriceCents,
+      );
+
+      // Batch 13 promo, deliberately UNCHANGED (pre-P2) economics: it discounts only the upfront
+      // charge. Re-validated from scratch against the AUTHORITATIVE classification (never a
+      // prior preview), so an ALL_FIRST_BOOKINGS promo can no longer be resolved against an
+      // optimistic guess that a race later disproves.
+      const resolvedPromo = params.promoCode
+        ? await this.promoApplicationService.resolve({
+            code: params.promoCode,
+            business: params.business,
+            customerUserId: params.customerUserId,
+            isFirstBooking: classification === "FIRST",
+            depositBeforePromoCents: financials.depositCents,
+          })
+        : undefined;
+      const onlineChargeCents = resolvedPromo
+        ? resolvedPromo.customerChargeNowCents
+        : financials.depositCents;
+
+      const contract: FinancialContractV2 = {
+        version: FINANCIAL_CONTRACT_VERSION,
+        productKind: params.productKind,
+        classification,
+        idempotencyKey: params.idempotencyKey,
+        bookingId: params.bookingId,
+        customerUserId,
+        businessId: params.business._id,
+        businessClientId: params.client._id,
+        currency: financials.currency,
+        eligibleBasisCents,
+        requiredUpfrontCents: financials.depositCents,
+        promoDiscountCents: financials.depositCents - onlineChargeCents,
+        onlineChargeCents,
+        travelFeeCents: financials.travelFeeCents,
+        ...(params.packageBundlePriceCents !== undefined
+          ? { packageBundlePriceCents: params.packageBundlePriceCents }
+          : {}),
+        bookingTotalCents: financials.totalCents,
+        upfrontLedgerType: classification === "FIRST" ? "PLATFORM_FEE" : "DEPOSIT",
+      };
+      await this.claimRepository.recordFinancialContract(params.idempotencyKey, contract);
+      return { financials, resolvedPromo, contract };
+    } catch (error) {
+      if (classification === "FIRST") {
+        await this.releaseFirstClaimAfterPreMoneyFailure(params.client, params.idempotencyKey);
+      }
+      throw error;
+    }
+  }
+
+  /** Never masks the caller's original error. An unbound claim is released immediately; a bound
+   * one defers to durable PaymentAttempt state (ambiguous/requires_action stays protected). */
+  private async releaseFirstClaimAfterPreMoneyFailure(
+    client: BusinessClientDocument,
+    idempotencyKey: string,
+  ): Promise<void> {
+    try {
+      await this.relationships.releaseAfterPreMoneyFailure(client._id, idempotencyKey);
+    } catch {
+      await this.relationships.reconcileQuietly(client._id);
+    }
+  }
+
+  /** The upfront charge for a contract-bearing operation. A FIRST charge binds its PaymentAttempt
+   * to the relationship claim BEFORE any provider dispatch (fencing: an operation that lost its
+   * claim can never create a PaymentIntent). */
+  private async chargeContractUpfront(params: {
+    customerUserId: string;
+    business: BusinessDocument;
+    client: BusinessClientDocument;
+    contract: FinancialContractV2;
+    purpose: Extract<PaymentIntentPurpose, "BOOKING_DEPOSIT" | "PACKAGE_PURCHASE">;
+    computedTax: ComputedTax | undefined;
+  }): Promise<PaymentIntentResult> {
+    const { contract, client } = params;
+    const correlation = {
+      version: contract.version,
+      classification: contract.classification,
+      productKind: contract.productKind,
+    };
+    return this.paymentService.chargeBookingDeposit({
+      userId: params.customerUserId,
+      amountCents: contract.onlineChargeCents,
+      idempotencyKey: contract.idempotencyKey,
+      metadata: buildPaymentIntentMetadata({
+        bookingId: String(contract.bookingId),
+        businessId: String(params.business._id),
+        businessClientId: String(client._id),
+        purpose: params.purpose,
+        preTaxChargeCents: contract.onlineChargeCents,
+        taxCents: params.computedTax?.taxCents ?? 0,
+        chargedAmountCents: contract.onlineChargeCents,
+        taxCalculationId: params.computedTax?.taxCalculationId,
+        taxMode: "PRE_ACTIVATION",
+        financialContract: correlation,
+      }),
+      financialContract: { ...correlation, businessClientId: client._id },
+      ...(contract.classification === "FIRST"
+        ? {
+            beforeProviderDispatch: (attempt: { _id: Types.ObjectId }) =>
+              this.relationships.bindPaymentAttempt(
+                client._id,
+                contract.idempotencyKey,
+                attempt._id,
+              ),
+          }
+        : {}),
+    });
   }
 
   private async resolveCancellationPolicySnapshot(

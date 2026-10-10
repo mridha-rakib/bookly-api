@@ -57,6 +57,13 @@ const defaultMessages: Record<string, string> = {
   BOOKING_FEE_ALREADY_CHARGED: "This fee has already been charged and can no longer be waived",
   BOOKING_FEE_CHARGE_IN_PROGRESS:
     "A charge for this fee is already in progress — please try again shortly",
+  // P1 — another first booking/package purchase for this customer at this business is still
+  // unresolved. Retryable: nothing was charged for this request. Deliberately does not say
+  // "returning" — that is only true once the other operation actually completes.
+  BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS:
+    "Another booking or package purchase with this business is still being finalized. Nothing was charged for this request — please wait a moment and try again.",
+  BOOKING_FINANCIAL_CONTRACT_CONFLICT:
+    "This booking's payment terms could not be confirmed. Any payment taken for it is refunded automatically — please start the booking again.",
 };
 
 export class BookingError extends AppError {

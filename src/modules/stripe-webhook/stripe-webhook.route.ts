@@ -2,6 +2,7 @@ import express, { Router } from "express";
 import { BookingRepository } from "../booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import { createFinancialRelationshipService } from "../client/financial-relationship.factory.js";
 import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
@@ -27,15 +28,22 @@ export const createStripeWebhookRoute = (): Router => {
     new BookingFinancialTransactionRepository(),
   );
   const bookingRepository = new BookingRepository();
+  const paymentAttemptRepository = new PaymentAttemptRepository();
+  const refundOperationRepository = new RefundOperationRepository();
   const webhookService = new StripeWebhookService(
     gateway,
     eventRepository,
     financialTransactionService,
     new PaymentTaxAssociationReconciler(gateway, bookingRepository),
-    new PaymentAttemptRepository(),
-    new RefundOperationRepository(),
+    paymentAttemptRepository,
+    refundOperationRepository,
     new PackageProgressRepository(),
     bookingRepository,
+    createFinancialRelationshipService({
+      paymentAttemptRepository,
+      refundOperationRepository,
+      bookingRepository,
+    }),
   );
   const controller = new StripeWebhookController(webhookService);
 

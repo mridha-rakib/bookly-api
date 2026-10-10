@@ -1,5 +1,8 @@
 import { model, Schema, type Types } from "mongoose";
 
+import type { FinancialContractV2 } from "./financial-contract.js";
+import { financialContractSchema } from "./financial-contract.model.js";
+
 /**
  * Booking-creation idempotency contract (Batch 3) — mirrors
  * booking-slot-reservation-claim.model.ts's proven design exactly: a flat, single-level unique
@@ -23,6 +26,10 @@ export type BookingCreationClaimDocument = {
   businessId: Types.ObjectId;
   actorUserId: Types.ObjectId;
   bookingId: Types.ObjectId;
+  /** P1 — the immutable Financial Contract V2 for a customer booking/package purchase, recorded
+   * once (set-if-absent) BEFORE any provider charge. Absent for manual bookings, package
+   * Session 2+ redemptions, and claims created before P1. */
+  financialContract?: FinancialContractV2 | undefined;
   createdAt: Date;
 };
 
@@ -32,6 +39,7 @@ const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     bookingId: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
+    financialContract: { type: financialContractSchema },
     createdAt: { type: Date, required: true, default: () => new Date() },
   },
   { timestamps: { createdAt: true, updatedAt: false } },

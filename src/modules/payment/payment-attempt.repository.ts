@@ -17,6 +17,9 @@ export type CreatePaymentAttemptInput = {
   packageProgressId?: Types.ObjectId | string | undefined;
   purpose: string;
   productKind?: "NORMAL_BOOKING" | "PACKAGE_PURCHASE" | undefined;
+  financialContractVersion?: 2 | undefined;
+  relationshipClassification?: "FIRST" | "RETURNING" | undefined;
+  businessClientId?: Types.ObjectId | string | undefined;
   currency: string;
   expectedAmountCents: number;
   providerCustomerId: string;
@@ -38,6 +41,9 @@ export class PaymentAttemptRepository {
         ...(input.bookingId ? { bookingId: new Types.ObjectId(input.bookingId) } : {}),
         ...(input.packageProgressId
           ? { packageProgressId: new Types.ObjectId(input.packageProgressId) }
+          : {}),
+        ...(input.businessClientId
+          ? { businessClientId: new Types.ObjectId(input.businessClientId) }
           : {}),
         currency: input.currency.toUpperCase(),
       }).save();
@@ -368,6 +374,11 @@ export class PaymentAttemptRepository {
       String(existing.businessId ?? "") !== String(input.businessId ?? "") ||
       existing.purpose !== input.purpose ||
       String(existing.productKind ?? "") !== String(input.productKind ?? "") ||
+      String(existing.financialContractVersion ?? "") !==
+        String(input.financialContractVersion ?? "") ||
+      String(existing.relationshipClassification ?? "") !==
+        String(input.relationshipClassification ?? "") ||
+      String(existing.businessClientId ?? "") !== String(input.businessClientId ?? "") ||
       existing.currency !== input.currency.toUpperCase() ||
       existing.expectedAmountCents !== input.expectedAmountCents ||
       existing.providerCustomerId !== input.providerCustomerId ||

@@ -335,7 +335,7 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     expect(client?.linkState).toBe("LINKED");
   });
 
-  it("[race, Batch 9 completion pass — bug found and fixed] two concurrent FIRST bookings for the SAME brand-new customer at DIFFERENT times both succeed, sharing exactly ONE BusinessClient row", async () => {
+  it("[race, Batch 9 completion pass — bug found and fixed; P1 semantics] two concurrent FIRST bookings for the SAME brand-new customer share exactly ONE BusinessClient row and never fail with a raw error", async () => {
     const { business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("concurrent-first-client");
     await saveCard(customer._id);
@@ -365,8 +365,24 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
         Awaited<ReturnType<typeof creationService.finalizeCustomerBooking>>
       > => r.status === "fulfilled" && r.value.status === "confirmed",
     );
-    // Two different times, same Customer+Business — no slot conflict, so BOTH must succeed now.
-    expect(confirmed).toHaveLength(2);
+    // P1: the first/returning claim is atomic before any charge, so while one first booking is
+    // unresolved the other may be refused with the retryable domain conflict
+    // BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS (nothing charged) — or, if it only arrived after the
+    // winner completed, succeed as RETURNING. What must never happen is the original bug: a raw
+    // duplicate-key error from the concurrent Client creation.
+    expect(confirmed.length).toBeGreaterThanOrEqual(1);
+    for (const r of results) {
+      if (r.status !== "rejected") continue;
+      expect(r.reason).toMatchObject({
+        statusCode: 409,
+        details: [{ code: "BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS" }],
+      });
+    }
+    expect(
+      confirmed.filter(
+        (r) => r.value.status === "confirmed" && r.value.booking.financials.platformFeeCents > 0,
+      ),
+    ).toHaveLength(1);
 
     const clients = await BusinessClientModel.find({
       businessId: business._id,
@@ -374,8 +390,7 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     }).exec();
     expect(clients).toHaveLength(1);
 
-    // Exactly one of the two bookings won activation (first-booking race, already covered
-    // elsewhere) — both still reference the SAME single Client row, never two fragmented ones.
+    // Every confirmed booking references the SAME single Client row, never two fragmented ones.
     for (const r of confirmed) {
       if (r.value.status !== "confirmed") continue;
       expect(String(r.value.booking.customer.businessClientId)).toBe(String(clients[0]?._id));

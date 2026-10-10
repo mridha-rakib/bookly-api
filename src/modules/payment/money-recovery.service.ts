@@ -1,6 +1,7 @@
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { StripeWebhookService } from "../stripe-webhook/stripe-webhook.service.js";
 import type { PaymentService } from "./payment.service.js";
@@ -19,11 +20,16 @@ export class MoneyRecoveryService {
     private readonly financialTransactionService: BookingFinancialTransactionService,
     private readonly webhookService: StripeWebhookService,
     private readonly packageProgressRepository?: PackageProgressRepository,
+    // P1 — converges unresolved FIRST customer↔business relationship claims from the durable
+    // PaymentAttempt/RefundOperation/Booking state the passes above just reconciled. Optional
+    // trailing dep (same construction-compatibility convention as packageProgressRepository).
+    private readonly relationshipService?: Pick<FinancialRelationshipService, "reconcilePending">,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
     paymentAttempts: number;
     refundOperations: number;
+    relationshipsScanned: number;
     webhooksProcessed: number;
     webhooksFailed: number;
     errors: number;
@@ -172,10 +178,19 @@ export class MoneyRecoveryService {
       }
     }
 
+    // Runs AFTER the payment/refund passes so a compensation refund confirmed in this same pass
+    // can restore eligibility immediately. Never a timeout unlock — see
+    // FinancialRelationshipService.reconcile for the exact durable-state rules.
+    const relationshipCounts = this.relationshipService
+      ? await this.relationshipService.reconcilePending(limit)
+      : { scanned: 0, errors: 0 };
+    errors += relationshipCounts.errors;
+
     const webhookCounts = await this.webhookService.recoverDue(limit);
     return {
       paymentAttempts,
       refundOperations,
+      relationshipsScanned: relationshipCounts.scanned,
       webhooksProcessed: webhookCounts.processed,
       webhooksFailed: webhookCounts.failed,
       errors,

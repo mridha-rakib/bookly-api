@@ -23,6 +23,83 @@ export type BusinessClientAddress = {
   additionalDirections?: string | undefined;
 };
 
+/**
+ * P1 relationship state machine (one per customer+business — BusinessClient is unique per
+ * `{businessId, linkedUserId}`):
+ *
+ *   ELIGIBLE --(atomic first claim, BEFORE any provider charge)--> FIRST_PENDING
+ *   FIRST_PENDING --(booking + required upfront committed in ONE transaction)--> CONSUMED
+ *   FIRST_PENDING --(proven pre-money failure of the SAME operation)--> ELIGIBLE
+ *   FIRST_PENDING --(provider charge succeeded, booking persistence failed)--> RESTORATION_PENDING
+ *   RESTORATION_PENDING --(exact full compensation refund durably confirmed)--> ELIGIBLE
+ *
+ * Every transition is a compare-and-set on `state` + the pending operation identity (and
+ * `revision` for recovery), so a stale worker can never release a claim another operation now
+ * owns, never turn CONSUMED back into ELIGIBLE, and never restore on the wrong refund. CONSUMED
+ * is terminal in P1 (successful-booking cancellation/void restoration is P4).
+ */
+export const financialRelationshipStates = [
+  "ELIGIBLE",
+  "FIRST_PENDING",
+  "CONSUMED",
+  "RESTORATION_PENDING",
+] as const;
+export type FinancialRelationshipState = (typeof financialRelationshipStates)[number];
+
+export type BusinessClientFinancialRelationship = {
+  version: 2;
+  state: FinancialRelationshipState;
+  /** Monotonic CAS counter — incremented by every state transition. */
+  revision: number;
+  /** How a pre-P1 row was interpreted on lazy initialization (audit only). */
+  initializedFrom: "LEGACY_ACTIVATED" | "LEGACY_UNACTIVATED";
+  stateChangedAt: Date;
+  /** Present exactly while FIRST_PENDING / RESTORATION_PENDING: the logical operation that
+   * owns the first claim. `idempotencyKey`/`bookingId` are the BookingCreationClaim identity. */
+  pending?:
+    | {
+        idempotencyKey: string;
+        bookingId: Types.ObjectId;
+        customerUserId: Types.ObjectId;
+        productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
+        claimedAt: Date;
+        /** Bounds ONLY the pre-dispatch window: once a PaymentAttempt is bound below, durable
+         * money state (never time) decides every transition. An unbound claim whose lease
+         * expired can be released because the owner must bind before any provider dispatch
+         * (see FinancialRelationshipRepository.bindPaymentAttempt) — so it provably moved no
+         * money and can no longer move any. */
+        claimLeaseExpiresAt: Date;
+        paymentAttemptId?: Types.ObjectId | undefined;
+        restorationRequiredAt?: Date | undefined;
+        restorationRefundOperationId?: Types.ObjectId | undefined;
+        /** Recovery round-robin cursor only (never a state input): unresolvable claims rotate
+         * to the back of the scan so they cannot starve newer ones. */
+        lastReconciledAt?: Date | undefined;
+      }
+    | undefined;
+  /** Set on FIRST_PENDING -> CONSUMED. Absent for a LEGACY_ACTIVATED row (see
+   * `activatedByBookingId` for that history). */
+  consumed?:
+    | {
+        idempotencyKey: string;
+        bookingId: Types.ObjectId;
+        productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
+        financialTransactionId?: Types.ObjectId | undefined;
+        consumedAt: Date;
+      }
+    | undefined;
+  /** Audit trail of the most recent return to ELIGIBLE. */
+  lastRelease?:
+    | {
+        idempotencyKey: string;
+        reason: "PRE_MONEY_FAILURE" | "PRE_DISPATCH_ABANDONED" | "COMPENSATION_REFUNDED";
+        paymentAttemptId?: Types.ObjectId | undefined;
+        refundOperationId?: Types.ObjectId | undefined;
+        releasedAt: Date;
+      }
+    | undefined;
+};
+
 export type BusinessClientDocument = {
   _id: Types.ObjectId;
   businessId: Types.ObjectId;
@@ -81,6 +158,16 @@ export type BusinessClientDocument = {
   activatedAt?: Date | undefined;
   activatedByBookingId?: Types.ObjectId | undefined;
 
+  /**
+   * P1 — the ONE authoritative, versioned customer↔business financial relationship (see
+   * BusinessClientFinancialRelationship). Once present it is the only source of first/returning
+   * classification; `activatedAt` above is then a legacy/analytics marker only (still written on
+   * first consumption for compatibility, never cleared on restoration, never read for money).
+   * Absent on pre-P1 rows: lazily initialized from `activatedAt` on the first qualifying
+   * operation (see FinancialRelationshipRepository.ensureInitialized).
+   */
+  financialRelationship?: BusinessClientFinancialRelationship | undefined;
+
   archivedAt?: Date | undefined;
   createdAt: Date;
   updatedAt: Date;
@@ -96,6 +183,71 @@ const addressSchema = new Schema<BusinessClientAddress>(
     floorUnit: { type: String, trim: true },
     aptRoom: { type: String, trim: true },
     additionalDirections: { type: String, trim: true, maxlength: 500 },
+  },
+  { _id: false },
+);
+
+const productKinds = ["NORMAL_BOOKING", "PACKAGE_PURCHASE"] as const;
+
+const financialRelationshipSchema = new Schema<BusinessClientFinancialRelationship>(
+  {
+    version: { type: Number, enum: [2], required: true },
+    state: { type: String, enum: financialRelationshipStates, required: true },
+    revision: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    initializedFrom: {
+      type: String,
+      enum: ["LEGACY_ACTIVATED", "LEGACY_UNACTIVATED"],
+      required: true,
+    },
+    stateChangedAt: { type: Date, required: true },
+    pending: {
+      type: new Schema(
+        {
+          idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
+          bookingId: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
+          customerUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+          productKind: { type: String, enum: productKinds, required: true },
+          claimedAt: { type: Date, required: true },
+          claimLeaseExpiresAt: { type: Date, required: true },
+          paymentAttemptId: { type: Schema.Types.ObjectId, ref: "PaymentAttempt" },
+          restorationRequiredAt: { type: Date },
+          restorationRefundOperationId: { type: Schema.Types.ObjectId, ref: "RefundOperation" },
+          lastReconciledAt: { type: Date },
+        },
+        { _id: false },
+      ),
+    },
+    consumed: {
+      type: new Schema(
+        {
+          idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
+          bookingId: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
+          productKind: { type: String, enum: productKinds, required: true },
+          financialTransactionId: {
+            type: Schema.Types.ObjectId,
+            ref: "BookingFinancialTransaction",
+          },
+          consumedAt: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+    },
+    lastRelease: {
+      type: new Schema(
+        {
+          idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
+          reason: {
+            type: String,
+            enum: ["PRE_MONEY_FAILURE", "PRE_DISPATCH_ABANDONED", "COMPENSATION_REFUNDED"],
+            required: true,
+          },
+          paymentAttemptId: { type: Schema.Types.ObjectId, ref: "PaymentAttempt" },
+          refundOperationId: { type: Schema.Types.ObjectId, ref: "RefundOperation" },
+          releasedAt: { type: Date, required: true },
+        },
+        { _id: false },
+      ),
+    },
   },
   { _id: false },
 );
@@ -125,6 +277,8 @@ const businessClientSchema = new Schema<BusinessClientDocument>(
 
     activatedAt: { type: Date },
     activatedByBookingId: { type: Schema.Types.ObjectId, ref: "Booking" },
+
+    financialRelationship: { type: financialRelationshipSchema },
 
     archivedAt: { type: Date },
   },
@@ -156,6 +310,17 @@ businessClientSchema.index({ businessId: 1, archivedAt: 1, createdAt: -1 });
 // scan on activatedAt, platform-wide (not scoped to one business ahead of the $group). Sparse
 // since most Clients never activate.
 businessClientSchema.index({ activatedAt: -1 }, { sparse: true });
+// P1 — money-recovery scan for unresolved first claims (FIRST_PENDING / RESTORATION_PENDING).
+// Partial: only rows with a pending first operation are indexed, which is a tiny, transient set.
+// Atomic claim/consume transitions are single-document CAS writes by `_id` and need no index;
+// one-relationship-per-pair reuses the existing `{businessId, linkedUserId}` unique index.
+businessClientSchema.index(
+  { "financialRelationship.pending.lastReconciledAt": 1 },
+  {
+    name: "financialRelationship_pending_recovery",
+    partialFilterExpression: { "financialRelationship.pending.idempotencyKey": { $exists: true } },
+  },
+);
 
 export const BusinessClientModel = model<BusinessClientDocument>(
   "BusinessClient",

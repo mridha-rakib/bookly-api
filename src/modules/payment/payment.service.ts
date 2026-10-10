@@ -11,8 +11,16 @@ import type {
   PaymentMethodSummary,
   RefundResult,
 } from "./payment.types.js";
+import type { PaymentAttemptDocument } from "./payment-attempt.model.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
+
+export type PaymentAttemptContractCorrelation = {
+  version: 2;
+  classification: "FIRST" | "RETURNING";
+  productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
+  businessClientId: Types.ObjectId | string;
+};
 
 export type SavedCardStatus = {
   hasSavedCard: boolean;
@@ -164,6 +172,11 @@ export class PaymentService {
     amountCents: number;
     idempotencyKey: string;
     metadata: Record<string, string>;
+    /** P1 — immutable Financial Contract V2 correlation persisted on the PaymentAttempt. */
+    financialContract?: PaymentAttemptContractCorrelation | undefined;
+    /** P1 — runs after the durable PaymentAttempt exists and BEFORE any provider interaction
+     * (e.g. binding a FIRST relationship claim to this attempt). Throwing aborts with no PI. */
+    beforeProviderDispatch?: ((attempt: PaymentAttemptDocument) => Promise<void>) | undefined;
   }): Promise<PaymentIntentResult> {
     const profile = await this.profileRepository.findByUserId(input.userId);
     const paymentMethodId = profile?.defaultPaymentMethodId;
@@ -181,6 +194,8 @@ export class PaymentService {
       offSession: false,
       saveForFutureUse: true,
       metadata: input.metadata,
+      financialContract: input.financialContract,
+      beforeProviderDispatch: input.beforeProviderDispatch,
     });
   }
 
@@ -452,23 +467,39 @@ export class PaymentService {
     offSession: boolean;
     saveForFutureUse: boolean;
     metadata: Record<string, string>;
+    financialContract?: PaymentAttemptContractCorrelation | undefined;
+    beforeProviderDispatch?: ((attempt: PaymentAttemptDocument) => Promise<void>) | undefined;
   }): Promise<PaymentIntentResult> {
     const purpose = input.metadata["purpose"] ?? "UNKNOWN";
+    const productKind =
+      purpose === "BOOKING_DEPOSIT"
+        ? ("NORMAL_BOOKING" as const)
+        : purpose === "PACKAGE_PURCHASE"
+          ? ("PACKAGE_PURCHASE" as const)
+          : undefined;
+    if (input.financialContract && input.financialContract.productKind !== productKind) {
+      throw new PaymentError("PAYMENT_IDEMPOTENCY_CONFLICT", 409);
+    }
     const { attempt, isNew } = await this.paymentAttemptRepository.createOrResumeWithDisposition({
       logicalIdempotencyKey: input.idempotencyKey,
       customerUserId: input.userId,
       ...(input.metadata["businessId"] ? { businessId: input.metadata["businessId"] } : {}),
       ...(input.metadata["bookingId"] ? { bookingId: input.metadata["bookingId"] } : {}),
       purpose,
-      ...(purpose === "BOOKING_DEPOSIT"
-        ? { productKind: "NORMAL_BOOKING" as const }
-        : purpose === "PACKAGE_PURCHASE"
-          ? { productKind: "PACKAGE_PURCHASE" as const }
-          : {}),
+      ...(productKind ? { productKind } : {}),
+      ...(input.financialContract
+        ? {
+            financialContractVersion: input.financialContract.version,
+            relationshipClassification: input.financialContract.classification,
+            businessClientId: input.financialContract.businessClientId,
+          }
+        : {}),
       currency: input.currency,
       expectedAmountCents: input.amountCents,
       providerCustomerId: input.stripeCustomerId,
     });
+
+    if (input.beforeProviderDispatch) await input.beforeProviderDispatch(attempt);
 
     let result: PaymentIntentResult;
     if (attempt.providerPaymentIntentId) {

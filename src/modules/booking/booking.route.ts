@@ -25,6 +25,7 @@ import { BusinessHoursRepository } from "../business-hours/business-hours.reposi
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { createFinancialRelationshipService } from "../client/financial-relationship.factory.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { IntegrationRepository } from "../integration/integration.repository.js";
 import { IntegrationService } from "../integration/integration.service.js";
@@ -109,13 +110,22 @@ const buildController = (): BookingController => {
   const reservationService = new BookingSlotReservationService(reservationRepository);
   const claimRepository = new BookingCreationClaimRepository();
   const packageProgressRepository = new PackageProgressRepository();
+  const paymentAttemptRepository = new PaymentAttemptRepository();
+  const refundOperationRepository = new RefundOperationRepository();
   const paymentService = new PaymentService(
     new StripePaymentGateway(),
     new CustomerPaymentProfileRepository(),
     userRepository,
-    new PaymentAttemptRepository(),
-    new RefundOperationRepository(),
+    paymentAttemptRepository,
+    refundOperationRepository,
   );
+  const financialRelationshipService = createFinancialRelationshipService({
+    paymentAttemptRepository,
+    refundOperationRepository,
+    bookingRepository,
+    claimRepository,
+    clientRepository,
+  });
   // Checkpoint B (Cyprus VAT, compute-only) — see CyprusTaxService's own doc comment.
   const taxService = new CyprusTaxService(new StripeTaxGateway());
   const financialTransactionService = new BookingFinancialTransactionService(
@@ -188,6 +198,7 @@ const buildController = (): BookingController => {
     appointmentReminderScheduler,
     packageProgressRepository,
     taxService,
+    financialRelationshipService,
   );
 
   const lifecycleService = new BookingLifecycleService(

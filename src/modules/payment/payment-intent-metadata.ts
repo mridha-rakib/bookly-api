@@ -27,6 +27,15 @@ export type PaymentIntentMetadataInput = {
   chargedAmountCents: number;
   taxCalculationId?: string | undefined;
   taxMode: PaymentTaxMode;
+  /** P1 — additive, optional Financial Contract V2 correlation. `businessClientId` above is the
+   * customer↔business relationship correlation. */
+  financialContract?:
+    | {
+        version: 2;
+        classification: "FIRST" | "RETURNING";
+        productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
+      }
+    | undefined;
 };
 
 export type ParsedPaymentIntentMetadata = PaymentIntentMetadataInput & {
@@ -87,6 +96,13 @@ export const buildPaymentIntentMetadata = (
     taxCents: String(input.taxCents),
     chargedAmountCents: String(input.chargedAmountCents),
     ...(input.taxCalculationId ? { taxCalculationId: input.taxCalculationId } : {}),
+    ...(input.financialContract
+      ? {
+          financialContractVersion: String(input.financialContract.version),
+          relationshipClassification: input.financialContract.classification,
+          productKind: input.financialContract.productKind,
+        }
+      : {}),
   };
 };
 

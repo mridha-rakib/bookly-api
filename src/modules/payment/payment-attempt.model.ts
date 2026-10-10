@@ -36,6 +36,11 @@ export type PaymentAttemptDocument = {
   businessId?: Types.ObjectId | undefined;
   purpose: string;
   productKind?: "NORMAL_BOOKING" | "PACKAGE_PURCHASE" | undefined;
+  /** P1 — immutable Financial Contract V2 correlation (absent on pre-P1 / non-contract
+   * attempts). A resume that would switch FIRST <-> RETURNING fails closed. */
+  financialContractVersion?: 2 | undefined;
+  relationshipClassification?: "FIRST" | "RETURNING" | undefined;
+  businessClientId?: Types.ObjectId | undefined;
   currency: string;
   expectedAmountCents: number;
   provider: "STRIPE";
@@ -67,6 +72,9 @@ const schema = new Schema<PaymentAttemptDocument>(
     businessId: { type: Schema.Types.ObjectId, ref: "Business" },
     purpose: { type: String, required: true, trim: true, maxlength: 80 },
     productKind: { type: String, enum: ["NORMAL_BOOKING", "PACKAGE_PURCHASE"] },
+    financialContractVersion: { type: Number, enum: [2] },
+    relationshipClassification: { type: String, enum: ["FIRST", "RETURNING"] },
+    businessClientId: { type: Schema.Types.ObjectId, ref: "BusinessClient" },
     currency: { type: String, required: true, uppercase: true, minlength: 3, maxlength: 3 },
     expectedAmountCents: { type: Number, required: true, min: 1, validate: Number.isInteger },
     provider: { type: String, enum: ["STRIPE"], required: true, default: "STRIPE" },

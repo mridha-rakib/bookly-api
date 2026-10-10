@@ -1,7 +1,11 @@
+import type { Types } from "mongoose";
 import type Stripe from "stripe";
+
+import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { PaymentGateway } from "../payment/payment.types.js";
 import type { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
@@ -53,6 +57,13 @@ export class StripeWebhookService {
     private readonly refundOperationRepository?: RefundOperationRepository,
     private readonly packageProgressRepository?: PackageProgressRepository,
     private readonly bookingRepository?: BookingRepository,
+    // P1 — converges a FIRST customer↔business relationship claim when its PaymentAttempt
+    // definitively fails or its failed-creation compensation refund settles. Best-effort here:
+    // the money-recovery worker's relationship scan is the guaranteed convergence path.
+    private readonly relationshipReconciler?: Pick<
+      FinancialRelationshipService,
+      "reconcileForPaymentAttempt"
+    >,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -386,6 +397,7 @@ export class StripeWebhookService {
         providerStatus: "FAILED",
       });
       if (storedAttempt && storedAttempt.providerStatus !== "FAILED") return;
+      await this.reconcileRelationship(attempt._id);
     }
     const bookingId = paymentIntent.metadata?.["bookingId"];
     if (!bookingId) {
@@ -398,6 +410,18 @@ export class StripeWebhookService {
     );
     if (pending) {
       await this.financialTransactionService.settleStatus(pending._id, "FAILED");
+    }
+  }
+
+  private async reconcileRelationship(paymentAttemptId: Types.ObjectId): Promise<void> {
+    if (!this.relationshipReconciler) return;
+    try {
+      await this.relationshipReconciler.reconcileForPaymentAttempt(paymentAttemptId);
+    } catch (error) {
+      logger.warn(
+        { err: error, recordType: "PaymentAttempt", recordId: String(paymentAttemptId) },
+        "Financial relationship reconciliation deferred to money recovery",
+      );
     }
   }
 
@@ -451,6 +475,9 @@ export class StripeWebhookService {
           await this.paymentAttemptRepository.markCompensationFailed(
             operation.sourcePaymentAttemptId,
           );
+        }
+        if (operation.reason === "BOOKING_PERSISTENCE_COMPENSATION") {
+          await this.reconcileRelationship(operation.sourcePaymentAttemptId);
         }
       }
       if (effectiveStatus === "SUCCEEDED" || effectiveStatus === "FAILED") {

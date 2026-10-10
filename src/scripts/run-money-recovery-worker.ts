@@ -5,6 +5,7 @@ import { DatabaseManager } from "../database/database-manager.js";
 import { BookingRepository } from "../modules/booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { createFinancialRelationshipService } from "../modules/client/financial-relationship.factory.js";
 import { PackageProgressRepository } from "../modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../modules/payment/customer-payment-profile.repository.js";
 import { MoneyRecoveryService } from "../modules/payment/money-recovery.service.js";
@@ -35,6 +36,11 @@ const buildService = (): MoneyRecoveryService => {
     attempts,
     refunds,
   );
+  const relationshipService = createFinancialRelationshipService({
+    paymentAttemptRepository: attempts,
+    refundOperationRepository: refunds,
+    bookingRepository,
+  });
   const webhookService = new StripeWebhookService(
     gateway,
     new StripeWebhookEventRepository(),
@@ -44,6 +50,7 @@ const buildService = (): MoneyRecoveryService => {
     refunds,
     packageProgressRepository,
     bookingRepository,
+    relationshipService,
   );
   return new MoneyRecoveryService(
     paymentService,
@@ -53,6 +60,7 @@ const buildService = (): MoneyRecoveryService => {
     financials,
     webhookService,
     packageProgressRepository,
+    relationshipService,
   );
 };
 
