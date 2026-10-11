@@ -5,6 +5,10 @@ import type { FinancialRelationshipService } from "../client/financial-relations
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { StripeWebhookService } from "../stripe-webhook/stripe-webhook.service.js";
 import type { PaymentService } from "./payment.service.js";
+import type {
+  PaymentAttemptDocument,
+  PaymentAttemptProviderStatus,
+} from "./payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "./payment-attempt.repository.js";
 import type { RefundOperationDocument } from "./refund-operation.model.js";
 import type { RefundOperationRepository } from "./refund-operation.repository.js";
@@ -13,6 +17,16 @@ const ORPHAN_GRACE_MS = 5 * 60_000;
 /** P1.1 — a bound FIRST charge still awaiting 3DS this long is re-read from Stripe. Reading is
  * always safe; only the provider's answer (never this age) can release the claim. */
 export const STALE_FIRST_REQUIRES_ACTION_MS = 30 * 60_000;
+/** P1.1.1 — a bound FIRST attempt with no recorded PaymentIntent this long after creation is
+ * far beyond any in-flight provider request (SDK timeout x retries), so a strongly consistent
+ * provider lookup can decide whether its PaymentIntent exists. */
+export const STALE_FIRST_UNSENT_MS = 15 * 60_000;
+/** Outcomes a FIRST-only pass leaves reserved and simply re-checks later. */
+const UNRESOLVED_PROVIDER_STATUSES: ReadonlySet<PaymentAttemptProviderStatus> = new Set([
+  "NOT_CREATED",
+  "UNKNOWN",
+  "REQUIRES_ACTION",
+]);
 
 export class MoneyRecoveryService {
   public constructor(
@@ -34,6 +48,7 @@ export class MoneyRecoveryService {
 
   public async runOnce(limit = 50): Promise<{
     paymentAttempts: number;
+    staleFirstUnsent: number;
     staleFirstRequiresAction: number;
     refundOperations: number;
     relationshipsScanned: number;
@@ -45,10 +60,11 @@ export class MoneyRecoveryService {
     let refundOperations = 0;
     let errors = 0;
 
-    // Runs BEFORE the generic pass so a stale attempt Stripe reports as succeeded is picked up
-    // by the existing P0 persistence/compensation handling below in this same pass.
+    // The FIRST-only passes run BEFORE the generic pass so an attempt Stripe reports as
+    // succeeded is picked up by the existing P0 persistence/compensation handling below.
+    const staleUnsent = await this.resolveStaleFirstUnsent(limit);
     const staleFirst = await this.reconcileStaleFirstRequiresAction(limit);
-    errors += staleFirst.errors;
+    errors += staleUnsent.errors + staleFirst.errors;
 
     const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
     for (const candidate of attempts) {
@@ -57,7 +73,16 @@ export class MoneyRecoveryService {
           candidate._id,
         );
         paymentAttempts += 1;
-        if (snapshot?.status !== "succeeded" || !attempt.bookingId) continue;
+        if (!snapshot) {
+          // P1.1.1 — queue fairness only: NOT_FOUND changes no provider meaning, but the row
+          // must rotate out instead of staying oldest forever and starving later work.
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            attempt._id,
+            "No provider PaymentIntent found for this PaymentAttempt yet",
+          );
+          continue;
+        }
+        if (snapshot.status !== "succeeded" || !attempt.bookingId) continue;
 
         const booking = attempt.businessId
           ? await this.bookingRepository.findById(attempt.businessId, attempt.bookingId)
@@ -87,7 +112,10 @@ export class MoneyRecoveryService {
           continue;
         }
 
-        if (Date.now() - attempt.createdAt.getTime() < ORPHAN_GRACE_MS) continue;
+        // P1.1.1 — the grace runs from when success was first recorded (a slow 3DS must not spend
+        // it before the money even moved); pre-P1.1.1 rows fall back to attempt creation.
+        const graceFrom = attempt.providerSucceededAt ?? attempt.createdAt;
+        if (Date.now() - graceFrom.getTime() < ORPHAN_GRACE_MS) continue;
         if (!(await this.paymentService.claimPaymentCompensation(attempt._id))) continue;
         await this.paymentService.refund({
           paymentIntentId: snapshot.paymentIntentId,
@@ -201,6 +229,7 @@ export class MoneyRecoveryService {
     const webhookCounts = await this.webhookService.recoverDue(limit);
     return {
       paymentAttempts,
+      staleFirstUnsent: staleUnsent.reconciled,
       staleFirstRequiresAction: staleFirst.reconciled,
       refundOperations,
       relationshipsScanned: relationshipCounts.scanned,
@@ -226,13 +255,53 @@ export class MoneyRecoveryService {
   private async reconcileStaleFirstRequiresAction(
     limit: number,
   ): Promise<{ reconciled: number; errors: number }> {
-    const relationships = this.relationshipService;
-    if (!relationships) return { reconciled: 0, errors: 0 };
-
+    if (!this.relationshipService) return { reconciled: 0, errors: 0 };
     const candidates = await this.paymentAttemptRepository.listStaleFirstRequiresAction(
       limit,
       new Date(Date.now() - STALE_FIRST_REQUIRES_ACTION_MS),
     );
+    return this.runFirstOwnedPass(
+      candidates,
+      "Stale FIRST requires_action",
+      async (candidate) =>
+        (await this.paymentService.reconcilePaymentAttempt(candidate._id)).attempt,
+    );
+  }
+
+  /**
+   * P1.1.1 — dedicated FIRST-only recovery for a bound charge whose dispatch left no recorded
+   * PaymentIntent (crash between bind and create, or a create that failed / timed out without a
+   * PaymentIntent in the response). Never part of the generic scan and never search-based: the
+   * strongly consistent customer-scoped list decides.
+   *   PaymentIntent found     -> recorded through the monotonic CAS; the relationship follows
+   *                              the P1.1 rules above (only FAILED/CANCELED release)
+   *   proven absent           -> FAILED + PROVIDER_NOT_CREATED (CAS), claim released
+   *                              (revision-guarded CAS); the operation is closed for creation
+   *   provider/correlation error -> backed off; nothing released
+   */
+  private async resolveStaleFirstUnsent(
+    limit: number,
+  ): Promise<{ reconciled: number; errors: number }> {
+    if (!this.relationshipService) return { reconciled: 0, errors: 0 };
+    const candidates = await this.paymentAttemptRepository.listStaleFirstUnsent(
+      limit,
+      new Date(Date.now() - STALE_FIRST_UNSENT_MS),
+    );
+    return this.runFirstOwnedPass(candidates, "Stale FIRST unsent", (candidate) =>
+      this.paymentService.resolveUnsentPaymentAttempt(candidate._id),
+    );
+  }
+
+  /** Shared driver of the FIRST-only passes: verifies the candidate still owns its FIRST_PENDING
+   * claim, lets `resolve` record the authoritative provider state, then converges the
+   * relationship purely from durable state. Unresolved outcomes and errors back off. */
+  private async runFirstOwnedPass(
+    candidates: PaymentAttemptDocument[],
+    label: string,
+    resolve: (candidate: PaymentAttemptDocument) => Promise<PaymentAttemptDocument>,
+  ): Promise<{ reconciled: number; errors: number }> {
+    const relationships = this.relationshipService;
+    if (!relationships) return { reconciled: 0, errors: 0 };
     let reconciled = 0;
     let errors = 0;
     for (const candidate of candidates) {
@@ -240,7 +309,7 @@ export class MoneyRecoveryService {
         if (!(await relationships.ownsPendingFirstClaim(candidate))) {
           logger.warn(
             { recordType: "PaymentAttempt", recordId: String(candidate._id) },
-            "Stale FIRST requires_action attempt does not own its relationship claim",
+            `${label} attempt does not own its relationship claim`,
           );
           await this.paymentAttemptRepository.scheduleRecoveryRetry(
             candidate._id,
@@ -249,12 +318,14 @@ export class MoneyRecoveryService {
           continue;
         }
 
-        const { attempt } = await this.paymentService.reconcilePaymentAttempt(candidate._id);
+        const attempt = await resolve(candidate);
         reconciled += 1;
-        if (attempt.providerStatus === "REQUIRES_ACTION") {
+        if (UNRESOLVED_PROVIDER_STATUSES.has(attempt.providerStatus)) {
           await this.paymentAttemptRepository.scheduleRecoveryRetry(
             attempt._id,
-            "PaymentIntent still requires customer action",
+            attempt.providerStatus === "REQUIRES_ACTION"
+              ? "PaymentIntent still requires customer action"
+              : "Provider PaymentIntent state is not resolved yet",
           );
           continue;
         }
@@ -278,7 +349,7 @@ export class MoneyRecoveryService {
             state: candidate.providerStatus,
             errorCategory: error instanceof Error ? error.name : "UNKNOWN",
           },
-          "Stale FIRST requires_action recovery item failed",
+          `${label} recovery item failed`,
         );
       }
     }

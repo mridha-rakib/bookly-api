@@ -143,6 +143,16 @@ export interface PaymentGateway {
     paymentAttemptId: string,
   ): Promise<ProviderLookupResult<PaymentIntentSnapshot>>;
 
+  /** P1.1.1 — the strongly consistent existence check (Stripe search, used by
+   * `findPaymentIntentByMetadata`, is eventually consistent and can miss a fresh PI): lists the
+   * known Customer's PaymentIntents created since `createdSince` and matches the
+   * `booklyPaymentAttemptId` metadata locally. NOT_FOUND here is evidence of absence. */
+  findCustomerPaymentIntentByAttempt?(input: {
+    stripeCustomerId: string;
+    paymentAttemptId: string;
+    createdSince: Date;
+  }): Promise<ProviderLookupResult<PaymentIntentSnapshot>>;
+
   createRefund(input: CreateRefundInput): Promise<RefundResult>;
 
   retrieveRefund?(refundId: string): Promise<RefundResult>;

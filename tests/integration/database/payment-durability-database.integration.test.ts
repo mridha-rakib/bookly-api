@@ -606,6 +606,181 @@ describe("durable payment/refund/webhook foundation", () => {
     });
   });
 
+  it("P1.1.1: providerSucceededAt is stamped once, on the first transition into SUCCEEDED", async () => {
+    // Synchronous success at creation.
+    const before = Date.now();
+    await service.chargeBookingDeposit({
+      userId,
+      amountCents: 2000,
+      idempotencyKey: "booking:success-clock-sync",
+      metadata: metadata(),
+    });
+    const sync = await attempts.findByLogicalKey("booking:success-clock-sync");
+    expect(sync?.providerSucceededAt?.getTime()).toBeGreaterThanOrEqual(before);
+
+    // requires_action -> FAILED (re-confirmable) -> SUCCEEDED, then duplicate SUCCEEDED writes.
+    gateway.queueNextChargeOutcome("requires_action");
+    const payment = await service.chargeBookingDeposit({
+      userId,
+      amountCents: 2000,
+      idempotencyKey: "booking:success-clock",
+      metadata: metadata(),
+    });
+    const id = (await attempts.findByLogicalKey("booking:success-clock"))?._id as Types.ObjectId;
+    const record = (providerStatus: "FAILED" | "SUCCEEDED") =>
+      attempts.recordProviderResult(id, {
+        providerPaymentIntentId: payment.paymentIntentId,
+        providerStatus,
+      });
+    expect((await attempts.findById(id))?.providerSucceededAt).toBeUndefined();
+    await record("FAILED");
+    expect((await attempts.findById(id))?.providerSucceededAt).toBeUndefined();
+    const first = (await record("SUCCEEDED")).providerSucceededAt?.getTime();
+    expect(first).toEqual(expect.any(Number));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    for (let index = 0; index < 3; index += 1) {
+      expect((await record("SUCCEEDED")).providerSucceededAt?.getTime()).toBe(first);
+    }
+    // Persistence and compensation retries never touch it either.
+    const token = (await attempts.claimPersistence(id)) as string;
+    await attempts.markCompensationRequired(id, "persistence failed", token);
+    await attempts.claimCompensation(id);
+    expect((await attempts.findById(id))?.providerSucceededAt?.getTime()).toBe(first);
+  });
+
+  it("P1.1.1: markProviderNotCreated closes only an attempt with no recorded provider state", async () => {
+    const create = async (key: string) =>
+      attempts.createOrResume({
+        logicalIdempotencyKey: key,
+        customerUserId: userId,
+        businessId,
+        bookingId,
+        purpose: "BOOKING_DEPOSIT",
+        productKind: "NORMAL_BOOKING",
+        currency: "EUR",
+        expectedAmountCents: 2000,
+        providerCustomerId: "cus_durable",
+      });
+
+    // Eligible: NOT_CREATED and UNKNOWN with no PaymentIntent recorded.
+    const unsent = await create("booking:unsent");
+    expect(await attempts.markProviderNotCreated(unsent._id)).toBe(true);
+    expect(await attempts.markProviderNotCreated(unsent._id)).toBe(false);
+    expect(await attempts.findById(unsent._id)).toMatchObject({
+      providerStatus: "FAILED",
+      lastErrorCode: "PROVIDER_NOT_CREATED",
+    });
+    const unknown = await create("booking:unknown");
+    await attempts.markProviderUnknown(unknown._id, "timeout");
+    expect(await attempts.markProviderNotCreated(unknown._id)).toBe(true);
+
+    // Refused: a recorded PaymentIntent, a terminal state, or started persistence/compensation.
+    const withPi = await service.chargeBookingDeposit({
+      userId,
+      amountCents: 2000,
+      idempotencyKey: "booking:with-pi",
+      metadata: metadata(),
+    });
+    const withPiAttempt = await attempts.findByLogicalKey("booking:with-pi");
+    expect(await attempts.markProviderNotCreated(withPiAttempt?._id as Types.ObjectId)).toBe(false);
+    expect((await attempts.findById(withPiAttempt?._id as Types.ObjectId))?.providerStatus).toBe(
+      "SUCCEEDED",
+    );
+    expect(withPi.status).toBe("succeeded");
+    for (const field of [{ persistenceStatus: "PERSISTING" }, { compensationStatus: "REQUIRED" }]) {
+      const guarded = await create(`booking:guarded-${Object.keys(field)[0]}`);
+      await PaymentAttemptModel.collection.updateOne({ _id: guarded._id }, { $set: field });
+      expect(await attempts.markProviderNotCreated(guarded._id), JSON.stringify(field)).toBe(false);
+    }
+
+    // A closed attempt can never dispatch again under its logical key...
+    const inputsBefore = gateway.paymentIntentInputs.length;
+    await expect(
+      service.chargeBookingDeposit({
+        userId,
+        amountCents: 2000,
+        idempotencyKey: "booking:unsent",
+        metadata: metadata(),
+      }),
+    ).rejects.toMatchObject({ statusCode: 402, details: [{ code: "PAYMENT_FAILED" }] });
+    expect(gateway.paymentIntentInputs).toHaveLength(inputsBefore);
+
+    // ...yet an authoritative later success (a PaymentIntent that surfaced anyway) supersedes it.
+    const surfaced = await attempts.recordProviderResult(unsent._id, {
+      providerPaymentIntentId: "pi_surfaced_late",
+      providerStatus: "SUCCEEDED",
+    });
+    expect(surfaced).toMatchObject({
+      providerStatus: "SUCCEEDED",
+      providerPaymentIntentId: "pi_surfaced_late",
+    });
+    expect(surfaced.providerSucceededAt).toBeInstanceOf(Date);
+  });
+
+  it("P1.1.1: the strong existence check records a found PI and closes only a proven-absent one", async () => {
+    // Created at Stripe but the response was lost, and search lags.
+    const original = gateway.createAndConfirmPaymentIntent.bind(gateway);
+    gateway.createAndConfirmPaymentIntent = async (input) => {
+      gateway.createAndConfirmPaymentIntent = original;
+      await original(input);
+      throw new Error("connection lost after provider accepted request");
+    };
+    await expect(
+      service.chargeBookingDeposit({
+        userId,
+        amountCents: 2000,
+        idempotencyKey: "booking:lost",
+        metadata: metadata(),
+      }),
+    ).rejects.toThrow("connection lost");
+    gateway.searchLagging = true;
+    const lost = await attempts.findByLogicalKey("booking:lost");
+    expect(lost?.providerStatus).toBe("UNKNOWN");
+
+    const found = await service.resolveUnsentPaymentAttempt(lost?._id as Types.ObjectId);
+    expect(found.providerStatus).toBe("SUCCEEDED");
+    expect(found.providerPaymentIntentId).toEqual(expect.any(String));
+    expect(gateway.paymentIntentInputs).toHaveLength(1);
+
+    // Never reached Stripe.
+    gateway.createAndConfirmPaymentIntent = async () => {
+      gateway.createAndConfirmPaymentIntent = original;
+      throw new Error("connection refused before the request was sent");
+    };
+    await expect(
+      service.chargeBookingDeposit({
+        userId,
+        amountCents: 2000,
+        idempotencyKey: "booking:never-sent",
+        metadata: metadata(),
+      }),
+    ).rejects.toThrow("connection refused");
+    const neverSent = await attempts.findByLogicalKey("booking:never-sent");
+    const closed = await service.resolveUnsentPaymentAttempt(neverSent?._id as Types.ObjectId);
+    expect(closed).toMatchObject({
+      providerStatus: "FAILED",
+      lastErrorCode: "PROVIDER_NOT_CREATED",
+    });
+
+    // Provider uncertainty writes nothing.
+    const uncertain = await attempts.createOrResume({
+      logicalIdempotencyKey: "booking:uncertain",
+      customerUserId: userId,
+      businessId,
+      bookingId,
+      purpose: "BOOKING_DEPOSIT",
+      productKind: "NORMAL_BOOKING",
+      currency: "EUR",
+      expectedAmountCents: 2000,
+      providerCustomerId: "cus_durable",
+    });
+    gateway.failNextCustomerList(new Error("stripe list unavailable"));
+    await expect(service.resolveUnsentPaymentAttempt(uncertain._id)).rejects.toThrow(
+      "stripe list unavailable",
+    );
+    expect((await attempts.findById(uncertain._id))?.providerStatus).toBe("NOT_CREATED");
+  });
+
   it("enriches an existing business-cancellation refund for package void reuse", async () => {
     const packageProgressId = new Types.ObjectId();
     const original = await refunds.createOrResume({

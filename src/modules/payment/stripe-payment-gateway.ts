@@ -223,6 +223,39 @@ export class StripePaymentGateway implements PaymentGateway {
     };
   }
 
+  public async findCustomerPaymentIntentByAttempt(input: {
+    stripeCustomerId: string;
+    paymentAttemptId: string;
+    createdSince: Date;
+  }): Promise<ProviderLookupResult<PaymentIntentSnapshot>> {
+    const matches: Stripe.PaymentIntent[] = [];
+    let startingAfter: string | undefined;
+    do {
+      const page = await this.wrap(() =>
+        this.client.paymentIntents.list({
+          customer: input.stripeCustomerId,
+          created: { gte: Math.floor(input.createdSince.getTime() / 1000) },
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        }),
+      );
+      for (const paymentIntent of page.data) {
+        if (paymentIntent.metadata?.["booklyPaymentAttemptId"] === input.paymentAttemptId) {
+          matches.push(paymentIntent);
+          if (matches.length > 1) return { outcome: "AMBIGUOUS" };
+        }
+      }
+      startingAfter = page.has_more ? page.data.at(-1)?.id : undefined;
+      if (page.has_more && !startingAfter) return { outcome: "AMBIGUOUS" };
+    } while (startingAfter);
+
+    if (matches.length === 0) return { outcome: "NOT_FOUND" };
+    return {
+      outcome: "FOUND_ONE",
+      value: this.toPaymentIntentSnapshot(matches[0] as Stripe.PaymentIntent),
+    };
+  }
+
   public async retrieveRefund(refundId: string): Promise<RefundResult> {
     const refund = await this.wrap(
       () => this.client.refunds.retrieve(refundId),

@@ -40,9 +40,14 @@ import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/c
 import {
   MoneyRecoveryService,
   STALE_FIRST_REQUIRES_ACTION_MS,
+  STALE_FIRST_UNSENT_MS,
 } from "../../../src/modules/payment/money-recovery.service.js";
+import { PaymentError } from "../../../src/modules/payment/payment.errors.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
-import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
+import {
+  PaymentAttemptModel,
+  PROVIDER_NOT_CREATED,
+} from "../../../src/modules/payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
@@ -544,6 +549,16 @@ describe("P1 — universal customer↔business financial relationship + Financia
       statusCode: 409,
       details: [{ code: "BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS" }],
     });
+
+  /** Moves an attempt's provider success (and creation) into the past, so the P0 orphan grace —
+   * measured from the recorded success since P1.1.1 — has genuinely elapsed. */
+  const ageSuccess = async (attemptId: Types.ObjectId, ageMs = 10 * 60_000) => {
+    const past = new Date(Date.now() - ageMs);
+    await PaymentAttemptModel.collection.updateOne(
+      { _id: attemptId },
+      { $set: { providerSucceededAt: past, createdAt: past } },
+    );
+  };
 
   const injectBookingPersistenceFailureOnce = () => {
     const original = bookingRepository.create.bind(bookingRepository);
@@ -1200,11 +1215,18 @@ describe("P1 — universal customer↔business financial relationship + Financia
 
     it("an orphaned succeeded charge is compensated by the worker and only then restored to ELIGIBLE", async () => {
       const { client, attempt } = await crashAfterCharge();
+      // An old attempt alone is not an orphan: the grace runs from the recorded success.
       await PaymentAttemptModel.collection.updateOne(
         { _id: attempt._id },
         { $set: { createdAt: new Date(Date.now() - 10 * 60_000) } },
       );
+      await recoveryService.runOnce();
+      expect(
+        (await PaymentAttemptModel.findById(attempt._id).orFail().exec()).compensationStatus,
+      ).toBe("NOT_REQUIRED");
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("FIRST_PENDING");
 
+      await ageSuccess(attempt._id);
       await recoveryService.runOnce();
 
       const refreshed = await PaymentAttemptModel.findById(attempt._id).orFail().exec();
@@ -1540,6 +1562,16 @@ describe("P1 — universal customer↔business financial relationship + Financia
       paymentGateway.succeedPaymentIntent(paymentIntentId);
       await makeStale(attempt._id);
 
+      // Success just observed by the stale pass: the grace starts now, not at attempt creation.
+      await recoveryService.runOnce();
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        compensationStatus: "NOT_REQUIRED",
+      });
+      expect(paymentGateway.refundInputs).toHaveLength(0);
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("FIRST_PENDING");
+
+      await ageSuccess(attempt._id, STALE_FIRST_REQUIRES_ACTION_MS);
       await recoveryService.runOnce();
       await recoveryService.runOnce();
 
@@ -1777,10 +1809,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
           }),
         ),
       ).rejects.toThrow(/not persisted yet/);
-      await PaymentAttemptModel.collection.updateOne(
-        { _id: attempt._id },
-        { $set: { createdAt: new Date(Date.now() - 10 * 60_000) } },
-      );
+      await ageSuccess(attempt._id);
       await recoveryService.runOnce();
 
       expect(await attemptOf(attempt._id)).toMatchObject({
@@ -1839,8 +1868,15 @@ describe("P1 — universal customer↔business financial relationship + Financia
 
       await recoveryService.runOnce();
 
-      const refreshed = await attemptOf(attempt._id);
+      // The stale FAILED read lost: the success stands and is never released as a failure.
+      let refreshed = await attemptOf(attempt._id);
       expect(refreshed.providerStatus).toBe("SUCCEEDED");
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("FIRST_PENDING");
+
+      // No finalize ever arrives: once the success itself outlives the grace, P0 compensates.
+      await ageSuccess(attempt._id, STALE_FIRST_REQUIRES_ACTION_MS);
+      await recoveryService.runOnce();
+      refreshed = await attemptOf(attempt._id);
       const row = await relationshipOf(client._id);
       // Converged through P0 compensation of the orphaned success — never a pre-money release.
       expect(row.financialRelationship?.lastRelease?.reason).not.toBe("PRE_MONEY_FAILURE");
@@ -1881,6 +1917,652 @@ describe("P1 — universal customer↔business financial relationship + Financia
       const after = await relationshipOf(client._id);
       expect(after.financialRelationship?.state).toBe("CONSUMED");
       expect(after.financialRelationship?.revision).toBe(consumed.financialRelationship?.revision);
+    });
+
+    // --- P1.1.1 Gap 2: bound FIRST attempt with no recorded PaymentIntent ---------------------
+
+    describe("P1.1.1 — bound FIRST attempt with no recorded PaymentIntent", () => {
+      /**
+       * Fails the FIRST charge at the provider boundary, after the claim was bound:
+       *  - `pi: false` — the request never produced a PaymentIntent (rejected / never reached
+       *    Stripe); `pi: true` — Stripe created it (with `outcome`) but the response was lost;
+       *  - `crash: true` — the process died before even recording UNKNOWN (stays NOT_CREATED).
+       * Stripe search is then made to lag, so only the strongly consistent list can see a PI.
+       */
+      const startFirstUnsent = async (
+        tag: string,
+        options: {
+          pi: boolean;
+          crash?: boolean;
+          outcome?: "succeeded" | "requires_action" | "failed";
+          kind?: "normal" | "package";
+        },
+      ) => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, tag);
+        const input =
+          options.kind === "package" ? packageInput(fixture) : normalInput(fixture, "10:00");
+        if (options.outcome) paymentGateway.queueNextChargeOutcome(options.outcome);
+        const originalCreate = paymentGateway.createAndConfirmPaymentIntent.bind(paymentGateway);
+        paymentGateway.createAndConfirmPaymentIntent = async (request) => {
+          paymentGateway.createAndConfirmPaymentIntent = originalCreate;
+          if (options.pi) await originalCreate(request);
+          throw new PaymentError("PAYMENT_FAILED", 402);
+        };
+        if (options.crash) {
+          const originalMark =
+            paymentAttemptRepository.markProviderUnknown.bind(paymentAttemptRepository);
+          paymentAttemptRepository.markProviderUnknown = async () => {
+            paymentAttemptRepository.markProviderUnknown = originalMark;
+            throw new Error("simulated process crash");
+          };
+        }
+
+        await expect(
+          options.kind === "package"
+            ? finalizePackage(fixture, customer._id, input)
+            : finalizeNormal(fixture, customer._id, input),
+        ).rejects.toBeDefined();
+        paymentGateway.searchLagging = true;
+
+        const attempt = await PaymentAttemptModel.findOne({
+          logicalIdempotencyKey: input.idempotencyKey,
+        })
+          .orFail()
+          .exec();
+        expect(attempt.providerStatus).toBe(options.crash ? "NOT_CREATED" : "UNKNOWN");
+        expect(attempt.providerPaymentIntentId).toBeUndefined();
+        const row = await relationshipOf(client._id);
+        // The pre-P1.1.1 dead end: bound, so no unbound cleanup or failure path can release it.
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(String(row.financialRelationship?.pending?.paymentAttemptId)).toBe(
+          String(attempt._id),
+        );
+        return {
+          fixture,
+          customer,
+          client,
+          input,
+          attempt,
+          revision: row.financialRelationship?.revision as number,
+        };
+      };
+
+      const makeUnsentStale = async (attemptId: Types.ObjectId) => {
+        await PaymentAttemptModel.collection.updateOne(
+          { _id: attemptId },
+          { $set: { createdAt: new Date(Date.now() - STALE_FIRST_UNSENT_MS - 60_000) } },
+        );
+      };
+
+      /** The PaymentIntent the fake provider holds for an attempt (bypasses the call counter). */
+      const providerPaymentIntentIdOf = async (attempt: {
+        _id: Types.ObjectId;
+        providerCustomerId: string;
+      }) => {
+        const lookup = await paymentGateway.findCustomerPaymentIntentByAttempt({
+          stripeCustomerId: attempt.providerCustomerId,
+          paymentAttemptId: String(attempt._id),
+          createdSince: new Date(0),
+        });
+        paymentGateway.customerListCalls = 0;
+        if (lookup.outcome !== "FOUND_ONE") throw new Error("expected a provider PaymentIntent");
+        return lookup.value.paymentIntentId;
+      };
+
+      const expectUntouched = async (
+        client: { _id: Types.ObjectId },
+        attemptId: Types.ObjectId,
+        revision: number,
+        providerStatus: string,
+      ) => {
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(row.financialRelationship?.revision).toBe(revision);
+        expect((await attemptOf(attemptId)).providerStatus).toBe(providerStatus);
+      };
+
+      it("NOT_CREATED crash with no PI: proven absent, closed, FIRST released once; same key fails closed; a new key claims FIRST", async () => {
+        const { fixture, customer, client, input, attempt, revision } = await startFirstUnsent(
+          "unsent-crash",
+          { pi: false, crash: true },
+        );
+        await makeUnsentStale(attempt._id);
+
+        const counts = await recoveryService.runOnce();
+
+        expect(counts).toMatchObject({ staleFirstUnsent: 1 });
+        expect(paymentGateway.customerListCalls).toBe(1);
+        const closed = await attemptOf(attempt._id);
+        expect(closed).toMatchObject({
+          providerStatus: "FAILED",
+          lastErrorCode: PROVIDER_NOT_CREATED,
+        });
+        expect(closed.providerPaymentIntentId).toBeUndefined();
+        let row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(row.financialRelationship?.lastRelease).toMatchObject({
+          reason: "PRE_MONEY_FAILURE",
+          idempotencyKey: input.idempotencyKey,
+        });
+        expect(String(row.financialRelationship?.lastRelease?.paymentAttemptId)).toBe(
+          String(attempt._id),
+        );
+
+        await recoveryService.runOnce();
+        await relationshipService.reconcilePending();
+        row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+
+        // The closed operation can never dispatch: existing 402 semantics, no PaymentIntent.
+        await expect(finalizeNormal(fixture, customer._id, input)).rejects.toMatchObject({
+          statusCode: 402,
+          details: [{ code: "PAYMENT_FAILED" }],
+        });
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+        expect(await attemptOf(attempt._id)).toMatchObject({
+          providerStatus: "FAILED",
+          lastErrorCode: PROVIDER_NOT_CREATED,
+        });
+
+        // The customer's retry under a NEW key is FIRST as normal.
+        paymentGateway.searchLagging = false;
+        const booking = confirmed(
+          await finalizeNormal(fixture, customer._id, normalInput(fixture, "12:00")),
+        );
+        expect(booking.financialContract?.classification).toBe("FIRST");
+        row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(String(row.financialRelationship?.consumed?.bookingId)).toBe(String(booking._id));
+        expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(1);
+      });
+
+      it("UNKNOWN with no PI (rejected / never reached Stripe): proven absent and released safely", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("unsent-unknown", {
+          pi: false,
+        });
+        await makeUnsentStale(attempt._id);
+
+        await recoveryService.runOnce();
+
+        expect(await attemptOf(attempt._id)).toMatchObject({
+          providerStatus: "FAILED",
+          lastErrorCode: PROVIDER_NOT_CREATED,
+        });
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(await ledgerCount()).toBe(0);
+      });
+
+      it("package FIRST with no PI resolves with the same semantics", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("unsent-package", {
+          pi: false,
+          kind: "package",
+        });
+        expect(attempt.productKind).toBe("PACKAGE_PURCHASE");
+        await makeUnsentStale(attempt._id);
+
+        await recoveryService.runOnce();
+
+        expect((await attemptOf(attempt._id)).lastErrorCode).toBe(PROVIDER_NOT_CREATED);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(await PackageProgressModel.countDocuments()).toBe(0);
+      });
+
+      it("NOT_CREATED, search misses but the list finds a requires_action PI: recorded, never released, no duplicate PI", async () => {
+        const { fixture, customer, client, input, attempt, revision } = await startFirstUnsent(
+          "lost-3ds",
+          { pi: true, crash: true, outcome: "requires_action" },
+        );
+        await makeUnsentStale(attempt._id);
+
+        await recoveryService.runOnce();
+
+        expect(paymentGateway.customerListCalls).toBe(1);
+        const recorded = await attemptOf(attempt._id);
+        expect(recorded.providerStatus).toBe("REQUIRES_ACTION");
+        expect(recorded.providerPaymentIntentId).toEqual(expect.any(String));
+        expect(recorded.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+        await expectUntouched(client, attempt._id, revision, "REQUIRES_ACTION");
+
+        // The same operation resumes the SAME PaymentIntent — never a second one.
+        const resumed = await finalizeNormal(fixture, customer._id, input);
+        expect(resumed.status).toBe("requires_action");
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      });
+
+      it("UNKNOWN, search misses but the list finds a succeeded PI: recorded, not released, not compensated; same-key finalize consumes once", async () => {
+        const { fixture, customer, client, input, attempt, revision } = await startFirstUnsent(
+          "lost-success",
+          { pi: true, outcome: "succeeded" },
+        );
+        await makeUnsentStale(attempt._id);
+        const before = Date.now();
+
+        await recoveryService.runOnce();
+
+        const recorded = await attemptOf(attempt._id);
+        expect(recorded).toMatchObject({
+          providerStatus: "SUCCEEDED",
+          compensationStatus: "NOT_REQUIRED",
+        });
+        expect(recorded.providerSucceededAt?.getTime()).toBeGreaterThanOrEqual(before);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        await expectUntouched(client, attempt._id, revision, "SUCCEEDED");
+
+        const booking = confirmed(await finalizeNormal(fixture, customer._id, input));
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(String(row.financialRelationship?.consumed?.bookingId)).toBe(String(booking._id));
+        expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(1);
+      });
+
+      it("the list finds a processing PI: kept reserved", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("lost-processing", {
+          pi: true,
+          outcome: "requires_action",
+        });
+        paymentGateway.setPaymentIntentStatus(
+          await providerPaymentIntentIdOf(attempt),
+          "processing",
+        );
+        await makeUnsentStale(attempt._id);
+
+        await recoveryService.runOnce();
+
+        await expectUntouched(client, attempt._id, revision, "PROCESSING");
+      });
+
+      it("the list finds a canceled PI: the existing canceled flow releases", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("lost-canceled", {
+          pi: true,
+          outcome: "requires_action",
+        });
+        paymentGateway.setPaymentIntentStatus(await providerPaymentIntentIdOf(attempt), "canceled");
+        await makeUnsentStale(attempt._id);
+
+        await recoveryService.runOnce();
+
+        expect(await attemptOf(attempt._id)).toMatchObject({
+          providerStatus: "CANCELED",
+          lastErrorCode: "PROVIDER_CANCELED",
+        });
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(row.financialRelationship?.lastRelease?.reason).toBe("PROVIDER_CANCELED");
+      });
+
+      it("provider lookup error: nothing released, backed off", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("lookup-error", {
+          pi: false,
+        });
+        await makeUnsentStale(attempt._id);
+        paymentGateway.failNextCustomerList(new Error("stripe list unavailable"));
+
+        const counts = await recoveryService.runOnce();
+
+        expect(counts.errors).toBeGreaterThanOrEqual(1);
+        await expectUntouched(client, attempt._id, revision, "UNKNOWN");
+        const refreshed = await attemptOf(attempt._id);
+        expect(refreshed.lastErrorMessage).toBe("stripe list unavailable");
+        expect(refreshed.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+      });
+
+      it("never resolves when the attempt does not own the claim, the relationship is consumed, persistence/compensation started, or it is too young", async () => {
+        const variants: Array<{
+          name: string;
+          prepare: (ctx: {
+            client: { _id: Types.ObjectId };
+            attempt: { _id: Types.ObjectId };
+          }) => Promise<void>;
+          expectFirstPending: boolean;
+        }> = [
+          {
+            name: "not owner",
+            expectFirstPending: true,
+            prepare: async ({ client }) => {
+              await BusinessClientModel.updateOne(
+                { _id: client._id },
+                {
+                  $set: { "financialRelationship.pending.paymentAttemptId": new Types.ObjectId() },
+                },
+              ).exec();
+            },
+          },
+          {
+            name: "relationship consumed",
+            expectFirstPending: false,
+            prepare: async ({ client }) => {
+              await BusinessClientModel.updateOne(
+                { _id: client._id },
+                {
+                  $set: { "financialRelationship.state": "CONSUMED" },
+                  $unset: { "financialRelationship.pending": 1 },
+                },
+              ).exec();
+            },
+          },
+          {
+            name: "persistence started",
+            expectFirstPending: true,
+            prepare: async ({ attempt }) => {
+              await PaymentAttemptModel.collection.updateOne(
+                { _id: attempt._id },
+                { $set: { persistenceStatus: "PERSISTING" } },
+              );
+            },
+          },
+          {
+            name: "compensation started",
+            expectFirstPending: true,
+            prepare: async ({ attempt }) => {
+              await PaymentAttemptModel.collection.updateOne(
+                { _id: attempt._id },
+                { $set: { compensationStatus: "REQUIRED" } },
+              );
+            },
+          },
+        ];
+        for (const variant of variants) {
+          const { client, attempt } = await startFirstUnsent(`guard-${variant.name}`, {
+            pi: false,
+          });
+          await makeUnsentStale(attempt._id);
+          await variant.prepare({ client, attempt });
+          const revision = (await relationshipOf(client._id)).financialRelationship
+            ?.revision as number;
+          paymentGateway.customerListCalls = 0;
+
+          await recoveryService.runOnce();
+
+          expect(paymentGateway.customerListCalls, variant.name).toBe(0);
+          const row = await relationshipOf(client._id);
+          expect(row.financialRelationship?.state, variant.name).toBe(
+            variant.expectFirstPending ? "FIRST_PENDING" : "CONSUMED",
+          );
+          expect(row.financialRelationship?.revision, variant.name).toBe(revision);
+          expect((await attemptOf(attempt._id)).providerStatus, variant.name).toBe("UNKNOWN");
+        }
+
+        // Too young: not resolved even though no PaymentIntent exists.
+        const young = await startFirstUnsent("guard-young", { pi: false });
+        paymentGateway.customerListCalls = 0;
+        await recoveryService.runOnce();
+        expect(paymentGateway.customerListCalls).toBe(0);
+        await expectUntouched(young.client, young.attempt._id, young.revision, "UNKNOWN");
+      });
+
+      it("duplicate concurrent workers: one terminalization, one release", async () => {
+        const { client, attempt, revision } = await startFirstUnsent("dup-workers", {
+          pi: false,
+        });
+        await makeUnsentStale(attempt._id);
+
+        await Promise.all([recoveryService.runOnce(), recoveryService.runOnce()]);
+
+        expect((await attemptOf(attempt._id)).lastErrorCode).toBe(PROVIDER_NOT_CREATED);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+      });
+
+      it("race: a success webhook recorded during the lookup wins — never closed or released, even on a wrong NOT_FOUND", async () => {
+        const { fixture, customer, client, input, attempt, revision } = await startFirstUnsent(
+          "lookup-race",
+          { pi: true, outcome: "succeeded" },
+        );
+        const paymentIntentId = await providerPaymentIntentIdOf(attempt);
+        await makeUnsentStale(attempt._id);
+
+        // Deliberately wrong lookup answer, with the webhook landing first: only the CAS on
+        // "still no PaymentIntent recorded" stands between this and a wrong release.
+        paymentGateway.findCustomerPaymentIntentByAttempt = async () => {
+          await webhookService
+            .process(
+              piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+                metadata: piMetadata(attempt._id),
+              }),
+            )
+            .catch(() => undefined);
+          return { outcome: "NOT_FOUND" };
+        };
+
+        await recoveryService.runOnce();
+
+        const recorded = await attemptOf(attempt._id);
+        expect(recorded.providerStatus).toBe("SUCCEEDED");
+        expect(recorded.providerPaymentIntentId).toBe(paymentIntentId);
+        expect(recorded.lastErrorCode).not.toBe(PROVIDER_NOT_CREATED);
+        await expectUntouched(client, attempt._id, revision, "SUCCEEDED");
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+
+        const booking = confirmed(await finalizeNormal(fixture, customer._id, input));
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+        expect(
+          String((await relationshipOf(client._id)).financialRelationship?.consumed?.bookingId),
+        ).toBe(String(booking._id));
+      });
+
+      it("generic recovery backs off NOT_FOUND without changing provider meaning (non-FIRST)", async () => {
+        const old = new Date(Date.now() - STALE_FIRST_UNSENT_MS - 60_000);
+        const { insertedId } = await PaymentAttemptModel.collection.insertOne({
+          logicalIdempotencyKey: `returning-unsent-${new Types.ObjectId().toString()}`,
+          customerUserId: new Types.ObjectId(),
+          purpose: "BOOKING_DEPOSIT",
+          productKind: "NORMAL_BOOKING",
+          financialContractVersion: 2,
+          relationshipClassification: "RETURNING",
+          currency: "EUR",
+          expectedAmountCents: 2_000,
+          provider: "STRIPE",
+          providerCustomerId: "cus_returning_unsent",
+          providerStatus: "NOT_CREATED",
+          persistenceStatus: "NOT_STARTED",
+          compensationStatus: "NOT_REQUIRED",
+          recoveryAttemptCount: 0,
+          createdAt: old,
+          updatedAt: old,
+        } as never);
+        const id = insertedId as unknown as Types.ObjectId;
+
+        await recoveryService.runOnce();
+
+        const refreshed = await attemptOf(id);
+        expect(refreshed.providerStatus).toBe("NOT_CREATED");
+        expect(refreshed.lastErrorCode).toBeUndefined();
+        expect(refreshed.recoveryAttemptCount).toBe(1);
+        expect(refreshed.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+        expect(paymentGateway.customerListCalls).toBe(0);
+      });
+
+      it("more than a full batch of NOT_FOUND rows cannot starve a SUCCEEDED orphan's compensation", async () => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, "starved-orphan");
+        const original = paymentService.claimPaymentPersistence.bind(paymentService);
+        paymentService.claimPaymentPersistence = async () => {
+          paymentService.claimPaymentPersistence = original;
+          throw new Error("simulated process crash");
+        };
+        const input = normalInput(fixture, "10:00");
+        await expect(finalizeNormal(fixture, customer._id, input)).rejects.toThrow(
+          "simulated process crash",
+        );
+        const orphan = await PaymentAttemptModel.findOne({
+          logicalIdempotencyKey: input.idempotencyKey,
+        })
+          .orFail()
+          .exec();
+        await ageSuccess(orphan._id);
+
+        const old = new Date(Date.now() - 24 * 60 * 60_000);
+        await PaymentAttemptModel.collection.insertMany(
+          Array.from({ length: 55 }, (_, index) => ({
+            logicalIdempotencyKey: `stuck-${index}-${new Types.ObjectId().toString()}`,
+            customerUserId: new Types.ObjectId(),
+            purpose: "BOOKING_DEPOSIT",
+            currency: "EUR",
+            expectedAmountCents: 2_000,
+            provider: "STRIPE",
+            providerCustomerId: `cus_stuck_${index}`,
+            providerStatus: index % 2 === 0 ? "NOT_CREATED" : "UNKNOWN",
+            persistenceStatus: "NOT_STARTED",
+            compensationStatus: "NOT_REQUIRED",
+            recoveryAttemptCount: 0,
+            createdAt: old,
+            updatedAt: old,
+          })) as never[],
+        );
+
+        // First pass: the batch is entirely the older NOT_FOUND rows (proving saturation)...
+        await recoveryService.runOnce();
+        expect((await attemptOf(orphan._id)).compensationStatus).toBe("NOT_REQUIRED");
+        // ...which now rotate out, so the next pass reaches the orphan.
+        await recoveryService.runOnce();
+
+        expect((await attemptOf(orphan._id)).compensationStatus).toBe("REFUNDED");
+        expect(paymentGateway.refundInputs).toHaveLength(1);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.lastRelease?.reason).toBe("COMPENSATION_REFUNDED");
+      });
+    });
+
+    // --- P1.1.1 Gap 3: orphan grace runs from the recorded provider success -------------------
+
+    describe("P1.1.1 — success-based orphan grace", () => {
+      const slowThreeDsSuccess = async (tag: string) => {
+        const started = await startFirstRequiresAction(tag);
+        // The customer spent 6 minutes in 3DS: older than the 5-minute grace, younger than the
+        // 30-minute stale pass.
+        await PaymentAttemptModel.collection.updateOne(
+          { _id: started.attempt._id },
+          { $set: { createdAt: new Date(Date.now() - 6 * 60_000) } },
+        );
+        paymentGateway.succeedPaymentIntent(started.paymentIntentId);
+        const before = Date.now();
+        await expect(
+          webhookService.process(
+            piEvent("payment_intent.succeeded", started.attempt, started.paymentIntentId, {
+              metadata: piMetadata(started.attempt._id),
+            }),
+          ),
+        ).rejects.toThrow(/not persisted yet/);
+        const succeeded = await attemptOf(started.attempt._id);
+        expect(succeeded.providerStatus).toBe("SUCCEEDED");
+        expect(succeeded.providerSucceededAt?.getTime()).toBeGreaterThanOrEqual(before);
+        return { ...started, succeededAt: succeeded.providerSucceededAt as Date };
+      };
+
+      it("slow 3DS: success just recorded on a 6-minute-old attempt is not compensated; duplicates keep the timestamp; finalize persists", async () => {
+        const { fixture, customer, client, input, attempt, paymentIntentId, succeededAt } =
+          await slowThreeDsSuccess("slow-3ds");
+
+        // Duplicate success webhook: the success clock is set once.
+        await expect(
+          webhookService.process(
+            piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+              metadata: piMetadata(attempt._id),
+            }),
+          ),
+        ).rejects.toThrow(/not persisted yet/);
+        expect((await attemptOf(attempt._id)).providerSucceededAt?.getTime()).toBe(
+          succeededAt.getTime(),
+        );
+
+        await recoveryService.runOnce();
+        expect((await attemptOf(attempt._id)).compensationStatus).toBe("NOT_REQUIRED");
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+
+        const booking = confirmed(await finalizeNormal(fixture, customer._id, input));
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(String(row.financialRelationship?.consumed?.bookingId)).toBe(String(booking._id));
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(1);
+        expect((await attemptOf(attempt._id)).providerSucceededAt?.getTime()).toBe(
+          succeededAt.getTime(),
+        );
+      });
+
+      it("no finalize ever arrives: compensated once the success outlives the grace, with exact refund/restoration", async () => {
+        const { client, attempt } = await slowThreeDsSuccess("slow-3ds-orphan");
+        await recoveryService.runOnce();
+        expect((await attemptOf(attempt._id)).compensationStatus).toBe("NOT_REQUIRED");
+
+        await ageSuccess(attempt._id, 6 * 60_000);
+        await recoveryService.runOnce();
+
+        expect((await attemptOf(attempt._id)).compensationStatus).toBe("REFUNDED");
+        expect(paymentGateway.refundInputs.map((refund) => refund.amountCents)).toEqual([
+          attempt.expectedAmountCents,
+        ]);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.lastRelease?.reason).toBe("COMPENSATION_REFUNDED");
+        expect(row.financialRelationship?.consumed).toBeUndefined();
+      });
+
+      it("recovery-discovered success establishes the same set-once success clock", async () => {
+        const { attempt, paymentIntentId } = await startFirstRequiresAction("discovered");
+        paymentGateway.succeedPaymentIntent(paymentIntentId);
+        await makeStale(attempt._id);
+        const before = Date.now();
+
+        await recoveryService.runOnce();
+
+        const discovered = await attemptOf(attempt._id);
+        expect(discovered.providerStatus).toBe("SUCCEEDED");
+        const succeededAt = discovered.providerSucceededAt?.getTime() as number;
+        expect(succeededAt).toBeGreaterThanOrEqual(before);
+        expect(discovered.compensationStatus).toBe("NOT_REQUIRED");
+
+        await expect(
+          webhookService.process(
+            piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+              metadata: piMetadata(attempt._id),
+            }),
+          ),
+        ).rejects.toThrow(/not persisted yet/);
+        await recoveryService.runOnce();
+        expect((await attemptOf(attempt._id)).providerSucceededAt?.getTime()).toBe(succeededAt);
+      });
+
+      it("legacy SUCCEEDED row without a success timestamp falls back to attempt creation", async () => {
+        const fixture = await setupFixture();
+        const { customer } = await createLinkedCustomer(fixture, "legacy-orphan");
+        const original = paymentService.claimPaymentPersistence.bind(paymentService);
+        paymentService.claimPaymentPersistence = async () => {
+          paymentService.claimPaymentPersistence = original;
+          throw new Error("simulated process crash");
+        };
+        const input = normalInput(fixture, "10:00");
+        await expect(finalizeNormal(fixture, customer._id, input)).rejects.toThrow(
+          "simulated process crash",
+        );
+        const legacy = await PaymentAttemptModel.findOne({
+          logicalIdempotencyKey: input.idempotencyKey,
+        })
+          .orFail()
+          .exec();
+        await PaymentAttemptModel.collection.updateOne(
+          { _id: legacy._id },
+          {
+            $set: { createdAt: new Date(Date.now() - 10 * 60_000) },
+            $unset: { providerSucceededAt: "" },
+          },
+        );
+
+        await recoveryService.runOnce();
+
+        expect((await attemptOf(legacy._id)).compensationStatus).toBe("REFUNDED");
+      });
     });
   });
 

@@ -18,6 +18,24 @@ export const paymentAttemptProviderStatuses = [
 ] as const;
 export type PaymentAttemptProviderStatus = (typeof paymentAttemptProviderStatuses)[number];
 
+/**
+ * P1.1.1 — `lastErrorCode` of an attempt proven to have NO provider PaymentIntent (strongly
+ * consistent customer-scoped list, never search alone). Such an attempt is FAILED with no
+ * `providerPaymentIntentId`, a combination no other path writes; it is closed for provider
+ * creation, so its logical operation can never dispatch a PaymentIntent again.
+ */
+export const PROVIDER_NOT_CREATED = "PROVIDER_NOT_CREATED";
+
+export const isProviderCreationClosed = (
+  attempt: Pick<
+    PaymentAttemptDocument,
+    "providerStatus" | "providerPaymentIntentId" | "lastErrorCode"
+  >,
+): boolean =>
+  attempt.providerStatus === "FAILED" &&
+  !attempt.providerPaymentIntentId &&
+  attempt.lastErrorCode === PROVIDER_NOT_CREATED;
+
 export const paymentAttemptPersistenceStatuses = [
   "NOT_STARTED",
   "PERSISTING",
@@ -54,6 +72,10 @@ export type PaymentAttemptDocument = {
   providerCustomerId: string;
   providerPaymentIntentId?: string | undefined;
   providerStatus: PaymentAttemptProviderStatus;
+  /** P1.1.1 — when Bookly first recorded provider success (set once, on the first transition
+   * into SUCCEEDED). The orphan-compensation grace runs from here, not from attempt creation.
+   * Absent on pre-P1.1.1 rows, which fall back to `createdAt`. */
+  providerSucceededAt?: Date | undefined;
   persistenceStatus: PaymentAttemptPersistenceStatus;
   compensationStatus: PaymentAttemptCompensationStatus;
   bookingId?: Types.ObjectId | undefined;
@@ -93,6 +115,7 @@ const schema = new Schema<PaymentAttemptDocument>(
       required: true,
       default: "NOT_CREATED",
     },
+    providerSucceededAt: { type: Date },
     persistenceStatus: {
       type: String,
       enum: paymentAttemptPersistenceStatuses,

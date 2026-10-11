@@ -220,6 +220,10 @@ export class FakePaymentGateway implements PaymentGateway {
       this.nextRetrieveError = undefined;
       throw error;
     }
+    return this.snapshotOf(paymentIntentId);
+  }
+
+  private snapshotOf(paymentIntentId: string): PaymentIntentSnapshot {
     const found = [...this.idempotentPaymentIntents.values()].find(
       (entry) => entry.paymentIntentId === paymentIntentId,
     );
@@ -240,9 +244,47 @@ export class FakePaymentGateway implements PaymentGateway {
     };
   }
 
+  /** Test control: Stripe search is eventually consistent — while true, metadata search misses
+   * every PaymentIntent (the customer-scoped list below stays strongly consistent). */
+  public searchLagging = false;
+  public customerListCalls = 0;
+  private nextCustomerListError: Error | undefined;
+
+  /** Test control: the next customer-scoped list call throws (a transient provider error). */
+  public failNextCustomerList(error: Error): void {
+    this.nextCustomerListError = error;
+  }
+
+  public async findCustomerPaymentIntentByAttempt(input: {
+    stripeCustomerId: string;
+    paymentAttemptId: string;
+    createdSince: Date;
+  }): Promise<ProviderLookupResult<PaymentIntentSnapshot>> {
+    this.customerListCalls += 1;
+    if (this.nextCustomerListError) {
+      const error = this.nextCustomerListError;
+      this.nextCustomerListError = undefined;
+      throw error;
+    }
+    const paymentIntentIds = new Set(
+      this.paymentIntentInputs
+        .filter(
+          (entry) =>
+            entry.stripeCustomerId === input.stripeCustomerId &&
+            entry.metadata["booklyPaymentAttemptId"] === input.paymentAttemptId,
+        )
+        .map((entry) => this.idempotentPaymentIntents.get(entry.idempotencyKey)?.paymentIntentId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    if (paymentIntentIds.size === 0) return { outcome: "NOT_FOUND" };
+    if (paymentIntentIds.size > 1) return { outcome: "AMBIGUOUS" };
+    return { outcome: "FOUND_ONE", value: this.snapshotOf([...paymentIntentIds][0] as string) };
+  }
+
   public async findPaymentIntentByMetadata(
     paymentAttemptId: string,
   ): Promise<ProviderLookupResult<PaymentIntentSnapshot>> {
+    if (this.searchLagging) return { outcome: "NOT_FOUND" };
     const inputs = this.paymentIntentInputs.filter(
       (entry) => entry.metadata["booklyPaymentAttemptId"] === paymentAttemptId,
     );

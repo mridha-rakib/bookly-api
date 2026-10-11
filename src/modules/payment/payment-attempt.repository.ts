@@ -7,6 +7,7 @@ import {
   type PaymentAttemptDocument,
   PaymentAttemptModel,
   type PaymentAttemptProviderStatus,
+  PROVIDER_NOT_CREATED,
 } from "./payment-attempt.model.js";
 
 export type CreatePaymentAttemptInput = {
@@ -109,20 +110,40 @@ export class PaymentAttemptRepository {
       ],
       UNKNOWN: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN"],
     };
-    const updated = await PaymentAttemptModel.findOneAndUpdate(
-      { _id: id, providerStatus: { $in: allowedPrevious[input.providerStatus] } },
-      {
-        $set: {
-          providerPaymentIntentId: input.providerPaymentIntentId,
-          providerStatus: input.providerStatus,
-          ...(input.clientSecret ? { clientSecret: input.clientSecret } : {}),
-          ...(input.lastErrorCode ? { lastErrorCode: input.lastErrorCode } : {}),
-          ...(input.lastErrorMessage ? { lastErrorMessage: input.lastErrorMessage } : {}),
-          ...(input.providerStatus === "UNKNOWN" ? { reconciliationNeededAt: new Date() } : {}),
-        },
-      },
-      { returnDocument: "after", runValidators: true },
-    ).exec();
+    const fields = {
+      providerPaymentIntentId: input.providerPaymentIntentId,
+      providerStatus: input.providerStatus,
+      ...(input.clientSecret ? { clientSecret: input.clientSecret } : {}),
+      ...(input.lastErrorCode ? { lastErrorCode: input.lastErrorCode } : {}),
+      ...(input.lastErrorMessage ? { lastErrorMessage: input.lastErrorMessage } : {}),
+      ...(input.providerStatus === "UNKNOWN" ? { reconciliationNeededAt: new Date() } : {}),
+    };
+    const options = { returnDocument: "after" as const, runValidators: true };
+    // The FIRST transition into SUCCEEDED stamps `providerSucceededAt` in the same atomic write;
+    // a duplicate SUCCEEDED can only match the SUCCEEDED-only filter below, which never touches
+    // it (SUCCEEDED and CANCELED are terminal, so nothing can slip between the two filters).
+    const updated =
+      input.providerStatus === "SUCCEEDED"
+        ? ((await PaymentAttemptModel.findOneAndUpdate(
+            {
+              _id: id,
+              providerStatus: {
+                $in: allowedPrevious.SUCCEEDED.filter((status) => status !== "SUCCEEDED"),
+              },
+            },
+            { $set: { ...fields, providerSucceededAt: new Date() } },
+            options,
+          ).exec()) ??
+          (await PaymentAttemptModel.findOneAndUpdate(
+            { _id: id, providerStatus: "SUCCEEDED" },
+            { $set: fields },
+            options,
+          ).exec()))
+        : await PaymentAttemptModel.findOneAndUpdate(
+            { _id: id, providerStatus: { $in: allowedPrevious[input.providerStatus] } },
+            { $set: fields },
+            options,
+          ).exec();
     if (updated) return updated;
     const current = await PaymentAttemptModel.findById(id).orFail();
     if (
@@ -387,6 +408,58 @@ export class PaymentAttemptRepository {
       .sort({ updatedAt: 1 })
       .limit(limit)
       .exec();
+  }
+
+  /**
+   * P1.1.1 — FIRST-only candidates whose provider dispatch never produced a recorded
+   * PaymentIntent (crash before/at create, or a create that failed/timed out with no PI in the
+   * response): bound V2 FIRST charges in NOT_CREATED/UNKNOWN with no PI id, nothing persisted or
+   * compensated, created before `staleBefore`. Ownership is verified per candidate by the caller.
+   */
+  public async listStaleFirstUnsent(
+    limit: number,
+    staleBefore: Date,
+  ): Promise<PaymentAttemptDocument[]> {
+    return PaymentAttemptModel.find({
+      providerStatus: { $in: ["NOT_CREATED", "UNKNOWN"] },
+      financialContractVersion: 2,
+      relationshipClassification: "FIRST",
+      providerPaymentIntentId: { $exists: false },
+      persistenceStatus: "NOT_STARTED",
+      compensationStatus: "NOT_REQUIRED",
+      createdAt: { $lte: staleBefore },
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /**
+   * P1.1.1 — NOT_CREATED/UNKNOWN -> FAILED + PROVIDER_NOT_CREATED, only after the caller proved
+   * with a strongly consistent provider lookup that no PaymentIntent exists. CAS on "still no PI
+   * recorded, nothing persisted/compensated": a provider result recorded first (original request
+   * or webhook) always wins. FAILED stays supersedable by an authoritative SUCCEEDED/CANCELED.
+   */
+  public async markProviderNotCreated(id: Types.ObjectId | string): Promise<boolean> {
+    const result = await PaymentAttemptModel.updateOne(
+      {
+        _id: id,
+        providerStatus: { $in: ["NOT_CREATED", "UNKNOWN"] },
+        providerPaymentIntentId: { $exists: false },
+        persistenceStatus: "NOT_STARTED",
+        compensationStatus: "NOT_REQUIRED",
+      },
+      {
+        $set: {
+          providerStatus: "FAILED",
+          lastErrorCode: PROVIDER_NOT_CREATED,
+          lastErrorMessage: "No provider PaymentIntent exists for this PaymentAttempt",
+        },
+        $unset: { reconciliationNeededAt: 1 },
+      },
+    ).exec();
+    return result.modifiedCount === 1;
   }
 
   public async scheduleRecoveryRetry(id: Types.ObjectId | string, message: string): Promise<void> {

@@ -11,9 +11,13 @@ import type {
   PaymentMethodSummary,
   RefundResult,
 } from "./payment.types.js";
-import type { PaymentAttemptDocument } from "./payment-attempt.model.js";
+import { isProviderCreationClosed, type PaymentAttemptDocument } from "./payment-attempt.model.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
+
+/** P1.1.1 — Stripe's `created` and our `createdAt` come from different clocks; the existence
+ * check lists from well before the attempt so skew can never hide its PaymentIntent. */
+const PROVIDER_CLOCK_SKEW_MS = 60 * 60_000;
 
 export type PaymentAttemptContractCorrelation = {
   version: 2;
@@ -383,6 +387,47 @@ export class PaymentService {
     return { attempt: updated, snapshot };
   }
 
+  /**
+   * P1.1.1 — resolves an attempt whose dispatch left no recorded PaymentIntent (NOT_CREATED /
+   * UNKNOWN, no PI id) with the strongly consistent customer-scoped list, never search alone.
+   * A found PI is recorded through the normal monotonic path; only proven absence closes the
+   * attempt (FAILED + PROVIDER_NOT_CREATED). Provider errors propagate with nothing written.
+   */
+  public async resolveUnsentPaymentAttempt(
+    paymentAttemptId: Types.ObjectId | string,
+  ): Promise<PaymentAttemptDocument> {
+    const attempt = await this.paymentAttemptRepository.findById(paymentAttemptId);
+    if (!attempt) throw new PaymentError("PAYMENT_FAILED", 404);
+    if (
+      attempt.providerPaymentIntentId ||
+      (attempt.providerStatus !== "NOT_CREATED" && attempt.providerStatus !== "UNKNOWN")
+    ) {
+      return attempt;
+    }
+
+    const lookup = await this.requireFindCustomerPaymentIntentByAttempt()({
+      stripeCustomerId: attempt.providerCustomerId,
+      paymentAttemptId: String(attempt._id),
+      createdSince: new Date(attempt.createdAt.getTime() - PROVIDER_CLOCK_SKEW_MS),
+    });
+    if (lookup.outcome === "AMBIGUOUS") {
+      await this.paymentAttemptRepository.markProviderUnknown(
+        attempt._id,
+        "Multiple provider PaymentIntents matched one PaymentAttempt",
+      );
+      throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
+    }
+    if (lookup.outcome === "FOUND_ONE") {
+      this.assertPaymentMatches(lookup.value, attempt, attempt.providerCustomerId);
+      return this.paymentAttemptRepository.recordProviderResult(
+        attempt._id,
+        this.toProviderResultRecord(lookup.value),
+      );
+    }
+    await this.paymentAttemptRepository.markProviderNotCreated(attempt._id);
+    return (await this.paymentAttemptRepository.findById(attempt._id)) ?? attempt;
+  }
+
   public async claimPaymentPersistence(
     paymentAttemptId: string | undefined,
   ): Promise<string | undefined | null> {
@@ -496,6 +541,16 @@ export class PaymentService {
       expectedAmountCents: input.amountCents,
       providerCustomerId: input.stripeCustomerId,
     });
+
+    // P1.1.1 — an operation proven never to have reached the provider is closed for creation:
+    // its FIRST claim may already be released (and re-won by another operation), so it must
+    // never dispatch again. Checked BEFORE binding so nothing is re-bound; the customer retries
+    // under a new key.
+    if (isProviderCreationClosed(attempt)) {
+      throw new PaymentError("PAYMENT_FAILED", 402, [
+        { message: "This payment attempt has expired. Please try again.", code: "PAYMENT_FAILED" },
+      ]);
+    }
 
     if (input.beforeProviderDispatch) await input.beforeProviderDispatch(attempt);
 
@@ -645,6 +700,15 @@ export class PaymentService {
   > {
     if (!this.gateway.findPaymentIntentByMetadata) throw new PaymentError("PAYMENT_FAILED", 503);
     return this.gateway.findPaymentIntentByMetadata.bind(this.gateway);
+  }
+
+  private requireFindCustomerPaymentIntentByAttempt(): NonNullable<
+    PaymentGateway["findCustomerPaymentIntentByAttempt"]
+  > {
+    if (!this.gateway.findCustomerPaymentIntentByAttempt) {
+      throw new PaymentError("PAYMENT_FAILED", 503);
+    }
+    return this.gateway.findCustomerPaymentIntentByAttempt.bind(this.gateway);
   }
 
   private requireRetrieveRefund(): NonNullable<PaymentGateway["retrieveRefund"]> {
