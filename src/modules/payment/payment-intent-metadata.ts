@@ -27,11 +27,11 @@ export type PaymentIntentMetadataInput = {
   chargedAmountCents: number;
   taxCalculationId?: string | undefined;
   taxMode: PaymentTaxMode;
-  /** P1 — additive, optional Financial Contract V2 correlation. `businessClientId` above is the
+  /** P1 — additive, optional Financial Contract (V2/V3) correlation. `businessClientId` above is the
    * customer↔business relationship correlation. */
   financialContract?:
     | {
-        version: 2;
+        version: 2 | 3;
         classification: "FIRST" | "RETURNING";
         productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
       }

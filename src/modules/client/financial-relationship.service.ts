@@ -5,7 +5,7 @@ import { BookingError } from "../booking/booking.errors.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingCreationClaimRepository } from "../booking/booking-creation-claim.repository.js";
 import type {
-  FinancialContractV2,
+  FinancialContract,
   RelationshipClassification,
 } from "../booking/financial-contract.js";
 import type { PaymentAttemptDocument } from "../payment/payment-attempt.model.js";
@@ -68,7 +68,7 @@ export class FinancialRelationshipService {
   public async resolveForFinalize(input: {
     client: BusinessClientDocument;
     identity: FirstClaimIdentity;
-    existingContract?: FinancialContractV2 | undefined;
+    existingContract?: FinancialContract | undefined;
   }): Promise<RelationshipClassification> {
     const { client, identity, existingContract } = input;
     if (existingContract && existingContract.productKind !== identity.productKind) {

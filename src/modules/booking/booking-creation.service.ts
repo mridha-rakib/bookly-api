@@ -45,6 +45,7 @@ import { TaxError } from "../payment/tax.errors.js";
 import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
+import { PromoError } from "../promo/promo.errors.js";
 import type { PromoApplicationService, ResolvedPromo } from "../promo/promo-application.service.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
@@ -71,9 +72,11 @@ import type { CreateBookingInput, CreateManualBookingInput } from "./booking-cre
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import {
   calculateFirstUpfrontCents,
-  FINANCIAL_CONTRACT_VERSION,
+  FINANCIAL_CONTRACT_V2,
+  FINANCIAL_CONTRACT_V3,
+  type FinancialContract,
   type FinancialContractProductKind,
-  type FinancialContractV2,
+  type FinancialContractVersion,
   type RelationshipClassification,
 } from "./financial-contract.js";
 
@@ -127,14 +130,16 @@ export type BookingCreationPreview = {
   balanceDueCents: number;
   requiresSavedCard: boolean;
   hasSavedCard: boolean;
-  /** Batch 13 — present only when a valid `promoCode` was supplied. `preTaxChargeCents` above
-   * already reflects the discount (== `promo.chargeCents`); this breakdown lets the frontend
-   * show the pre-promo deposit and discount without recomputing the taxable amount in React. */
+  /** Present only when a valid `promoCode` was supplied. P2: the promo discounts the booking
+   * PRICE — `financials` (total, deposit, balance) and `preTaxChargeCents` above are already
+   * post-promo; this breakdown lets the frontend show the price before the promo and the
+   * discount without recomputing anything in React. */
   promo?: {
     code: string;
     type: "PERCENTAGE" | "FIXED";
     value: number;
-    depositBeforePromoCents: number;
+    /** services + add-ons − service discount, before the promo (travel excluded). */
+    promoEligibleBaseCents: number;
     discountCents: number;
   };
 };
@@ -177,7 +182,7 @@ type PackageRedemptionPricingContext = {
 type EstablishedFinancialTerms = {
   financials: BookingFinancials;
   resolvedPromo: ResolvedPromo | undefined;
-  contract: FinancialContractV2;
+  contract: FinancialContract;
 };
 
 export type FinalizeBookingResult =
@@ -538,21 +543,8 @@ export class BookingCreationService {
     const classification = this.relationships.peekClassification(existingClient);
     const isFirstBooking = classification === "FIRST";
 
-    const { financials } = this.assembleCustomerFinancials(
-      lines,
-      travelFeeCents,
-      classification,
-      undefined,
-    );
-    const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
-
-    const overallEndAt = lines.reduce(
-      (max, line) => (line.endAt > max ? line.endAt : max),
-      lines[0]?.endAt ?? startAt,
-    );
-
-    // Batch 13 — read-only, side-effect-free promo preview: resolves and computes the discount
-    // against the ALREADY-canonical deposit (never a second pricing engine), but never claims a
+    // P2 — read-only, side-effect-free promo preview: the promo discounts the booking price
+    // BEFORE the upfront is computed (same calculation finalize uses), but never claims a
     // redemption — see PromoApplicationService's own doc comment. A retried/duplicate preview
     // call can never consume usage.
     const resolvedPromo = input.promoCode
@@ -561,17 +553,30 @@ export class BookingCreationService {
           business,
           customerUserId,
           isFirstBooking,
-          depositBeforePromoCents: financials.depositCents,
+          promoEligibleBaseCents: this.assembleFinancials("BOOKLY_MANAGED", lines, travelFeeCents)
+            .eligiblePlatformFeeBasisCents,
         })
       : undefined;
+    const { financials } = this.assembleCustomerFinancials(
+      lines,
+      travelFeeCents,
+      classification,
+      undefined,
+      resolvedPromo?.promoDiscountCents,
+    );
+    this.assertPromoDepositSupportable(financials, resolvedPromo);
+    const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
+
+    const overallEndAt = lines.reduce(
+      (max, line) => (line.endAt > max ? line.endAt : max),
+      lines[0]?.endAt ?? startAt,
+    );
 
     // Checkpoint B (Cyprus VAT, compute-only) — the SAME canonical amount the customer would
-    // actually be charged (post-clamp, post-promo), never the pre-promo deposit. Read-only, like
-    // the rest of this preview: no PaymentIntent, no persistence, and (per this checkpoint's own
+    // actually be charged (P2: the upfront on the promo-discounted price). Read-only, like the
+    // rest of this preview: no PaymentIntent, no persistence, and (per this checkpoint's own
     // scope) the ACTUAL PaymentIntent amount in finalize remains this same pre-tax value.
-    const customerChargeNowCents = resolvedPromo
-      ? resolvedPromo.customerChargeNowCents
-      : financials.depositCents;
+    const customerChargeNowCents = financials.depositCents;
     const computedTax = await this.computeCyprusTax(
       customerChargeNowCents,
       `preview-${new Types.ObjectId().toHexString()}`,
@@ -603,8 +608,8 @@ export class BookingCreationService {
       financials,
       // Batch 6.5: the amount actually charged online is ALWAYS the deposit, first booking or
       // returning — never platformFeeCents, which is 0 for a returning customer even though a
-      // real deposit is still due (see BookingFinancials's own doc comment). Batch 13: when a
-      // valid promo is supplied, this becomes the promo-discounted amount instead.
+      // real deposit is still due (see BookingFinancials's own doc comment). P2: with a promo,
+      // that deposit is computed from the promo-discounted price.
       ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
@@ -614,7 +619,7 @@ export class BookingCreationService {
               code: resolvedPromo.promo.code,
               type: resolvedPromo.promo.type,
               value: resolvedPromo.promo.value,
-              depositBeforePromoCents: resolvedPromo.depositBeforePromoCents,
+              promoEligibleBaseCents: resolvedPromo.promoEligibleBaseCents,
               discountCents: resolvedPromo.promoDiscountCents,
             },
           }
@@ -788,7 +793,7 @@ export class BookingCreationService {
     client: BusinessClientDocument;
     existingClaim: boolean;
     purpose: Extract<PaymentIntentPurpose, "BOOKING_DEPOSIT" | "PACKAGE_PURCHASE">;
-    terms: { contract: FinancialContractV2 };
+    terms: { contract: FinancialContract };
     persist: (
       paymentResult: PaymentIntentResult | undefined,
       persistenceLeaseToken: string | undefined,
@@ -819,9 +824,9 @@ export class BookingCreationService {
 
     let paymentResult: PaymentIntentResult | undefined;
 
-    // Batch 13: the ACTUAL Stripe charge amount/gate is the contract's online charge — a Promo
-    // may fully cover the upfront, and a FIRST zero basis is a zero obligation (never a fake €0
-    // PaymentIntent; the saved-card requirement still applies either way).
+    // The ACTUAL Stripe charge amount/gate is the contract's online charge — a FIRST zero basis
+    // (P2: including a promo that zeroes the price) is a zero obligation, never a fake €0
+    // PaymentIntent; the saved-card requirement still applies either way.
     if (customerChargeNowCents > 0) {
       try {
         paymentResult = await this.chargeContractUpfront({
@@ -1930,7 +1935,7 @@ export class BookingCreationService {
     notes: string | undefined;
     idempotencyKey: string;
     client: BusinessClientDocument;
-    contract: FinancialContractV2;
+    contract: FinancialContract;
     paymentResult: PaymentIntentResult | undefined;
     resolvedPromo: ResolvedPromo | undefined;
     customerChargeNowCents: number;
@@ -1986,21 +1991,22 @@ export class BookingCreationService {
         }));
 
         // P1 — first/returning was decided atomically BEFORE the charge (the relationship claim)
-        // and frozen in the Financial Contract V2, so there is no post-charge race left to
+        // and frozen in the Financial Contract, so there is no post-charge race left to
         // resolve here: the previous `markActivated`-decides-the-ledger-after-money-moved
         // pattern is gone. A concurrent competing first operation never reached a charge.
-        // Batch 13 — `hasDepositObligation` (not `paymentResult` truthiness) gates ledger-
-        // writing: a Promo may reduce the ACTUAL Stripe charge to €0 while a real upfront
-        // ENTITLEMENT still exists (`financials.depositCents > 0`).
+        // `hasDepositObligation` (not `paymentResult` truthiness) gates ledger-writing: a zero
+        // obligation (P2: e.g. a 100% promo on a FIRST booking) writes no ledger row.
         const hasDepositObligation = params.financials.depositCents > 0;
         const financials = params.financials;
 
-        // Batch 13 — an ALL_FIRST_BOOKINGS promo re-validates against the authoritative
-        // classification (unchanged pre-P2 promo economics).
+        // The authoritative, atomic usage consumption — only here, inside the persistence
+        // transaction (no pre-payment reservation); an ALL_FIRST_BOOKINGS promo re-validates
+        // against the authoritative classification. A rollback removes the consumption.
         if (params.resolvedPromo) {
           await this.promoApplicationService.claimRedemption(
             {
               resolved: params.resolvedPromo,
+              requiredUpfrontCents: params.contract.requiredUpfrontCents,
               bookingId: params.bookingId,
               businessId: params.business._id,
               customerUserId: params.createdBy.actorUserId,
@@ -2055,7 +2061,8 @@ export class BookingCreationService {
                     value: params.resolvedPromo.promo.value,
                     discountCents: params.resolvedPromo.promoDiscountCents,
                     chargeCents: params.customerChargeNowCents,
-                    fundingOwner: "BOOKLY" as const,
+                    // P2 — only a V3 contract can carry a promo (see establishFinancialTerms).
+                    fundingOwner: "BUSINESS" as const,
                     appliedAt: new Date(),
                   },
                 }
@@ -2077,19 +2084,14 @@ export class BookingCreationService {
           // (see BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first
           // booking, DEPOSIT (already part of this ledger's vocabulary — see
           // booking-financial-transaction.types.ts — never PLATFORM_FEE) for a returning
-          // customer's Business-owned prepayment. Batch 13: `amountCents` is the amount
-          // ACTUALLY charged (post-promo) — every downstream reader of "the customer's upfront
-          // payment" (cancellation/no-show netting, refunds — see
-          // BookingFinancialTransactionService.findSucceededUpfrontPayment) already reads this
-          // real ledger amount, never `financials.depositCents` directly, so nothing else needs
-          // to change for promo-aware cancellation/no-show exposure. Skipped entirely when a
-          // Promo fully covers the deposit (`customerChargeNowCents === 0`): the ledger schema's
-          // own `amountCents` invariant requires a positive amount (a real, immutable financial
-          // event must represent SOME money movement) — a real €0 DEBIT would carry no
-          // information no other row already carries, so it is never written rather than
-          // relaxing that invariant for a case with nothing to record. The Booking's own `promo`
-          // snapshot (chargeCents: 0) and the PromoRedemption audit row remain the complete,
-          // truthful record of what happened.
+          // customer's Business-owned prepayment. `amountCents` is the amount ACTUALLY charged
+          // (P2: the full upfront computed on the promo-discounted price, never upfront − promo)
+          // — every downstream reader of "the customer's upfront payment" (cancellation/no-show
+          // netting, refunds — see BookingFinancialTransactionService.findSucceededUpfrontPayment)
+          // reads this real ledger amount. Skipped entirely for a zero charge: the ledger
+          // schema's own `amountCents` invariant requires a positive amount (a real, immutable
+          // financial event must represent SOME money movement), so a fake €0 row is never
+          // written.
           if (params.customerChargeNowCents > 0) {
             const transaction = await this.financialTransactionService.record(
               {
@@ -2113,29 +2115,9 @@ export class BookingCreationService {
             );
             succeededTransactionId = transaction._id;
           }
-
-          // Batch 13 — a RETURNING booking's Promo shortfall: the Business is still owed the
-          // FULL pre-promo deposit (rule #3 — "do NOT simply reduce DEPOSIT... the authoritative
-          // Business-owned economic deposit remains [the full amount]"). Never written for a
-          // FIRST booking's promo — there Bookly simply collects less PLATFORM_FEE and no other
-          // party needs compensating (see PROMO_SUBSIDY's own type-level doc comment).
-          if (params.resolvedPromo && !isFirst && params.resolvedPromo.promoDiscountCents > 0) {
-            await this.financialTransactionService.record(
-              {
-                businessId: params.business._id,
-                bookingId: params.bookingId,
-                businessClientId: params.client._id,
-                customerUserId: params.createdBy.actorUserId,
-                type: "PROMO_SUBSIDY",
-                direction: "CREDIT",
-                amountCents: params.resolvedPromo.promoDiscountCents,
-                currency: params.financials.currency,
-                status: "SUCCEEDED",
-                idempotencyKey: `${params.idempotencyKey}:promo-subsidy`,
-              },
-              dbSession,
-            );
-          }
+          // P2 — no PROMO_SUBSIDY: the Business funds the promo (its booking price, and so its
+          // entitlement, is already discounted). The ledger type stays readable for Batch 13
+          // history only.
         }
 
         // P1 — FIRST_PENDING -> CONSUMED in this SAME transaction, fenced on this exact logical
@@ -2577,6 +2559,7 @@ export class BookingCreationService {
     source: BookingSource,
     lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
     travelFeeCents: number,
+    promoDiscountCents?: number | undefined,
   ): BookingFinancials {
     const servicesSubtotalCents = lines.reduce((sum, line) => sum + line.amountCents, 0);
     const addonsSubtotalCents = lines.reduce(
@@ -2584,8 +2567,14 @@ export class BookingCreationService {
       0,
     );
     const serviceDiscountCents = lines.reduce((sum, line) => sum + line.discountCents, 0);
+    // P2 — a (normal-booking-only) promo discounts the price AFTER the service discount and
+    // BEFORE any deposit is computed; travel is never discounted. Without a promo this is the
+    // unchanged legacy basis.
     const eligiblePlatformFeeBasisCents =
-      servicesSubtotalCents + addonsSubtotalCents - serviceDiscountCents;
+      servicesSubtotalCents +
+      addonsSubtotalCents -
+      serviceDiscountCents -
+      (promoDiscountCents ?? 0);
 
     // The deposit: charged online for EVERY BOOKLY_MANAGED booking (confirmed rule, Batch 6.5)
     // — never gated on first/returning. A MANUAL Booking never has one (rule E).
@@ -2613,6 +2602,7 @@ export class BookingCreationService {
       servicesSubtotalCents,
       addonsSubtotalCents,
       serviceDiscountCents,
+      ...(promoDiscountCents !== undefined ? { promoDiscountCents } : {}),
       travelFeeCents,
       eligiblePlatformFeeBasisCents,
       platformFeeCents,
@@ -2633,17 +2623,27 @@ export class BookingCreationService {
    *    travel never expand Bookly's first upfront). Bookly-owned: platformFeeCents = upfront.
    *
    * Travel is excluded from every basis. Add-ons/travel remain in totalCents/balanceDueCents as
-   * the Business-collected balance. `eligiblePlatformFeeBasisCents` keeps its validated legacy
-   * meaning (it is the cancellation/no-show basis); the FIRST basis is returned separately and
-   * recorded in the Financial Contract V2.
+   * the Business-collected balance. `eligiblePlatformFeeBasisCents` is the cancellation/no-show
+   * basis; the FIRST basis is returned separately and recorded in the Financial Contract.
+   *
+   * P2 — `promoDiscountCents` (normal bookings only; never with `packageBundlePriceCents`)
+   * discounts the normal price first, so FIRST and RETURNING both compute their (unchanged)
+   * formula from the discounted price, and that discounted price is also the stored
+   * cancellation/no-show basis and the booking total (plus travel).
    */
   private assembleCustomerFinancials(
     lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
     travelFeeCents: number,
     classification: RelationshipClassification,
     packageBundlePriceCents: number | undefined,
+    promoDiscountCents?: number | undefined,
   ): { financials: BookingFinancials; eligibleBasisCents: number } {
-    const returning = this.assembleFinancials("BOOKLY_MANAGED", lines, travelFeeCents);
+    const returning = this.assembleFinancials(
+      "BOOKLY_MANAGED",
+      lines,
+      travelFeeCents,
+      promoDiscountCents,
+    );
     if (classification === "RETURNING") {
       return { financials: returning, eligibleBasisCents: returning.eligiblePlatformFeeBasisCents };
     }
@@ -2662,12 +2662,46 @@ export class BookingCreationService {
   }
 
   /**
-   * P1 — the authoritative classification + immutable Financial Contract V2 for one logical
+   * P2 — until P3 removes the RETURNING online deposit, its legacy €5 floor can exceed a booking
+   * whose price a promo lowered (a deposit the booking cannot support). Rejected here, BEFORE any
+   * contract, tax compute or provider call: no PaymentIntent, nothing persisted, no promo usage
+   * consumed — the customer can retry without the promo. FIRST can never trip this (its upfront
+   * is capped at the discounted basis).
+   */
+  private assertPromoDepositSupportable(
+    financials: BookingFinancials,
+    resolvedPromo: ResolvedPromo | undefined,
+  ): void {
+    if (resolvedPromo && financials.depositCents > financials.totalCents) {
+      throw new PromoError("PROMO_BELOW_MINIMUM_DEPOSIT", 400);
+    }
+  }
+
+  /** V3 for every new NORMAL booking (P2 promo economics). A package purchase stays V2 (it never
+   * carries a promo); a normal operation recorded under V2 before P2 resumes under V2. */
+  private financialContractVersionFor(
+    productKind: FinancialContractProductKind,
+    existingContract: FinancialContract | undefined,
+  ): FinancialContractVersion {
+    if (productKind === "PACKAGE_PURCHASE") return FINANCIAL_CONTRACT_V2;
+    return existingContract?.version === FINANCIAL_CONTRACT_V2
+      ? FINANCIAL_CONTRACT_V2
+      : FINANCIAL_CONTRACT_V3;
+  }
+
+  /**
+   * P1 — the authoritative classification + immutable Financial Contract for one logical
    * operation, established AFTER the BookingCreationClaim exists and BEFORE any tax compute or
    * provider charge. The relationship claim (ELIGIBLE -> FIRST_PENDING) happens first; a
    * competing first operation gets BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS here with nothing
    * charged. Any later failure in this stage is a proven pre-money failure and releases a FIRST
-   * claim this operation holds.
+   * claim this operation holds (a bound one defers to its durable PaymentAttempt state).
+   *
+   * P2 — the promo is re-resolved from scratch on every attempt (an expired/deactivated/
+   * exhausted promo fails here) and its identity + economics are frozen in the V3 contract, so a
+   * resumed operation whose promo was edited or replaced — even by an equal discount — fails
+   * closed in recordFinancialContract. Never repriced: a captured charge is left to P0
+   * compensation.
    */
   private async establishFinancialTerms(params: {
     business: BusinessDocument;
@@ -2676,7 +2710,7 @@ export class BookingCreationService {
     idempotencyKey: string;
     bookingId: Types.ObjectId;
     productKind: FinancialContractProductKind;
-    existingContract: FinancialContractV2 | undefined;
+    existingContract: FinancialContract | undefined;
     lines: ResolvedServiceLine[];
     travelFeeCents: number;
     packageBundlePriceCents?: number | undefined;
@@ -2695,32 +2729,46 @@ export class BookingCreationService {
     });
 
     try {
-      const { financials, eligibleBasisCents } = this.assembleCustomerFinancials(
+      const version = this.financialContractVersionFor(params.productKind, params.existingContract);
+      // A pre-P2 (V2) promo operation discounted only its upfront — terms P2 no longer produces.
+      // It can never be reproduced exactly, so it fails closed (P0 compensates any capture).
+      if (
+        version === FINANCIAL_CONTRACT_V2 &&
+        (params.promoCode !== undefined || (params.existingContract?.promoDiscountCents ?? 0) > 0)
+      ) {
+        throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+      }
+
+      // The normal promo-eligible price: services + add-ons − service discount (travel excluded).
+      const promoEligibleBaseCents = this.assembleFinancials(
+        "BOOKLY_MANAGED",
         params.lines,
         params.travelFeeCents,
-        classification,
-        params.packageBundlePriceCents,
-      );
-
-      // Batch 13 promo, deliberately UNCHANGED (pre-P2) economics: it discounts only the upfront
-      // charge. Re-validated from scratch against the AUTHORITATIVE classification (never a
-      // prior preview), so an ALL_FIRST_BOOKINGS promo can no longer be resolved against an
-      // optimistic guess that a race later disproves.
+      ).eligiblePlatformFeeBasisCents;
+      // Re-validated from scratch against the AUTHORITATIVE classification (never a prior
+      // preview), so an ALL_FIRST_BOOKINGS promo can never be resolved against an optimistic
+      // guess that a race later disproves.
       const resolvedPromo = params.promoCode
         ? await this.promoApplicationService.resolve({
             code: params.promoCode,
             business: params.business,
             customerUserId: params.customerUserId,
             isFirstBooking: classification === "FIRST",
-            depositBeforePromoCents: financials.depositCents,
+            promoEligibleBaseCents,
           })
         : undefined;
-      const onlineChargeCents = resolvedPromo
-        ? resolvedPromo.customerChargeNowCents
-        : financials.depositCents;
 
-      const contract: FinancialContractV2 = {
-        version: FINANCIAL_CONTRACT_VERSION,
+      const { financials, eligibleBasisCents } = this.assembleCustomerFinancials(
+        params.lines,
+        params.travelFeeCents,
+        classification,
+        params.packageBundlePriceCents,
+        resolvedPromo?.promoDiscountCents,
+      );
+      this.assertPromoDepositSupportable(financials, resolvedPromo);
+
+      const contract: FinancialContract = {
+        version,
         productKind: params.productKind,
         classification,
         idempotencyKey: params.idempotencyKey,
@@ -2730,15 +2778,28 @@ export class BookingCreationService {
         businessClientId: params.client._id,
         currency: financials.currency,
         eligibleBasisCents,
+        ...(version === FINANCIAL_CONTRACT_V3 ? { promoEligibleBaseCents } : {}),
         requiredUpfrontCents: financials.depositCents,
-        promoDiscountCents: financials.depositCents - onlineChargeCents,
-        onlineChargeCents,
+        promoDiscountCents: resolvedPromo?.promoDiscountCents ?? 0,
+        // P2 — the promo already lowered the price, so the whole upfront is charged online.
+        onlineChargeCents: financials.depositCents,
         travelFeeCents: financials.travelFeeCents,
         ...(params.packageBundlePriceCents !== undefined
           ? { packageBundlePriceCents: params.packageBundlePriceCents }
           : {}),
         bookingTotalCents: financials.totalCents,
         upfrontLedgerType: classification === "FIRST" ? "PLATFORM_FEE" : "DEPOSIT",
+        ...(resolvedPromo
+          ? {
+              promo: {
+                promoId: resolvedPromo.promo._id,
+                normalizedCode: resolvedPromo.promo.normalizedCode,
+                type: resolvedPromo.promo.type,
+                value: resolvedPromo.promo.value,
+                fundingOwner: "BUSINESS" as const,
+              },
+            }
+          : {}),
       };
       await this.claimRepository.recordFinancialContract(params.idempotencyKey, contract);
       return { financials, resolvedPromo, contract };
@@ -2770,7 +2831,7 @@ export class BookingCreationService {
     customerUserId: string;
     business: BusinessDocument;
     client: BusinessClientDocument;
-    contract: FinancialContractV2;
+    contract: FinancialContract;
     purpose: Extract<PaymentIntentPurpose, "BOOKING_DEPOSIT" | "PACKAGE_PURCHASE">;
     computedTax: ComputedTax | undefined;
   }): Promise<PaymentIntentResult> {

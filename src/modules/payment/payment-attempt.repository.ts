@@ -18,7 +18,7 @@ export type CreatePaymentAttemptInput = {
   packageProgressId?: Types.ObjectId | string | undefined;
   purpose: string;
   productKind?: "NORMAL_BOOKING" | "PACKAGE_PURCHASE" | undefined;
-  financialContractVersion?: 2 | undefined;
+  financialContractVersion?: 2 | 3 | undefined;
   relationshipClassification?: "FIRST" | "RETURNING" | undefined;
   businessClientId?: Types.ObjectId | string | undefined;
   currency: string;
@@ -387,7 +387,7 @@ export class PaymentAttemptRepository {
 
   /**
    * P1.1 — FIRST-only stale requires_action candidates (deliberately NOT part of
-   * `listRecoverable`): a bound, dispatched Financial Contract V2 FIRST charge that has waited
+   * `listRecoverable`): a bound, dispatched Financial Contract (V2/V3) FIRST charge that has waited
    * on customer authentication since before `staleBefore`, with no persistence or compensation
    * started. Ownership of the relationship claim is verified per candidate by the caller.
    */
@@ -397,7 +397,7 @@ export class PaymentAttemptRepository {
   ): Promise<PaymentAttemptDocument[]> {
     return PaymentAttemptModel.find({
       providerStatus: "REQUIRES_ACTION",
-      financialContractVersion: 2,
+      financialContractVersion: { $in: [2, 3] },
       relationshipClassification: "FIRST",
       providerPaymentIntentId: { $type: "string" },
       persistenceStatus: "NOT_STARTED",
@@ -413,7 +413,7 @@ export class PaymentAttemptRepository {
   /**
    * P1.1.1 — FIRST-only candidates whose provider dispatch never produced a recorded
    * PaymentIntent (crash before/at create, or a create that failed/timed out with no PI in the
-   * response): bound V2 FIRST charges in NOT_CREATED/UNKNOWN with no PI id, nothing persisted or
+   * response): bound V2/V3 FIRST charges in NOT_CREATED/UNKNOWN with no PI id, nothing persisted or
    * compensated, created before `staleBefore`. Ownership is verified per candidate by the caller.
    */
   public async listStaleFirstUnsent(
@@ -422,7 +422,7 @@ export class PaymentAttemptRepository {
   ): Promise<PaymentAttemptDocument[]> {
     return PaymentAttemptModel.find({
       providerStatus: { $in: ["NOT_CREATED", "UNKNOWN"] },
-      financialContractVersion: 2,
+      financialContractVersion: { $in: [2, 3] },
       relationshipClassification: "FIRST",
       providerPaymentIntentId: { $exists: false },
       persistenceStatus: "NOT_STARTED",

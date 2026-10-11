@@ -10,6 +10,7 @@ export type CreatePromoRedemptionInput = {
   bookingId: Types.ObjectId;
   businessId: Types.ObjectId;
   customerUserId: Types.ObjectId;
+  promoEligibleBaseCents?: number | undefined;
   depositBeforePromoCents: number;
   promoDiscountCents: number;
   customerChargeNowCents: number;
@@ -58,13 +59,14 @@ export class PromoRedemptionRepository {
   /** Batch 13 — Super Admin Finance "Discounted money" card: one reduced sum of every
    * Bookly-funded promo discount actually applied within a period, never a raw dump. Bounded by
    * `redeemedAt` (when the discount actually happened), matching every other period-bounded
-   * Finance read in this codebase. */
+   * Finance read in this codebase. P2 — Business-funded redemptions are not Bookly's cost, so
+   * only BOOKLY-funded (legacy) rows count toward this Bookly-funded figure. */
   public async sumDiscountInRange(
     from: Date,
     to: Date,
   ): Promise<{ totalCents: number; count: number }> {
     const result = await PromoRedemptionModel.aggregate<{ totalCents: number; count: number }>([
-      { $match: { redeemedAt: { $gte: from, $lt: to } } },
+      { $match: { redeemedAt: { $gte: from, $lt: to }, fundingOwner: "BOOKLY" } },
       {
         $group: {
           _id: null,

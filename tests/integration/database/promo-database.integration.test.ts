@@ -535,7 +535,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
 
   // --- Financial correctness: FIRST booking --------------------------------------------------
 
-  it("[26] [financial-ownership] FIRST booking: €80 service -> €16 deposit, €5 promo -> customer pays €11, Bookly's PLATFORM_FEE is €11 (never €16), no PROMO_SUBSIDY written", async () => {
+  it("[26] [P2] FIRST booking: €80 service, €5 promo -> €75 price, FIRST upfront 20% of €75 = €15 charged in full as PLATFORM_FEE, Business-funded, no PROMO_SUBSIDY", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({ code: "FIVE", type: "FIXED", value: 500, createdByUserId: superAdmin._id });
 
@@ -551,25 +551,34 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (result.status !== "confirmed") throw new Error("expected confirmed");
 
-    // The canonical, un-discounted entitlement stays €16 — never rewritten.
-    expect(result.booking.financials.depositCents).toBe(1600);
-    expect(result.booking.financials.platformFeeCents).toBe(1600);
-    // The promo snapshot records what actually happened.
-    expect(result.booking.promo?.discountCents).toBe(500);
-    expect(result.booking.promo?.chargeCents).toBe(1100);
+    // The promo lowers the booking PRICE first; the FIRST formula then runs on €75.
+    expect(result.booking.financials).toMatchObject({
+      servicesSubtotalCents: 8000,
+      promoDiscountCents: 500,
+      eligiblePlatformFeeBasisCents: 7500,
+      totalCents: 7500,
+      depositCents: 1500,
+      platformFeeCents: 1500,
+      balanceDueCents: 6000,
+    });
+    expect(result.booking.promo).toMatchObject({
+      discountCents: 500,
+      chargeCents: 1500,
+      fundingOwner: "BUSINESS",
+    });
 
     const ledger = await financialTransactionService.listForBooking(result.booking._id);
     const platformFeeEntry = ledger.find((e) => e.type === "PLATFORM_FEE");
-    expect(platformFeeEntry?.amountCents).toBe(1100); // the REAL charged/ledgered amount
+    expect(platformFeeEntry?.amountCents).toBe(1500); // U, never U - P
     expect(ledger.find((e) => e.type === "PROMO_SUBSIDY")).toBeUndefined();
 
     const summary = await financeService.getPlatformSummary(around());
-    expect(summary.bookly.grossCents).toBe(1100);
+    expect(summary.bookly.grossCents).toBe(1500);
   });
 
-  // --- Financial correctness: RETURNING booking (the critical scenario) -----------------------
+  // --- Financial correctness: RETURNING booking (pre-P3 legacy deposit on the discounted price) --
 
-  it("[27][28][29] [financial-ownership] RETURNING booking: customer pays €11 (€16 - €5 promo), Business is STILL entitled to the full €16 via a PROMO_SUBSIDY credit, Stripe fee is deducted from the REAL €11 charge only", async () => {
+  it("[27][28][29] [P2] RETURNING booking: €5 promo lowers the price to €75, legacy deposit 20% of €75 = €15 charged as DEPOSIT, no PROMO_SUBSIDY, Business bears the promo", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({ code: "FIVE", type: "FIXED", value: 500, createdByUserId: superAdmin._id });
 
@@ -593,36 +602,44 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
 
-    expect(second.booking.financials.depositCents).toBe(1600);
-    expect(second.booking.financials.platformFeeCents).toBe(0); // returning: never Bookly's
-    expect(second.booking.promo?.discountCents).toBe(500);
-    expect(second.booking.promo?.chargeCents).toBe(1100);
+    expect(second.booking.financials).toMatchObject({
+      promoDiscountCents: 500,
+      eligiblePlatformFeeBasisCents: 7500,
+      totalCents: 7500,
+      depositCents: 1500,
+      platformFeeCents: 0, // returning: never Bookly's
+      balanceDueCents: 6000,
+    });
+    expect(second.booking.promo).toMatchObject({
+      discountCents: 500,
+      chargeCents: 1500,
+      fundingOwner: "BUSINESS",
+    });
+    expect(second.booking.financialContract).toMatchObject({
+      version: 3,
+      classification: "RETURNING",
+      upfrontLedgerType: "DEPOSIT",
+    });
 
     const ledger = await financialTransactionService.listForBooking(second.booking._id);
-    const depositEntry = ledger.find((e) => e.type === "DEPOSIT");
-    expect(depositEntry?.amountCents).toBe(1100); // the REAL amount actually charged to Stripe
-    const subsidyEntry = ledger.find((e) => e.type === "PROMO_SUBSIDY");
-    expect(subsidyEntry).toBeDefined();
-    expect(subsidyEntry?.direction).toBe("CREDIT");
-    expect(subsidyEntry?.amountCents).toBe(500); // exactly the shortfall
+    expect(ledger.find((e) => e.type === "DEPOSIT")?.amountCents).toBe(1500);
+    expect(ledger.find((e) => e.type === "PROMO_SUBSIDY")).toBeUndefined();
 
     await settleProcessingFee(second.booking._id);
     const settled = await financialTransactionService.listForBooking(second.booking._id);
     const processingFeeEntry = settled.find(
       (e) => e.type === "PROCESSING_FEE" && e.metadata?.["sourceType"] === "DEPOSIT",
     );
-    expect(processingFeeEntry).toBeDefined();
     expect(processingFeeEntry?.amountCents).toBe(55); // the fixture's fixed 55-cent fee
 
-    // Business's total economic entitlement: €11 (real charge) + €5 (Bookly subsidy) - €0.55
-    // (Stripe fee on the REAL €11 charge) = €15.45 — the full €16 minus only the real fee, never
-    // reduced by the promo itself.
+    // The Business bears the promo: its online-collected entitlement is the €15 deposit on the
+    // discounted price (the €60 balance is collected at the venue) — no Bookly top-up.
     const payable = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
-    expect(payable.grossCents).toBe(1100 + 500);
-    expect(payable.netCents).toBe(1100 + 500 - 55);
+    expect(payable.grossCents).toBe(1500);
+    expect(payable.netCents).toBe(1500 - 55);
   });
 
-  it("[9][33] service discount + Promo stack sequentially — Promo never touches Service price", async () => {
+  it("[9][33] [P2] service discount happens BEFORE the promo; the promo never rewrites Service pricing", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({
       code: "HALF",
@@ -631,7 +648,8 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       createdByUserId: superAdmin._id,
     });
 
-    // €100 service, 10% service discount -> €90 basis -> €18 deposit (within €5-35 clamp).
+    // €100 service, 10% service discount -> €90; 50% promo of €90 = €45 -> €45 price;
+    // FIRST 20% of €45 = €9.
     const { owner, business, membership, service } = await setupBookableBusiness(10_000, 10);
     const customer = await createCustomer("stacking");
     await saveCard(customer._id);
@@ -644,25 +662,39 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (result.status !== "confirmed") throw new Error("expected confirmed");
 
-    expect(result.booking.financials.serviceDiscountCents).toBe(1000); // 10% of €100
-    expect(result.booking.financials.eligiblePlatformFeeBasisCents).toBe(9000); // €90
-    expect(result.booking.financials.depositCents).toBe(1800); // 20% of €90
-    expect(result.booking.promo?.discountCents).toBe(900); // 50% of €18
+    expect(result.booking.financials).toMatchObject({
+      serviceDiscountCents: 1000,
+      promoDiscountCents: 4500,
+      eligiblePlatformFeeBasisCents: 4500,
+      totalCents: 4500,
+      depositCents: 900,
+    });
+    expect(result.booking.financialContract).toMatchObject({
+      promoEligibleBaseCents: 9000,
+      promoDiscountCents: 4500,
+      eligibleBasisCents: 4500,
+    });
     expect(result.booking.promo?.chargeCents).toBe(900);
     // The Service's own snapshot is untouched by the promo.
     expect(result.booking.serviceLines[0]?.amountCents).toBe(10_000);
   });
 
-  // --- Fixed-above-deposit and 100% edge cases --------------------------------------------------
+  // --- FIXED-above-price and 100% edge cases ----------------------------------------------------
 
-  it("[23][34] a FIXED promo larger than the deposit clamps to exactly the deposit — €0 due, no negative balance, no credit", async () => {
+  it("[23][34] [P2] a FIXED promo larger than the booking price is capped at the price — €0 price, no PaymentIntent, no ledger, no credit", async () => {
     const superAdmin = await createSuperAdmin();
-    await createPromo({ code: "BIG", type: "FIXED", value: 2500, createdByUserId: superAdmin._id });
+    await createPromo({
+      code: "BIG",
+      type: "FIXED",
+      value: 10_000,
+      createdByUserId: superAdmin._id,
+    });
 
-    const { owner, business, membership, service } = await setupBookableBusiness(8000); // €16 deposit
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("fixed-above");
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const piBefore = paymentGateway.paymentIntentInputs.length;
 
     const result = await creationService.finalizeCustomerBooking(
       String(customer._id),
@@ -671,18 +703,21 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (result.status !== "confirmed") throw new Error("expected confirmed");
 
-    expect(result.booking.promo?.discountCents).toBe(1600); // clamped, never 2500
+    expect(result.booking.promo?.discountCents).toBe(8000); // capped at the price, never €100
     expect(result.booking.promo?.chargeCents).toBe(0);
+    expect(result.booking.financials).toMatchObject({
+      eligiblePlatformFeeBasisCents: 0,
+      totalCents: 0,
+      depositCents: 0,
+      balanceDueCents: 0,
+    });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(piBefore);
 
-    // A real €0 ledger DEBIT is never written (the schema's own amountCents invariant requires
-    // a positive amount, and a €0 row would carry no information the Booking's own promo
-    // snapshot doesn't already carry) — no fake Stripe charge, no PLATFORM_FEE entry at all.
     const ledger = await financialTransactionService.listForBooking(result.booking._id);
-    expect(ledger.find((e) => e.type === "PLATFORM_FEE")).toBeUndefined();
-    expect(ledger.find((e) => e.type === "DEPOSIT")).toBeUndefined();
+    expect(ledger).toHaveLength(0);
   });
 
-  it("[24][25] a 100% PERCENTAGE promo zero-charges the booking; card is still saved (real SetupIntent), booking is real and finalizable", async () => {
+  it("[24][25] [P2] a 100% PERCENTAGE promo zeroes the FIRST price: €0 due, no PI, card still saved, booking real and UPCOMING", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({
       code: "FREE",
@@ -705,7 +740,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       preTaxChargeCents: 0,
       taxCents: 0,
       dueNowCents: 0,
-      balanceDueCents: 6_400,
+      balanceDueCents: 0,
     });
     expect(taxGateway.calls).toHaveLength(0);
 
@@ -717,6 +752,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     if (result.status !== "confirmed") throw new Error("expected confirmed");
     expect(result.booking.promo?.chargeCents).toBe(0);
     expect(result.booking.status).toBe("UPCOMING");
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
 
     const cardStatus = await paymentService.getSavedCardStatus(String(customer._id));
     expect(cardStatus.hasSavedCard).toBe(true);
@@ -974,8 +1010,11 @@ describe("database-backed Promo Code system (Batch 13)", () => {
         String(business._id),
         finalizeInput(service._id, membership._id, "PREVIEWONLY"),
       );
-      expect(preview.promo?.depositBeforePromoCents).toBe(2_000);
-      expect(preview.promo?.discountCents).toBe(500);
+      // P2: 25% off the €100 price = €25 -> €75 price -> FIRST 20% of €75 = €15.
+      expect(preview.promo?.promoEligibleBaseCents).toBe(10_000);
+      expect(preview.promo?.discountCents).toBe(2_500);
+      expect(preview.financials.totalCents).toBe(7_500);
+      expect(preview.balanceDueCents).toBe(6_000);
       expect(preview.preTaxChargeCents).toBe(1_500);
       expect(preview.taxCents).toBe(285);
       expect(preview.dueNowCents).toBe(1_785);
@@ -1025,7 +1064,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
 
   // --- Cancellation/no-show basis is promo-aware -------------------------------------------------
 
-  it("[30] cancellation netting uses the REAL post-promo charged amount, never the pre-promo entitlement", async () => {
+  it("[30] [P2] the stored cancellation/no-show basis is the discounted price, and netting reads the real charged upfront", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({
       code: "CANCELPROMO",
@@ -1034,7 +1073,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       createdByUserId: superAdmin._id,
     });
 
-    const { owner, business, membership, service } = await setupBookableBusiness(8000); // €16 deposit
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("cancel-promo");
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
@@ -1045,14 +1084,14 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       finalizeInput(service._id, membership._id, "CANCELPROMO"),
     );
     if (result.status !== "confirmed") throw new Error("expected confirmed");
-    expect(result.booking.promo?.chargeCents).toBe(1100); // €16 - €5
+    // The field every cancellation/no-show percentage reads (P4/P5 operate on it later).
+    expect(result.booking.financials.eligiblePlatformFeeBasisCents).toBe(7500); // €80 - €5
+    expect(result.booking.promo?.chargeCents).toBe(1500); // 20% of €75
 
     const upfront = await financialTransactionService.findSucceededUpfrontPayment(
       result.booking._id,
     );
-    // The netting primitive every cancellation/no-show caller already uses reads the REAL
-    // charged amount automatically — zero changes needed to that code for promo-awareness.
-    expect(upfront?.amountCents).toBe(1100);
+    expect(upfront?.amountCents).toBe(1500);
   });
 
   // --- Redemption permanence -----------------------------------------------------------------
@@ -1288,7 +1327,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     expect(updated?.value).toBe(750);
   });
 
-  it("[P2.0] money contract: a €5 FIXED promo sent as 500 cents is stored as 500 and discounts exactly €5 off the €16 deposit", async () => {
+  it("[P2.0] money contract: a €5 FIXED promo sent as 500 cents is stored as 500 and discounts exactly €5 off the €80 booking price", async () => {
     const superAdmin = await createSuperAdmin();
     const app = buildSuperAdminApp();
 
@@ -1300,7 +1339,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     expect(created.status).toBe(201);
     expect((await promoRepository.findByNormalizedCode("EUROFIVE"))?.value).toBe(500);
 
-    const { owner, business, membership, service } = await setupBookableBusiness(8000); // €16 deposit
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("eurofive");
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
@@ -1315,7 +1354,8 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     expect(result.booking.promo?.type).toBe("FIXED");
     expect(result.booking.promo?.value).toBe(500);
     expect(result.booking.promo?.discountCents).toBe(500);
-    expect(result.booking.promo?.chargeCents).toBe(1100);
+    expect(result.booking.financials.totalCents).toBe(7500);
+    expect(result.booking.promo?.chargeCents).toBe(1500); // P2: FIRST 20% of €75
   });
 
   // --- Delete safety: never destroys audit history ------------------------------------------------

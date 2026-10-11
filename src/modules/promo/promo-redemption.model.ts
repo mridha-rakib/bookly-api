@@ -24,14 +24,21 @@ export type PromoRedemptionDocument = {
   bookingId: Types.ObjectId;
   businessId: Types.ObjectId;
   customerUserId: Types.ObjectId;
-  /** The canonical, un-discounted online booking-time amount (== the Booking's own
-   * `financials.depositCents`, snapshotted here too since immutability of THIS row must not
-   * depend on the Booking document never changing it later). */
+  /** P2 only (BUSINESS-funded rows) — the normal booking price BEFORE the promo: services +
+   * add-ons − service discount, travel excluded. The discounted price is
+   * `promoEligibleBaseCents − promoDiscountCents`. Absent on Batch 13 (BOOKLY-funded) rows. */
+  promoEligibleBaseCents?: number | undefined;
+  /** Batch 13 rows: the un-discounted online upfront the promo was taken off. P2 rows: the
+   * upfront computed from the DISCOUNTED price (no separate pre-promo upfront exists), so it
+   * equals `customerChargeNowCents`. Snapshotted here so THIS row's immutability never depends
+   * on the Booking document. */
   depositBeforePromoCents: number;
+  /** Batch 13 rows: off the upfront. P2 rows: off the booking price (`promoEligibleBaseCents`). */
   promoDiscountCents: number;
-  /** What the customer actually paid online — always `depositBeforePromoCents -
-   * promoDiscountCents`, clamped at 0. */
+  /** What the customer actually paid online. Batch 13: `depositBeforePromoCents -
+   * promoDiscountCents`, clamped at 0. P2: the full upfront on the discounted price. */
   customerChargeNowCents: number;
+  /** BOOKLY (Batch 13, legacy) or BUSINESS (every P2 redemption). */
   fundingOwner: PromoFundingOwner;
   /** The REAL, post-activation-race-resolution first/returning outcome (never the pre-charge
    * optimistic snapshot) — see booking-creation.service.ts's promo integration comment. */
@@ -50,6 +57,7 @@ const promoRedemptionSchema = new Schema<PromoRedemptionDocument>(
     bookingId: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     customerUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    promoEligibleBaseCents: { type: Number, min: 0, validate: Number.isInteger },
     depositBeforePromoCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     promoDiscountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     customerChargeNowCents: { type: Number, required: true, min: 0, validate: Number.isInteger },

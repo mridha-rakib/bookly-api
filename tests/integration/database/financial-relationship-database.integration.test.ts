@@ -684,7 +684,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
         .orFail()
         .exec();
       expect(attempt.relationshipClassification).toBe("FIRST");
-      expect(attempt.financialContractVersion).toBe(2);
+      expect(attempt.financialContractVersion).toBe(3); // P2: every new normal booking is V3
       let row = await relationshipOf(client._id);
       expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
       expect(String(row.financialRelationship?.pending?.paymentAttemptId)).toBe(
@@ -806,7 +806,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
       expect(stateAtProvider?.financialRelationship?.pending?.paymentAttemptId).toBeDefined();
       expect(booking.financials).toMatchObject({ depositCents: 2_000, platformFeeCents: 2_000 });
       expect(booking.financialContract).toMatchObject({
-        version: 2,
+        version: 3,
         productKind: "NORMAL_BOOKING",
         classification: "FIRST",
         eligibleBasisCents: 10_000,
@@ -845,11 +845,11 @@ describe("P1 — universal customer↔business financial relationship + Financia
       expect(attempt).toMatchObject({
         persistenceStatus: "COMPLETED",
         relationshipClassification: "FIRST",
-        financialContractVersion: 2,
+        financialContractVersion: 3,
       });
       const metadata = paymentGateway.paymentIntentInputs[0]?.metadata ?? {};
       expect(metadata).toMatchObject({
-        financialContractVersion: "2",
+        financialContractVersion: "3",
         relationshipClassification: "FIRST",
         productKind: "NORMAL_BOOKING",
         businessClientId: String(client._id),

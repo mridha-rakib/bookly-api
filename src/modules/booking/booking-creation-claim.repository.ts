@@ -5,7 +5,7 @@ import {
   type BookingCreationClaimDocument,
   BookingCreationClaimModel,
 } from "./booking-creation-claim.model.js";
-import { type FinancialContractV2, findFinancialContractMismatch } from "./financial-contract.js";
+import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
 
 export type ClaimBookingCreationInput = {
   idempotencyKey: string;
@@ -64,8 +64,8 @@ export class BookingCreationClaimRepository {
    */
   public async recordFinancialContract(
     idempotencyKey: string,
-    contract: FinancialContractV2,
-  ): Promise<FinancialContractV2> {
+    contract: FinancialContract,
+  ): Promise<FinancialContract> {
     if (contract.idempotencyKey !== idempotencyKey) {
       throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
     }

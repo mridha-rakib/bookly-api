@@ -1,8 +1,11 @@
-/** Batch 13 — Promo Code system. Confirmed product rules (do not reinterpret):
+/** Promo Code system. Confirmed product rules (P2 — supersede Batch 13's deposit-only rules;
+ * do not reinterpret):
  *  - SUPER_ADMIN only creates/manages Promo Codes (no Business Owner promo management).
- *  - Every Promo Code is Bookly-funded — never the Business.
- *  - A Promo discounts the booking-time ONLINE charge only (the already-computed
- *    clamp(20%, €5, €35) deposit) — never the underlying Service price/eligible basis.
+ *  - NORMAL bookings only (never package purchase/redemption/Session 2+). The promo discounts
+ *    the booking PRICE — services + add-ons − service discount, travel excluded — BEFORE the
+ *    FIRST upfront / RETURNING deposit is computed from the discounted price.
+ *  - The Business funds the discount (no Bookly PROMO_SUBSIDY). Batch 13's Bookly-funded,
+ *    deposit-only redemptions stay readable as history.
  */
 export const promoTypes = ["PERCENTAGE", "FIXED"] as const;
 export type PromoType = (typeof promoTypes)[number];
@@ -24,8 +27,8 @@ export type PromoScope = (typeof promoScopes)[number];
 export const promoStatuses = ["ACTIVE", "DEACTIVATED"] as const;
 export type PromoStatus = (typeof promoStatuses)[number];
 
-/** The one confirmed funding owner — stored explicitly (not hardcoded at every read site) so the
- * ledger/redemption history stays self-explanatory and future-proof if a second funding model is
- * ever added. */
-export const promoFundingOwners = ["BOOKLY"] as const;
+/** Stored explicitly (never hardcoded at read sites) so ledger/redemption history stays
+ * self-explanatory. P2: every NEW promo redemption is BUSINESS-funded (the promo lowers the
+ * Business's booking price; no PROMO_SUBSIDY). BOOKLY remains readable for Batch 13 rows. */
+export const promoFundingOwners = ["BOOKLY", "BUSINESS"] as const;
 export type PromoFundingOwner = (typeof promoFundingOwners)[number];

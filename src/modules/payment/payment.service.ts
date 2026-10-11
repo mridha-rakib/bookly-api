@@ -20,7 +20,7 @@ import { RefundOperationRepository } from "./refund-operation.repository.js";
 const PROVIDER_CLOCK_SKEW_MS = 60 * 60_000;
 
 export type PaymentAttemptContractCorrelation = {
-  version: 2;
+  version: 2 | 3;
   classification: "FIRST" | "RETURNING";
   productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
   businessClientId: Types.ObjectId | string;
@@ -176,7 +176,7 @@ export class PaymentService {
     amountCents: number;
     idempotencyKey: string;
     metadata: Record<string, string>;
-    /** P1 — immutable Financial Contract V2 correlation persisted on the PaymentAttempt. */
+    /** P1 — immutable Financial Contract (V2/V3) correlation persisted on the PaymentAttempt. */
     financialContract?: PaymentAttemptContractCorrelation | undefined;
     /** P1 — runs after the durable PaymentAttempt exists and BEFORE any provider interaction
      * (e.g. binding a FIRST relationship claim to this attempt). Throwing aborts with no PI. */

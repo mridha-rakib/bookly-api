@@ -15,6 +15,7 @@ import {
   cancellationTiers,
 } from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import { type ClientPropertyType, clientPropertyTypes } from "../client/client.types.js";
+import { type PromoFundingOwner, promoFundingOwners } from "../promo/promo.types.js";
 import {
   type BookingActorRole,
   type BookingCurrency,
@@ -32,7 +33,7 @@ import {
   DEPOSIT_MIN_CENTS,
   MAX_CUSTOMER_RESCHEDULE_COUNT,
 } from "./booking.types.js";
-import type { FinancialContractV2 } from "./financial-contract.js";
+import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 
 // --- Actor / customer -------------------------------------------------------------------
@@ -208,6 +209,11 @@ export type BookingFinancials = {
   servicesSubtotalCents: number;
   addonsSubtotalCents: number;
   serviceDiscountCents: number;
+  /** P2 (Financial Contract V3) only — the Business-funded promo discount off the booking price.
+   * When present, `eligiblePlatformFeeBasisCents` (and therefore `totalCents` and every later
+   * cancellation/no-show basis) is the DISCOUNTED price. Absent on every pre-P2, MANUAL, package
+   * and no-promo Booking (legacy invariant unchanged). */
+  promoDiscountCents?: number | undefined;
   travelFeeCents: number;
   eligiblePlatformFeeBasisCents: number;
   platformFeeCents: number;
@@ -227,31 +233,31 @@ export type BookingFinancials = {
   taxTransactionId?: string | undefined;
 };
 
-// --- Promo Code snapshot (Batch 13) --------------------------------------------------------
+// --- Promo Code snapshot (Batch 13, P2) ----------------------------------------------------
 //
-// A Promo Code discounts ONLY the already-computed online booking-time charge
-// (BookingFinancials.depositCents) — it never rewrites Service pricing, `serviceDiscountCents`,
-// `eligiblePlatformFeeBasisCents`, or `totalCents`/`balanceDueCents`. `depositCents` above
-// therefore STAYS the full pre-promo canonical entitlement (what the Business/Bookly is
-// economically owed); this snapshot records only the ADDITIONAL promo facts needed to explain
-// why the actual Stripe charge (and the ledger's DEBIT entry amount — see
-// booking-creation.service.ts) was lower. Present only when a promo was actually applied —
-// absent, never a zero-value object, for every other Booking (additive, matches every other
-// optional snapshot on this model). Denormalizes code/type/value at application time (never a
-// live PromoCode lookup) so a later Promo edit/deactivation can never corrupt this Booking's own
-// history — the SAME immutable-snapshot discipline `serviceSnapshot` already established.
+// Two readable generations, distinguished by `fundingOwner`:
+//  - BOOKLY (Batch 13, pre-P2 / Financial Contract V2): the promo discounted ONLY the online
+//    upfront charge — `financials` stayed the full pre-promo entitlement and `chargeCents` was
+//    `depositCents - discountCents`.
+//  - BUSINESS (P2 / Financial Contract V3): the promo discounted the booking PRICE
+//    (`financials.promoDiscountCents === discountCents`; `eligiblePlatformFeeBasisCents`,
+//    `totalCents` and `depositCents` are all post-promo) and `chargeCents === depositCents`.
+// Present only when a promo was actually applied — absent, never a zero-value object, for every
+// other Booking. Denormalizes code/type/value at application time (never a live PromoCode
+// lookup) so a later Promo edit/deactivation can never corrupt this Booking's own history — the
+// SAME immutable-snapshot discipline `serviceSnapshot` already established.
 export type BookingPromoSnapshot = {
   promoId: Types.ObjectId;
   code: string;
   type: "PERCENTAGE" | "FIXED";
   value: number;
   discountCents: number;
-  /** What was actually charged online: `financials.depositCents - discountCents`, clamped at 0.
-   * This is ALSO the amount the ledger's PLATFORM_FEE/DEPOSIT entry records (see
-   * booking-creation.service.ts) — everything downstream (cancellation/no-show netting, refunds)
-   * already reads from that real ledger amount, never from this field directly. */
+  /** What was actually charged online. This is ALSO the amount the ledger's
+   * PLATFORM_FEE/DEPOSIT entry records (see booking-creation.service.ts) — everything downstream
+   * (cancellation/no-show netting, refunds) already reads from that real ledger amount, never
+   * from this field directly. */
   chargeCents: number;
-  fundingOwner: "BOOKLY";
+  fundingOwner: PromoFundingOwner;
   appliedAt: Date;
 };
 
@@ -480,12 +486,13 @@ export type BookingDocument = {
   cancellationOutcome?: BookingCancellationOutcome | undefined;
   completionPayment?: BookingCompletionPayment | undefined;
   promo?: BookingPromoSnapshot | undefined;
-  /** P1 — the immutable Financial Contract V2 this customer booking / package purchase origin
-   * Booking was classified and priced under (copied from its BookingCreationClaim). Absent on
-   * legacy, MANUAL and package Session 2+ Bookings. Note `financials.eligiblePlatformFeeBasisCents`
-   * keeps its legacy meaning (cancellation/no-show basis); a FIRST package's upfront basis is
-   * `financialContract.eligibleBasisCents` (bundle price only). */
-  financialContract?: FinancialContractV2 | undefined;
+  /** P1 — the immutable Financial Contract (V2, or V3 for P2 normal bookings) this customer
+   * booking / package purchase origin Booking was classified and priced under (copied from its
+   * BookingCreationClaim). Absent on legacy, MANUAL and package Session 2+ Bookings. Note
+   * `financials.eligiblePlatformFeeBasisCents` is the cancellation/no-show basis (P2: after the
+   * promo); a FIRST package's upfront basis is `financialContract.eligibleBasisCents` (bundle
+   * price only). */
+  financialContract?: FinancialContract | undefined;
   notes?: string | undefined;
   // No hard-delete/archive path is modeled: a Booking is never removed once created — its
   // status changes, but the record (and every snapshot on it) persists indefinitely as the
@@ -687,6 +694,7 @@ const bookingFinancialsSchema = new Schema<BookingFinancials>(
     servicesSubtotalCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     addonsSubtotalCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     serviceDiscountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    promoDiscountCents: { type: Number, min: 0, validate: Number.isInteger },
     travelFeeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     eligiblePlatformFeeBasisCents: {
       type: Number,
@@ -731,20 +739,26 @@ bookingFinancialsSchema.pre("validate", function () {
     throw new Error("serviceDiscountCents cannot exceed servicesSubtotalCents");
   }
 
-  const expectedBasis =
+  // P2: the promo discount comes AFTER the service discount and never exceeds the price.
+  const promoEligibleBaseCents =
     financials.servicesSubtotalCents +
     financials.addonsSubtotalCents -
     financials.serviceDiscountCents;
-  if (financials.eligiblePlatformFeeBasisCents !== expectedBasis) {
+  const promoDiscountCents = financials.promoDiscountCents ?? 0;
+  if (promoDiscountCents > promoEligibleBaseCents) {
+    throw new Error("promoDiscountCents cannot exceed the promo-eligible booking price");
+  }
+  if (financials.eligiblePlatformFeeBasisCents !== promoEligibleBaseCents - promoDiscountCents) {
     throw new Error(
-      "eligiblePlatformFeeBasisCents must equal servicesSubtotalCents + addonsSubtotalCents - serviceDiscountCents (travel fee excluded by design)",
+      "eligiblePlatformFeeBasisCents must equal servicesSubtotalCents + addonsSubtotalCents - serviceDiscountCents - promoDiscountCents (travel fee excluded by design)",
     );
   }
 
   // P1: a FIRST upfront is clamp(20%, €5, €35) but never above its eligible basis, so a nonzero
   // platform fee below €5 is legitimate only as that cap-to-basis case, where it EQUALS the FIRST
-  // basis: normal = eligiblePlatformFeeBasisCents; package = the bundle price, i.e.
-  // servicesSubtotalCents - serviceDiscountCents (a package line never carries a discount).
+  // basis: normal = eligiblePlatformFeeBasisCents (P2: already promo-discounted); package = the
+  // bundle price, i.e. servicesSubtotalCents - serviceDiscountCents (a package line never
+  // carries a discount, and a package never carries a promo).
   const capToBasisFee =
     financials.platformFeeCents === financials.eligiblePlatformFeeBasisCents ||
     financials.platformFeeCents ===
@@ -919,7 +933,7 @@ const bookingPromoSnapshotSchema = new Schema<BookingPromoSnapshot>(
     value: { type: Number, required: true, min: 0 },
     discountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     chargeCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
-    fundingOwner: { type: String, enum: ["BOOKLY"], required: true },
+    fundingOwner: { type: String, enum: promoFundingOwners, required: true },
     appliedAt: { type: Date, required: true },
   },
   { _id: false },

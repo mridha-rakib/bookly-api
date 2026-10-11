@@ -13,6 +13,9 @@ const defaultMessages: Record<string, string> = {
   PROMO_PER_USER_LIMIT_REACHED: "You have already used this promo code the maximum number of times",
   PROMO_INVALID_STATUS_TRANSITION: "This promo cannot move to the requested status",
   PROMO_HAS_REDEMPTIONS: "This promo has redemption history and cannot be deleted",
+  // P2 — pre-charge guard: nothing was charged and no usage was consumed.
+  PROMO_BELOW_MINIMUM_DEPOSIT:
+    "This promo code lowers this booking below the minimum online deposit, so it can't be used for this booking. Nothing was charged.",
 };
 
 export class PromoError extends AppError {

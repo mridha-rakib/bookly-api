@@ -1,6 +1,6 @@
 import { model, Schema, type Types } from "mongoose";
 
-import type { FinancialContractV2 } from "./financial-contract.js";
+import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 
 /**
@@ -29,7 +29,7 @@ export type BookingCreationClaimDocument = {
   /** P1 — the immutable Financial Contract V2 for a customer booking/package purchase, recorded
    * once (set-if-absent) BEFORE any provider charge. Absent for manual bookings, package
    * Session 2+ redemptions, and claims created before P1. */
-  financialContract?: FinancialContractV2 | undefined;
+  financialContract?: FinancialContract | undefined;
   createdAt: Date;
 };
 

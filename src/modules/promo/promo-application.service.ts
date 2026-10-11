@@ -6,21 +6,25 @@ import type { PromoRepository } from "./promo.repository.js";
 import type { PromoRedemptionRepository } from "./promo-redemption.repository.js";
 import type { PromoUserUsageRepository } from "./promo-user-usage.repository.js";
 
+/** P2 — a validated promo and its discount off the NORMAL booking price. */
 export type ResolvedPromo = {
   promo: PromoCodeDocument;
-  depositBeforePromoCents: number;
+  /** services + add-ons − service discount (travel excluded) — the price BEFORE the promo. */
+  promoEligibleBaseCents: number;
+  /** 0 <= promoDiscountCents <= promoEligibleBaseCents. */
   promoDiscountCents: number;
-  customerChargeNowCents: number;
+  /** promoEligibleBaseCents − promoDiscountCents: the basis every upfront is computed from. */
+  discountedBaseCents: number;
 };
 
 /**
- * Batch 13 — the ONE place a Promo Code is validated and its discount computed. Both
+ * The ONE place a Promo Code is validated and its discount computed. Both
  * `previewCustomerBooking` and `finalizeCustomerBooking` call `resolve` (finalize re-validates
  * from scratch — never trusts the preview); only `finalizeCustomerBooking`, inside the SAME
- * MongoDB transaction that persists the Booking, calls `claimRedemption`. Never a second pricing
- * engine: this only ever discounts the ALREADY-COMPUTED `depositBeforePromoCents` (the existing
- * clamp(20%, €5, €35) canonical deposit) — it never touches Service pricing, add-ons, travel fee,
- * or `eligiblePlatformFeeBasisCents`.
+ * MongoDB transaction that persists the Booking, calls `claimRedemption` (no pre-payment
+ * reservation exists). P2: the promo discounts the NORMAL booking price (services + add-ons −
+ * service discount, travel excluded) BEFORE any upfront is computed — the caller computes the
+ * FIRST upfront / RETURNING deposit from `discountedBaseCents`. Never applied to a package.
  */
 export class PromoApplicationService {
   public constructor(
@@ -43,7 +47,7 @@ export class PromoApplicationService {
     business: BusinessDocument;
     customerUserId: string;
     isFirstBooking: boolean;
-    depositBeforePromoCents: number;
+    promoEligibleBaseCents: number;
     now?: Date;
   }): Promise<ResolvedPromo> {
     const now = input.now ?? new Date();
@@ -70,14 +74,13 @@ export class PromoApplicationService {
       }
     }
 
-    const promoDiscountCents = this.computeDiscountCents(promo, input.depositBeforePromoCents);
-    const customerChargeNowCents = Math.max(0, input.depositBeforePromoCents - promoDiscountCents);
+    const promoDiscountCents = this.computeDiscountCents(promo, input.promoEligibleBaseCents);
 
     return {
       promo,
-      depositBeforePromoCents: input.depositBeforePromoCents,
+      promoEligibleBaseCents: input.promoEligibleBaseCents,
       promoDiscountCents,
-      customerChargeNowCents,
+      discountedBaseCents: input.promoEligibleBaseCents - promoDiscountCents,
     };
   }
 
@@ -93,6 +96,8 @@ export class PromoApplicationService {
   public async claimRedemption(
     input: {
       resolved: ResolvedPromo;
+      /** The upfront computed from the discounted basis — what the customer pays online. */
+      requiredUpfrontCents: number;
       bookingId: Types.ObjectId;
       businessId: Types.ObjectId;
       customerUserId: Types.ObjectId;
@@ -132,10 +137,13 @@ export class PromoApplicationService {
         bookingId: input.bookingId,
         businessId: input.businessId,
         customerUserId: input.customerUserId,
-        depositBeforePromoCents: input.resolved.depositBeforePromoCents,
+        // P2: no pre-promo deposit exists — the upfront is computed after the price discount,
+        // so both upfront snapshots are that one amount (see PromoRedemptionDocument).
+        promoEligibleBaseCents: input.resolved.promoEligibleBaseCents,
+        depositBeforePromoCents: input.requiredUpfrontCents,
         promoDiscountCents: input.resolved.promoDiscountCents,
-        customerChargeNowCents: input.resolved.customerChargeNowCents,
-        fundingOwner: "BOOKLY",
+        customerChargeNowCents: input.requiredUpfrontCents,
+        fundingOwner: "BUSINESS",
         isFirstBooking: input.isFirstBooking,
       },
       session,
@@ -171,15 +179,13 @@ export class PromoApplicationService {
     }
   }
 
-  /** FIXED: `min(fixedValueCents, depositBeforePromoCents)` — never negative, never a customer
-   * credit, an unused remainder simply disappears (rule #5). PERCENTAGE: `round(deposit ×
-   * percentage / 100)`, clamped at `depositBeforePromoCents` — there is NO separate promo cap
-   * (the deposit itself is already capped at €35); a 100% promo may legitimately zero the charge. */
-  private computeDiscountCents(promo: PromoCodeDocument, depositBeforePromoCents: number): number {
-    if (promo.type === "FIXED") {
-      return Math.min(Math.round(promo.value), depositBeforePromoCents);
-    }
-    const computed = Math.round((depositBeforePromoCents * promo.value) / 100);
-    return Math.min(computed, depositBeforePromoCents);
+  /** Against the promo-eligible booking price (`base`). FIXED: `min(valueCents, base)` — never
+   * negative, never a customer credit, an unused remainder simply disappears. PERCENTAGE:
+   * `round(base × percentage / 100)` (unchanged rounding), clamped to [0, base] — there is NO
+   * separate promo cap; a 100% promo legitimately zeroes the discounted price. */
+  private computeDiscountCents(promo: PromoCodeDocument, base: number): number {
+    const computed =
+      promo.type === "FIXED" ? Math.round(promo.value) : Math.round((base * promo.value) / 100);
+    return Math.min(Math.max(0, computed), base);
   }
 }
