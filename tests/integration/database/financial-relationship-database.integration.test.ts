@@ -36,6 +36,8 @@ import { FinancialRelationshipRepository } from "../../../src/modules/client/fin
 import { FinancialRelationshipService } from "../../../src/modules/client/financial-relationship.service.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
+import { computePackageBalanceSettlement } from "../../../src/modules/package-progress/package-progress.rules.js";
+import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import {
   MoneyRecoveryService,
@@ -49,6 +51,7 @@ import {
   PROVIDER_NOT_CREATED,
 } from "../../../src/modules/payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
+import { buildPaymentIntentMetadata } from "../../../src/modules/payment/payment-intent-metadata.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
@@ -67,6 +70,7 @@ import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhoo
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
+import { legacyReturningDepositCents } from "../../helpers/legacy-returning-deposit.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -1885,19 +1889,45 @@ describe("P1 — universal customer↔business financial relationship + Financia
       expect(paymentGateway.refundInputs).toHaveLength(1);
     });
 
-    it("RETURNING requires_action attempts are never scanned by the FIRST-only pass and the relationship is never touched", async () => {
+    it("(pre-P3 in-flight) RETURNING requires_action attempts are never scanned by the FIRST-only pass and the relationship is never touched", async () => {
       const fixture = await setupFixture();
       const { customer, client } = await createLinkedCustomer(fixture, "returning-3ds");
       confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "10:00")));
       const consumed = await relationshipOf(client._id);
 
-      const input = normalInput(fixture, "12:00");
+      // P3: a new RETURNING purchase is €0 online and never creates an attempt. A RETURNING
+      // requires_action attempt can only be pre-P3 history, so create exactly that shape through
+      // the real payment service (RETURNING correlation, real PaymentIntent).
+      const idempotencyKey = `legacy-returning-3ds-${new Types.ObjectId().toString()}`;
       paymentGateway.queueNextChargeOutcome("requires_action");
-      const result = await finalizeNormal(fixture, customer._id, input);
+      const result = await paymentService.chargeBookingDeposit({
+        userId: customer._id,
+        amountCents: 2_000,
+        idempotencyKey,
+        metadata: buildPaymentIntentMetadata({
+          bookingId: new Types.ObjectId().toString(),
+          businessId: String(fixture.business._id),
+          businessClientId: String(client._id),
+          purpose: "BOOKING_DEPOSIT",
+          preTaxChargeCents: 2_000,
+          taxCents: 0,
+          chargedAmountCents: 2_000,
+          taxMode: "PRE_ACTIVATION",
+          financialContract: {
+            version: 3,
+            classification: "RETURNING",
+            productKind: "NORMAL_BOOKING",
+          },
+        }),
+        financialContract: {
+          version: 3,
+          classification: "RETURNING",
+          productKind: "NORMAL_BOOKING",
+          businessClientId: client._id,
+        },
+      });
       if (result.status !== "requires_action") throw new Error("expected requires_action");
-      const attempt = await PaymentAttemptModel.findOne({
-        logicalIdempotencyKey: input.idempotencyKey,
-      })
+      const attempt = await PaymentAttemptModel.findOne({ logicalIdempotencyKey: idempotencyKey })
         .orFail()
         .exec();
       expect(attempt.relationshipClassification).toBe("RETURNING");
@@ -2654,32 +2684,39 @@ describe("P1 — universal customer↔business financial relationship + Financia
     });
   });
 
-  // --- RETURNING stays pre-P3 --------------------------------------------------------------------
+  // --- P3: RETURNING is €0 online for BOTH purchase kinds --------------------------------------
 
-  describe("RETURNING keeps current (pre-P3) payment behaviour", () => {
-    it("normal and package RETURNING still charge a real DEPOSIT online (never €0) and never mutate the relationship", async () => {
+  describe("P3 — RETURNING is €0 online for normal bookings AND package purchases", () => {
+    it("normal and package RETURNING charge nothing online (no PI, no attempt, no ledger), keep the full total as the venue balance, and never mutate the relationship", async () => {
       const fixture = await setupFixture({ bundlePriceCents: 10_000 });
       const addon = await createAddon(fixture, fixture.packageService._id, 4_000);
       const { customer, client } = await createLinkedCustomer(fixture, "returning");
       confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "09:00")));
       const consumed = await relationshipOf(client._id);
 
+      const piAfterFirst = paymentGateway.paymentIntentInputs.length;
+      const attemptsAfterFirst = await PaymentAttemptModel.countDocuments().exec();
+
       const normal = confirmed(
         await finalizeNormal(fixture, customer._id, normalInput(fixture, "11:00")),
       );
-      expect(normal.financials).toMatchObject({ depositCents: 2_000, platformFeeCents: 0 });
+      expect(normal.financials).toMatchObject({
+        depositCents: 0,
+        platformFeeCents: 0,
+        totalCents: 10_000,
+        balanceDueCents: 10_000,
+      });
       expect(normal.financialContract).toMatchObject({
+        version: 3,
         classification: "RETURNING",
         upfrontLedgerType: "DEPOSIT",
-        onlineChargeCents: 2_000,
+        requiredUpfrontCents: 0,
+        onlineChargeCents: 0,
       });
-      expect(paymentGateway.paymentIntentInputs.at(-1)).toMatchObject({ amountCents: 2_000 });
-      expect(
-        paymentGateway.paymentIntentInputs.at(-1)?.metadata["relationshipClassification"],
-      ).toBe("RETURNING");
-      expect((await ledgerFor(normal._id)).map((entry) => entry.type)).toEqual(["DEPOSIT"]);
+      expect(await ledgerFor(normal._id)).toHaveLength(0);
 
-      // Package RETURNING keeps the legacy deposit on bundle + add-ons (20% of €140 = €28).
+      // Package RETURNING is €0 online too — the full bundle + add-ons total (€140) stays the
+      // venue balance; the V2 package contract still records the bundle + add-ons basis.
       const pkg = confirmed(
         await finalizePackage(
           fixture,
@@ -2687,14 +2724,27 @@ describe("P1 — universal customer↔business financial relationship + Financia
           packageInput(fixture, "14:00", { addonIds: [String(addon._id)] }),
         ),
       );
-      expect(pkg.financials).toMatchObject({ depositCents: 2_800, platformFeeCents: 0 });
+      expect(pkg.financials).toMatchObject({
+        depositCents: 0,
+        platformFeeCents: 0,
+        totalCents: 14_000,
+        balanceDueCents: 14_000,
+      });
       expect(pkg.financialContract).toMatchObject({
+        version: 2,
         classification: "RETURNING",
         eligibleBasisCents: 14_000,
+        packageBundlePriceCents: 10_000,
         upfrontLedgerType: "DEPOSIT",
+        requiredUpfrontCents: 0,
+        onlineChargeCents: 0,
       });
-      expect(paymentGateway.paymentIntentInputs.at(-1)).toMatchObject({ amountCents: 2_800 });
-      expect((await ledgerFor(pkg._id)).map((entry) => entry.type)).toEqual(["DEPOSIT"]);
+      expect(await ledgerFor(pkg._id)).toHaveLength(0);
+      expect(await PackageProgressModel.countDocuments({ originBookingId: pkg._id })).toBe(1);
+
+      // No provider money and no durable attempt for either RETURNING purchase.
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(piAfterFirst);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(attemptsAfterFirst);
 
       const after = await relationshipOf(client._id);
       expect(after.financialRelationship).toEqual(consumed.financialRelationship);
@@ -2861,6 +2911,605 @@ describe("P1 — universal customer↔business financial relationship + Financia
       const after = await relationshipOf(client._id);
       expect(after.financialRelationship?.state).toBe("CONSUMED");
       expect(String(after.financialRelationship?.consumed?.bookingId)).toBe(String(purchase._id));
+    });
+  });
+  // --- P3: shared RETURNING €0 across product kinds ---------------------------------------------
+
+  describe("P3 — shared customer↔business relationship; RETURNING €0 online for both product kinds", () => {
+    const noMoneyFor = async (bookingId: Types.ObjectId) => {
+      expect(await ledgerFor(bookingId)).toHaveLength(0);
+      expect(await PaymentAttemptModel.countDocuments({ bookingId }).exec()).toBe(0);
+      expect(
+        paymentGateway.paymentIntentInputs.filter(
+          (input) => input.metadata["bookingId"] === String(bookingId),
+        ),
+      ).toHaveLength(0);
+    };
+
+    const redeemInput = (fixture: Fixture, time: string, addonIds: string[] = []) => ({
+      staffMembershipId: String(fixture.staffId),
+      startAt: startAtFor(time, DATE_2),
+      addonIds,
+      idempotencyKey: `redeem-${new Types.ObjectId().toString()}`,
+    });
+
+    const redeem = (
+      fixture: Fixture,
+      customerId: Types.ObjectId,
+      progressId: Types.ObjectId,
+      input: ReturnType<typeof redeemInput>,
+    ) =>
+      creationService.redeemPackageSession(
+        String(customerId),
+        String(fixture.business._id),
+        String(progressId),
+        input,
+      );
+
+    describe("FIRST is shared: whichever purchase kind consumes it first", () => {
+      it("NORMAL FIRST consumes the shared relationship; a later PACKAGE purchase is RETURNING and €0 online", async () => {
+        const fixture = await setupFixture({ bundlePriceCents: 30_000 });
+        const { customer, client } = await createLinkedCustomer(fixture, "normal-then-package");
+
+        const first = confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture)));
+        expect(first.financialContract).toMatchObject({
+          classification: "FIRST",
+          eligibleBasisCents: 10_000,
+          requiredUpfrontCents: 2_000,
+        });
+        const consumed = await relationshipOf(client._id);
+        expect(consumed.financialRelationship).toMatchObject({ state: "CONSUMED" });
+        expect(consumed.financialRelationship?.consumed?.productKind).toBe("NORMAL_BOOKING");
+
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        expect(pkg.financialContract).toMatchObject({
+          version: 2,
+          productKind: "PACKAGE_PURCHASE",
+          classification: "RETURNING",
+          requiredUpfrontCents: 0,
+          onlineChargeCents: 0,
+        });
+        expect(pkg.financials).toMatchObject({
+          depositCents: 0,
+          platformFeeCents: 0,
+          totalCents: 30_000,
+          balanceDueCents: 30_000,
+        });
+        await noMoneyFor(pkg._id);
+        // The relationship was only read, never written, by the RETURNING purchase.
+        expect((await relationshipOf(client._id)).financialRelationship).toEqual(
+          consumed.financialRelationship,
+        );
+      });
+
+      it("PACKAGE FIRST (bundle basis, unchanged) consumes the SAME relationship; a later NORMAL booking is RETURNING and €0 online", async () => {
+        const fixture = await setupFixture({ bundlePriceCents: 10_000 });
+        const addon = await createAddon(fixture, fixture.packageService._id, 4_000);
+        const { customer, client } = await createLinkedCustomer(fixture, "package-then-normal");
+
+        const pkg = confirmed(
+          await finalizePackage(
+            fixture,
+            customer._id,
+            packageInput(fixture, "14:00", { addonIds: [String(addon._id)] }),
+          ),
+        );
+        // FIRST basis is the bundle price ONLY (never + add-ons): 20% of €100 = €20.
+        expect(pkg.financialContract).toMatchObject({
+          version: 2,
+          classification: "FIRST",
+          eligibleBasisCents: 10_000,
+          packageBundlePriceCents: 10_000,
+          requiredUpfrontCents: 2_000,
+          onlineChargeCents: 2_000,
+          upfrontLedgerType: "PLATFORM_FEE",
+        });
+        expect(pkg.financials).toMatchObject({
+          totalCents: 14_000,
+          depositCents: 2_000,
+          platformFeeCents: 2_000,
+          balanceDueCents: 12_000,
+        });
+        expect((await ledgerFor(pkg._id)).map((e) => [e.type, e.amountCents])).toEqual([
+          ["PLATFORM_FEE", 2_000],
+        ]);
+        expect(
+          await PaymentAttemptModel.countDocuments({
+            bookingId: pkg._id,
+            relationshipClassification: "FIRST",
+          }),
+        ).toBe(1);
+        const consumed = await relationshipOf(client._id);
+        expect(consumed.financialRelationship?.state).toBe("CONSUMED");
+        expect(consumed.financialRelationship?.consumed?.productKind).toBe("PACKAGE_PURCHASE");
+
+        const normal = confirmed(
+          await finalizeNormal(fixture, customer._id, normalInput(fixture, "10:00")),
+        );
+        expect(normal.financialContract).toMatchObject({
+          version: 3,
+          classification: "RETURNING",
+          requiredUpfrontCents: 0,
+          onlineChargeCents: 0,
+        });
+        expect(normal.financials).toMatchObject({ depositCents: 0, balanceDueCents: 10_000 });
+        await noMoneyFor(normal._id);
+        expect((await relationshipOf(client._id)).financialRelationship).toEqual(
+          consumed.financialRelationship,
+        );
+      });
+
+      it("concurrent NORMAL vs PACKAGE FIRST: exactly one claims FIRST; the loser is rejected before any contract/attempt/charge; its retry is RETURNING €0", async () => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, "cross-race");
+        const normal = normalInput(fixture, "10:00");
+        const pkg = packageInput(fixture, "14:00");
+
+        const { results, firstSettledIndex, whileHeld, attemptsWhileHeld } =
+          await raceWithHeldWinner(client._id, [
+            () => finalizeNormal(fixture, customer._id, normal),
+            () => finalizePackage(fixture, customer._id, pkg),
+          ]);
+        const loserIndex = firstSettledIndex;
+        const winnerIndex = loserIndex === 0 ? 1 : 0;
+        const loser = results[loserIndex] as PromiseRejectedResult;
+        expect(loser.status).toBe("rejected");
+        expectFirstInProgress(loser.reason);
+        expect(whileHeld.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(attemptsWhileHeld).toBe(1); // only the winner's
+        const winner = results[winnerIndex] as PromiseFulfilledResult<FinalizeBookingResult>;
+        const winnerBooking = confirmed(winner.value);
+        expect(winnerBooking.financialContract?.classification).toBe("FIRST");
+
+        const loserKey = loserIndex === 0 ? normal.idempotencyKey : pkg.idempotencyKey;
+        expect(await PaymentAttemptModel.countDocuments({ logicalIdempotencyKey: loserKey })).toBe(
+          0,
+        );
+        expect(await BookingCreationClaimModel.countDocuments({ idempotencyKey: loserKey })).toBe(
+          0,
+        );
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+
+        // The loser's retry (same logical action, released claim) is now RETURNING and €0.
+        const retry = confirmed(
+          loserIndex === 0
+            ? await finalizeNormal(fixture, customer._id, normal)
+            : await finalizePackage(fixture, customer._id, pkg),
+        );
+        expect(retry.financialContract).toMatchObject({
+          classification: "RETURNING",
+          onlineChargeCents: 0,
+        });
+        await noMoneyFor(retry._id);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(String(row.financialRelationship?.consumed?.bookingId)).toBe(
+          String(winnerBooking._id),
+        );
+      });
+
+      it("a declined PACKAGE FIRST never consumes the relationship; the next NORMAL booking is FIRST", async () => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, "declined-package");
+        paymentGateway.queueNextChargeOutcome("failed");
+        await expect(
+          finalizePackage(fixture, customer._id, packageInput(fixture)),
+        ).rejects.toMatchObject({ statusCode: 402 });
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+        expect(await BookingModel.countDocuments()).toBe(0);
+
+        const normal = confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture)));
+        expect(normal.financialContract?.classification).toBe("FIRST");
+        expect(normal.financials.platformFeeCents).toBe(2_000);
+        expect(
+          (await relationshipOf(client._id)).financialRelationship?.consumed?.productKind,
+        ).toBe("NORMAL_BOOKING");
+      });
+
+      it("package FIRST under €5 is capped at the bundle basis (€3 PLATFORM_FEE, real attempt)", async () => {
+        const fixture = await setupFixture({ bundlePriceCents: 300 });
+        const { customer } = await createLinkedCustomer(fixture, "package-first-tiny");
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        expect(pkg.financials).toMatchObject({ depositCents: 300, platformFeeCents: 300 });
+        expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(300);
+        expect((await ledgerFor(pkg._id))[0]).toMatchObject({
+          type: "PLATFORM_FEE",
+          amountCents: 300,
+        });
+      });
+    });
+
+    describe("PACKAGE RETURNING purchase", () => {
+      const setupReturning = async (options: Parameters<typeof setupFixture>[0] = {}) => {
+        const fixture = await setupFixture(options);
+        const linked = await createLinkedCustomer(fixture, "package-returning");
+        confirmed(
+          await finalizeNormal(
+            fixture,
+            linked.customer._id,
+            normalInput(fixture, "09:00", { travel: Boolean(options.travel) }),
+          ),
+        );
+        return { fixture, ...linked };
+      };
+
+      it("preview and finalize: €0 online, full bundle + add-ons + travel as the origin balance, PackageProgress created once, settlement outstanding = full total, platform entitlement 0", async () => {
+        const { fixture, customer } = await setupReturning({
+          bundlePriceCents: 30_000,
+          travel: { feeCents: 2_500 },
+        });
+        const addon = await createAddon(fixture, fixture.packageService._id, 4_000);
+        const input = packageInput(fixture, "14:00", {
+          addonIds: [String(addon._id)],
+          travel: true,
+        });
+        const taxBefore = taxGateway.calls.length;
+
+        const quote = await creationService.previewPackagePurchase(
+          String(customer._id),
+          String(fixture.business._id),
+          input,
+        );
+        expect(quote).toMatchObject({
+          isFirstBooking: false,
+          preTaxChargeCents: 0,
+          taxCents: 0,
+          dueNowCents: 0,
+          balanceDueCents: 36_500,
+          requiresSavedCard: true,
+        });
+
+        const result = await finalizePackage(fixture, customer._id, input);
+        expect(result.status).toBe("confirmed"); // never requires_action — nothing to authenticate
+        const pkg = confirmed(result);
+        expect(taxGateway.calls).toHaveLength(taxBefore);
+        expect(pkg.financials).toMatchObject({
+          servicesSubtotalCents: 30_000,
+          addonsSubtotalCents: 4_000,
+          travelFeeCents: 2_500,
+          totalCents: 36_500,
+          depositCents: 0,
+          platformFeeCents: 0,
+          balanceDueCents: 36_500,
+        });
+        expect(pkg.financialContract).toMatchObject({
+          version: 2,
+          classification: "RETURNING",
+          packageBundlePriceCents: 30_000,
+          requiredUpfrontCents: 0,
+          onlineChargeCents: 0,
+          bookingTotalCents: 36_500,
+        });
+        await noMoneyFor(pkg._id);
+        const progresses = await PackageProgressModel.find({ originBookingId: pkg._id }).exec();
+        expect(progresses).toHaveLength(1);
+        expect(progresses[0]).toMatchObject({ totalSessions: 3, remainingSessions: 2 });
+        expect(computePackageBalanceSettlement(pkg)).toEqual({
+          balanceSettled: false,
+          outstandingBalanceCents: 36_500,
+        });
+      });
+
+      it("a bundle under €5 succeeds at €0 online (no legacy €5 floor)", async () => {
+        const { fixture, customer } = await setupReturning({ bundlePriceCents: 300 });
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        expect(pkg.financials).toMatchObject({
+          depositCents: 0,
+          totalCents: 300,
+          balanceDueCents: 300,
+        });
+        await noMoneyFor(pkg._id);
+      });
+
+      it("a saved card is still required (PAYMENT_METHOD_REQUIRED) even though nothing is charged", async () => {
+        const { fixture, customer } = await setupReturning();
+        await CustomerPaymentProfileModel.updateOne(
+          { userId: customer._id },
+          { $unset: { defaultPaymentMethodId: "" } },
+        ).exec();
+        const input = packageInput(fixture);
+        await expect(finalizePackage(fixture, customer._id, input)).rejects.toMatchObject({
+          statusCode: 402,
+          details: [expect.objectContaining({ code: "PAYMENT_METHOD_REQUIRED" })],
+        });
+        expect(await PackageProgressModel.countDocuments()).toBe(0);
+        expect(
+          await BookingCreationClaimModel.countDocuments({ idempotencyKey: input.idempotencyKey }),
+        ).toBe(0);
+      });
+
+      it("same-key retry is idempotent: one booking, one PackageProgress, no money", async () => {
+        const { fixture, customer } = await setupReturning();
+        const input = packageInput(fixture);
+        const first = confirmed(await finalizePackage(fixture, customer._id, input));
+        const again = confirmed(await finalizePackage(fixture, customer._id, input));
+        expect(String(again._id)).toBe(String(first._id));
+        expect(await PackageProgressModel.countDocuments()).toBe(1);
+        await noMoneyFor(first._id);
+      });
+
+      it("voiding an unused €0 RETURNING package refunds nothing and records no refund settlement", async () => {
+        const { fixture, customer } = await setupReturning();
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        const progress = await PackageProgressModel.findOne({ originBookingId: pkg._id })
+          .orFail()
+          .exec();
+        const voided = await lifecycleService.voidUnusedPackage(
+          String(customer._id),
+          String(fixture.business._id),
+          String(progress._id),
+          "changed my mind",
+        );
+        expect(voided.voidedAt).toBeDefined();
+        expect(voided.voidRefundSettlement).toBeUndefined();
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        expect(await RefundOperationModel.countDocuments()).toBe(0);
+      });
+    });
+
+    describe("PACKAGE Session 2+ stays outside the relationship and its economics are unchanged", () => {
+      it("a RETURNING package unlocks Session 2 only once the FULL origin total is recorded paid; Sessions 2 and 3 are €0 base, never touch the relationship, and add-ons keep the legacy redemption deposit", async () => {
+        const fixture = await setupFixture({ bundlePriceCents: 10_000 });
+        const { customer, client } = await createLinkedCustomer(fixture, "session-2");
+        confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "09:00")));
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        const progress = await PackageProgressModel.findOne({ originBookingId: pkg._id })
+          .orFail()
+          .exec();
+        const relationshipBefore = (await relationshipOf(client._id)).financialRelationship;
+
+        // Locked: the €0-online purchase leaves the whole €100 outstanding.
+        await expect(
+          redeem(fixture, customer._id, progress._id, redeemInput(fixture, "10:00")),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        // A partial venue payment still does not unlock it.
+        await lifecycleService.completeBooking(
+          String(fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(fixture.business._id),
+          String(pkg._id),
+          { settlement: "PARTIAL", amountCents: 9_000 },
+        );
+        await expect(
+          redeem(fixture, customer._id, progress._id, redeemInput(fixture, "10:00")),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        expect(
+          (await PackageProgressModel.findById(progress._id).orFail().exec()).remainingSessions,
+        ).toBe(2);
+        expect((await relationshipOf(client._id)).financialRelationship).toEqual(
+          relationshipBefore,
+        );
+      });
+
+      it("after the full origin total is settled: Session 2 and Session 3 are €0 base with no money and no relationship write; a Session add-on still pays the unchanged legacy redemption deposit", async () => {
+        const fixture = await setupFixture({ bundlePriceCents: 10_000 });
+        const addon = await createAddon(fixture, fixture.packageService._id, 4_000);
+        const { customer, client } = await createLinkedCustomer(fixture, "session-settled");
+        confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "09:00")));
+        const pkg = confirmed(await finalizePackage(fixture, customer._id, packageInput(fixture)));
+        const progress = await PackageProgressModel.findOne({ originBookingId: pkg._id })
+          .orFail()
+          .exec();
+        await lifecycleService.completeBooking(
+          String(fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(fixture.business._id),
+          String(pkg._id),
+          { settlement: "FULL" },
+        );
+        const relationshipBefore = (await relationshipOf(client._id)).financialRelationship;
+
+        const session2 = confirmed(
+          await redeem(fixture, customer._id, progress._id, redeemInput(fixture, "10:00")),
+        );
+        expect(session2.financials).toMatchObject({ totalCents: 0, depositCents: 0 });
+        expect(session2.serviceLines[0]?.pricingInput.sessionIndex).toBe(2);
+        expect(session2.financialContract).toBeUndefined();
+        await noMoneyFor(session2._id);
+
+        // Session 3 with an add-on: the redemption keeps its own unchanged legacy deposit path
+        // (never the P3 €0 rule — it is not a relationship-classified purchase).
+        const session3 = confirmed(
+          await redeem(
+            fixture,
+            customer._id,
+            progress._id,
+            redeemInput(fixture, "12:00", [String(addon._id)]),
+          ),
+        );
+        expect(session3.serviceLines[0]?.pricingInput.sessionIndex).toBe(3);
+        expect(session3.financials).toMatchObject({
+          addonsSubtotalCents: 4_000,
+          totalCents: 4_000,
+          depositCents: legacyReturningDepositCents(4_000),
+          platformFeeCents: 0,
+        });
+        expect((await ledgerFor(session3._id)).map((e) => [e.type, e.amountCents])).toEqual([
+          ["DEPOSIT", legacyReturningDepositCents(4_000)],
+        ]);
+
+        const after = await PackageProgressModel.findById(progress._id).orFail().exec();
+        expect(after.remainingSessions).toBe(0);
+        expect((await relationshipOf(client._id)).financialRelationship).toEqual(
+          relationshipBefore,
+        );
+      });
+    });
+
+    describe("pre-P3 in-flight RETURNING operations fail closed (never silently repriced)", () => {
+      /** Recreates, through the real repositories/services, the durable state a pre-P3 RETURNING
+       * operation left behind: its claim with the frozen deposit-bearing contract, and its real
+       * requires_action PaymentAttempt — exactly what a resume after P3 finds. */
+      const seedInFlightReturning = async (
+        fixture: Fixture,
+        customerId: Types.ObjectId,
+        clientId: Types.ObjectId,
+        kind: "normal" | "package",
+      ) => {
+        const input = kind === "normal" ? normalInput(fixture, "11:00") : packageInput(fixture);
+        const bookingId = new Types.ObjectId();
+        await claimRepository.claim({
+          idempotencyKey: input.idempotencyKey,
+          businessId: fixture.business._id,
+          actorUserId: customerId,
+          bookingId,
+        });
+        const depositCents = 2_000; // legacy clamp(20%) of the €100 basis
+        const contract = {
+          version: kind === "normal" ? 3 : 2,
+          productKind: kind === "normal" ? "NORMAL_BOOKING" : "PACKAGE_PURCHASE",
+          classification: "RETURNING",
+          idempotencyKey: input.idempotencyKey,
+          bookingId,
+          customerUserId: customerId,
+          businessId: fixture.business._id,
+          businessClientId: clientId,
+          currency: "EUR",
+          eligibleBasisCents: 10_000,
+          ...(kind === "normal" ? { promoEligibleBaseCents: 10_000 } : {}),
+          requiredUpfrontCents: depositCents,
+          promoDiscountCents: 0,
+          onlineChargeCents: depositCents,
+          travelFeeCents: 0,
+          ...(kind === "package" ? { packageBundlePriceCents: 10_000 } : {}),
+          bookingTotalCents: 10_000,
+          upfrontLedgerType: "DEPOSIT",
+        } as const;
+        await claimRepository.recordFinancialContract(input.idempotencyKey, contract as never);
+        paymentGateway.queueNextChargeOutcome("requires_action");
+        const charge = await paymentService.chargeBookingDeposit({
+          userId: customerId,
+          amountCents: depositCents,
+          idempotencyKey: input.idempotencyKey,
+          metadata: buildPaymentIntentMetadata({
+            bookingId: String(bookingId),
+            businessId: String(fixture.business._id),
+            businessClientId: String(clientId),
+            purpose: kind === "normal" ? "BOOKING_DEPOSIT" : "PACKAGE_PURCHASE",
+            preTaxChargeCents: depositCents,
+            taxCents: 0,
+            chargedAmountCents: depositCents,
+            taxMode: "PRE_ACTIVATION",
+            financialContract: {
+              version: contract.version,
+              classification: "RETURNING",
+              productKind: contract.productKind,
+            },
+          }),
+          financialContract: {
+            version: contract.version,
+            classification: "RETURNING",
+            productKind: contract.productKind,
+            businessClientId: clientId,
+          },
+        });
+        if (charge.status !== "requires_action") throw new Error("expected requires_action");
+        return { input, charge, depositCents };
+      };
+
+      it.each(["normal", "package"] as const)(
+        "%s: the resume conflicts, the frozen contract is untouched, and no second PaymentIntent is created",
+        async (kind) => {
+          const fixture = await setupFixture();
+          const { customer, client } = await createLinkedCustomer(fixture, `inflight-${kind}`);
+          confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "09:00")));
+          const { input } = await seedInFlightReturning(fixture, customer._id, client._id, kind);
+          const before = await BookingCreationClaimModel.findOne({
+            idempotencyKey: input.idempotencyKey,
+          })
+            .orFail()
+            .lean()
+            .exec();
+          const piCount = paymentGateway.paymentIntentInputs.length;
+
+          await expect(
+            kind === "normal"
+              ? finalizeNormal(fixture, customer._id, input as ReturnType<typeof normalInput>)
+              : finalizePackage(fixture, customer._id, input as ReturnType<typeof packageInput>),
+          ).rejects.toMatchObject({
+            statusCode: 409,
+            details: [{ code: "BOOKING_FINANCIAL_CONTRACT_CONFLICT" }],
+          });
+
+          const after = await BookingCreationClaimModel.findOne({
+            idempotencyKey: input.idempotencyKey,
+          })
+            .orFail()
+            .lean()
+            .exec();
+          expect(after.financialContract).toEqual(before.financialContract);
+          expect(after.financialContract?.requiredUpfrontCents).toBe(2_000);
+          expect(paymentGateway.paymentIntentInputs).toHaveLength(piCount);
+          expect(await BookingModel.countDocuments({ _id: before.bookingId })).toBe(0);
+        },
+      );
+
+      it.each(["normal", "package"] as const)(
+        "%s: money captured by the old 3DS is compensated exactly once by P0 once its success is observed",
+        async (kind) => {
+          const fixture = await setupFixture();
+          const { customer, client } = await createLinkedCustomer(fixture, `inflight-paid-${kind}`);
+          confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "09:00")));
+          const { input, charge, depositCents } = await seedInFlightReturning(
+            fixture,
+            customer._id,
+            client._id,
+            kind,
+          );
+          const relationshipBefore = (await relationshipOf(client._id)).financialRelationship;
+          paymentGateway.succeedPaymentIntent(charge.paymentIntentId); // the customer finished 3DS
+
+          await expect(
+            kind === "normal"
+              ? finalizeNormal(fixture, customer._id, input as ReturnType<typeof normalInput>)
+              : finalizePackage(fixture, customer._id, input as ReturnType<typeof packageInput>),
+          ).rejects.toMatchObject({ details: [{ code: "BOOKING_FINANCIAL_CONTRACT_CONFLICT" }] });
+
+          const attempt = await PaymentAttemptModel.findOne({
+            logicalIdempotencyKey: input.idempotencyKey,
+          })
+            .orFail()
+            .exec();
+          // P0: the success webhook records the provider success on the attempt first, then asks
+          // to be retried (no ledger row exists for an operation that could never persist).
+          const succeeded = webhookService.process({
+            id: `evt_${new Types.ObjectId().toString()}`,
+            type: "payment_intent.succeeded",
+            data: {
+              object: {
+                id: charge.paymentIntentId,
+                amount: depositCents,
+                currency: "eur",
+                customer: attempt.providerCustomerId,
+                metadata: paymentGateway.paymentIntentInputs.at(-1)?.metadata ?? {},
+              },
+            },
+          } as unknown as Stripe.Event);
+          await expect(succeeded).rejects.toThrow("source ledger row is not persisted yet");
+          expect(
+            (await PaymentAttemptModel.findById(attempt._id).orFail().exec()).providerStatus,
+          ).toBe("SUCCEEDED");
+          await ageSuccess(attempt._id);
+          await recoveryService.runOnce();
+          await recoveryService.runOnce(); // a duplicate pass never refunds twice
+
+          const refreshed = await PaymentAttemptModel.findById(attempt._id).orFail().exec();
+          expect(refreshed.compensationStatus).toBe("REFUNDED");
+          expect(
+            await RefundOperationModel.countDocuments({ sourcePaymentAttemptId: attempt._id }),
+          ).toBe(1);
+          expect(paymentGateway.refundInputs).toHaveLength(1);
+          expect(paymentGateway.refundInputs[0]?.amountCents).toBe(depositCents);
+          expect(
+            await BookingModel.countDocuments({ _id: attempt.bookingId as Types.ObjectId }),
+          ).toBe(0);
+          expect(await PackageProgressModel.countDocuments()).toBe(0);
+          // RETURNING never touches the relationship, even through compensation.
+          expect((await relationshipOf(client._id)).financialRelationship).toEqual(
+            relationshipBefore,
+          );
+        },
+      );
     });
   });
 });

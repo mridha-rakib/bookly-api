@@ -425,7 +425,7 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     expect(count).toBe(0);
   });
 
-  it("Batch 6.5: a returning customer's second booking still charges a real deposit online, but Bookly earns no platform fee on it", async () => {
+  it("P3: a returning customer's second booking is €0 online (no PaymentIntent, no ledger) and Bookly earns no platform fee on it", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     const customer = await createCustomer("c");
     await saveCard(customer._id);
@@ -450,22 +450,19 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
 
     expect(second.status).toBe("confirmed");
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    // The deposit is STILL charged online for a returning booking — never €0 due now — but
-    // Bookly does not economically keep it (platformFeeCents 0).
-    expect(second.booking.financials.depositCents).toBe(2000);
+    // P3: a RETURNING booking pays nothing online — the whole total is the venue balance — and
+    // Bookly takes no platform fee on it.
+    expect(second.booking.financials.depositCents).toBe(0);
     expect(second.booking.financials.platformFeeCents).toBe(0);
-    expect(second.booking.financials.balanceDueCents).toBe(8000);
+    expect(second.booking.financials.balanceDueCents).toBe(10_000);
 
-    // A real Stripe deposit charge happened (ledgered DEPOSIT, not PLATFORM_FEE — the Business,
-    // not Bookly, economically owns this money).
-    const ledger = await financialTransactionService.listForBooking(second.booking._id);
-    const depositEntry = ledger.find((entry) => entry.type === "DEPOSIT");
-    expect(depositEntry?.status).toBe("SUCCEEDED");
-    expect(depositEntry?.amountCents).toBe(2000);
-    expect(ledger.some((entry) => entry.type === "PLATFORM_FEE")).toBe(false);
+    // No provider money moved for it: only the FIRST booking ever reached Stripe, and the
+    // RETURNING booking has no ledger row at all (no DEPOSIT, no PLATFORM_FEE).
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(await financialTransactionService.listForBooking(second.booking._id)).toHaveLength(0);
   });
 
-  it("Batch 6.5: a returning customer without a saved card is rejected before finalizing (deposit is still required)", async () => {
+  it("a returning customer without a saved card is rejected before finalizing (P3: the card is still required even though nothing is charged online)", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     const customer = await createCustomer("c2");
     await saveCard(customer._id);

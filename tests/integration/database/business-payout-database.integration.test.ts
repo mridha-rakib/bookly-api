@@ -49,6 +49,7 @@ import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhoo
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { seedLegacyReturningDeposit } from "../../helpers/legacy-returning-deposit.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -495,7 +496,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
   // --- 3/4/5: returning DEPOSIT belongs to Business, enters payable net of its own Stripe fee -
 
-  it("returning customer: same €16 online charge is Business-owned DEPOSIT, enters pending payable net of its own Stripe fee", async () => {
+  it("legacy (pre-P3) returning customer: a €16 Business-owned DEPOSIT enters pending payable net of its own Stripe fee", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("returning");
     await saveCard(customer._id);
@@ -514,8 +515,13 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    expect(second.booking.financials.platformFeeCents).toBe(0);
-    expect(second.booking.financials.depositCents).toBe(1600);
+    // P3: a RETURNING booking is €0 online — seed the pre-P3 Business-owned DEPOSIT this
+    // payout/refund path is about (real PI + attempt + ledger, see the helper).
+    expect(second.booking.financials.depositCents).toBe(0);
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
     await settleProcessingFee(first.booking._id);
     await settleProcessingFee(second.booking._id);
 
@@ -677,7 +683,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     expect(summary.bookly.refundsCents).toBe(1600);
   });
 
-  it("a business-cancellation refund of a RETURNING booking's DEPOSIT reduces Business payable, not Bookly revenue", async () => {
+  it("a business-cancellation refund of a legacy (pre-P3) RETURNING booking's DEPOSIT reduces Business payable, not Bookly revenue", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("refund-returning");
     await saveCard(customer._id);
@@ -694,6 +700,13 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
+    // P3: a RETURNING booking is €0 online — seed the pre-P3 Business-owned DEPOSIT this
+    // payout/refund path is about (real PI + attempt + ledger, see the helper).
+    expect(second.booking.financials.depositCents).toBe(0);
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
 
     await lifecycleService.cancelByBusiness(
       String(owner._id),
@@ -706,6 +719,8 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     const payable = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
     // DEPOSIT (+1600) then fully refunded (-1600) -> nets to 0, correctly excluded from payable
     // (never double counted, never leaking into Bookly's side).
+    expect(payable.grossCents).toBe(1600);
+    expect(payable.refundsCents).toBe(1600);
     expect(payable.grossCents - payable.refundsCents).toBe(0);
     expect(payable.netCents).toBeLessThanOrEqual(0);
   });
@@ -729,6 +744,13 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
+    // P3: a RETURNING booking is €0 online — seed the pre-P3 Business-owned DEPOSIT this
+    // payout/refund path is about (real PI + attempt + ledger, see the helper).
+    expect(second.booking.financials.depositCents).toBe(0);
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
     await settleProcessingFee(first.booking._id);
     await settleProcessingFee(second.booking._id);
 
@@ -798,6 +820,13 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
+    // P3: a RETURNING booking is €0 online — seed the pre-P3 Business-owned DEPOSIT this
+    // payout/refund path is about (real PI + attempt + ledger, see the helper).
+    expect(second.booking.financials.depositCents).toBe(0);
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
 
     const admin = await userRepository.create({
       normalizedEmail: `admin-race-${new Types.ObjectId().toString()}@example.com`,
@@ -863,7 +892,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       await linkCustomerToBusiness(business._id, owner._id, customer._id);
       // TWO bookings by the SAME customer, exactly as the pre-existing payout tests above do:
       // the first is a first-time booking (Bookly-owned PLATFORM_FEE), the second a returning
-      // booking whose DEPOSIT is Business-owned — that second one is what creates the payable.
+      // booking carrying a seeded legacy (pre-P3) Business-owned DEPOSIT — that is the payable.
       for (const time of ["10:00", "14:00"]) {
         const result = await creationService.finalizeCustomerBooking(
           String(customer._id),
@@ -871,6 +900,13 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
           finalizeInput(service._id, membership._id, time),
         );
         if (result.status !== "confirmed") throw new Error("expected confirmed");
+        if (time === "14:00") {
+          // P3: the RETURNING booking is €0 online — seed its pre-P3 legacy DEPOSIT.
+          await seedLegacyReturningDeposit(
+            { paymentService, financialTransactionService },
+            result.booking,
+          );
+        }
         await settleProcessingFee(result.booking._id);
       }
 

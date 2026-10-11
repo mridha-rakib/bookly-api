@@ -35,6 +35,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { seedLegacyReturningDeposit } from "../../helpers/legacy-returning-deposit.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -352,7 +353,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
 
   // --- Returning customer: cancellation-fee netting against the DEPOSIT ledger type ------------
 
-  it("returning customer's late cancellation nets the fee against the DEPOSIT-ledgered amount (not platformFeeCents)", async () => {
+  it("legacy (pre-P3) returning customer's late cancellation nets the fee against the DEPOSIT-ledgered amount (not platformFeeCents)", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     await cancellationPolicyRepository.replace(
       business._id,
@@ -376,8 +377,14 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    expect(second.booking.financials.platformFeeCents).toBe(0);
-    expect(second.booking.financials.depositCents).toBe(2000);
+    // P3: a RETURNING booking is €0 online. This legacy path nets/refunds against a pre-P3
+    // Business-owned DEPOSIT, so seed exactly that historical state (real PI + attempt + ledger).
+    expect(second.booking.financials).toMatchObject({ platformFeeCents: 0, depositCents: 0 });
+    const legacy = await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
+    expect(legacy.depositCents).toBe(2000);
 
     // Force the second booking's schedule inside the UNDER_2_HOURS window.
     await BookingModel.updateOne(
@@ -406,7 +413,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
 
   // --- Returning customer: no-show netting against the DEPOSIT ledger type ----------------------
 
-  it("returning customer's no-show worker nets the fee against the DEPOSIT-ledgered amount", async () => {
+  it("legacy (pre-P3) returning customer's no-show worker nets the fee against the DEPOSIT-ledgered amount", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     await cancellationPolicyRepository.replace(
       business._id,
@@ -430,8 +437,14 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    expect(second.booking.financials.platformFeeCents).toBe(0);
-    expect(second.booking.financials.depositCents).toBe(2000);
+    // P3: a RETURNING booking is €0 online. This legacy path nets/refunds against a pre-P3
+    // Business-owned DEPOSIT, so seed exactly that historical state (real PI + attempt + ledger).
+    expect(second.booking.financials).toMatchObject({ platformFeeCents: 0, depositCents: 0 });
+    const legacy = await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
+    expect(legacy.depositCents).toBe(2000);
 
     await lifecycleService.markNoShow(
       String(owner._id),
@@ -456,7 +469,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
 
   // --- Business cancellation refunds a RETURNING customer's DEPOSIT (the bug this batch fixes) --
 
-  it("business cancellation refunds a returning customer's DEPOSIT-ledgered amount (previously invisible when only PLATFORM_FEE was searched)", async () => {
+  it("business cancellation refunds a legacy (pre-P3) returning customer's DEPOSIT-ledgered amount (previously invisible when only PLATFORM_FEE was searched)", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     const customer = await createCustomer("business-cancel-returning");
     await saveCard(customer._id);
@@ -475,8 +488,14 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    expect(second.booking.financials.platformFeeCents).toBe(0);
-    expect(second.booking.financials.depositCents).toBe(2000);
+    // P3: a RETURNING booking is €0 online. This legacy path nets/refunds against a pre-P3
+    // Business-owned DEPOSIT, so seed exactly that historical state (real PI + attempt + ledger).
+    expect(second.booking.financials).toMatchObject({ platformFeeCents: 0, depositCents: 0 });
+    const legacy = await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
+    expect(legacy.depositCents).toBe(2000);
 
     const cancelled = await lifecycleService.cancelByBusiness(
       String(owner._id),
@@ -549,17 +568,15 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
         details: [{ code: "BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS" }],
       });
     }
-    expect(paymentGateway.paymentIntentInputs).toHaveLength(confirmed.length);
+    // Only the FIRST winner moves money.
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(platformFeeBookings.length);
 
-    // A RETURNING booking (if the loser arrived late) still charged a REAL deposit online —
-    // never €0 (P3 not implemented) — ledgered as Business-owned DEPOSIT.
+    // P3: a RETURNING booking (if the loser arrived late) is €0 online — no PaymentIntent, no
+    // ledger row; its whole total is the venue balance.
     for (const r of depositOnlyBookings) {
       if (r.status !== "confirmed") continue;
-      expect(r.booking.financials.depositCents).toBe(2000);
-      const ledger = await financialTransactionService.listForBooking(r.booking._id);
-      const depositEntry = ledger.find((entry) => entry.type === "DEPOSIT");
-      expect(depositEntry?.status).toBe("SUCCEEDED");
-      expect(depositEntry?.amountCents).toBe(2000);
+      expect(r.booking.financials).toMatchObject({ depositCents: 0, balanceDueCents: 10_000 });
+      expect(await financialTransactionService.listForBooking(r.booking._id)).toHaveLength(0);
     }
     for (const r of platformFeeBookings) {
       if (r.status !== "confirmed") continue;
@@ -588,7 +605,7 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
 
   // --- Waived returning no-show never charges later (nets against DEPOSIT correctly) -----------
 
-  it("a waived returning-customer no-show correctly nets against the DEPOSIT ledger entry and never charges later", async () => {
+  it("a waived legacy (pre-P3) returning-customer no-show correctly nets against the DEPOSIT ledger entry and never charges later", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     await cancellationPolicyRepository.replace(
       business._id,
@@ -612,7 +629,14 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    expect(second.booking.financials.platformFeeCents).toBe(0);
+    // P3: a RETURNING booking is €0 online. This legacy path nets/refunds against a pre-P3
+    // Business-owned DEPOSIT, so seed exactly that historical state (real PI + attempt + ledger).
+    expect(second.booking.financials).toMatchObject({ platformFeeCents: 0, depositCents: 0 });
+    const legacy = await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
+    expect(legacy.depositCents).toBe(2000);
 
     await lifecycleService.markNoShow(
       String(owner._id),

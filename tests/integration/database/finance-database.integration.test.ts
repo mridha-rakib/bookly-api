@@ -39,6 +39,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { seedLegacyReturningDeposit } from "../../helpers/legacy-returning-deposit.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -354,7 +355,7 @@ describe("database-backed Business Finance (Batch 7)", () => {
 
   // --- Fee-recovery summary: cancellation + no-show -----------------------------------------------
 
-  it("counts a returning customer's settled late-cancellation fee as Business payout, excludes PLATFORM_FEE/DEPOSIT", async () => {
+  it("counts a legacy (pre-P3) returning customer's settled late-cancellation fee as Business payout, excludes PLATFORM_FEE/DEPOSIT", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(10_000);
     await cancellationPolicyRepository.replace(
       business._id,
@@ -378,6 +379,13 @@ describe("database-backed Business Finance (Batch 7)", () => {
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
+    // P3: a RETURNING booking is €0 online — seed the pre-P3 Business-owned DEPOSIT the fee nets
+    // against (real PI + attempt + ledger, see the helper).
+    expect(second.booking.financials.depositCents).toBe(0);
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
 
     await BookingModel.updateOne(
       { _id: second.booking._id },

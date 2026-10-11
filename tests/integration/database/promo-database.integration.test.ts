@@ -37,8 +37,6 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
-import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
-import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
@@ -72,7 +70,6 @@ describe("database-backed Promo Code system (Batch 13)", () => {
   let paymentService: PaymentService;
   let financialTransactionService: BookingFinancialTransactionService;
   let financeService: FinanceService;
-  let webhookService: StripeWebhookService;
   let promoRepository: PromoRepository;
   let promoRedemptionRepository: PromoRedemptionRepository;
   let tokenService: TokenService;
@@ -111,11 +108,6 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       financialTransactionService,
       bookingRepository,
       businessPayoutRepository,
-    );
-    webhookService = new StripeWebhookService(
-      paymentGateway,
-      new StripeWebhookEventRepository(),
-      financialTransactionService,
     );
     promoRepository = new PromoRepository();
     promoRedemptionRepository = new PromoRedemptionRepository();
@@ -365,31 +357,6 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     ...(promoCode ? { promoCode } : {}),
   });
 
-  /** Mirrors business-payout-database.integration.test.ts's own helper exactly: the only path
-   * that ever records a real PROCESSING_FEE entry. */
-  const settleProcessingFee = async (bookingId: Types.ObjectId) => {
-    const entries = await financialTransactionService.listForBooking(bookingId);
-    for (const entry of entries) {
-      if (!entry.providerReference || entry.status !== "SUCCEEDED") continue;
-      const providerInput = paymentGateway.paymentIntentInputs.find(
-        (input) => input.metadata["bookingId"] === String(bookingId),
-      );
-      await webhookService.process({
-        id: `evt_${entry.providerReference}`,
-        type: "payment_intent.succeeded",
-        data: {
-          object: {
-            id: entry.providerReference,
-            amount: entry.amountCents,
-            currency: entry.currency.toLowerCase(),
-            customer: providerInput?.stripeCustomerId,
-            metadata: providerInput?.metadata ?? { bookingId: String(bookingId) },
-          },
-        },
-      } as never);
-    }
-  };
-
   const createPromo = async (input: {
     code: string;
     type: "PERCENTAGE" | "FIXED";
@@ -578,7 +545,7 @@ describe("database-backed Promo Code system (Batch 13)", () => {
 
   // --- Financial correctness: RETURNING booking (pre-P3 legacy deposit on the discounted price) --
 
-  it("[27][28][29] [P2] RETURNING booking: €5 promo lowers the price to €75, legacy deposit 20% of €75 = €15 charged as DEPOSIT, no PROMO_SUBSIDY, Business bears the promo", async () => {
+  it("[27][28][29] [P2/P3] RETURNING booking: €5 promo lowers the price to €75, €0 online (no PI, no ledger), full €75 at the venue, no PROMO_SUBSIDY, Business bears the promo", async () => {
     const superAdmin = await createSuperAdmin();
     await createPromo({ code: "FIVE", type: "FIXED", value: 500, createdByUserId: superAdmin._id });
 
@@ -602,41 +569,39 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
 
+    // P2 still lowers the price first; P3 makes the RETURNING upfront €0, so the whole
+    // discounted price is the venue balance.
     expect(second.booking.financials).toMatchObject({
       promoDiscountCents: 500,
       eligiblePlatformFeeBasisCents: 7500,
       totalCents: 7500,
-      depositCents: 1500,
+      depositCents: 0,
       platformFeeCents: 0, // returning: never Bookly's
-      balanceDueCents: 6000,
+      balanceDueCents: 7500,
     });
     expect(second.booking.promo).toMatchObject({
       discountCents: 500,
-      chargeCents: 1500,
+      chargeCents: 0,
       fundingOwner: "BUSINESS",
     });
     expect(second.booking.financialContract).toMatchObject({
       version: 3,
       classification: "RETURNING",
       upfrontLedgerType: "DEPOSIT",
+      requiredUpfrontCents: 0,
+      onlineChargeCents: 0,
     });
+    // Only the FIRST booking ever reached Stripe.
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
 
     const ledger = await financialTransactionService.listForBooking(second.booking._id);
-    expect(ledger.find((e) => e.type === "DEPOSIT")?.amountCents).toBe(1500);
-    expect(ledger.find((e) => e.type === "PROMO_SUBSIDY")).toBeUndefined();
+    expect(ledger).toHaveLength(0); // no DEPOSIT, no PLATFORM_FEE, no PROMO_SUBSIDY
 
-    await settleProcessingFee(second.booking._id);
-    const settled = await financialTransactionService.listForBooking(second.booking._id);
-    const processingFeeEntry = settled.find(
-      (e) => e.type === "PROCESSING_FEE" && e.metadata?.["sourceType"] === "DEPOSIT",
-    );
-    expect(processingFeeEntry?.amountCents).toBe(55); // the fixture's fixed 55-cent fee
-
-    // The Business bears the promo: its online-collected entitlement is the €15 deposit on the
-    // discounted price (the €60 balance is collected at the venue) — no Bookly top-up.
+    // The Business bears the promo: nothing was collected online for it (the €75 discounted
+    // price is collected at the venue) — no Bookly top-up, nothing payable online.
     const payable = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
-    expect(payable.grossCents).toBe(1500);
-    expect(payable.netCents).toBe(1500 - 55);
+    expect(payable.grossCents).toBe(0);
+    expect(payable.netCents).toBe(0);
   });
 
   it("[9][33] [P2] service discount happens BEFORE the promo; the promo never rewrites Service pricing", async () => {

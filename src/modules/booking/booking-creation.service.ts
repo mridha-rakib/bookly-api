@@ -45,7 +45,6 @@ import { TaxError } from "../payment/tax.errors.js";
 import type { ComputedTax, CyprusTaxService } from "../payment/tax.service.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
-import { PromoError } from "../promo/promo.errors.js";
 import type { PromoApplicationService, ResolvedPromo } from "../promo/promo-application.service.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
@@ -255,15 +254,14 @@ const resolveValidCoordinate = (
  * and the Batch 4 final report for exactly how it is resolved here): `UPCOMING` is this
  * codebase's confirmed "the customer is expected to actually show up" status. A MANUAL Booking
  * has no payment concept at all (fee/deposit=0 by construction — rule E), so `UPCOMING` never
- * implied "paid" for one. A BOOKLY_MANAGED Customer Booking now only ever reaches `UPCOMING`
- * AFTER its required deposit payment has genuinely succeeded — charged online for EVERY
- * BOOKLY_MANAGED booking, first or returning (Batch 6.5 correction; a returning Customer is
- * NEVER "nothing beyond a verified saved card" — see PAYMENT-GATING's continuation in
- * `finalizeCustomerBooking`'s own doc comment, and BookingFinancials's own doc comment for the
- * full deposit-vs-platform-fee distinction). `previewCustomerBooking` remains a read-only,
- * side-effect-free quote (now Customer-aware, so it can show the ACTUAL applicable amount — the
- * real clamp(20%, €5, €35) deposit formula for both a first and a returning Customer, never €0
- * for either) and never persists anything.
+ * implied "paid" for one. A BOOKLY_MANAGED Customer Booking only ever reaches `UPCOMING` AFTER
+ * its required upfront payment (if any) has genuinely succeeded. P3: only a FIRST purchase
+ * (normal booking or package purchase — one shared customer↔business relationship) carries an
+ * online upfront; every RETURNING purchase is €0 online with the full total payable at the
+ * venue, yet still requires a verified saved card (cancellation/no-show policy). See
+ * `finalizeCustomerBooking`'s own doc comment and BookingFinancials's own doc comment.
+ * `previewCustomerBooking` remains a read-only, side-effect-free, Customer-aware quote of the
+ * ACTUAL amount due now and never persists anything.
  */
 export class BookingCreationService {
   public constructor(
@@ -510,11 +508,9 @@ export class BookingCreationService {
 
   /**
    * A real, side-effect-free quote — Customer-aware (unlike Batch 3's version) so it can show
-   * the ACTUAL amount due now: the clamp(20%, €5, €35) booking deposit, charged online for
-   * EVERY BOOKLY_MANAGED booking — first or returning (Batch 6.5 correction: never €0 for a
-   * returning Customer; see BookingFinancials's own doc comment for the full deposit-vs-
-   * platform-fee distinction). Never reserves or persists anything; `finalizeCustomerBooking`
-   * is the only path that does.
+   * the ACTUAL amount due now: the FIRST upfront (20%, €5 floor, €35 cap, never above the
+   * basis) for a first purchase, €0 for a RETURNING one (P3). Never reserves or persists
+   * anything; `finalizeCustomerBooking` is the only path that does.
    */
   public async previewCustomerBooking(
     customerUserId: string,
@@ -564,7 +560,6 @@ export class BookingCreationService {
       undefined,
       resolvedPromo?.promoDiscountCents,
     );
-    this.assertPromoDepositSupportable(financials, resolvedPromo);
     const cardStatus = await this.paymentService.getSavedCardStatus(customerUserId);
 
     const overallEndAt = lines.reduce(
@@ -641,24 +636,27 @@ export class BookingCreationService {
    *     the Customer's BusinessClient row (see resolveOrCreateCustomerClient — this is exactly
    *     the gap Batch 3 flagged and deferred for TRAVEL_TO_CUSTOMER; AT_BUSINESS_LOCATION with
    *     no existing Client row remains a genuine, still-unresolved product gap — see the report).
-   *  3. Require a saved card regardless of classification (confirmed rule: "returning
-   *     customers also need a saved card").
+   *  3. Require a saved card regardless of classification or amount (confirmed rule:
+   *     "returning customers also need a saved card" — P3 keeps it for a €0 RETURNING
+   *     purchase: the card backs the cancellation/no-show policy).
    *  4. Claim the idempotency key (pre-generated bookingId, same pattern as Batch 3's
    *     `persistBooking`).
    *  5. P1 — establishFinancialTerms: atomically claim/resume the customer↔business first
    *     relationship (ELIGIBLE -> FIRST_PENDING) BEFORE any money moves, or classify RETURNING
    *     from a CONSUMED relationship; a competing unresolved first operation gets
    *     BOOKING_FIRST_RELATIONSHIP_IN_PROGRESS with nothing charged. Then record the immutable
-   *     Financial Contract V2 on the claim (a resumed operation must match it or fail closed).
-   *  6. Whenever the contract's online charge is nonzero: charge it ON-session, saving the card
+   *     Financial Contract (V3 normal / V2 package) on the claim (a resumed operation must match
+   *     it or fail closed — a pre-P3 RETURNING deposit contract therefore never resumes as €0).
+   *  6. Whenever the contract's online charge is nonzero (FIRST only — a RETURNING purchase is
+   *     €0 online since P3: no PaymentIntent, no PaymentAttempt): charge it ON-session, saving the card
    *     for future off-session use in the same call. A FIRST charge binds its PaymentAttempt to
    *     the relationship claim before dispatch. `requires_action` retains the claim, the durable
    *     PaymentAttempt and FIRST_PENDING, returns a clientSecret for 3DS, then the same
    *     idempotencyKey resumes the same PaymentIntent and first claim. A definitive failure
    *     releases FIRST_PENDING; an ambiguous one keeps it protected for reconciliation.
-   *  7. Reserve every line, persist the Booking, write the PLATFORM_FEE (FIRST) or DEPOSIT
-   *     (RETURNING, unchanged pre-P3) ledger row, and — for FIRST — consume the relationship
-   *     (FIRST_PENDING -> CONSUMED), all inside ONE MongoDB transaction.
+   *  7. Reserve every line, persist the Booking, write the PLATFORM_FEE ledger row for a
+   *     nonzero FIRST upfront (a €0 RETURNING purchase writes none), and — for FIRST — consume
+   *     the relationship (FIRST_PENDING -> CONSUMED), all inside ONE MongoDB transaction.
    *  8. If step 7 fails AFTER a successful charge, retain the claim and durable PaymentAttempt,
    *     record compensation-required, and create/resume a durable RefundOperation; a FIRST
    *     relationship moves to RESTORATION_PENDING and only returns to ELIGIBLE once that exact
@@ -1914,7 +1912,8 @@ export class BookingCreationService {
 
   /**
    * Reserve-all-lines + persist the Booking (+ PackageProgress for a purchase) + write the upfront
-   * ledger row typed by the Financial Contract V2 (PLATFORM_FEE for FIRST, DEPOSIT for RETURNING)
+   * ledger row typed by the Financial Contract (PLATFORM_FEE for a nonzero FIRST upfront; a P3
+   * RETURNING purchase is €0 online and writes none — a pre-P3 RETURNING deposit was DEPOSIT)
    * + for FIRST consume the customer↔business relationship (FIRST_PENDING -> CONSUMED) + fence
    * the PaymentAttempt completion — all inside ONE transaction, the same pattern as
    * `persistBooking` (Manual). If the relationship consume CAS fails (ownership lost), the whole
@@ -2080,11 +2079,11 @@ export class BookingCreationService {
         }
 
         if (hasDepositObligation) {
-          // The SAME deposit charge — the ledger TYPE alone records who economically owns it
-          // (see BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first
-          // booking, DEPOSIT (already part of this ledger's vocabulary — see
-          // booking-financial-transaction.types.ts — never PLATFORM_FEE) for a returning
-          // customer's Business-owned prepayment. `amountCents` is the amount ACTUALLY charged
+          // The upfront charge — the ledger TYPE alone records who economically owns it (see
+          // BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first purchase.
+          // Since P3 a RETURNING purchase has no upfront at all (depositCents 0), so this block
+          // never runs for it; DEPOSIT remains the contract's ledger type for RETURNING and is
+          // only ever found on pre-P3 history. `amountCents` is the amount ACTUALLY charged
           // (P2: the full upfront computed on the promo-discounted price, never upfront − promo)
           // — every downstream reader of "the customer's upfront payment" (cancellation/no-show
           // netting, refunds — see BookingFinancialTransactionService.findSucceededUpfrontPayment)
@@ -2099,8 +2098,8 @@ export class BookingCreationService {
                 bookingId: params.bookingId,
                 businessClientId: params.client._id,
                 customerUserId: params.createdBy.actorUserId,
-                // FIRST upfront is always Bookly's PLATFORM_FEE; RETURNING keeps the pre-P3
-                // Business-owned DEPOSIT — exactly as the contract recorded before the charge.
+                // FIRST upfront is always Bookly's PLATFORM_FEE — exactly as the contract
+                // recorded before the charge (a P3 RETURNING contract never reaches here).
                 type: params.contract.upfrontLedgerType,
                 direction: "DEBIT",
                 amountCents: params.customerChargeNowCents,
@@ -2549,11 +2548,11 @@ export class BookingCreationService {
   }
 
   /**
-   * The non-FIRST financial snapshot: MANUAL (no deposit — rule E), package Session 2+ extras,
-   * and the current pre-P3 RETURNING deposit (legacy clamp(20%, €5, €35) on the legacy basis,
-   * Business-owned, `platformFeeCents = 0`). A FIRST upfront is never computed here — see
-   * assembleCustomerFinancials, which is the only path that can produce a nonzero
-   * platformFeeCents, from the relationship's authoritative classification.
+   * The shared price snapshot (totals, the eligible basis, and the legacy clamp(20%, €5, €35)
+   * deposit). Used as-is for MANUAL (no deposit — rule E) and package Session 2+ extras (their
+   * unchanged legacy deposit). For relationship-classified purchases it is only the starting
+   * point — see assembleCustomerFinancials, which sets the FIRST upfront or the P3 €0
+   * RETURNING upfront from the relationship's authoritative classification.
    */
   private assembleFinancials(
     source: BookingSource,
@@ -2613,10 +2612,14 @@ export class BookingCreationService {
   }
 
   /**
-   * P1 — customer booking / package purchase financials from the relationship classification.
+   * P1 — customer booking / package purchase financials from the relationship classification
+   * (ONE shared customer↔business relationship — whichever purchase kind consumes it first is
+   * FIRST; every later normal booking AND package purchase is RETURNING).
    *
-   *  - RETURNING keeps the CURRENT (pre-P3) behaviour exactly: the legacy deposit on the legacy
-   *    basis (services + add-ons − service discount), charged online, Business-owned.
+   *  - RETURNING (P3): €0 online for BOTH a normal booking and a package purchase — no deposit,
+   *    no platform fee; the full total (incl. add-ons and travel) is the venue balance. The
+   *    eligible basis is unchanged (normal: the promo-discounted price; package: bundle +
+   *    add-ons) and stays the cancellation/no-show basis.
    *  - FIRST uses the canonical first upfront (calculateFirstUpfrontCents — 20%, €5 floor, €35
    *    cap, never above the basis) on the FIRST basis: normal = services + eligible add-ons −
    *    service discount; package = `Service.packagePricing.bundlePriceCents` ONLY (add-ons and
@@ -2627,9 +2630,11 @@ export class BookingCreationService {
    * basis; the FIRST basis is returned separately and recorded in the Financial Contract.
    *
    * P2 — `promoDiscountCents` (normal bookings only; never with `packageBundlePriceCents`)
-   * discounts the normal price first, so FIRST and RETURNING both compute their (unchanged)
-   * formula from the discounted price, and that discounted price is also the stored
-   * cancellation/no-show basis and the booking total (plus travel).
+   * discounts the normal price first, so the FIRST upfront is computed from the discounted
+   * price, and that discounted price is also the stored cancellation/no-show basis and the
+   * booking total (plus travel).
+   *
+   * Never used by MANUAL or package Session 2+ (both call assembleFinancials directly).
    */
   private assembleCustomerFinancials(
     lines: Array<Pick<ResolvedServiceLine, "amountCents" | "discountCents" | "addons">>,
@@ -2645,7 +2650,15 @@ export class BookingCreationService {
       promoDiscountCents,
     );
     if (classification === "RETURNING") {
-      return { financials: returning, eligibleBasisCents: returning.eligiblePlatformFeeBasisCents };
+      return {
+        financials: {
+          ...returning,
+          depositCents: 0,
+          platformFeeCents: 0,
+          balanceDueCents: returning.totalCents,
+        },
+        eligibleBasisCents: returning.eligiblePlatformFeeBasisCents,
+      };
     }
 
     const eligibleBasisCents = packageBundlePriceCents ?? returning.eligiblePlatformFeeBasisCents;
@@ -2659,22 +2672,6 @@ export class BookingCreationService {
       },
       eligibleBasisCents,
     };
-  }
-
-  /**
-   * P2 — until P3 removes the RETURNING online deposit, its legacy €5 floor can exceed a booking
-   * whose price a promo lowered (a deposit the booking cannot support). Rejected here, BEFORE any
-   * contract, tax compute or provider call: no PaymentIntent, nothing persisted, no promo usage
-   * consumed — the customer can retry without the promo. FIRST can never trip this (its upfront
-   * is capped at the discounted basis).
-   */
-  private assertPromoDepositSupportable(
-    financials: BookingFinancials,
-    resolvedPromo: ResolvedPromo | undefined,
-  ): void {
-    if (resolvedPromo && financials.depositCents > financials.totalCents) {
-      throw new PromoError("PROMO_BELOW_MINIMUM_DEPOSIT", 400);
-    }
   }
 
   /** V3 for every new NORMAL booking (P2 promo economics). A package purchase stays V2 (it never
@@ -2765,7 +2762,6 @@ export class BookingCreationService {
         params.packageBundlePriceCents,
         resolvedPromo?.promoDiscountCents,
       );
-      this.assertPromoDepositSupportable(financials, resolvedPromo);
 
       const contract: FinancialContract = {
         version,

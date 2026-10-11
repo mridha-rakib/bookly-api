@@ -506,7 +506,7 @@ describe("database-backed no-show eligibility window + max services (Batch 21)",
         venuePayment,
       );
 
-    // €100 service, €20 deposit -> €80 balance due.
+    // €100 service, €20 FIRST upfront -> €80 balance due (later bookings are RETURNING: €0 online).
     const full = await confirmBooking(customer._id, business._id, service._id, membership._id);
     expect(full.financials.balanceDueCents).toBe(8000);
     const fullDone = await complete(full._id, { settlement: "FULL" });
@@ -521,9 +521,12 @@ describe("database-backed no-show eligibility window + max services (Batch 21)",
     expect(unpaidDone.completionPayment?.paid).toBe(false);
     expect(unpaidDone.completionPayment?.amountCents).toBeUndefined();
 
-    // rejects: PARTIAL equal to the balance, above the balance, and zero/negative
+    // rejects: PARTIAL equal to the balance, above the balance, and zero/negative. This later
+    // booking is RETURNING, so (P3) nothing was charged online and its balance is the full €100.
     const bad = await confirmBooking(customer._id, business._id, service._id, membership._id);
-    for (const amount of [8000, 9000, 0, -1]) {
+    expect(bad.financials).toMatchObject({ depositCents: 0, balanceDueCents: 10_000 });
+    const balance = bad.financials.balanceDueCents;
+    for (const amount of [balance, balance + 1000, 0, -1]) {
       await expect(
         complete(bad._id, { settlement: "PARTIAL", amountCents: amount }),
       ).rejects.toMatchObject({ statusCode: 400 });

@@ -210,6 +210,76 @@ describe("P2 — Financial Contract V3 (business-funded booking-price promo)", (
   });
 });
 
+describe("P3 — RETURNING €0 contracts (no V4, no package V3, no tightened invariant)", () => {
+  const ids = {
+    bookingId: new Types.ObjectId("aaaaaaaaaaaaaaaaaaaaaaaa"),
+    customerUserId: new Types.ObjectId("bbbbbbbbbbbbbbbbbbbbbbbb"),
+    businessId: new Types.ObjectId("cccccccccccccccccccccccc"),
+    businessClientId: new Types.ObjectId("dddddddddddddddddddddddd"),
+  };
+  // €100 normal RETURNING (V3) and a €100 bundle + €40 add-on package RETURNING (V2).
+  const normalReturning = (upfront: number): FinancialContract => ({
+    version: 3,
+    productKind: "NORMAL_BOOKING",
+    classification: "RETURNING",
+    idempotencyKey: "normal",
+    ...ids,
+    currency: "EUR",
+    promoEligibleBaseCents: 10_000,
+    promoDiscountCents: 0,
+    eligibleBasisCents: 10_000,
+    requiredUpfrontCents: upfront,
+    onlineChargeCents: upfront,
+    travelFeeCents: 0,
+    bookingTotalCents: 10_000,
+    upfrontLedgerType: "DEPOSIT",
+  });
+  const packageReturning = (upfront: number): FinancialContract => ({
+    version: 2,
+    productKind: "PACKAGE_PURCHASE",
+    classification: "RETURNING",
+    idempotencyKey: "package",
+    ...ids,
+    currency: "EUR",
+    eligibleBasisCents: 14_000,
+    requiredUpfrontCents: upfront,
+    promoDiscountCents: 0,
+    onlineChargeCents: upfront,
+    travelFeeCents: 0,
+    packageBundlePriceCents: 10_000,
+    bookingTotalCents: 14_000,
+    upfrontLedgerType: "DEPOSIT",
+  });
+
+  it("a P3 normal RETURNING V3 contract with 0/0 is valid", () => {
+    expect(findFinancialContractInvariantViolation(normalReturning(0))).toBeUndefined();
+  });
+
+  it("a P3 package RETURNING V2 contract with 0/0 is valid", () => {
+    expect(findFinancialContractInvariantViolation(packageReturning(0))).toBeUndefined();
+  });
+
+  it("pre-P3 RETURNING contracts with a deposit stay valid and readable (both versions)", () => {
+    expect(findFinancialContractInvariantViolation(normalReturning(2_000))).toBeUndefined();
+    expect(findFinancialContractInvariantViolation(packageReturning(2_800))).toBeUndefined();
+  });
+
+  it("a package purchase can never be expressed as a V3 contract", () => {
+    expect(
+      findFinancialContractInvariantViolation({ ...packageReturning(0), version: 3 }),
+    ).toBeDefined();
+  });
+
+  it("a pre-P3 deposit contract never matches its P3 €0 candidate (fail closed, never repriced)", () => {
+    expect(findFinancialContractMismatch(normalReturning(2_000), normalReturning(0))).toBe(
+      "requiredUpfrontCents",
+    );
+    expect(findFinancialContractMismatch(packageReturning(2_800), packageReturning(0))).toBe(
+      "requiredUpfrontCents",
+    );
+  });
+});
+
 describe("relationship preview estimate (read-only)", () => {
   const service = new FinancialRelationshipService(
     {} as never,

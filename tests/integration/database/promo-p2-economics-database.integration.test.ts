@@ -38,6 +38,7 @@ import { ClientRepository } from "../../../src/modules/client/client.repository.
 import { FinancialRelationshipRepository } from "../../../src/modules/client/financial-relationship.repository.js";
 import { FinancialRelationshipService } from "../../../src/modules/client/financial-relationship.service.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
+import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import {
   MoneyRecoveryService,
@@ -496,8 +497,12 @@ describe("P2.1 — business-funded booking-price promos + Financial Contract V3"
   });
 
   /** Makes this customer RETURNING at the fixture's business with a no-promo booking. */
-  const consumeFirst = async (fixture: Fixture, customerId: Types.ObjectId, time = "09:00") =>
-    confirmed(await finalize(fixture, customerId, normalInput(fixture, time)));
+  const consumeFirst = async (
+    fixture: Fixture,
+    customerId: Types.ObjectId,
+    time = "09:00",
+    extra: { travel?: boolean } = {},
+  ) => confirmed(await finalize(fixture, customerId, normalInput(fixture, time, extra)));
 
   const ageSuccess = async (attemptId: Types.ObjectId, ageMs = 10 * 60_000) => {
     const past = new Date(Date.now() - ageMs);
@@ -718,89 +723,174 @@ describe("P2.1 — business-funded booking-price promos + Financial Contract V3"
 
   // --- C: RETURNING ----------------------------------------------------------------------------
 
-  describe("normal RETURNING (legacy deposit until P3, on the discounted price)", () => {
-    it("20% promo on €100 -> €80; legacy deposit 20% of €80 = €16 as DEPOSIT; no PROMO_SUBSIDY; balance €64", async () => {
-      const fixture = await setupFixture();
-      const { customer } = await createLinkedCustomer(fixture, "returning");
-      await consumeFirst(fixture, customer._id);
-      await createPromo({ code: "TWENTY", type: "PERCENTAGE", value: 20 });
-
-      const booking = confirmed(
-        await finalize(
-          fixture,
-          customer._id,
-          normalInput(fixture, "11:00", { promoCode: "TWENTY" }),
-        ),
-      );
-      expect(bookingService.calculateBookingDepositCents(8_000)).toBe(1_600); // formula unchanged
+  describe("normal RETURNING (P3: €0 online; the promo still discounts the price first)", () => {
+    /** Asserts the full P3 zero-online RETURNING shape for one booking. */
+    const expectZeroOnlineReturning = async (
+      booking: Awaited<ReturnType<typeof consumeFirst>>,
+      expected: { promoDiscountCents?: number; basisCents: number; travelCents?: number },
+    ) => {
+      const totalCents = expected.basisCents + (expected.travelCents ?? 0);
       expect(booking.financials).toMatchObject({
-        promoDiscountCents: 2_000,
-        eligiblePlatformFeeBasisCents: 8_000,
-        totalCents: 8_000,
-        depositCents: 1_600,
+        eligiblePlatformFeeBasisCents: expected.basisCents,
+        travelFeeCents: expected.travelCents ?? 0,
+        totalCents,
+        depositCents: 0,
         platformFeeCents: 0,
-        balanceDueCents: 6_400,
+        balanceDueCents: totalCents,
       });
+      expect(booking.financials.promoDiscountCents).toBe(expected.promoDiscountCents);
       expect(booking.financialContract).toMatchObject({
         version: 3,
         classification: "RETURNING",
         upfrontLedgerType: "DEPOSIT",
-        requiredUpfrontCents: 1_600,
-        onlineChargeCents: 1_600,
+        eligibleBasisCents: expected.basisCents,
+        promoDiscountCents: expected.promoDiscountCents ?? 0,
+        requiredUpfrontCents: 0,
+        onlineChargeCents: 0,
+        bookingTotalCents: totalCents,
       });
-      const ledger = await ledgerFor(booking._id);
-      expect(ledger).toHaveLength(1);
-      expect(ledger[0]).toMatchObject({ type: "DEPOSIT", amountCents: 1_600 });
+      expect(await ledgerFor(booking._id)).toHaveLength(0); // no DEPOSIT / PLATFORM_FEE / subsidy
+      expect(
+        await PaymentAttemptModel.countDocuments({
+          bookingId: booking._id,
+          purpose: "BOOKING_DEPOSIT",
+        }),
+      ).toBe(0);
+    };
+
+    it("A: 20% promo on €100 -> €80 price; €0 online, €80 balance; no PI, no attempt, no ledger", async () => {
+      const fixture = await setupFixture();
+      const { customer } = await createLinkedCustomer(fixture, "returning");
+      await consumeFirst(fixture, customer._id);
+      const promo = await createPromo({ code: "TWENTY", type: "PERCENTAGE", value: 20 });
+      const piBefore = paymentGateway.paymentIntentInputs.length;
+      const taxBefore = taxGateway.calls.length;
+      const input = normalInput(fixture, "11:00", { promoCode: "TWENTY" });
+
+      const quote = await preview(fixture, customer._id, input);
+      expect(quote).toMatchObject({
+        isFirstBooking: false,
+        preTaxChargeCents: 0,
+        taxCents: 0,
+        dueNowCents: 0,
+        balanceDueCents: 8_000,
+        requiresSavedCard: true,
+        promo: { promoEligibleBaseCents: 10_000, discountCents: 2_000 },
+      });
+
+      const booking = confirmed(await finalize(fixture, customer._id, input));
+      await expectZeroOnlineReturning(booking, { promoDiscountCents: 2_000, basisCents: 8_000 });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(piBefore);
+      expect(taxGateway.calls).toHaveLength(taxBefore); // €0 is never sent to Stripe Tax
+      expect(booking.promo).toMatchObject({ chargeCents: 0, fundingOwner: "BUSINESS" });
+      // Usage is still consumed atomically with the booking.
+      expect(await promoState(promo._id)).toEqual({ redeemedCount: 1, redemptions: 1 });
       expect(await BookingFinancialTransactionModel.countDocuments({ type: "PROMO_SUBSIDY" })).toBe(
         0,
       );
-      expect(booking.promo?.fundingOwner).toBe("BUSINESS");
     });
 
-    it("no-promo RETURNING is unchanged: €100 -> legacy €20 DEPOSIT", async () => {
+    it("B: 20% promo + €15 travel -> €95 total, €0 online, €95 balance (travel never discounted)", async () => {
+      const fixture = await setupFixture({ travel: { feeCents: 1_500 } });
+      const { customer } = await createLinkedCustomer(fixture, "returning-travel");
+      await consumeFirst(fixture, customer._id, "09:00", { travel: true });
+      await createPromo({ code: "TWENTY", type: "PERCENTAGE", value: 20 });
+      const booking = confirmed(
+        await finalize(
+          fixture,
+          customer._id,
+          normalInput(fixture, "11:00", { promoCode: "TWENTY", travel: true }),
+        ),
+      );
+      await expectZeroOnlineReturning(booking, {
+        promoDiscountCents: 2_000,
+        basisCents: 8_000,
+        travelCents: 1_500,
+      });
+    });
+
+    it("C: €10 base, €8 FIXED promo -> €2 price; €0 online, €2 balance — no minimum-deposit rejection any more", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 1_000 });
+      const { customer } = await createLinkedCustomer(fixture, "low-value");
+      await consumeFirst(fixture, customer._id);
+      const promo = await createPromo({ code: "EIGHT", type: "FIXED", value: 800 });
+      const input = normalInput(fixture, "11:00", { promoCode: "EIGHT" });
+
+      expect(await preview(fixture, customer._id, input)).toMatchObject({
+        dueNowCents: 0,
+        balanceDueCents: 200,
+      });
+      const booking = confirmed(await finalize(fixture, customer._id, input));
+      await expectZeroOnlineReturning(booking, { promoDiscountCents: 800, basisCents: 200 });
+      expect(await promoState(promo._id)).toEqual({ redeemedCount: 1, redemptions: 1 });
+    });
+
+    it("D/E: 100% promo -> €0 total (no travel) and travel-only €15 balance (with travel), both €0 online", async () => {
+      const plain = await setupFixture();
+      const a = await createLinkedCustomer(plain, "free");
+      await consumeFirst(plain, a.customer._id);
+      await createPromo({ code: "FREE", type: "PERCENTAGE", value: 100 });
+      const zero = confirmed(
+        await finalize(plain, a.customer._id, normalInput(plain, "11:00", { promoCode: "FREE" })),
+      );
+      await expectZeroOnlineReturning(zero, { promoDiscountCents: 10_000, basisCents: 0 });
+      expect(zero.status).toBe("UPCOMING");
+
+      const travel = await setupFixture({ travel: { feeCents: 1_500 } });
+      const b = await createLinkedCustomer(travel, "free-travel");
+      await consumeFirst(travel, b.customer._id, "09:00", { travel: true });
+      const withTravel = confirmed(
+        await finalize(
+          travel,
+          b.customer._id,
+          normalInput(travel, "11:00", { promoCode: "FREE", travel: true }),
+        ),
+      );
+      await expectZeroOnlineReturning(withTravel, {
+        promoDiscountCents: 10_000,
+        basisCents: 0,
+        travelCents: 1_500,
+      });
+    });
+
+    it("no promo: €100 -> €0 online, €100 balance; the future penalty basis stays the full price", async () => {
       const fixture = await setupFixture();
       const { customer } = await createLinkedCustomer(fixture, "returning-plain");
       await consumeFirst(fixture, customer._id);
       const booking = confirmed(
         await finalize(fixture, customer._id, normalInput(fixture, "11:00")),
       );
-      expect(booking.financials).toMatchObject({ depositCents: 2_000, totalCents: 10_000 });
-      const ledger = await ledgerFor(booking._id);
-      expect(ledger[0]).toMatchObject({ type: "DEPOSIT", amountCents: 2_000 });
+      await expectZeroOnlineReturning(booking, { basisCents: 10_000 });
+      expect(booking.financialContract?.promo).toBeUndefined();
     });
 
-    it("low-value guard: a promo that lowers a RETURNING price below the legacy €5 deposit is rejected BEFORE any provider call, consumes nothing, and the customer can retry without it", async () => {
-      const fixture = await setupFixture({ fixedPriceCents: 1_000 });
-      const { customer } = await createLinkedCustomer(fixture, "low-value");
+    it("a RETURNING price under €5 (no promo) now succeeds at €0 online — the legacy €5 floor no longer applies", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 300 });
+      const { customer } = await createLinkedCustomer(fixture, "under-five");
+      await consumeFirst(fixture, customer._id); // FIRST: capped at the €3 basis
+      const booking = confirmed(
+        await finalize(fixture, customer._id, normalInput(fixture, "11:00")),
+      );
+      await expectZeroOnlineReturning(booking, { basisCents: 300 });
+    });
+
+    it("a saved card is still required for a €0 RETURNING booking (PAYMENT_METHOD_REQUIRED, nothing persisted)", async () => {
+      const fixture = await setupFixture();
+      const { customer } = await createLinkedCustomer(fixture, "no-card");
       await consumeFirst(fixture, customer._id);
-      const promo = await createPromo({ code: "EIGHT", type: "FIXED", value: 800 });
-      const piBefore = paymentGateway.paymentIntentInputs.length;
-      const taxBefore = taxGateway.calls.length;
-      const input = normalInput(fixture, "11:00", { promoCode: "EIGHT" });
-
-      // €10 - €8 = €2 price, but the legacy RETURNING floor is €5 > €2.
-      await expect(preview(fixture, customer._id, input)).rejects.toEqual(
-        expectCode("PROMO_BELOW_MINIMUM_DEPOSIT", 400),
-      );
-      await expect(finalize(fixture, customer._id, input)).rejects.toEqual(
-        expectCode("PROMO_BELOW_MINIMUM_DEPOSIT", 400),
-      );
-
-      expect(paymentGateway.paymentIntentInputs).toHaveLength(piBefore);
-      expect(taxGateway.calls).toHaveLength(taxBefore);
-      expect(
-        await PaymentAttemptModel.countDocuments({ logicalIdempotencyKey: input.idempotencyKey }),
-      ).toBe(0);
+      await CustomerPaymentProfileModel.updateOne(
+        { userId: customer._id },
+        { $unset: { defaultPaymentMethodId: "" } },
+      ).exec();
+      const input = normalInput(fixture, "11:00");
+      await expect(finalize(fixture, customer._id, input)).rejects.toMatchObject({
+        statusCode: 402,
+        details: [expect.objectContaining({ code: "PAYMENT_METHOD_REQUIRED" })],
+      });
       expect(
         await BookingCreationClaimModel.countDocuments({ idempotencyKey: input.idempotencyKey }),
       ).toBe(0);
-      expect(await BookingModel.countDocuments({ promo: { $exists: true } })).toBe(0);
-      expect(await promoState(promo._id)).toEqual({ redeemedCount: 0, redemptions: 0 });
-
-      // Changing the terms (dropping the promo) is a clean retry under the SAME key.
-      const { promoCode: _dropped, ...withoutPromo } = input;
-      const booking = confirmed(await finalize(fixture, customer._id, withoutPromo));
-      expect(booking.financials).toMatchObject({ depositCents: 500, totalCents: 1_000 });
+      expect(await BookingModel.countDocuments()).toBe(1); // only the FIRST booking
     });
   });
 
