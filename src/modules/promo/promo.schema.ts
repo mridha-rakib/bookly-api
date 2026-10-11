@@ -6,6 +6,10 @@ const isoDateTimeSchema = z.string().datetime({ offset: true }).or(z.string().da
 
 export const promoIdParamsSchema = z.object({ promoId: objectIdSchema }).strict();
 
+/** FIXED promo values are integer cents (the UI converts euros -> cents before sending). A PATCH
+ * that omits `type` or `value` is re-validated against the merged promo in PromoService. */
+export const FIXED_VALUE_INTEGER_CENTS_MESSAGE = "Fixed value must be a whole number of cents";
+
 const promoWriteBodyBase = z
   .object({
     code: z.string().trim().min(1).max(40),
@@ -19,6 +23,10 @@ const promoWriteBodyBase = z
     perUserUsageLimit: z.number().int().positive().optional(),
   })
   .strict()
+  .refine((value) => value.type !== "FIXED" || Number.isInteger(value.value), {
+    message: FIXED_VALUE_INTEGER_CENTS_MESSAGE,
+    path: ["value"],
+  })
   .refine((value) => value.scope !== "SELECTED_BUSINESSES" || value.businessIds.length > 0, {
     message: "SELECTED_BUSINESSES scope requires at least one businessId",
     path: ["businessIds"],
@@ -53,6 +61,10 @@ export const updatePromoBodySchema = z
     perUserUsageLimit: z.number().int().positive().optional(),
   })
   .strict()
+  .refine(
+    (value) => value.type !== "FIXED" || value.value === undefined || Number.isInteger(value.value),
+    { message: FIXED_VALUE_INTEGER_CENTS_MESSAGE, path: ["value"] },
+  )
   .transform((value) => ({
     ...value,
     startAt: value.startAt ? new Date(value.startAt) : undefined,

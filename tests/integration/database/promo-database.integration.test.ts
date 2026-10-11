@@ -1171,6 +1171,153 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     expect(response.status).toBe(403);
   });
 
+  // --- P2.0: FIXED promo value is integer cents ---------------------------------------------------
+
+  const promoBody = (overrides: Record<string, unknown>) => ({
+    code: "UNITS",
+    scope: "ALL_BOOKINGS",
+    businessIds: [],
+    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    ...overrides,
+  });
+
+  it("[P2.0] create: FIXED integer cents is accepted and stored as-is", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+
+    const response = await request(app)
+      .post("/super-admin/promo-codes")
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send(promoBody({ type: "FIXED", value: 500 }));
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.value).toBe(500);
+    const stored = await promoRepository.findByNormalizedCode("UNITS");
+    expect(stored?.type).toBe("FIXED");
+    expect(stored?.value).toBe(500);
+  });
+
+  it("[P2.0] create: FIXED fractional, zero or negative cents is rejected and nothing is stored", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+    const auth = await bearerFor(superAdmin._id, "SUPER_ADMIN");
+
+    for (const value of [5.5, 0, -100]) {
+      const response = await request(app)
+        .post("/super-admin/promo-codes")
+        .set("Authorization", auth)
+        .send(promoBody({ type: "FIXED", value }));
+      expect(response.status).toBe(400);
+    }
+    expect(await promoRepository.findByNormalizedCode("UNITS")).toBeNull();
+  });
+
+  it("[P2.0] create: a fractional PERCENTAGE value valid before P2.0 is still accepted", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+
+    const response = await request(app)
+      .post("/super-admin/promo-codes")
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send(promoBody({ type: "PERCENTAGE", value: 12.5 }));
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.value).toBe(12.5);
+  });
+
+  it("[P2.0] update: changing an existing FIXED promo's value to fractional cents is rejected", async () => {
+    const superAdmin = await createSuperAdmin();
+    const promo = await createPromo({
+      code: "FIXEDFIVE",
+      type: "FIXED",
+      value: 500,
+      createdByUserId: superAdmin._id,
+    });
+    const app = buildSuperAdminApp();
+
+    const response = await request(app)
+      .patch(`/super-admin/promo-codes/${promo._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send({ value: 5.5 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.errors[0].code).toBe("PROMO_INVALID");
+    expect((await promoRepository.findById(promo._id))?.value).toBe(500);
+  });
+
+  it("[P2.0] update: a type-only switch of a fractional PERCENTAGE promo to FIXED revalidates the effective value and is rejected", async () => {
+    const superAdmin = await createSuperAdmin();
+    const promo = await createPromo({
+      code: "PCTFRACTION",
+      type: "PERCENTAGE",
+      value: 5.5,
+      createdByUserId: superAdmin._id,
+    });
+    const app = buildSuperAdminApp();
+
+    const response = await request(app)
+      .patch(`/super-admin/promo-codes/${promo._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send({ type: "FIXED" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.errors[0].code).toBe("PROMO_INVALID");
+    const unchanged = await promoRepository.findById(promo._id);
+    expect(unchanged?.type).toBe("PERCENTAGE");
+    expect(unchanged?.value).toBe(5.5);
+  });
+
+  it("[P2.0] update: switching to FIXED with integer cents is accepted", async () => {
+    const superAdmin = await createSuperAdmin();
+    const promo = await createPromo({
+      code: "PCTTOFIXED",
+      type: "PERCENTAGE",
+      value: 5.5,
+      createdByUserId: superAdmin._id,
+    });
+    const app = buildSuperAdminApp();
+
+    const response = await request(app)
+      .patch(`/super-admin/promo-codes/${promo._id}`)
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send({ type: "FIXED", value: 750 });
+
+    expect(response.status).toBe(200);
+    const updated = await promoRepository.findById(promo._id);
+    expect(updated?.type).toBe("FIXED");
+    expect(updated?.value).toBe(750);
+  });
+
+  it("[P2.0] money contract: a €5 FIXED promo sent as 500 cents is stored as 500 and discounts exactly €5 off the €16 deposit", async () => {
+    const superAdmin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+
+    // What the admin UI sends after converting the €5 input to cents.
+    const created = await request(app)
+      .post("/super-admin/promo-codes")
+      .set("Authorization", await bearerFor(superAdmin._id, "SUPER_ADMIN"))
+      .send(promoBody({ code: "EUROFIVE", type: "FIXED", value: 500 }));
+    expect(created.status).toBe(201);
+    expect((await promoRepository.findByNormalizedCode("EUROFIVE"))?.value).toBe(500);
+
+    const { owner, business, membership, service } = await setupBookableBusiness(8000); // €16 deposit
+    const customer = await createCustomer("eurofive");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+
+    const result = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "EUROFIVE"),
+    );
+    if (result.status !== "confirmed") throw new Error("expected confirmed");
+
+    expect(result.booking.promo?.type).toBe("FIXED");
+    expect(result.booking.promo?.value).toBe(500);
+    expect(result.booking.promo?.discountCents).toBe(500);
+    expect(result.booking.promo?.chargeCents).toBe(1100);
+  });
+
   // --- Delete safety: never destroys audit history ------------------------------------------------
 
   it("deleting a Promo with redemption history force-deactivates instead of hard-deleting", async () => {

@@ -3,6 +3,7 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import { PromoError } from "./promo.errors.js";
 import type { PromoCodeDocument } from "./promo.model.js";
 import type { CreatePromoInput, PromoRepository, UpdatePromoInput } from "./promo.repository.js";
+import { FIXED_VALUE_INTEGER_CENTS_MESSAGE } from "./promo.schema.js";
 import type { PromoScope, PromoType } from "./promo.types.js";
 import type { PromoRedemptionRepository } from "./promo-redemption.repository.js";
 
@@ -198,6 +199,13 @@ export class PromoService {
     if (type === "FIXED" && value <= 0) {
       throw new PromoError("PROMO_INVALID", 400, [
         { message: "Fixed value must be greater than 0", code: "PROMO_INVALID" },
+      ]);
+    }
+    // Runs on the effective type+value after a PATCH merge too — e.g. a type-only switch of a
+    // fractional PERCENTAGE promo to FIXED must not persist fractional cents.
+    if (type === "FIXED" && !Number.isInteger(value)) {
+      throw new PromoError("PROMO_INVALID", 400, [
+        { message: FIXED_VALUE_INTEGER_CENTS_MESSAGE, code: "PROMO_INVALID" },
       ]);
     }
   }
