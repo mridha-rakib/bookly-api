@@ -76,9 +76,13 @@ export class PaymentAttemptRepository {
       providerPaymentIntentId: string;
       providerStatus: PaymentAttemptProviderStatus;
       clientSecret?: string | undefined;
+      lastErrorCode?: string | undefined;
       lastErrorMessage?: string | undefined;
     },
   ): Promise<PaymentAttemptDocument> {
+    // SUCCEEDED and CANCELED are provider-terminal and never regress. FAILED
+    // (requires_payment_method) is re-confirmable, so the authoritative terminal outcomes may
+    // still supersede it — a legitimate later success must never be discarded (P1.1).
     const allowedPrevious: Record<PaymentAttemptProviderStatus, PaymentAttemptProviderStatus[]> = {
       NOT_CREATED: ["NOT_CREATED"],
       CREATED: ["NOT_CREATED", "CREATED", "UNKNOWN"],
@@ -90,9 +94,19 @@ export class PaymentAttemptRepository {
         "REQUIRES_ACTION",
         "PROCESSING",
         "UNKNOWN",
+        "FAILED",
         "SUCCEEDED",
       ],
       FAILED: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN", "FAILED"],
+      CANCELED: [
+        "NOT_CREATED",
+        "CREATED",
+        "REQUIRES_ACTION",
+        "PROCESSING",
+        "UNKNOWN",
+        "FAILED",
+        "CANCELED",
+      ],
       UNKNOWN: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN"],
     };
     const updated = await PaymentAttemptModel.findOneAndUpdate(
@@ -102,6 +116,7 @@ export class PaymentAttemptRepository {
           providerPaymentIntentId: input.providerPaymentIntentId,
           providerStatus: input.providerStatus,
           ...(input.clientSecret ? { clientSecret: input.clientSecret } : {}),
+          ...(input.lastErrorCode ? { lastErrorCode: input.lastErrorCode } : {}),
           ...(input.lastErrorMessage ? { lastErrorMessage: input.lastErrorMessage } : {}),
           ...(input.providerStatus === "UNKNOWN" ? { reconciliationNeededAt: new Date() } : {}),
         },
@@ -343,6 +358,31 @@ export class PaymentAttemptRepository {
           ],
         },
       ],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /**
+   * P1.1 — FIRST-only stale requires_action candidates (deliberately NOT part of
+   * `listRecoverable`): a bound, dispatched Financial Contract V2 FIRST charge that has waited
+   * on customer authentication since before `staleBefore`, with no persistence or compensation
+   * started. Ownership of the relationship claim is verified per candidate by the caller.
+   */
+  public async listStaleFirstRequiresAction(
+    limit: number,
+    staleBefore: Date,
+  ): Promise<PaymentAttemptDocument[]> {
+    return PaymentAttemptModel.find({
+      providerStatus: "REQUIRES_ACTION",
+      financialContractVersion: 2,
+      relationshipClassification: "FIRST",
+      providerPaymentIntentId: { $type: "string" },
+      persistenceStatus: "NOT_STARTED",
+      compensationStatus: "NOT_REQUIRED",
+      createdAt: { $lte: staleBefore },
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
     })
       .sort({ updatedAt: 1 })
       .limit(limit)

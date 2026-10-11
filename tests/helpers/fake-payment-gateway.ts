@@ -60,13 +60,39 @@ export class FakePaymentGateway implements PaymentGateway {
   }
 
   public succeedPaymentIntent(paymentIntentId: string): void {
+    this.setPaymentIntentStatus(paymentIntentId, "succeeded");
+  }
+
+  /** Test control: moves an existing fake PaymentIntent to another provider state — e.g. a 3DS
+   * failure (`failed` = Stripe requires_payment_method) or a Dashboard cancel (`canceled`). */
+  public setPaymentIntentStatus(
+    paymentIntentId: string,
+    status: PaymentIntentResult["status"],
+  ): void {
     for (const [key, value] of this.idempotentPaymentIntents) {
       if (value.paymentIntentId === paymentIntentId) {
-        this.idempotentPaymentIntents.set(key, { paymentIntentId, status: "succeeded" });
+        this.idempotentPaymentIntents.set(key, {
+          paymentIntentId,
+          status,
+          ...(status === "requires_action" ? { clientSecret: `${paymentIntentId}_secret` } : {}),
+          ...(status === "failed" ? { failureMessage: "Authentication failed (test)." } : {}),
+          ...(status === "canceled"
+            ? { failureMessage: "The payment was canceled.", cancellationReason: "abandoned" }
+            : {}),
+        });
         return;
       }
     }
     throw new Error("Unknown fake PaymentIntent");
+  }
+
+  /** Every PaymentIntent id `retrievePaymentIntent` was asked for, in order. */
+  public retrievedPaymentIntentIds: string[] = [];
+  private nextRetrieveError: Error | undefined;
+
+  /** Test control: the next `retrievePaymentIntent` call throws (a transient provider error). */
+  public failNextRetrieve(error: Error): void {
+    this.nextRetrieveError = error;
   }
 
   public seedPaymentMethod(paymentMethodId: string, summary: PaymentMethodSummary): void {
@@ -188,6 +214,12 @@ export class FakePaymentGateway implements PaymentGateway {
   }
 
   public async retrievePaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot> {
+    this.retrievedPaymentIntentIds.push(paymentIntentId);
+    if (this.nextRetrieveError) {
+      const error = this.nextRetrieveError;
+      this.nextRetrieveError = undefined;
+      throw error;
+    }
     const found = [...this.idempotentPaymentIntents.values()].find(
       (entry) => entry.paymentIntentId === paymentIntentId,
     );

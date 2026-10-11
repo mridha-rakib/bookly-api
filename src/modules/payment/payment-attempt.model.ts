@@ -1,5 +1,11 @@
 import { model, Schema, type Types } from "mongoose";
 
+/**
+ * Provider (Stripe PaymentIntent) lifecycle as last observed. Only SUCCEEDED and CANCELED are
+ * provider-terminal. FAILED mirrors Stripe `requires_payment_method` (decline / failed 3DS): the
+ * PaymentIntent can still be re-confirmed by anyone holding its client_secret, so FAILED is
+ * never a seal — an authoritative later SUCCEEDED or CANCELED supersedes it (P1.1).
+ */
 export const paymentAttemptProviderStatuses = [
   "NOT_CREATED",
   "CREATED",
@@ -7,6 +13,7 @@ export const paymentAttemptProviderStatuses = [
   "PROCESSING",
   "SUCCEEDED",
   "FAILED",
+  "CANCELED",
   "UNKNOWN",
 ] as const;
 export type PaymentAttemptProviderStatus = (typeof paymentAttemptProviderStatuses)[number];

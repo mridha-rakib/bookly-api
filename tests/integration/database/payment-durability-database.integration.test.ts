@@ -516,6 +516,96 @@ describe("durable payment/refund/webhook foundation", () => {
     );
   });
 
+  it("P1.1: re-confirmable FAILED is superseded by provider SUCCEEDED; terminal states never regress", async () => {
+    const charge = async (key: string) => {
+      gateway.queueNextChargeOutcome("requires_action");
+      const payment = await service.chargeBookingDeposit({
+        userId,
+        amountCents: 2000,
+        idempotencyKey: key,
+        metadata: metadata(),
+      });
+      const attempt = await attempts.findByLogicalKey(key);
+      return { paymentIntentId: payment.paymentIntentId, id: attempt?._id as Types.ObjectId };
+    };
+    const statusOf = async (id: Types.ObjectId) => (await attempts.findById(id))?.providerStatus;
+
+    // requires_payment_method after the client_secret was exposed -> FAILED, not a seal.
+    const reconfirmed = await charge("booking:reconfirmed");
+    await attempts.recordProviderResult(reconfirmed.id, {
+      providerPaymentIntentId: reconfirmed.paymentIntentId,
+      providerStatus: "FAILED",
+    });
+    await attempts.recordProviderResult(reconfirmed.id, {
+      providerPaymentIntentId: reconfirmed.paymentIntentId,
+      providerStatus: "SUCCEEDED",
+    });
+    expect(await statusOf(reconfirmed.id)).toBe("SUCCEEDED");
+    // ...and the success is monotonic: neither a stale FAILED nor a CANCELED can reverse it.
+    for (const providerStatus of ["FAILED", "CANCELED", "REQUIRES_ACTION"] as const) {
+      await attempts.recordProviderResult(reconfirmed.id, {
+        providerPaymentIntentId: reconfirmed.paymentIntentId,
+        providerStatus,
+      });
+      expect(await statusOf(reconfirmed.id)).toBe("SUCCEEDED");
+    }
+    expect(await attempts.claimPersistence(reconfirmed.id)).toEqual(expect.any(String));
+
+    // CANCELED is terminal: it supersedes FAILED and nothing supersedes it.
+    const canceled = await charge("booking:canceled");
+    await attempts.recordProviderResult(canceled.id, {
+      providerPaymentIntentId: canceled.paymentIntentId,
+      providerStatus: "FAILED",
+    });
+    await attempts.recordProviderResult(canceled.id, {
+      providerPaymentIntentId: canceled.paymentIntentId,
+      providerStatus: "CANCELED",
+      lastErrorCode: "PROVIDER_CANCELED",
+    });
+    for (const providerStatus of [
+      "SUCCEEDED",
+      "FAILED",
+      "REQUIRES_ACTION",
+      "PROCESSING",
+    ] as const) {
+      await attempts.recordProviderResult(canceled.id, {
+        providerPaymentIntentId: canceled.paymentIntentId,
+        providerStatus,
+      });
+      expect(await statusOf(canceled.id)).toBe("CANCELED");
+    }
+    await attempts.markProviderUnknown(canceled.id, "late ambiguous response");
+    const terminal = await attempts.findById(canceled.id);
+    expect(terminal).toMatchObject({
+      providerStatus: "CANCELED",
+      lastErrorCode: "PROVIDER_CANCELED",
+    });
+    expect(await attempts.claimPersistence(canceled.id)).toBeNull();
+  });
+
+  it("P1.1: provider reconciliation records a canceled PaymentIntent with its terminal reason", async () => {
+    gateway.queueNextChargeOutcome("requires_action");
+    const payment = await service.chargeBookingDeposit({
+      userId,
+      amountCents: 2000,
+      idempotencyKey: "booking:reconcile-canceled",
+      metadata: metadata(),
+    });
+    gateway.setPaymentIntentStatus(payment.paymentIntentId, "canceled");
+    const attempt = await attempts.findByLogicalKey("booking:reconcile-canceled");
+
+    const { attempt: reconciled, snapshot } = await service.reconcilePaymentAttempt(
+      attempt?._id as Types.ObjectId,
+    );
+
+    expect(snapshot?.status).toBe("canceled");
+    expect(reconciled).toMatchObject({
+      providerStatus: "CANCELED",
+      lastErrorCode: "PROVIDER_CANCELED",
+      lastErrorMessage: "Stripe cancellation_reason: abandoned",
+    });
+  });
+
   it("enriches an existing business-cancellation refund for package void reuse", async () => {
     const packageProgressId = new Types.ObjectId();
     const original = await refunds.createOrResume({

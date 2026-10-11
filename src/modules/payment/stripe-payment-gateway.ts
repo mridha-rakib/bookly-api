@@ -368,6 +368,19 @@ export class StripePaymentGateway implements PaymentGateway {
       return { paymentIntentId: paymentIntent.id, status: "processing" };
     }
 
+    // Terminal: a canceled PaymentIntent can never be confirmed again (unlike
+    // requires_payment_method, which falls through to the re-confirmable `failed` below).
+    if (paymentIntent.status === "canceled") {
+      return {
+        paymentIntentId: paymentIntent.id,
+        status: "canceled",
+        failureMessage: "The payment was canceled.",
+        ...(paymentIntent.cancellation_reason
+          ? { cancellationReason: paymentIntent.cancellation_reason }
+          : {}),
+      };
+    }
+
     return {
       paymentIntentId: paymentIntent.id,
       status: "failed",

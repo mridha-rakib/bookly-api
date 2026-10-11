@@ -53,11 +53,14 @@ export type CreatePaymentIntentInput = {
 export type PaymentIntentResult = {
   paymentIntentId: string;
   paymentAttemptId?: string | undefined;
-  status: "succeeded" | "requires_action" | "processing" | "failed";
+  /** `failed` is Stripe `requires_payment_method` (re-confirmable); `canceled` is terminal. */
+  status: "succeeded" | "requires_action" | "processing" | "failed" | "canceled";
   clientSecret?: string | undefined;
   /** A short, safe-to-display summary (e.g. "Your card was declined") — never the raw Stripe
    * error object/message passed straight through (see PaymentError's own comment). */
   failureMessage?: string | undefined;
+  /** Stripe's `cancellation_reason`, present only for a `canceled` PaymentIntent. */
+  cancellationReason?: string | undefined;
   /** Present once Stripe reports the underlying balance transaction — the authoritative source
    * for the real processing-fee amount (see rule #12 / PROCESSING_FEE ledger entries). Absent
    * on a synchronous confirm response; populated later from the `payment_intent.succeeded`

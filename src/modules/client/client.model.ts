@@ -92,7 +92,11 @@ export type BusinessClientFinancialRelationship = {
   lastRelease?:
     | {
         idempotencyKey: string;
-        reason: "PRE_MONEY_FAILURE" | "PRE_DISPATCH_ABANDONED" | "COMPENSATION_REFUNDED";
+        reason:
+          | "PRE_MONEY_FAILURE"
+          | "PRE_DISPATCH_ABANDONED"
+          | "PROVIDER_CANCELED"
+          | "COMPENSATION_REFUNDED";
         paymentAttemptId?: Types.ObjectId | undefined;
         refundOperationId?: Types.ObjectId | undefined;
         releasedAt: Date;
@@ -238,7 +242,12 @@ const financialRelationshipSchema = new Schema<BusinessClientFinancialRelationsh
           idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
           reason: {
             type: String,
-            enum: ["PRE_MONEY_FAILURE", "PRE_DISPATCH_ABANDONED", "COMPENSATION_REFUNDED"],
+            enum: [
+              "PRE_MONEY_FAILURE",
+              "PRE_DISPATCH_ABANDONED",
+              "PROVIDER_CANCELED",
+              "COMPENSATION_REFUNDED",
+            ],
             required: true,
           },
           paymentAttemptId: { type: Schema.Types.ObjectId, ref: "PaymentAttempt" },

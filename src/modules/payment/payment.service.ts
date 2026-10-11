@@ -376,12 +376,10 @@ export class PaymentService {
       snapshot = lookup.value;
     }
     this.assertPaymentMatches(snapshot, attempt, attempt.providerCustomerId);
-    const updated = await this.paymentAttemptRepository.recordProviderResult(attempt._id, {
-      providerPaymentIntentId: snapshot.paymentIntentId,
-      providerStatus: this.toPaymentAttemptStatus(snapshot.status),
-      clientSecret: snapshot.clientSecret,
-      lastErrorMessage: snapshot.failureMessage,
-    });
+    const updated = await this.paymentAttemptRepository.recordProviderResult(
+      attempt._id,
+      this.toProviderResultRecord(snapshot),
+    );
     return { attempt: updated, snapshot };
   }
 
@@ -527,12 +525,10 @@ export class PaymentService {
       result = await this.createProviderPaymentIntent(input, attempt);
     }
 
-    const stored = await this.paymentAttemptRepository.recordProviderResult(attempt._id, {
-      providerPaymentIntentId: result.paymentIntentId,
-      providerStatus: this.toPaymentAttemptStatus(result.status),
-      clientSecret: result.clientSecret,
-      lastErrorMessage: result.failureMessage,
-    });
+    const stored = await this.paymentAttemptRepository.recordProviderResult(
+      attempt._id,
+      this.toProviderResultRecord(result),
+    );
     return { ...result, paymentAttemptId: String(stored._id) };
   }
 
@@ -605,12 +601,29 @@ export class PaymentService {
     }
   }
 
+  /** A canceled PaymentIntent records its terminal reason; every other outcome keeps the
+   * existing safe failure summary. */
+  private toProviderResultRecord(result: PaymentIntentResult) {
+    return {
+      providerPaymentIntentId: result.paymentIntentId,
+      providerStatus: this.toPaymentAttemptStatus(result.status),
+      clientSecret: result.clientSecret,
+      ...(result.status === "canceled"
+        ? {
+            lastErrorCode: "PROVIDER_CANCELED",
+            lastErrorMessage: `Stripe cancellation_reason: ${result.cancellationReason ?? "unspecified"}`,
+          }
+        : { lastErrorMessage: result.failureMessage }),
+    };
+  }
+
   private toPaymentAttemptStatus(
     status: PaymentIntentResult["status"],
   ): import("./payment-attempt.model.js").PaymentAttemptProviderStatus {
     if (status === "succeeded") return "SUCCEEDED";
     if (status === "requires_action") return "REQUIRES_ACTION";
     if (status === "processing") return "PROCESSING";
+    if (status === "canceled") return "CANCELED";
     return "FAILED";
   }
 

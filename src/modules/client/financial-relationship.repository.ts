@@ -189,13 +189,14 @@ export class FinancialRelationshipRepository {
    *  - `unbound`: no PaymentAttempt was ever bound, so no provider dispatch happened (the owner
    *    must bind before dispatching). Optionally also requires the pre-dispatch lease to have
    *    expired (recovery path for an abandoned/crashed owner).
-   *  - `failedAttempt`: the bound PaymentAttempt is terminally FAILED (verified by the caller).
+   *  - `failedAttempt`: the bound PaymentAttempt is FAILED or provider-CANCELED (verified by the
+   *    caller from durable PaymentAttempt state, never from elapsed time).
    */
   public async releaseFirstClaim(
     clientId: Types.ObjectId,
     input: {
       idempotencyKey: string;
-      reason: "PRE_MONEY_FAILURE" | "PRE_DISPATCH_ABANDONED";
+      reason: "PRE_MONEY_FAILURE" | "PRE_DISPATCH_ABANDONED" | "PROVIDER_CANCELED";
       expectedRevision?: number | undefined;
       requireLeaseExpiredBefore?: Date | undefined;
     } & (

@@ -37,7 +37,10 @@ import { FinancialRelationshipService } from "../../../src/modules/client/financ
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
-import { MoneyRecoveryService } from "../../../src/modules/payment/money-recovery.service.js";
+import {
+  MoneyRecoveryService,
+  STALE_FIRST_REQUIRES_ACTION_MS,
+} from "../../../src/modules/payment/money-recovery.service.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
 import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
@@ -54,6 +57,7 @@ import { StaffRepository } from "../../../src/modules/staff/staff.repository.js"
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
+import { StripeWebhookEventModel } from "../../../src/modules/stripe-webhook/stripe-webhook-event.model.js";
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
@@ -1324,6 +1328,559 @@ describe("P1 — universal customer↔business financial relationship + Financia
       expect(after.financialRelationship?.state).toBe("CONSUMED");
       expect(after.financialRelationship?.revision).toBe(revision);
       expect(String(after.financialRelationship?.consumed?.bookingId)).toBe(String(booking._id));
+    });
+  });
+
+  // --- P1.1: first-payment lifecycle --------------------------------------------------------------
+
+  describe("P1.1 — first-payment lifecycle (abandoned 3DS, cancellation, re-confirmable failure)", () => {
+    const startFirstRequiresAction = async (tag: string, kind: "normal" | "package" = "normal") => {
+      const fixture = await setupFixture();
+      const { customer, client } = await createLinkedCustomer(fixture, tag);
+      const input = kind === "normal" ? normalInput(fixture, "10:00") : packageInput(fixture);
+      paymentGateway.queueNextChargeOutcome("requires_action");
+      const result =
+        kind === "normal"
+          ? await finalizeNormal(fixture, customer._id, input)
+          : await finalizePackage(fixture, customer._id, input);
+      if (result.status !== "requires_action") throw new Error("expected requires_action");
+      expect(result.clientSecret).toEqual(expect.any(String));
+      const attempt = await PaymentAttemptModel.findOne({
+        logicalIdempotencyKey: input.idempotencyKey,
+      })
+        .orFail()
+        .exec();
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(String(row.financialRelationship?.pending?.paymentAttemptId)).toBe(
+        String(attempt._id),
+      );
+      return {
+        fixture,
+        customer,
+        client,
+        input,
+        attempt,
+        paymentIntentId: result.paymentIntentId,
+        revision: row.financialRelationship?.revision as number,
+      };
+    };
+
+    const makeStale = async (attemptId: Types.ObjectId) => {
+      await PaymentAttemptModel.collection.updateOne(
+        { _id: attemptId },
+        { $set: { createdAt: new Date(Date.now() - STALE_FIRST_REQUIRES_ACTION_MS - 60_000) } },
+      );
+    };
+
+    const piEvent = (
+      type:
+        | "payment_intent.succeeded"
+        | "payment_intent.payment_failed"
+        | "payment_intent.canceled",
+      attempt: { expectedAmountCents: number; providerCustomerId: string },
+      paymentIntentId: string,
+      options: { metadata?: Record<string, string>; eventId?: string } = {},
+    ) =>
+      ({
+        id: options.eventId ?? `evt_${new Types.ObjectId().toString()}`,
+        type,
+        data: {
+          object: {
+            id: paymentIntentId,
+            amount: attempt.expectedAmountCents,
+            currency: "eur",
+            customer: attempt.providerCustomerId,
+            metadata: options.metadata ?? {},
+            ...(type === "payment_intent.canceled" ? { cancellation_reason: "abandoned" } : {}),
+          },
+        },
+      }) as unknown as Stripe.Event;
+
+    /** The attempt's PaymentIntent metadata, exactly as Stripe would echo it on its events. */
+    const piMetadata = (attemptId: Types.ObjectId) =>
+      paymentGateway.paymentIntentInputs.find(
+        (entry) => entry.metadata["booklyPaymentAttemptId"] === String(attemptId),
+      )?.metadata as Record<string, string>;
+
+    const attemptOf = (id: Types.ObjectId) => PaymentAttemptModel.findById(id).orFail().exec();
+    const ledgerCount = (filter: Record<string, unknown> = {}) =>
+      BookingFinancialTransactionModel.countDocuments(filter).exec();
+
+    it("generic cleanup never releases a bound requires_action claim, even after its pre-dispatch lease expired", async () => {
+      const { client, attempt, revision } = await startFirstRequiresAction("abandoned");
+      await BusinessClientModel.updateOne(
+        { _id: client._id },
+        { $set: { "financialRelationship.pending.claimLeaseExpiresAt": new Date(Date.now() - 1) } },
+      ).exec();
+
+      expect(
+        await relationshipRepository.releaseFirstClaim(client._id, {
+          idempotencyKey: attempt.logicalIdempotencyKey,
+          reason: "PRE_DISPATCH_ABANDONED",
+          unbound: true,
+          requireLeaseExpiredBefore: new Date(),
+        }),
+      ).toBe(false);
+      await relationshipService.reconcilePending();
+      await relationshipService.releaseAfterPreMoneyFailure(
+        client._id,
+        attempt.logicalIdempotencyKey,
+      );
+      await recoveryService.runOnce();
+
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(row.financialRelationship?.revision).toBe(revision);
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+      // Not stale yet: the dedicated pass does not even read the provider.
+      expect(paymentGateway.retrievedPaymentIntentIds).toHaveLength(0);
+    });
+
+    it("stale + Stripe still requires_action: stays reserved, no ledger, no consumption, backed off", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("still-3ds");
+      await makeStale(attempt._id);
+
+      const counts = await recoveryService.runOnce();
+
+      expect(counts).toMatchObject({ staleFirstRequiresAction: 1, errors: 0 });
+      expect(paymentGateway.retrievedPaymentIntentIds).toEqual([paymentIntentId]);
+      const refreshed = await attemptOf(attempt._id);
+      expect(refreshed.providerStatus).toBe("REQUIRES_ACTION");
+      expect(refreshed.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(row.financialRelationship?.revision).toBe(revision);
+      expect(await ledgerCount()).toBe(0);
+      expect(await BookingModel.countDocuments()).toBe(0);
+
+      // Backed off: the next pass does not hammer the provider.
+      await recoveryService.runOnce();
+      expect(paymentGateway.retrievedPaymentIntentIds).toHaveLength(1);
+    });
+
+    it("stale + Stripe canceled: attempt terminal CANCELED, FIRST released exactly once, customer can be FIRST again", async () => {
+      const { fixture, customer, client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("stale-canceled");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+      await makeStale(attempt._id);
+
+      await recoveryService.runOnce();
+
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "CANCELED",
+        lastErrorCode: "PROVIDER_CANCELED",
+        lastErrorMessage: "Stripe cancellation_reason: abandoned",
+      });
+      let row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect(row.financialRelationship?.lastRelease).toMatchObject({
+        reason: "PROVIDER_CANCELED",
+        idempotencyKey: attempt.logicalIdempotencyKey,
+      });
+      expect(String(row.financialRelationship?.lastRelease?.paymentAttemptId)).toBe(
+        String(attempt._id),
+      );
+
+      await recoveryService.runOnce();
+      await relationshipService.reconcilePending();
+      await relationshipService.reconcileForPaymentAttempt(attempt._id);
+      row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect(await ledgerCount()).toBe(0);
+
+      const next = confirmed(
+        await finalizePackage(fixture, customer._id, packageInput(fixture, "14:00")),
+      );
+      expect(next.financialContract?.classification).toBe("FIRST");
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+
+    it("stale + Stripe succeeded, the customer's same-key finalize wins: FIRST consumed exactly once, one PLATFORM_FEE, no refund", async () => {
+      const { fixture, customer, client, input, attempt, paymentIntentId } =
+        await startFirstRequiresAction("stale-succeeded");
+      paymentGateway.succeedPaymentIntent(paymentIntentId);
+      await makeStale(attempt._id);
+
+      // Deterministic interleaving: the customer's post-3DS finalize lands right after the stale
+      // pass recorded the provider success and before the P0 orphan pass looks at it.
+      let booking: Awaited<ReturnType<typeof finalizeNormal>> | undefined;
+      const original = relationshipService.reconcileForPaymentAttempt.bind(relationshipService);
+      relationshipService.reconcileForPaymentAttempt = async (id) => {
+        relationshipService.reconcileForPaymentAttempt = original;
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("SUCCEEDED");
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe(
+          "FIRST_PENDING",
+        );
+        booking = await finalizeNormal(fixture, customer._id, input);
+        return original(id);
+      };
+
+      await recoveryService.runOnce();
+
+      const persisted = confirmed(booking as Awaited<ReturnType<typeof finalizeNormal>>);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(paymentGateway.refundInputs).toHaveLength(0);
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("CONSUMED");
+      expect(String(row.financialRelationship?.consumed?.bookingId)).toBe(String(persisted._id));
+      expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(1);
+      expect(await ledgerCount({ type: "REFUND" })).toBe(0);
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        persistenceStatus: "COMPLETED",
+        compensationStatus: "NOT_REQUIRED",
+      });
+    });
+
+    it("stale + Stripe succeeded with no finalize: never released early, P0 compensates once, FIRST never consumed", async () => {
+      const { client, attempt, paymentIntentId } = await startFirstRequiresAction("stale-orphan");
+      paymentGateway.succeedPaymentIntent(paymentIntentId);
+      await makeStale(attempt._id);
+
+      await recoveryService.runOnce();
+      await recoveryService.runOnce();
+
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        compensationStatus: "REFUNDED",
+      });
+      expect(paymentGateway.refundInputs).toHaveLength(1);
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      // Released only by the exact compensation refund — never as a pre-money failure.
+      expect(row.financialRelationship?.lastRelease?.reason).toBe("COMPENSATION_REFUNDED");
+      expect(row.financialRelationship?.consumed).toBeUndefined();
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(0);
+    });
+
+    it("stale + Stripe processing: stays protected", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("stale-processing");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "processing");
+      await makeStale(attempt._id);
+
+      await recoveryService.runOnce();
+
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("PROCESSING");
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(row.financialRelationship?.revision).toBe(revision);
+      expect(await ledgerCount()).toBe(0);
+    });
+
+    it("transient provider error: nothing released, retried later", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("stripe-down");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+      paymentGateway.failNextRetrieve(new Error("stripe temporarily unavailable"));
+      await makeStale(attempt._id);
+
+      const counts = await recoveryService.runOnce();
+
+      expect(counts.errors).toBeGreaterThanOrEqual(1);
+      const refreshed = await attemptOf(attempt._id);
+      expect(refreshed.providerStatus).toBe("REQUIRES_ACTION");
+      expect(refreshed.lastErrorMessage).toBe("stripe temporarily unavailable");
+      expect(refreshed.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(row.financialRelationship?.revision).toBe(revision);
+
+      // Once due again, the authoritative answer (canceled) converges it.
+      await PaymentAttemptModel.updateOne(
+        { _id: attempt._id },
+        { $set: { nextRecoveryAt: new Date(Date.now() - 1) } },
+      ).exec();
+      await recoveryService.runOnce();
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+    });
+
+    it("mismatched relationship/attempt ownership: safe no-op, no provider read", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("mismatch");
+      await BusinessClientModel.updateOne(
+        { _id: client._id },
+        { $set: { "financialRelationship.pending.paymentAttemptId": new Types.ObjectId() } },
+      ).exec();
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+      await makeStale(attempt._id);
+
+      await recoveryService.runOnce();
+
+      expect(paymentGateway.retrievedPaymentIntentIds).not.toContain(paymentIntentId);
+      const refreshed = await attemptOf(attempt._id);
+      expect(refreshed.providerStatus).toBe("REQUIRES_ACTION");
+      expect(refreshed.nextRecoveryAt?.getTime()).toBeGreaterThan(Date.now());
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+      expect(row.financialRelationship?.revision).toBe(revision);
+    });
+
+    it("payment_intent.canceled webhook releases a bound FIRST once; duplicates and late failures are no-ops", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("webhook-canceled");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+      const event = piEvent("payment_intent.canceled", attempt, paymentIntentId);
+
+      expect(await webhookService.process(event)).toBe(true);
+
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "CANCELED",
+        lastErrorCode: "PROVIDER_CANCELED",
+        lastErrorMessage: "Stripe cancellation_reason: abandoned",
+      });
+      let row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect(row.financialRelationship?.lastRelease?.reason).toBe("PROVIDER_CANCELED");
+      expect(
+        (await StripeWebhookEventModel.findOne({ eventId: event.id }).orFail().exec()).status,
+      ).toBe("PROCESSED");
+
+      // Same event redelivered, a distinct duplicate event, and a late payment_failed.
+      expect(await webhookService.process(event)).toBe(false);
+      expect(
+        await webhookService.process(piEvent("payment_intent.canceled", attempt, paymentIntentId)),
+      ).toBe(true);
+      await webhookService.process(
+        piEvent("payment_intent.payment_failed", attempt, paymentIntentId),
+      );
+      await recoveryService.runOnce();
+
+      row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("CANCELED");
+      expect(await ledgerCount()).toBe(0);
+    });
+
+    it("payment_intent.canceled releases a package-purchase FIRST with the same semantics", async () => {
+      const { client, attempt, paymentIntentId, revision } = await startFirstRequiresAction(
+        "package-canceled",
+        "package",
+      );
+      expect(attempt.productKind).toBe("PACKAGE_PURCHASE");
+
+      await webhookService.process(piEvent("payment_intent.canceled", attempt, paymentIntentId));
+
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect(row.financialRelationship?.lastRelease?.reason).toBe("PROVIDER_CANCELED");
+      expect(await PackageProgressModel.countDocuments()).toBe(0);
+      expect(await ledgerCount()).toBe(0);
+    });
+
+    it("a canceled event after a legitimate success never reverses it (retained for investigation)", async () => {
+      const fixture = await setupFixture();
+      const { customer, client } = await createLinkedCustomer(fixture, "success-then-cancel");
+      const booking = confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture)));
+      const before = await relationshipOf(client._id);
+      const attempt = await PaymentAttemptModel.findOne({ bookingId: booking._id }).orFail().exec();
+      const ledgerBefore = await ledgerCount();
+      const event = piEvent(
+        "payment_intent.canceled",
+        attempt,
+        attempt.providerPaymentIntentId as string,
+      );
+
+      await webhookService.process(event);
+
+      expect(
+        (await StripeWebhookEventModel.findOne({ eventId: event.id }).orFail().exec()).status,
+      ).toBe("FAILED");
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        persistenceStatus: "COMPLETED",
+      });
+      const after = await relationshipOf(client._id);
+      expect(after.financialRelationship?.state).toBe("CONSUMED");
+      expect(after.financialRelationship?.revision).toBe(before.financialRelationship?.revision);
+      expect(await BookingModel.countDocuments({ _id: booking._id })).toBe(1);
+      expect(await ledgerCount()).toBe(ledgerBefore);
+    });
+
+    it("requires_payment_method after client_secret exposure is not a seal: a re-confirmed success re-claims and consumes exactly once", async () => {
+      const { fixture, customer, client, input, attempt, paymentIntentId } =
+        await startFirstRequiresAction("reconfirm");
+      expect(
+        (await PaymentAttemptModel.findById(attempt._id).select("+clientSecret").orFail())
+          .clientSecret,
+      ).toEqual(expect.any(String));
+
+      // 3DS fails -> requires_payment_method. P1 behaviour kept: the customer may retry.
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "failed");
+      await webhookService.process(
+        piEvent("payment_intent.payment_failed", attempt, paymentIntentId),
+      );
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("FAILED");
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+
+      // The exposed client_secret is re-confirmed and succeeds: the success is accepted (not an
+      // investigation), and only waits for the source ledger row like any early webhook.
+      paymentGateway.succeedPaymentIntent(paymentIntentId);
+      const metadata = piMetadata(attempt._id);
+      const succeeded = piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+        metadata,
+      });
+      await expect(webhookService.process(succeeded)).rejects.toThrow(/not persisted yet/);
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("SUCCEEDED");
+      expect(
+        (await StripeWebhookEventModel.findOne({ eventId: succeeded.id }).orFail().exec()).status,
+      ).toBe("RETRYABLE");
+
+      // Same logical operation resumes: same PI, re-claims FIRST, consumes once.
+      const booking = confirmed(await finalizeNormal(fixture, customer._id, input));
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      const consumed = await relationshipOf(client._id);
+      expect(consumed.financialRelationship?.state).toBe("CONSUMED");
+      expect(String(consumed.financialRelationship?.consumed?.bookingId)).toBe(String(booking._id));
+
+      // Duplicate / redelivered succeeded events: no second consumption, no duplicate ledger.
+      for (let index = 0; index < 2; index += 1) {
+        await webhookService.process(
+          piEvent("payment_intent.succeeded", attempt, paymentIntentId, { metadata }),
+        );
+      }
+      await recoveryService.runOnce();
+      const after = await relationshipOf(client._id);
+      expect(after.financialRelationship?.revision).toBe(consumed.financialRelationship?.revision);
+      expect(await ledgerCount({ type: "PLATFORM_FEE" })).toBe(1);
+      expect(await ledgerCount({ type: "PROCESSING_FEE" })).toBe(1);
+      expect(paymentGateway.refundInputs).toHaveLength(0);
+    });
+
+    it("a late re-confirmed success after another operation consumed FIRST is refunded by P0, never double-consumed", async () => {
+      const { fixture, customer, client, attempt, paymentIntentId } =
+        await startFirstRequiresAction("late-success");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "failed");
+      await webhookService.process(
+        piEvent("payment_intent.payment_failed", attempt, paymentIntentId),
+      );
+
+      // The customer retries under a NEW key (as the frontend does after a 402) and wins FIRST.
+      const winner = confirmed(
+        await finalizePackage(fixture, customer._id, packageInput(fixture, "14:00")),
+      );
+      const consumed = await relationshipOf(client._id);
+      expect(consumed.financialRelationship?.state).toBe("CONSUMED");
+
+      paymentGateway.succeedPaymentIntent(paymentIntentId);
+      await expect(
+        webhookService.process(
+          piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+            metadata: piMetadata(attempt._id),
+          }),
+        ),
+      ).rejects.toThrow(/not persisted yet/);
+      await PaymentAttemptModel.collection.updateOne(
+        { _id: attempt._id },
+        { $set: { createdAt: new Date(Date.now() - 10 * 60_000) } },
+      );
+      await recoveryService.runOnce();
+
+      expect(await attemptOf(attempt._id)).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        compensationStatus: "REFUNDED",
+      });
+      expect(paymentGateway.refundInputs.map((refund) => refund.amountCents)).toEqual([
+        attempt.expectedAmountCents,
+      ]);
+      const after = await relationshipOf(client._id);
+      expect(after.financialRelationship?.state).toBe("CONSUMED");
+      expect(after.financialRelationship?.revision).toBe(consumed.financialRelationship?.revision);
+      expect(String(after.financialRelationship?.consumed?.bookingId)).toBe(String(winner._id));
+    });
+
+    it("race: stale recovery and the canceled webhook converge to one release", async () => {
+      const { client, attempt, paymentIntentId, revision } =
+        await startFirstRequiresAction("race-cancel");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+      await makeStale(attempt._id);
+
+      await Promise.all([
+        recoveryService.runOnce(),
+        webhookService.process(piEvent("payment_intent.canceled", attempt, paymentIntentId)),
+        relationshipService.reconcilePending(),
+      ]);
+
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("CANCELED");
+      const row = await relationshipOf(client._id);
+      expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+      expect(row.financialRelationship?.revision).toBe(revision + 1);
+      expect(row.financialRelationship?.lastRelease?.reason).toBe("PROVIDER_CANCELED");
+    });
+
+    it("race: a stale provider read never overwrites a newer success or releases on it", async () => {
+      const { client, attempt, paymentIntentId } = await startFirstRequiresAction("race-stale");
+      paymentGateway.setPaymentIntentStatus(paymentIntentId, "failed");
+      await makeStale(attempt._id);
+
+      // The recovery worker's provider read observes requires_payment_method; before it records
+      // that, the customer re-confirms and the success webhook lands first.
+      const originalRetrieve = paymentGateway.retrievePaymentIntent.bind(paymentGateway);
+      paymentGateway.retrievePaymentIntent = async (id) => {
+        paymentGateway.retrievePaymentIntent = originalRetrieve;
+        const staleSnapshot = await originalRetrieve(id);
+        paymentGateway.succeedPaymentIntent(paymentIntentId);
+        await webhookService
+          .process(
+            piEvent("payment_intent.succeeded", attempt, paymentIntentId, {
+              metadata: piMetadata(attempt._id),
+            }),
+          )
+          .catch(() => undefined);
+        return staleSnapshot;
+      };
+
+      await recoveryService.runOnce();
+
+      const refreshed = await attemptOf(attempt._id);
+      expect(refreshed.providerStatus).toBe("SUCCEEDED");
+      const row = await relationshipOf(client._id);
+      // Converged through P0 compensation of the orphaned success — never a pre-money release.
+      expect(row.financialRelationship?.lastRelease?.reason).not.toBe("PRE_MONEY_FAILURE");
+      expect(["RESTORATION_PENDING", "ELIGIBLE"]).toContain(row.financialRelationship?.state);
+      expect(refreshed.compensationStatus).toBe("REFUNDED");
+      expect(paymentGateway.refundInputs).toHaveLength(1);
+    });
+
+    it("RETURNING requires_action attempts are never scanned by the FIRST-only pass and the relationship is never touched", async () => {
+      const fixture = await setupFixture();
+      const { customer, client } = await createLinkedCustomer(fixture, "returning-3ds");
+      confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "10:00")));
+      const consumed = await relationshipOf(client._id);
+
+      const input = normalInput(fixture, "12:00");
+      paymentGateway.queueNextChargeOutcome("requires_action");
+      const result = await finalizeNormal(fixture, customer._id, input);
+      if (result.status !== "requires_action") throw new Error("expected requires_action");
+      const attempt = await PaymentAttemptModel.findOne({
+        logicalIdempotencyKey: input.idempotencyKey,
+      })
+        .orFail()
+        .exec();
+      expect(attempt.relationshipClassification).toBe("RETURNING");
+      paymentGateway.setPaymentIntentStatus(result.paymentIntentId, "canceled");
+      await makeStale(attempt._id);
+
+      await recoveryService.runOnce();
+      expect(paymentGateway.retrievedPaymentIntentIds).not.toContain(result.paymentIntentId);
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+
+      // The canceled webhook is still recorded on the attempt, but RETURNING never mutates
+      // the (already CONSUMED) relationship.
+      await webhookService.process(
+        piEvent("payment_intent.canceled", attempt, result.paymentIntentId),
+      );
+      expect((await attemptOf(attempt._id)).providerStatus).toBe("CANCELED");
+      const after = await relationshipOf(client._id);
+      expect(after.financialRelationship?.state).toBe("CONSUMED");
+      expect(after.financialRelationship?.revision).toBe(consumed.financialRelationship?.revision);
     });
   });
 

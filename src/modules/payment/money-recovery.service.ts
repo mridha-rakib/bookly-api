@@ -10,6 +10,9 @@ import type { RefundOperationDocument } from "./refund-operation.model.js";
 import type { RefundOperationRepository } from "./refund-operation.repository.js";
 
 const ORPHAN_GRACE_MS = 5 * 60_000;
+/** P1.1 — a bound FIRST charge still awaiting 3DS this long is re-read from Stripe. Reading is
+ * always safe; only the provider's answer (never this age) can release the claim. */
+export const STALE_FIRST_REQUIRES_ACTION_MS = 30 * 60_000;
 
 export class MoneyRecoveryService {
   public constructor(
@@ -23,11 +26,15 @@ export class MoneyRecoveryService {
     // P1 — converges unresolved FIRST customer↔business relationship claims from the durable
     // PaymentAttempt/RefundOperation/Booking state the passes above just reconciled. Optional
     // trailing dep (same construction-compatibility convention as packageProgressRepository).
-    private readonly relationshipService?: Pick<FinancialRelationshipService, "reconcilePending">,
+    private readonly relationshipService?: Pick<
+      FinancialRelationshipService,
+      "reconcilePending" | "reconcileForPaymentAttempt" | "ownsPendingFirstClaim"
+    >,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
     paymentAttempts: number;
+    staleFirstRequiresAction: number;
     refundOperations: number;
     relationshipsScanned: number;
     webhooksProcessed: number;
@@ -37,6 +44,11 @@ export class MoneyRecoveryService {
     let paymentAttempts = 0;
     let refundOperations = 0;
     let errors = 0;
+
+    // Runs BEFORE the generic pass so a stale attempt Stripe reports as succeeded is picked up
+    // by the existing P0 persistence/compensation handling below in this same pass.
+    const staleFirst = await this.reconcileStaleFirstRequiresAction(limit);
+    errors += staleFirst.errors;
 
     const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
     for (const candidate of attempts) {
@@ -189,12 +201,88 @@ export class MoneyRecoveryService {
     const webhookCounts = await this.webhookService.recoverDue(limit);
     return {
       paymentAttempts,
+      staleFirstRequiresAction: staleFirst.reconciled,
       refundOperations,
       relationshipsScanned: relationshipCounts.scanned,
       webhooksProcessed: webhookCounts.processed,
       webhooksFailed: webhookCounts.failed,
       errors,
     };
+  }
+
+  /**
+   * P1.1 — dedicated FIRST-only recovery for a bound charge abandoned at 3DS (never part of the
+   * generic `listRecoverable` scan). Each candidate that still owns its FIRST_PENDING claim is
+   * re-read from Stripe and recorded through the monotonic PaymentAttempt CAS; the relationship
+   * then converges purely from that durable state:
+   *   canceled                -> CANCELED, claim released (revision-guarded CAS)
+   *   requires_payment_method -> FAILED, claim released; a later success still reconciles
+   *   succeeded               -> SUCCEEDED, claim kept for the P0 persistence/compensation pass
+   *   processing              -> PROCESSING, claim kept (generic pass follows it)
+   *   requires_action         -> unchanged and backed off; the claim stays reserved
+   *   provider/correlation error -> backed off; nothing released
+   * Nothing is ever canceled at Stripe here: there is no approved auto-cancellation policy.
+   */
+  private async reconcileStaleFirstRequiresAction(
+    limit: number,
+  ): Promise<{ reconciled: number; errors: number }> {
+    const relationships = this.relationshipService;
+    if (!relationships) return { reconciled: 0, errors: 0 };
+
+    const candidates = await this.paymentAttemptRepository.listStaleFirstRequiresAction(
+      limit,
+      new Date(Date.now() - STALE_FIRST_REQUIRES_ACTION_MS),
+    );
+    let reconciled = 0;
+    let errors = 0;
+    for (const candidate of candidates) {
+      try {
+        if (!(await relationships.ownsPendingFirstClaim(candidate))) {
+          logger.warn(
+            { recordType: "PaymentAttempt", recordId: String(candidate._id) },
+            "Stale FIRST requires_action attempt does not own its relationship claim",
+          );
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            candidate._id,
+            "PaymentAttempt does not own its FIRST relationship claim",
+          );
+          continue;
+        }
+
+        const { attempt } = await this.paymentService.reconcilePaymentAttempt(candidate._id);
+        reconciled += 1;
+        if (attempt.providerStatus === "REQUIRES_ACTION") {
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            attempt._id,
+            "PaymentIntent still requires customer action",
+          );
+          continue;
+        }
+        await relationships.reconcileForPaymentAttempt(attempt._id);
+      } catch (error) {
+        errors += 1;
+        const message = error instanceof Error ? error.message : "Unknown recovery error";
+        await this.paymentAttemptRepository
+          .scheduleRecoveryRetry(candidate._id, message)
+          .catch((scheduleError: unknown) =>
+            logger.error(
+              { err: scheduleError, recordType: "PaymentAttempt", recordId: String(candidate._id) },
+              "Could not schedule money recovery retry",
+            ),
+          );
+        logger.warn(
+          {
+            recordType: "PaymentAttempt",
+            recordId: String(candidate._id),
+            providerId: candidate.providerPaymentIntentId,
+            state: candidate.providerStatus,
+            errorCategory: error instanceof Error ? error.name : "UNKNOWN",
+          },
+          "Stale FIRST requires_action recovery item failed",
+        );
+      }
+    }
+    return { reconciled, errors };
   }
 
   private async ensureRefundLedger(

@@ -21,6 +21,7 @@ import type { StripeWebhookEventRepository } from "./stripe-webhook-event.reposi
 const HANDLED_EVENT_TYPES = new Set([
   "payment_intent.succeeded",
   "payment_intent.payment_failed",
+  "payment_intent.canceled",
   "setup_intent.succeeded",
   "charge.refunded",
 ]);
@@ -123,6 +124,9 @@ export class StripeWebhookService {
         case "payment_intent.payment_failed":
           await this.handlePaymentIntentFailed(event.data.object as Stripe.PaymentIntent);
           break;
+        case "payment_intent.canceled":
+          await this.handlePaymentIntentCanceled(event.data.object as Stripe.PaymentIntent);
+          break;
         case "charge.refunded":
           await this.handleChargeRefunded(event.data.object as Stripe.Charge);
           break;
@@ -148,7 +152,8 @@ export class StripeWebhookService {
     const object = event.data.object;
     if (
       event.type === "payment_intent.succeeded" ||
-      event.type === "payment_intent.payment_failed"
+      event.type === "payment_intent.payment_failed" ||
+      event.type === "payment_intent.canceled"
     ) {
       const paymentIntent = object as Stripe.PaymentIntent;
       return {
@@ -164,6 +169,9 @@ export class StripeWebhookService {
                 ? paymentIntent.customer
                 : paymentIntent.customer?.id,
             metadata: paymentIntent.metadata,
+            ...(event.type === "payment_intent.canceled"
+              ? { cancellation_reason: paymentIntent.cancellation_reason ?? null }
+              : {}),
           },
         },
       };
@@ -197,7 +205,9 @@ export class StripeWebhookService {
     return { id: event.id, type: event.type, data: { object: {} } };
   }
 
-  private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent): Promise<void> {
+  /** The durable PaymentAttempt this PaymentIntent belongs to (by stored PI id, else by the
+   * attempt id stamped into its metadata), after verifying amount/currency/customer. */
+  private async findCorrelatedAttempt(paymentIntent: Stripe.PaymentIntent) {
     let attempt = await this.paymentAttemptRepository?.findByProviderPaymentIntentId(
       paymentIntent.id,
     );
@@ -205,18 +215,25 @@ export class StripeWebhookService {
     if (!attempt && metadataAttemptId) {
       attempt = await this.paymentAttemptRepository?.findById(metadataAttemptId);
     }
+    if (!attempt) return undefined;
+    const customerId =
+      typeof paymentIntent.customer === "string"
+        ? paymentIntent.customer
+        : paymentIntent.customer?.id;
+    if (
+      paymentIntent.amount !== attempt.expectedAmountCents ||
+      paymentIntent.currency.toUpperCase() !== attempt.currency ||
+      customerId !== attempt.providerCustomerId
+    ) {
+      throw new InvestigationWebhookError("PaymentAttempt provider correlation mismatch");
+    }
+    return attempt;
+  }
+
+  private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent): Promise<void> {
+    const attempt = await this.findCorrelatedAttempt(paymentIntent);
     if (attempt) {
-      const customerId =
-        typeof paymentIntent.customer === "string"
-          ? paymentIntent.customer
-          : paymentIntent.customer?.id;
-      if (
-        paymentIntent.amount !== attempt.expectedAmountCents ||
-        paymentIntent.currency.toUpperCase() !== attempt.currency ||
-        customerId !== attempt.providerCustomerId
-      ) {
-        throw new InvestigationWebhookError("PaymentAttempt provider correlation mismatch");
-      }
+      // FAILED (requires_payment_method) is superseded here; only CANCELED conflicts.
       const storedAttempt = await this.paymentAttemptRepository?.recordProviderResult(attempt._id, {
         providerPaymentIntentId: paymentIntent.id,
         providerStatus: "SUCCEEDED",
@@ -373,25 +390,8 @@ export class StripeWebhookService {
   }
 
   private async handlePaymentIntentFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {
-    let attempt = await this.paymentAttemptRepository?.findByProviderPaymentIntentId(
-      paymentIntent.id,
-    );
-    const metadataAttemptId = paymentIntent.metadata?.["booklyPaymentAttemptId"];
-    if (!attempt && metadataAttemptId) {
-      attempt = await this.paymentAttemptRepository?.findById(metadataAttemptId);
-    }
+    const attempt = await this.findCorrelatedAttempt(paymentIntent);
     if (attempt) {
-      const customerId =
-        typeof paymentIntent.customer === "string"
-          ? paymentIntent.customer
-          : paymentIntent.customer?.id;
-      if (
-        paymentIntent.amount !== attempt.expectedAmountCents ||
-        paymentIntent.currency.toUpperCase() !== attempt.currency ||
-        customerId !== attempt.providerCustomerId
-      ) {
-        throw new InvestigationWebhookError("PaymentAttempt provider correlation mismatch");
-      }
       const storedAttempt = await this.paymentAttemptRepository?.recordProviderResult(attempt._id, {
         providerPaymentIntentId: paymentIntent.id,
         providerStatus: "FAILED",
@@ -399,6 +399,36 @@ export class StripeWebhookService {
       if (storedAttempt && storedAttempt.providerStatus !== "FAILED") return;
       await this.reconcileRelationship(attempt._id);
     }
+    await this.settlePendingLedgerAsFailed(paymentIntent);
+  }
+
+  /**
+   * P1.1 — a canceled PaymentIntent is provider-terminal: Stripe never cancels a succeeded PI and
+   * a canceled PI can never be confirmed again, so the event type alone is authoritative and
+   * out-of-order delivery cannot make it stale. Records CANCELED (+ Stripe's cancellation
+   * reason), then converges a bound FIRST claim through the CAS-guarded relationship release.
+   * Never consumes FIRST and never creates a ledger entry.
+   */
+  private async handlePaymentIntentCanceled(paymentIntent: Stripe.PaymentIntent): Promise<void> {
+    const attempt = await this.findCorrelatedAttempt(paymentIntent);
+    if (attempt) {
+      const storedAttempt = await this.paymentAttemptRepository?.recordProviderResult(attempt._id, {
+        providerPaymentIntentId: paymentIntent.id,
+        providerStatus: "CANCELED",
+        lastErrorCode: "PROVIDER_CANCELED",
+        lastErrorMessage: `Stripe cancellation_reason: ${paymentIntent.cancellation_reason ?? "unspecified"}`,
+      });
+      // Only an internal SUCCEEDED can refuse CANCELED — impossible for a genuine Stripe event,
+      // so the recorded success is kept untouched and the event is retained for investigation.
+      if (storedAttempt && storedAttempt.providerStatus !== "CANCELED") {
+        throw new InvestigationWebhookError("PaymentAttempt terminal provider state conflict");
+      }
+      await this.reconcileRelationship(attempt._id);
+    }
+    await this.settlePendingLedgerAsFailed(paymentIntent);
+  }
+
+  private async settlePendingLedgerAsFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {
     const bookingId = paymentIntent.metadata?.["bookingId"];
     if (!bookingId) {
       return;

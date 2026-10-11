@@ -200,6 +200,26 @@ export class FinancialRelationshipService {
     await this.reconcile(client._id);
   }
 
+  /** P1.1 — true only while this exact attempt still owns its relationship's FIRST_PENDING
+   * claim: same BusinessClient, same logical operation, and bound to this very attempt. The
+   * stale requires_action recovery pass touches nothing for any other attempt. */
+  public async ownsPendingFirstClaim(attempt: PaymentAttemptDocument): Promise<boolean> {
+    if (!attempt.businessId || attempt.relationshipClassification !== "FIRST") return false;
+    const client = await this.clientRepository.findByBusinessIdAndLinkedUserId(
+      attempt.businessId,
+      attempt.customerUserId,
+    );
+    const relationship = client?.financialRelationship;
+    const pending = relationship?.pending;
+    return Boolean(
+      client &&
+        relationship?.state === "FIRST_PENDING" &&
+        pending?.idempotencyKey === attempt.logicalIdempotencyKey &&
+        pending.paymentAttemptId?.equals(attempt._id) &&
+        (!attempt.businessClientId || attempt.businessClientId.equals(client._id)),
+    );
+  }
+
   /** Recovery-worker pass over every unresolved first claim. */
   public async reconcilePending(limit = 50): Promise<{ scanned: number; errors: number }> {
     const rows = await this.relationshipRepository.listPending(limit);
@@ -232,10 +252,17 @@ export class FinancialRelationshipService {
    *   pending booking committed (FIRST contract, same op)  -> CONSUMED
    *   FIRST_PENDING, no attempt bound, lease expired      -> ELIGIBLE (never dispatched)
    *   FIRST_PENDING, bound attempt FAILED                 -> ELIGIBLE
+   *   FIRST_PENDING, bound attempt CANCELED (provider)    -> ELIGIBLE
    *   FIRST_PENDING, bound attempt SUCCEEDED + compensation required -> RESTORATION_PENDING
    *   RESTORATION_PENDING, exact full compensation refund SUCCEEDED -> ELIGIBLE
    *   anything else (requires_action, processing, unknown, refund pending/failed/partial/
    *   mismatched)                                          -> unchanged
+   *
+   * FAILED (requires_payment_method) releases even though Stripe could still re-confirm it: the
+   * customer's retry runs under a NEW logical key and would otherwise be blocked indefinitely.
+   * That is safe because a late success no longer seals out (PaymentAttempt FAILED ->
+   * SUCCEEDED): the same operation can re-claim and consume, or P0 compensation refunds it —
+   * it can never consume FIRST a second time.
    */
   public async reconcile(clientId: Types.ObjectId): Promise<void> {
     let row = await this.relationshipRepository.findByClientId(clientId);
@@ -285,10 +312,10 @@ export class FinancialRelationshipService {
       const attempt = await this.paymentAttemptRepository.findById(pending.paymentAttemptId);
       if (!attempt || attempt.logicalIdempotencyKey !== pending.idempotencyKey) return;
 
-      if (attempt.providerStatus === "FAILED") {
+      if (attempt.providerStatus === "FAILED" || attempt.providerStatus === "CANCELED") {
         await this.relationshipRepository.releaseFirstClaim(clientId, {
           idempotencyKey: pending.idempotencyKey,
-          reason: "PRE_MONEY_FAILURE",
+          reason: attempt.providerStatus === "CANCELED" ? "PROVIDER_CANCELED" : "PRE_MONEY_FAILURE",
           paymentAttemptId: attempt._id,
           expectedRevision: relationship.revision,
         });
