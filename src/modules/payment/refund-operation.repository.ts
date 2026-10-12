@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 
 import { PaymentError } from "./payment.errors.js";
 import {
@@ -23,6 +23,58 @@ export type CreateRefundOperationInput = {
 };
 
 export class RefundOperationRepository {
+  /** P4: durable intent in the domain transaction, before any provider call. */
+  public async prepare(
+    input: CreateRefundOperationInput,
+    session: ClientSession,
+  ): Promise<RefundOperationDocument> {
+    const row = await RefundOperationModel.findOneAndUpdate(
+      { logicalIdempotencyKey: input.logicalIdempotencyKey },
+      { $setOnInsert: { ...input, currency: input.currency.toUpperCase() } },
+      {
+        upsert: true,
+        session,
+        returnDocument: "after",
+        runValidators: true,
+        setDefaultsOnInsert: true,
+      },
+    )
+      .orFail()
+      .exec();
+    for (const field of [
+      "sourcePaymentIntentId",
+      "expectedRefundAmountCents",
+      "bookingId",
+      "businessId",
+      "businessClientId",
+      "customerUserId",
+      "sourceFinancialTransactionId",
+    ] as const) {
+      if (String(row[field] ?? "") !== String(input[field] ?? ""))
+        throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
+    }
+    if (
+      row.currency !== input.currency.toUpperCase() ||
+      (row.reason !== input.reason &&
+        !(
+          row.reason === "BUSINESS_CANCELLATION" &&
+          ["PACKAGE_VOID", "BUSINESS_PACKAGE_TERMINATION"].includes(input.reason)
+        ))
+    ) {
+      throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
+    }
+    if (input.packageProgressId && !row.packageProgressId) {
+      row.packageProgressId = new Types.ObjectId(input.packageProgressId);
+      await row.save({ session });
+    }
+    if (
+      input.packageProgressId &&
+      String(row.packageProgressId) !== String(input.packageProgressId)
+    )
+      throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
+    return row;
+  }
+
   public async createOrResume(input: CreateRefundOperationInput): Promise<RefundOperationDocument> {
     return (await this.createOrResumeWithDisposition(input)).operation;
   }
@@ -60,7 +112,8 @@ export class RefundOperationRepository {
       }).orFail();
       const reasonCompatible =
         existing.reason === input.reason ||
-        (existing.reason === "BUSINESS_CANCELLATION" && input.reason === "PACKAGE_VOID");
+        (existing.reason === "BUSINESS_CANCELLATION" &&
+          ["PACKAGE_VOID", "BUSINESS_PACKAGE_TERMINATION"].includes(input.reason));
       const packageCompatible =
         String(existing.packageProgressId ?? "") === String(input.packageProgressId ?? "") ||
         (!existing.packageProgressId && Boolean(input.packageProgressId));
@@ -138,18 +191,25 @@ export class RefundOperationRepository {
       RECONCILIATION_REQUIRED: ["CREATED", "PROVIDER_PENDING", "RECONCILIATION_REQUIRED"],
     };
     const updated = await RefundOperationModel.findOneAndUpdate(
-      { _id: id, providerStatus: { $in: allowedPrevious[input.providerStatus] } },
+      {
+        _id: id,
+        providerStatus: { $in: allowedPrevious[input.providerStatus] },
+        $or: [
+          { providerRefundId: { $exists: false } },
+          { providerRefundId: input.providerRefundId },
+        ],
+      },
       {
         $set: {
           providerRefundId: input.providerRefundId,
           providerStatus: input.providerStatus,
           lastReconciledAt: new Date(),
-          ...(input.providerStatus === "PROVIDER_PENDING"
+          ...(input.providerStatus === "PROVIDER_PENDING" || input.providerStatus === "SUCCEEDED"
             ? { reconciliationNeededAt: new Date() }
             : {}),
         },
         ...(input.providerStatus === "SUCCEEDED"
-          ? { $unset: { reconciliationNeededAt: 1, lastErrorCode: 1, lastErrorMessage: 1 } }
+          ? { $unset: { lastErrorCode: 1, lastErrorMessage: 1 } }
           : {}),
       },
       { returnDocument: "after", runValidators: true },
@@ -219,10 +279,15 @@ export class RefundOperationRepository {
           $or: [
             {
               providerStatus: "CREATED",
-              providerCallStartedAt: { $exists: true },
             },
             { providerStatus: { $in: ["PROVIDER_PENDING", "RECONCILIATION_REQUIRED"] } },
-            { providerStatus: "SUCCEEDED", succeededLedgerTransactionId: { $exists: false } },
+            {
+              providerStatus: "SUCCEEDED",
+              $or: [
+                { succeededLedgerTransactionId: { $exists: false } },
+                { reconciliationNeededAt: { $exists: true } },
+              ],
+            },
           ],
         },
       ],
@@ -230,6 +295,13 @@ export class RefundOperationRepository {
       .sort({ updatedAt: 1 })
       .limit(limit)
       .exec();
+  }
+
+  public async markDomainReconciled(id: Types.ObjectId | string): Promise<void> {
+    await RefundOperationModel.updateOne(
+      { _id: id, providerStatus: "SUCCEEDED", succeededLedgerTransactionId: { $exists: true } },
+      { $unset: { reconciliationNeededAt: 1 } },
+    ).exec();
   }
 
   public async scheduleRecoveryRetry(id: Types.ObjectId | string, message: string): Promise<void> {

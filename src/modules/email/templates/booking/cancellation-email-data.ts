@@ -66,7 +66,11 @@ export const buildCancellationEmailData = (
     /** The real, authoritative outcome of a refund the caller just executed — see this file's
      * own module doc comment. Overrides the persisted `cancellationOutcome`'s refund fields
      * only; every other field (fee/deposit-applied/additional-charge) is unaffected. */
-    refundOverride?: { succeeded: boolean; amountCents: number };
+    refundOverride?: {
+      succeeded: boolean;
+      amountCents: number;
+      status?: "PENDING" | "SUCCEEDED" | "FAILED";
+    };
   },
 ): CancellationEmailData => {
   const tz = booking.schedule.timezone;
@@ -84,9 +88,7 @@ export const buildCancellationEmailData = (
     ? context.refundOverride.amountCents
     : (outcome?.refundOwedCents ?? 0);
   const settlementStatus = context.refundOverride
-    ? context.refundOverride.succeeded
-      ? "SUCCEEDED"
-      : "FAILED"
+    ? (context.refundOverride.status ?? (context.refundOverride.succeeded ? "SUCCEEDED" : "FAILED"))
     : (outcome?.settlementStatus ?? "NOT_APPLICABLE");
 
   return {

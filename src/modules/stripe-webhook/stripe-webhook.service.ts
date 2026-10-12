@@ -1,6 +1,5 @@
 import type { Types } from "mongoose";
 import type Stripe from "stripe";
-
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
@@ -15,6 +14,7 @@ import {
   parsePaymentIntentMetadata,
 } from "../payment/payment-intent-metadata.js";
 import type { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
+import { ensureRefundAccounting } from "../payment/refund-accounting.js";
 import type { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import type { StripeWebhookEventRepository } from "./stripe-webhook-event.repository.js";
 
@@ -64,7 +64,8 @@ export class StripeWebhookService {
     private readonly relationshipReconciler?: Pick<
       FinancialRelationshipService,
       "reconcileForPaymentAttempt"
-    >,
+    > &
+      Partial<Pick<FinancialRelationshipService, "reconcile">>,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -516,14 +517,7 @@ export class StripeWebhookService {
           const progress = await this.packageProgressRepository.findByIdInternal(
             operation.packageProgressId,
           );
-          if (progress && !progress.voidedAt) {
-            await this.packageProgressRepository.voidPackage(progress._id, {
-              status: settlementStatus,
-              amountCents: operation.expectedRefundAmountCents,
-              refundOperationId: operation._id,
-              providerRefundId: refund.id,
-            });
-          } else {
+          if (progress?.voidedAt) {
             await this.packageProgressRepository.settleVoidRefund(
               operation._id,
               settlementStatus,
@@ -534,7 +528,9 @@ export class StripeWebhookService {
       }
       if (
         operation.bookingId &&
-        operation.reason === "BUSINESS_CANCELLATION" &&
+        ["BUSINESS_CANCELLATION", "BUSINESS_PACKAGE_TERMINATION", "PACKAGE_VOID"].includes(
+          operation.reason,
+        ) &&
         (effectiveStatus === "SUCCEEDED" || effectiveStatus === "FAILED")
       ) {
         await this.bookingRepository?.updateCancellationSettlement(
@@ -543,58 +539,15 @@ export class StripeWebhookService {
           refund.id,
         );
       }
-      if (
-        effectiveStatus === "SUCCEEDED" &&
-        !operation.succeededLedgerTransactionId &&
-        operation.bookingId &&
-        operation.businessId &&
-        operation.businessClientId
-      ) {
-        let sourceType = "COMPENSATION";
-        if (operation.sourceFinancialTransactionId) {
-          const sourceEntries = await this.financialTransactionService.listForBooking(
-            operation.bookingId,
-          );
-          sourceType =
-            sourceEntries.find(
-              (entry) => String(entry._id) === String(operation?.sourceFinancialTransactionId),
-            )?.type ?? "UNKNOWN";
-        }
-        try {
-          const ledger = await this.financialTransactionService.record({
-            businessId: operation.businessId,
-            bookingId: operation.bookingId,
-            businessClientId: operation.businessClientId,
-            ...(operation.customerUserId ? { customerUserId: operation.customerUserId } : {}),
-            type: "REFUND",
-            direction: "CREDIT",
-            amountCents: operation.expectedRefundAmountCents,
-            currency: operation.currency as "EUR",
-            status: "SUCCEEDED",
-            providerReference: refund.id,
-            idempotencyKey: `refund-operation:${String(operation._id)}:ledger`,
-            metadata: {
-              sourceType,
-              ...(operation.sourceFinancialTransactionId
-                ? { sourceTransactionId: String(operation.sourceFinancialTransactionId) }
-                : {}),
-            },
-          });
-          await this.refundOperationRepository?.markLedgerSucceeded(operation._id, ledger._id);
-        } catch {
-          const existing = await this.financialTransactionService.findByIdempotencyKey(
-            `refund-operation:${String(operation._id)}:ledger`,
-          );
-          if (!existing) throw new RetryableWebhookError("Refund ledger persistence failed");
-          const settled =
-            existing.status === "PENDING"
-              ? await this.financialTransactionService.settleStatus(existing._id, "SUCCEEDED")
-              : existing;
-          await this.refundOperationRepository?.markLedgerSucceeded(
-            operation._id,
-            (settled ?? existing)._id,
-          );
-        }
+      if (effectiveStatus === "SUCCEEDED" && storedOperation && this.refundOperationRepository) {
+        await ensureRefundAccounting(
+          storedOperation,
+          this.financialTransactionService,
+          this.refundOperationRepository,
+        );
+        if (operation.businessClientId)
+          await this.relationshipReconciler?.reconcile?.(operation.businessClientId);
+        await this.refundOperationRepository.markDomainReconciled(operation._id);
       }
       if (effectiveStatus === "FAILED") {
         const pendingLedger = await this.financialTransactionService.findByIdempotencyKey(

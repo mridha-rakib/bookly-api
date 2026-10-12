@@ -1,7 +1,6 @@
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import type Stripe from "stripe";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
@@ -57,7 +56,9 @@ import { RefundOperationRepository } from "../../../src/modules/payment/refund-o
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
+import { PromoRedemptionModel } from "../../../src/modules/promo/promo-redemption.model.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
+import { PromoUserUsageModel } from "../../../src/modules/promo/promo-user-usage.model.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
@@ -2865,7 +2866,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
   // --- Phase-boundary regressions (P4 not implemented) ------------------------------------------
 
   describe("phase boundaries", () => {
-    it("business cancellation of a consumed FIRST booking refunds via P0 but does NOT restore ELIGIBLE (P4)", async () => {
+    it("P4 business cancellation restores a consumed FIRST only after succeeded refund accounting", async () => {
       const fixture = await setupFixture();
       const { customer, client } = await createLinkedCustomer(fixture, "biz-cancel");
       const booking = confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture)));
@@ -2885,8 +2886,8 @@ describe("P1 — universal customer↔business financial relationship + Financia
 
       await recoveryService.runOnce();
       const after = await relationshipOf(client._id);
-      expect(after.financialRelationship).toEqual(before.financialRelationship);
-      expect(after.financialRelationship?.state).toBe("CONSUMED");
+      expect(after.financialRelationship?.consumed).toEqual(before.financialRelationship?.consumed);
+      expect(after.financialRelationship?.state).toBe("ELIGIBLE");
     });
 
     it("customer whole-package void of a FIRST package refunds but the relationship stays CONSUMED", async () => {
@@ -3510,6 +3511,1131 @@ describe("P1 — universal customer↔business financial relationship + Financia
           );
         },
       );
+    });
+  });
+  describe("P4 business cancellation and package commands", () => {
+    const purchaseForP4 = async (kind: "normal" | "package", price = 10000) => {
+      const fixture = await setupFixture({ bundlePriceCents: price });
+      const { customer, client } = await createLinkedCustomer(
+        fixture,
+        `p4-${new Types.ObjectId()}`,
+      );
+      const booking = confirmed(
+        kind === "normal"
+          ? await finalizeNormal(fixture, customer._id, normalInput(fixture))
+          : await finalizePackage(fixture, customer._id, packageInput(fixture)),
+      );
+      const progress =
+        kind === "package"
+          ? await PackageProgressModel.findOne({ originBookingId: booking._id }).orFail()
+          : null;
+      return { fixture, customer, client, booking, progress };
+    };
+    const cancelP4 = async (
+      row: Awaited<ReturnType<typeof purchaseForP4>>,
+      role: "CUSTOMER" | "BUSINESS_OWNER" = "BUSINESS_OWNER",
+    ) =>
+      row.progress
+        ? lifecycleService.packageAction(
+            String(role === "CUSTOMER" ? row.customer._id : row.fixture.owner._id),
+            role,
+            String(row.fixture.business._id),
+            String(row.progress._id),
+            "TERMINATE",
+          )
+        : lifecycleService.cancelByBusiness(
+            String(row.fixture.owner._id),
+            "BUSINESS_OWNER",
+            String(row.fixture.business._id),
+            String(row.booking._id),
+            "P4",
+          );
+    const redeemP4 = async (
+      row: Awaited<ReturnType<typeof purchaseForP4>>,
+      time: string,
+      addonIds: string[] = [],
+    ) =>
+      confirmed(
+        await creationService.redeemPackageSession(
+          String(row.customer._id),
+          String(row.fixture.business._id),
+          String(row.progress!._id),
+          {
+            staffMembershipId: String(row.fixture.staffId),
+            startAt: startAtFor(time, DATE_2),
+            addonIds,
+            idempotencyKey: `p4-${new Types.ObjectId()}`,
+          },
+        ),
+      );
+
+    it.each(["normal", "package"] as const)(
+      "%s: refund pending protects FIRST; exact success restores once and another product can be FIRST",
+      async (kind) => {
+        const row = await purchaseForP4(kind);
+        paymentGateway.queueNextRefundOutcome("pending");
+        await cancelP4(row);
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "RESTORATION_PENDING",
+        );
+        await expect(
+          finalizeNormal(row.fixture, row.customer._id, normalInput(row.fixture, "12:00")),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        await cancelP4(row);
+        expect(paymentGateway.refundInputs).toHaveLength(1);
+        const operation = await RefundOperationModel.findOne({
+          bookingId: row.booking._id,
+        }).orFail();
+        expect(operation.expectedRefundAmountCents).toBe(
+          row.booking.financialContract!.onlineChargeCents,
+        );
+        paymentGateway.succeedRefund(operation.providerRefundId!);
+        await recoveryService.runOnce();
+        await recoveryService.runOnce();
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "ELIGIBLE",
+        );
+        const refunds = (await ledgerFor(row.booking._id)).filter(
+          (entry) => entry.type === "REFUND",
+        );
+        expect(refunds).toHaveLength(1);
+        expect(refunds[0]?.status).toBe("SUCCEEDED");
+        const next = confirmed(
+          kind === "normal"
+            ? await finalizePackage(row.fixture, row.customer._id, packageInput(row.fixture))
+            : await finalizeNormal(row.fixture, row.customer._id, normalInput(row.fixture)),
+        );
+        expect(next.financialContract?.classification).toBe("FIRST");
+        await relationshipService.reconcile(row.client._id);
+        expect(
+          (await relationshipOf(row.client._id)).financialRelationship?.consumed?.bookingId,
+        ).toEqual(next._id);
+      },
+    );
+    it.each(["normal", "package"] as const)(
+      "%s: refund failure never unlocks FIRST",
+      async (kind) => {
+        const row = await purchaseForP4(kind);
+        paymentGateway.queueNextRefundOutcome("failed");
+        await cancelP4(row);
+        await recoveryService.runOnce();
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "RESTORATION_PENDING",
+        );
+      },
+    );
+    it.each(["normal", "package"] as const)(
+      "%s: crash before dispatch leaves a recoverable committed intent",
+      async (kind) => {
+        const row = await purchaseForP4(kind);
+        const spy = vi
+          .spyOn(paymentService, "refund")
+          .mockRejectedValueOnce(new Error("process stopped before provider"));
+        await cancelP4(row);
+        spy.mockRestore();
+        const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+        expect(op.providerStatus).toBe("CREATED");
+        expect(op.providerCallStartedAt).toBeUndefined();
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        await recoveryService.runOnce();
+        expect(paymentGateway.refundInputs).toHaveLength(1);
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "ELIGIBLE",
+        );
+      },
+    );
+    it("failed refund accounting is not restoration proof, and confirmed recovery repairs one row", async () => {
+      const row = await purchaseForP4("normal");
+      paymentGateway.queueNextRefundOutcome("pending");
+      await cancelP4(row);
+      const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+      const ledger = await BookingFinancialTransactionModel.findOne({
+        type: "REFUND",
+        bookingId: row.booking._id,
+      }).orFail();
+      await BookingFinancialTransactionModel.updateOne(
+        { _id: ledger._id },
+        { $set: { status: "FAILED" } },
+      );
+      await RefundOperationModel.updateOne(
+        { _id: op._id },
+        { $set: { providerStatus: "SUCCEEDED", succeededLedgerTransactionId: ledger._id } },
+      );
+      await relationshipService.reconcile(row.client._id);
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+        "RESTORATION_PENDING",
+      );
+      paymentGateway.succeedRefund(op.providerRefundId!);
+      await recoveryService.runOnce();
+      expect((await BookingFinancialTransactionModel.findById(ledger._id))?.status).toBe(
+        "SUCCEEDED",
+      );
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+      expect(
+        await BookingFinancialTransactionModel.countDocuments({
+          type: "REFUND",
+          bookingId: row.booking._id,
+        }),
+      ).toBe(1);
+    });
+    it.each(["amount", "currency", "source", "client"])(
+      "mismatched %s cannot restore",
+      async (mismatch) => {
+        const row = await purchaseForP4("normal");
+        paymentGateway.queueNextRefundOutcome("pending");
+        await cancelP4(row);
+        const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+        const fields =
+          mismatch === "amount"
+            ? { expectedRefundAmountCents: op.expectedRefundAmountCents - 1 }
+            : mismatch === "currency"
+              ? { currency: "USD" }
+              : mismatch === "source"
+                ? { sourceFinancialTransactionId: new Types.ObjectId() }
+                : { businessClientId: new Types.ObjectId() };
+        await RefundOperationModel.updateOne(
+          { _id: op._id },
+          { $set: { ...fields, providerStatus: "SUCCEEDED" } },
+        );
+        await relationshipService.reconcile(row.client._id);
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "RESTORATION_PENDING",
+        );
+      },
+    );
+    it.each([
+      "businessId",
+      "businessClientId",
+      "customerUserId",
+      "providerReference",
+      "sourceType",
+    ] as const)(
+      "mismatched refund ledger %s cannot restore or be silently repaired",
+      async (field) => {
+        const row = await purchaseForP4("normal");
+        paymentGateway.queueNextRefundOutcome("pending");
+        await cancelP4(row);
+        const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+        const ledger = await BookingFinancialTransactionModel.findOne({
+          type: "REFUND",
+          bookingId: row.booking._id,
+        }).orFail();
+        const mismatch =
+          field === "providerReference"
+            ? "re_other"
+            : field === "sourceType"
+              ? "DEPOSIT"
+              : new Types.ObjectId();
+        const path = field === "sourceType" ? "metadata.sourceType" : field;
+        await BookingFinancialTransactionModel.updateOne(
+          { _id: ledger._id },
+          { $set: { status: "SUCCEEDED", [path]: mismatch } },
+        );
+        await RefundOperationModel.updateOne(
+          { _id: op._id },
+          { $set: { providerStatus: "SUCCEEDED", succeededLedgerTransactionId: ledger._id } },
+        );
+        paymentGateway.succeedRefund(op.providerRefundId!);
+        await relationshipService.reconcile(row.client._id);
+        await recoveryService.runOnce();
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "RESTORATION_PENDING",
+        );
+        const unchanged = await BookingFinancialTransactionModel.findById(ledger._id).orFail();
+        expect(
+          String(field === "sourceType" ? unchanged.metadata?.["sourceType"] : unchanged[field]),
+        ).toBe(String(mismatch));
+        expect(
+          await BookingFinancialTransactionModel.countDocuments({
+            type: "REFUND",
+            bookingId: row.booking._id,
+          }),
+        ).toBe(1);
+      },
+    );
+    it("provider refund identity is fenced even when the replacement reports success", async () => {
+      const row = await purchaseForP4("normal");
+      paymentGateway.queueNextRefundOutcome("pending");
+      await cancelP4(row);
+      const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+      await expect(
+        refundOperationRepository.recordProviderResult(op._id, {
+          providerRefundId: "re_other",
+          providerStatus: "SUCCEEDED",
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect((await RefundOperationModel.findById(op._id))?.providerRefundId).toBe(
+        op.providerRefundId,
+      );
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+        "RESTORATION_PENDING",
+      );
+    });
+    it.each(["normal", "package"] as const)(
+      "%s: request, webhook and recovery race converge on one refund",
+      async (kind) => {
+        const row = await purchaseForP4(kind);
+        paymentGateway.queueNextRefundOutcome("pending");
+        await cancelP4(row);
+        const op = await RefundOperationModel.findOne({ bookingId: row.booking._id }).orFail();
+        const sourceBefore = await BookingFinancialTransactionModel.findById(
+          op.sourceFinancialTransactionId,
+        ).lean();
+        paymentGateway.succeedRefund(op.providerRefundId!);
+        await Promise.all([
+          cancelP4(row),
+          recoveryService.runOnce(),
+          webhookService.process({
+            id: `evt_${new Types.ObjectId()}`,
+            type: "charge.refunded",
+            data: {
+              object: {
+                id: `ch_${new Types.ObjectId()}`,
+                payment_intent: op.sourcePaymentIntentId,
+                metadata: {},
+                refunds: {
+                  data: [
+                    {
+                      id: op.providerRefundId,
+                      amount: op.expectedRefundAmountCents,
+                      currency: "eur",
+                      status: "succeeded",
+                      metadata: { booklyRefundOperationId: String(op._id) },
+                    },
+                  ],
+                },
+              },
+            },
+          } as unknown as Stripe.Event),
+        ]);
+        expect(paymentGateway.refundInputs).toHaveLength(1);
+        expect(await RefundOperationModel.countDocuments({ bookingId: row.booking._id })).toBe(1);
+        expect(
+          await BookingFinancialTransactionModel.countDocuments({
+            bookingId: row.booking._id,
+            type: "REFUND",
+            direction: "CREDIT",
+            status: "SUCCEEDED",
+          }),
+        ).toBe(1);
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "ELIGIBLE",
+        );
+        expect(
+          await BookingFinancialTransactionModel.findById(op.sourceFinancialTransactionId).lean(),
+        ).toEqual(sourceBefore);
+      },
+    );
+    it("zero-bundle package restores transactionally without money artifacts", async () => {
+      const row = await purchaseForP4("package", 0);
+      await cancelP4(row);
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+      expect(await RefundOperationModel.countDocuments()).toBe(0);
+      expect(await BookingFinancialTransactionModel.countDocuments()).toBe(0);
+      expect((await PackageProgressModel.findById(row.progress!._id))?.voidedAt).toBeDefined();
+    });
+    it("package origin-only and later session cancellation preserve consumed FIRST", async () => {
+      const row = await purchaseForP4("package", 300);
+      const later = await redeemP4(row, "10:00");
+      await lifecycleService.cancelByBusiness(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(row.booking._id),
+        "origin only",
+      );
+      expect((await PackageProgressModel.findById(row.progress!._id))?.voidedAt).toBeUndefined();
+      await lifecycleService.cancelByBusiness(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(later._id),
+        "later only",
+      );
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("CONSUMED");
+      await cancelP4(row);
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+      expect(paymentGateway.refundInputs).toHaveLength(1);
+    });
+    it.each(["CUSTOMER", "BUSINESS_OWNER"] as const)(
+      "%s future batch excludes origin, retains entitlement and is repeat safe",
+      async (role) => {
+        const row = await purchaseForP4("package", 0);
+        const later = await redeemP4(row, "10:00");
+        const action = () =>
+          lifecycleService.packageAction(
+            String(role === "CUSTOMER" ? row.customer._id : row.fixture.owner._id),
+            role,
+            String(row.fixture.business._id),
+            String(row.progress!._id),
+            "CANCEL_FUTURE",
+          );
+        const result = await action();
+        expect(result.cancelledBookingIds).toEqual([String(later._id)]);
+        expect(result.packageProgress.remainingSessions).toBe(2);
+        expect(result.packageProgress.voidedAt).toBeUndefined();
+        await action();
+        expect((await PackageProgressModel.findById(row.progress!._id))?.remainingSessions).toBe(2);
+        expect((await BookingModel.findById(row.booking._id))?.status).toBe("UPCOMING");
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "CONSUMED",
+        );
+        expect((await redeemP4(row, "11:00")).status).toBe("UPCOMING");
+      },
+    );
+    it.each(["CUSTOMER", "BUSINESS_OWNER"] as const)(
+      "%s partial termination preserves completed history without bundle proration",
+      async (role) => {
+        const row = await purchaseForP4("package");
+        await lifecycleService.completeBooking(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(row.booking._id),
+          { settlement: "FULL" },
+        );
+        const later = await redeemP4(row, "10:00");
+        await cancelP4(row, role);
+        expect((await BookingModel.findById(row.booking._id))?.status).toBe("COMPLETED");
+        expect((await BookingModel.findById(later._id))?.status).toBe(
+          role === "CUSTOMER" ? "CANCELLED_BY_CUSTOMER" : "CANCELLED_BY_BUSINESS",
+        );
+        const progress = await PackageProgressModel.findById(row.progress!._id).orFail();
+        expect(progress.voidedAt).toBeDefined();
+        expect(progress.completedSessions).toBe(1);
+        expect(paymentGateway.refundInputs.map((input) => input.amountCents)).toEqual(
+          role === "CUSTOMER" ? [] : [2000],
+        );
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          role === "CUSTOMER" ? "CONSUMED" : "ELIGIBLE",
+        );
+        expect(await packageProgressRepository.claimSession(progress._id)).toBeNull();
+      },
+    );
+    it.each(["PENDING", "UPCOMING"] as const)(
+      "unresolved %s blocks full termination without partial writes",
+      async (status) => {
+        const row = await purchaseForP4("package", 0);
+        await BookingModel.updateOne(
+          { _id: row.booking._id },
+          { $set: { status, "schedule.startAt": new Date(Date.now() - 60000) } },
+        );
+        await expect(cancelP4(row)).rejects.toMatchObject({ statusCode: 409 });
+        expect((await PackageProgressModel.findById(row.progress!._id))?.voidedAt).toBeUndefined();
+        expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+          "CONSUMED",
+        );
+      },
+    );
+    it.each(["SUPERVISOR", "STAFF", "SUPER_ADMIN"] as const)(
+      "%s cannot full-terminate",
+      async (role) => {
+        const row = await purchaseForP4("package", 0);
+        await expect(
+          lifecycleService.packageAction(
+            String(row.fixture.owner._id),
+            role,
+            String(row.fixture.business._id),
+            String(row.progress!._id),
+            "TERMINATE",
+          ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+      },
+    );
+    it("cross-customer and cross-business package actions are denied", async () => {
+      const row = await purchaseForP4("package", 0);
+      const other = await purchaseForP4("package", 0);
+      await expect(
+        lifecycleService.packageAction(
+          String(other.customer._id),
+          "CUSTOMER",
+          String(row.fixture.business._id),
+          String(row.progress!._id),
+          "TERMINATE",
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      await expect(
+        lifecycleService.packageAction(
+          String(other.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(other.fixture.business._id),
+          String(row.progress!._id),
+          "TERMINATE",
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+    it("termination beats stale claim; precharged extras are compensated and no booking survives", async () => {
+      const row = await purchaseForP4("package", 0);
+      const addon = await createAddon(row.fixture, row.fixture.packageService._id, 2000);
+      let enter!: () => void;
+      let resume!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const original = packageProgressRepository.claimSession.bind(packageProgressRepository);
+      const spy = vi
+        .spyOn(packageProgressRepository, "claimSession")
+        .mockImplementationOnce(async (...args) => {
+          enter();
+          await gate;
+          return original(...args);
+        });
+      const scheduling = redeemP4(row, "10:00", [String(addon._id)]).then(
+        () => ({ success: true }),
+        (error) => ({ success: false, error }),
+      );
+      await entered;
+      await cancelP4(row);
+      resume();
+      const outcome = await scheduling;
+      spy.mockRestore();
+      expect(outcome.success).toBe(false);
+      expect(await BookingModel.countDocuments({ status: "UPCOMING" })).toBe(0);
+      expect(paymentGateway.refundInputs.map((input) => input.amountCents)).toEqual([500]);
+    });
+    it("claim-first and duplicate termination cancel each future booking once", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      await Promise.all([cancelP4(row), cancelP4(row)]);
+      const progress = await PackageProgressModel.findById(row.progress!._id).orFail();
+      expect(progress.voidedAt).toBeDefined();
+      expect(progress.remainingSessions).toBe(3);
+      expect(progress.sessions.find((entry) => entry.bookingId.equals(later._id))?.status).toBe(
+        "CANCELLED",
+      );
+      expect(await BookingModel.countDocuments({ status: "UPCOMING" })).toBe(0);
+    });
+    it("Session extras refund recovery cannot terminate package or restore FIRST", async () => {
+      const row = await purchaseForP4("package", 0);
+      const addon = await createAddon(row.fixture, row.fixture.packageService._id, 2000);
+      const later = await redeemP4(row, "10:00", [String(addon._id)]);
+      paymentGateway.queueNextRefundOutcome("pending");
+      await lifecycleService.cancelByBusiness(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(later._id),
+        "extras",
+      );
+      const op = await RefundOperationModel.findOne({ bookingId: later._id }).orFail();
+      await RefundOperationModel.updateOne(
+        { _id: op._id },
+        { $set: { packageProgressId: row.progress!._id } },
+      );
+      paymentGateway.succeedRefund(op.providerRefundId!);
+      await recoveryService.runOnce();
+      expect((await PackageProgressModel.findById(row.progress!._id))?.voidedAt).toBeUndefined();
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+    it.each(["succeeded", "pending", "failed"] as const)(
+      "business promo reversal survives %s refund and duplicate cancellation",
+      async (refundStatus) => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, `promo-${refundStatus}`);
+        const code = `P4${new Types.ObjectId()}`;
+        const promo = await new PromoRepository().create({
+          code,
+          normalizedCode: code.toUpperCase(),
+          type: "PERCENTAGE",
+          value: 20,
+          scope: "ALL_BOOKINGS",
+          perUserUsageLimit: 1,
+          businessIds: [],
+          expiresAt: new Date("2040-01-01"),
+          createdByUserId: fixture.owner._id,
+        });
+        const booking = confirmed(
+          await creationService.finalizeCustomerBooking(
+            String(customer._id),
+            String(fixture.business._id),
+            { ...normalInput(fixture), promoCode: code },
+          ),
+        );
+        paymentGateway.queueNextRefundOutcome(refundStatus);
+        const cancel = () =>
+          lifecycleService.cancelByBusiness(
+            String(fixture.owner._id),
+            "BUSINESS_OWNER",
+            String(fixture.business._id),
+            String(booking._id),
+            "promo",
+          );
+        await cancel();
+        await cancel();
+        expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(0);
+        expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(0);
+        expect(await PromoRedemptionModel.countDocuments({ bookingId: booking._id })).toBe(1);
+        expect(
+          (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.usageRestoredAt,
+        ).toBeDefined();
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe(
+          refundStatus === "succeeded" ? "ELIGIBLE" : "RESTORATION_PENDING",
+        );
+      },
+    );
+    it("100% promo zero FIRST restores both entitlements without payment; underflow aborts the whole transaction", async () => {
+      const fixture = await setupFixture();
+      const { customer, client } = await createLinkedCustomer(fixture, "p4-zero-promo");
+      const promo = await new PromoRepository().create({
+        code: "P4ZERO",
+        normalizedCode: "P4ZERO",
+        type: "PERCENTAGE",
+        value: 100,
+        scope: "ALL_BOOKINGS",
+        perUserUsageLimit: 1,
+        businessIds: [],
+        expiresAt: new Date("2040-01-01"),
+        createdByUserId: fixture.owner._id,
+      });
+      const booking = confirmed(
+        await creationService.finalizeCustomerBooking(
+          String(customer._id),
+          String(fixture.business._id),
+          { ...normalInput(fixture), promoCode: "P4ZERO" },
+        ),
+      );
+      await PromoUserUsageModel.updateOne({ promoId: promo._id }, { $set: { count: 0 } });
+      const cancel = () =>
+        lifecycleService.cancelByBusiness(
+          String(fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(fixture.business._id),
+          String(booking._id),
+          "zero",
+        );
+      await expect(cancel()).rejects.toThrow();
+      expect((await BookingModel.findById(booking._id))?.status).toBe("UPCOMING");
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
+      expect(
+        (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.usageRestoredAt,
+      ).toBeUndefined();
+      await PromoUserUsageModel.updateOne({ promoId: promo._id }, { $set: { count: 1 } });
+      await cancel();
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+      expect(await RefundOperationModel.countDocuments()).toBe(0);
+      expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+      expect(await BookingFinancialTransactionModel.countDocuments()).toBe(0);
+    });
+    it.each(["normal", "package"] as const)(
+      "zero package restoration permits next %s FIRST",
+      async (nextKind) => {
+        const row = await purchaseForP4("package", 0);
+        await cancelP4(row);
+        const next = confirmed(
+          nextKind === "normal"
+            ? await finalizeNormal(row.fixture, row.customer._id, normalInput(row.fixture))
+            : await finalizePackage(row.fixture, row.customer._id, packageInput(row.fixture)),
+        );
+        expect(next.financialContract?.classification).toBe("FIRST");
+      },
+    );
+    it.each(["CUSTOMER", "NO_SHOW"] as const)("%s never reverses promo or FIRST", async (actor) => {
+      const fixture = await setupFixture();
+      const { customer, client } = await createLinkedCustomer(fixture, `p4-keep-${actor}`);
+      const code = `KEEP${new Types.ObjectId()}`;
+      const promo = await new PromoRepository().create({
+        code,
+        normalizedCode: code.toUpperCase(),
+        type: "PERCENTAGE",
+        value: 20,
+        scope: "ALL_BOOKINGS",
+        perUserUsageLimit: 1,
+        businessIds: [],
+        expiresAt: new Date("2040-01-01"),
+        createdByUserId: fixture.owner._id,
+      });
+      const booking = confirmed(
+        await creationService.finalizeCustomerBooking(
+          String(customer._id),
+          String(fixture.business._id),
+          { ...normalInput(fixture), promoCode: code },
+        ),
+      );
+      if (actor === "CUSTOMER")
+        await lifecycleService.cancelByCustomer(
+          String(customer._id),
+          String(booking._id),
+          undefined,
+        );
+      else {
+        await lifecycleService.markNoShow(
+          String(fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(fixture.business._id),
+          String(booking._id),
+        );
+        await lifecycleService.waiveFee(
+          String(fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(fixture.business._id),
+          String(booking._id),
+          "test",
+          undefined,
+        );
+      }
+      expect(
+        (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.usageRestoredAt,
+      ).toBeUndefined();
+      expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(1);
+      expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(1);
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+    it("unlimited promo restores only the counters it actually consumed", async () => {
+      const fixture = await setupFixture();
+      const { customer } = await createLinkedCustomer(fixture, "p4-unlimited");
+      const promo = await new PromoRepository().create({
+        code: "UNLIMITED",
+        normalizedCode: "UNLIMITED",
+        type: "PERCENTAGE",
+        value: 100,
+        scope: "ALL_BOOKINGS",
+        businessIds: [],
+        expiresAt: new Date("2040-01-01"),
+        createdByUserId: fixture.owner._id,
+      });
+      const booking = confirmed(
+        await creationService.finalizeCustomerBooking(
+          String(customer._id),
+          String(fixture.business._id),
+          { ...normalInput(fixture), promoCode: promo.code },
+        ),
+      );
+      await lifecycleService.cancelByBusiness(
+        String(fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(fixture.business._id),
+        String(booking._id),
+        undefined,
+      );
+      expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(0);
+      expect(await PromoUserUsageModel.countDocuments()).toBe(0);
+      expect(
+        (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.userUsageCounted,
+      ).toBe(false);
+    });
+    it("active supervisor may cancel future appointments but cannot terminate the package", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      const supervisor = await userRepository.create({
+        normalizedEmail: "p4-supervisor@example.com",
+        passwordHash: "hash",
+        role: "SUPERVISOR",
+        status: "ACTIVE",
+      });
+      await staffRepository.create({
+        userId: supervisor._id,
+        businessId: row.fixture.business._id,
+        role: "SUPERVISOR",
+        createdByUserId: row.fixture.owner._id,
+      });
+      const result = await lifecycleService.packageAction(
+        String(supervisor._id),
+        "SUPERVISOR",
+        String(row.fixture.business._id),
+        String(row.progress!._id),
+        "CANCEL_FUTURE",
+      );
+      expect(result.cancelledBookingIds).toEqual([String(later._id)]);
+      await expect(
+        lifecycleService.packageAction(
+          String(supervisor._id),
+          "SUPERVISOR",
+          String(row.fixture.business._id),
+          String(row.progress!._id),
+          "TERMINATE",
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+    it("claim commits while termination is beginning: fresh transactional read includes it", async () => {
+      const row = await purchaseForP4("package", 0);
+      let entered!: () => void;
+      let resume!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const original = packageProgressRepository.findByIdInternal.bind(packageProgressRepository);
+      const spy = vi
+        .spyOn(packageProgressRepository, "findByIdInternal")
+        .mockImplementationOnce(async (...args) => {
+          entered();
+          await gate;
+          return original(...args);
+        });
+      const termination = cancelP4(row);
+      await ready;
+      const later = await redeemP4(row, "10:00");
+      resume();
+      await termination;
+      spy.mockRestore();
+      expect((await BookingModel.findById(later._id))?.status).toBe("CANCELLED_BY_BUSINESS");
+      expect(
+        (await PackageProgressModel.findById(row.progress!._id))?.sessions.some(
+          (entry) => entry.status === "SCHEDULED",
+        ),
+      ).toBe(false);
+    });
+    it("full termination vs completion preserves whichever session interpretation won", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      const results = await Promise.allSettled([
+        cancelP4(row),
+        lifecycleService.completeBooking(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(later._id),
+        ),
+      ]);
+      if (results[0]?.status === "rejected") await cancelP4(row);
+      const booking = await BookingModel.findById(later._id).orFail();
+      const progress = await PackageProgressModel.findById(row.progress!._id).orFail();
+      expect(progress.voidedAt).toBeDefined();
+      expect(progress.sessions.find((entry) => entry.bookingId.equals(later._id))?.status).toBe(
+        booking.status === "COMPLETED" ? "COMPLETED" : "CANCELLED",
+      );
+    });
+    it("full termination vs no-show either cancels or fails closed on pending resolution", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      const results = await Promise.allSettled([
+        cancelP4(row),
+        lifecycleService.markNoShow(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(later._id),
+        ),
+      ]);
+      const progress = await PackageProgressModel.findById(row.progress!._id).orFail();
+      const booking = await BookingModel.findById(later._id).orFail();
+      if (results[0]?.status === "fulfilled") {
+        expect(progress.voidedAt).toBeDefined();
+        expect(booking.status).toBe("CANCELLED_BY_BUSINESS");
+      } else {
+        expect(progress.voidedAt).toBeUndefined();
+        expect(booking.status).toBe("PENDING");
+      }
+    });
+    it("full termination vs reschedule leaves no scheduled booking on the terminal package", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      const results = await Promise.allSettled([
+        cancelP4(row),
+        lifecycleService.rescheduleByOwner(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(later._id),
+          startAtFor("12:00", DATE_2),
+        ),
+      ]);
+      if (results[0]?.status === "rejected") await cancelP4(row);
+      expect((await BookingModel.findById(later._id))?.status).toBe("CANCELLED_BY_BUSINESS");
+      expect((await PackageProgressModel.findById(row.progress!._id))?.voidedAt).toBeDefined();
+    });
+    it("missing positive upfront evidence fails closed rather than restoring zero FIRST", async () => {
+      const row = await purchaseForP4("normal");
+      await BookingFinancialTransactionModel.deleteMany({ bookingId: row.booking._id });
+      await expect(cancelP4(row)).rejects.toMatchObject({ statusCode: 409 });
+      expect((await BookingModel.findById(row.booking._id))?.status).toBe("UPCOMING");
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+    it("legacy relationship without consumed identity is never guessed for restoration", async () => {
+      const row = await purchaseForP4("normal");
+      await BusinessClientModel.updateOne(
+        { _id: row.client._id },
+        { $unset: { "financialRelationship.consumed": 1 } },
+      );
+      await cancelP4(row);
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+    it("business RETURNING normal promo and package terminate without restoring the original FIRST", async () => {
+      const row = await purchaseForP4("normal");
+      const promo = await new PromoRepository().create({
+        code: "RETURNP4",
+        normalizedCode: "RETURNP4",
+        type: "PERCENTAGE",
+        value: 100,
+        scope: "ALL_BOOKINGS",
+        perUserUsageLimit: 1,
+        businessIds: [],
+        expiresAt: new Date("2040-01-01"),
+        createdByUserId: row.fixture.owner._id,
+      });
+      const returning = confirmed(
+        await creationService.finalizeCustomerBooking(
+          String(row.customer._id),
+          String(row.fixture.business._id),
+          { ...normalInput(row.fixture, "12:00"), promoCode: promo.code },
+        ),
+      );
+      await lifecycleService.cancelByBusiness(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(returning._id),
+        undefined,
+      );
+      const purchase = confirmed(
+        await finalizePackage(row.fixture, row.customer._id, packageInput(row.fixture)),
+      );
+      const progress = await PackageProgressModel.findOne({
+        originBookingId: purchase._id,
+      }).orFail();
+      await lifecycleService.packageAction(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(progress._id),
+        "TERMINATE",
+      );
+      expect(purchase.financialContract?.classification).toBe("RETURNING");
+      expect(
+        (await relationshipOf(row.client._id)).financialRelationship?.consumed?.bookingId,
+      ).toEqual(row.booking._id);
+      expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(0);
+      expect(await RefundOperationModel.countDocuments()).toBe(0);
+      expect(await BookingFinancialTransactionModel.countDocuments({ type: "REFUND" })).toBe(0);
+    });
+    it.each(["PENDING", "UPCOMING"] as const)(
+      "future batch excludes %s past/unresolved session",
+      async (status) => {
+        const row = await purchaseForP4("package", 0);
+        const earlier = await redeemP4(row, "10:00");
+        const future = await redeemP4(row, "11:00");
+        await BookingModel.updateOne(
+          { _id: earlier._id },
+          { $set: { status, "schedule.startAt": new Date(Date.now() - 60000) } },
+        );
+        const result = await lifecycleService.packageAction(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(row.progress!._id),
+          "CANCEL_FUTURE",
+        );
+        expect(result.cancelledBookingIds).toEqual([String(future._id)]);
+        expect((await BookingModel.findById(earlier._id))?.status).toBe(status);
+        expect(result.packageProgress.remainingSessions).toBe(1);
+      },
+    );
+    it("repeated promo reversal repository entry is a no-op even after a limit edit", async () => {
+      const fixture = await setupFixture();
+      const { customer } = await createLinkedCustomer(fixture, "p4-repeat-reversal");
+      const promo = await new PromoRepository().create({
+        code: "REENTRY",
+        normalizedCode: "REENTRY",
+        type: "PERCENTAGE",
+        value: 100,
+        scope: "ALL_BOOKINGS",
+        perUserUsageLimit: 1,
+        businessIds: [],
+        expiresAt: new Date("2040-01-01"),
+        createdByUserId: fixture.owner._id,
+      });
+      const booking = confirmed(
+        await creationService.finalizeCustomerBooking(
+          String(customer._id),
+          String(fixture.business._id),
+          { ...normalInput(fixture), promoCode: promo.code },
+        ),
+      );
+      const dbSession = await mongoose.startSession();
+      try {
+        await dbSession.withTransaction(async () => {
+          const reversals = new PromoRedemptionRepository();
+          const identity = {
+            bookingId: booking._id,
+            businessId: fixture.business._id,
+            customerUserId: customer._id,
+            actorUserId: fixture.owner._id,
+          };
+          await reversals.restoreBusinessCancellation(identity, dbSession);
+          await reversals.restoreBusinessCancellation(identity, dbSession);
+        });
+      } finally {
+        await dbSession.endSession();
+      }
+      expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(0);
+      expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(0);
+      expect(await PromoRedemptionModel.countDocuments({ bookingId: booking._id })).toBe(1);
+    });
+    it("completed sessions cannot be restored by a repeated terminal hook", async () => {
+      const row = await purchaseForP4("package", 0);
+      const later = await redeemP4(row, "10:00");
+      await lifecycleService.completeBooking(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(later._id),
+      );
+      const before = await PackageProgressModel.findById(row.progress!._id).orFail();
+      await packageProgressRepository.resolveSessionOnTerminalStatus(later._id, "RESTORE");
+      const after = await PackageProgressModel.findById(row.progress!._id).orFail();
+      expect(after.remainingSessions).toBe(before.remainingSessions);
+      expect(after.sessions.find((entry) => entry.bookingId.equals(later._id))?.status).toBe(
+        "COMPLETED",
+      );
+    });
+    it("future batch includes a claim that commits before its fresh transactional read", async () => {
+      const row = await purchaseForP4("package", 0);
+      let entered!: () => void;
+      let resume!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const original = packageProgressRepository.findByIdInternal.bind(packageProgressRepository);
+      const spy = vi
+        .spyOn(packageProgressRepository, "findByIdInternal")
+        .mockImplementationOnce(async (...args) => {
+          entered();
+          await gate;
+          return original(...args);
+        });
+      const batch = lifecycleService.packageAction(
+        String(row.fixture.owner._id),
+        "BUSINESS_OWNER",
+        String(row.fixture.business._id),
+        String(row.progress!._id),
+        "CANCEL_FUTURE",
+      );
+      await ready;
+      const later = await redeemP4(row, "10:00");
+      resume();
+      const result = await batch;
+      spy.mockRestore();
+      expect(result.cancelledBookingIds).toEqual([String(later._id)]);
+      expect(result.packageProgress.voidedAt).toBeUndefined();
+      expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe("CONSUMED");
+      expect((await redeemP4(row, "11:00")).status).toBe("UPCOMING");
+    });
+    it.each(["CUSTOMER", "BUSINESS_OWNER"] as const)(
+      "business cancellation vs %s cancellation reverses promo only for the winning business transition",
+      async (competingActor) => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(
+          fixture,
+          `p4-cancel-race-${competingActor}`,
+        );
+        const promo = await new PromoRepository().create({
+          code: "RACEP4",
+          normalizedCode: "RACEP4",
+          type: "PERCENTAGE",
+          value: 100,
+          scope: "ALL_BOOKINGS",
+          perUserUsageLimit: 1,
+          businessIds: [],
+          expiresAt: new Date("2040-01-01"),
+          createdByUserId: fixture.owner._id,
+        });
+        const booking = confirmed(
+          await creationService.finalizeCustomerBooking(
+            String(customer._id),
+            String(fixture.business._id),
+            { ...normalInput(fixture), promoCode: promo.code },
+          ),
+        );
+        const businessCancel = () =>
+          lifecycleService.cancelByBusiness(
+            String(fixture.owner._id),
+            "BUSINESS_OWNER",
+            String(fixture.business._id),
+            String(booking._id),
+            undefined,
+          );
+        const outcomes = await Promise.allSettled([
+          businessCancel(),
+          competingActor === "CUSTOMER"
+            ? lifecycleService.cancelByCustomer(
+                String(customer._id),
+                String(booking._id),
+                undefined,
+              )
+            : businessCancel(),
+        ]);
+        expect(outcomes.some((outcome) => outcome.status === "fulfilled")).toBe(true);
+        const final = await BookingModel.findById(booking._id).orFail();
+        const businessWon = final.status === "CANCELLED_BY_BUSINESS";
+        expect(final.eventHistory.filter((event) => event.type === "STATUS_CHANGED")).toHaveLength(
+          1,
+        );
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe(
+          businessWon ? "ELIGIBLE" : "CONSUMED",
+        );
+        expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(
+          businessWon ? 0 : 1,
+        );
+        expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(
+          businessWon ? 0 : 1,
+        );
+        const redemption = await PromoRedemptionModel.findOne({ bookingId: booking._id }).orFail();
+        expect(Boolean(redemption.usageRestoredAt)).toBe(businessWon);
+        expect(await PromoRedemptionModel.countDocuments({ bookingId: booking._id })).toBe(1);
+      },
+    );
+    it.each(["CUSTOMER", "BUSINESS_OWNER"] as const)(
+      "%s full termination preserves a forfeited session and its money facts",
+      async (actor) => {
+        const row = await purchaseForP4("package", 300);
+        const later = await redeemP4(row, "10:00");
+        await lifecycleService.markNoShow(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(later._id),
+        );
+        await lifecycleService.waiveFee(
+          String(row.fixture.owner._id),
+          "BUSINESS_OWNER",
+          String(row.fixture.business._id),
+          String(later._id),
+          "test",
+          undefined,
+        );
+        const before = await BookingFinancialTransactionModel.find({ bookingId: later._id }).lean();
+        await cancelP4(row, actor);
+        const progress = await PackageProgressModel.findById(row.progress!._id).orFail();
+        expect(progress.voidedAt).toBeDefined();
+        expect(progress.sessions.find((entry) => entry.bookingId.equals(later._id))?.status).toBe(
+          "FORFEITED",
+        );
+        expect(progress.remainingSessions).toBe(2);
+        expect(
+          await BookingFinancialTransactionModel.find({ bookingId: later._id }).lean(),
+        ).toEqual(before);
+        const refunds = await RefundOperationModel.find({ bookingId: row.booking._id });
+        if (actor === "CUSTOMER") {
+          expect(refunds).toHaveLength(0);
+          expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+            "CONSUMED",
+          );
+        } else {
+          expect(refunds).toHaveLength(1);
+          expect(refunds[0]?.expectedRefundAmountCents).toBe(
+            row.booking.financialContract?.onlineChargeCents,
+          );
+          expect((await relationshipOf(row.client._id)).financialRelationship?.state).toBe(
+            "ELIGIBLE",
+          );
+        }
+      },
+    );
+    it("terminal success cannot regress from a stale settlement writer", async () => {
+      const row = await purchaseForP4("normal");
+      await cancelP4(row);
+      await bookingRepository.updateCancellationSettlement(row.booking._id, "FAILED", undefined);
+      expect(
+        (await BookingModel.findById(row.booking._id))?.cancellationOutcome?.settlementStatus,
+      ).toBe("SUCCEEDED");
     });
   });
 });

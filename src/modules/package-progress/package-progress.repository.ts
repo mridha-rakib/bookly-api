@@ -37,8 +37,11 @@ export class PackageProgressRepository {
 
   public async findByIdInternal(
     id: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<PackageProgressDocument | null> {
-    return PackageProgressModel.findById(id).exec();
+    return PackageProgressModel.findById(id)
+      .session(session ?? null)
+      .exec();
   }
 
   /** Business-scoped Customer-owned read — the redemption endpoint's own lookup
@@ -98,7 +101,7 @@ export class PackageProgressRepository {
     session?: ClientSession,
   ): Promise<PackageProgressDocument | null> {
     return PackageProgressModel.findOneAndUpdate(
-      { _id: id, remainingSessions: { $gte: 1 } },
+      { _id: id, voidedAt: { $exists: false }, remainingSessions: { $gte: 1 } },
       { $inc: { remainingSessions: -1 } },
       { returnDocument: "after", ...(session ? { session } : {}) },
     ).exec();
@@ -198,7 +201,10 @@ export class PackageProgressRepository {
     providerRefundId?: string,
   ): Promise<void> {
     await PackageProgressModel.updateOne(
-      { "voidRefundSettlement.refundOperationId": refundOperationId },
+      {
+        "voidRefundSettlement.refundOperationId": refundOperationId,
+        "voidRefundSettlement.status": { $ne: "SUCCEEDED" },
+      },
       {
         $set: {
           "voidRefundSettlement.status": status,

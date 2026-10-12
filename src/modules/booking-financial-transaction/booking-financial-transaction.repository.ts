@@ -54,6 +54,23 @@ export type ListByBusinessIdInput = {
 };
 
 export class BookingFinancialTransactionRepository {
+  public findById(id: Types.ObjectId | string) {
+    return BookingFinancialTransactionModel.findById(id).exec();
+  }
+
+  /** Only a confirmed provider refund may repair its own failed accounting projection. */
+  public confirmRefund(id: Types.ObjectId | string, providerReference: string) {
+    return BookingFinancialTransactionModel.findOneAndUpdate(
+      {
+        _id: id,
+        type: "REFUND",
+        direction: "CREDIT",
+        status: { $in: ["PENDING", "FAILED", "SUCCEEDED"] },
+      },
+      { $set: { status: "SUCCEEDED", providerReference } },
+      { returnDocument: "after", runValidators: true },
+    ).exec();
+  }
   /** The one write path — every entry is append-only from here on (see updateStatus below for
    * the single narrow exception). */
   public async create(

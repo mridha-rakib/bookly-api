@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { EmailOutboxRepository, type EnqueueEmailResult } from "./email-outbox.repository.js";
 import type { EnqueueEmailInput } from "./email-outbox.types.js";
 
@@ -14,7 +15,7 @@ export class EmailOutboxService {
     private readonly repository: EmailOutboxRepository = new EmailOutboxRepository(),
   ) {}
 
-  public enqueue(input: EnqueueEmailInput): Promise<EnqueueEmailResult> {
-    return this.repository.enqueue(input);
+  public enqueue(input: EnqueueEmailInput, session?: ClientSession): Promise<EnqueueEmailResult> {
+    return this.repository.enqueue(input, session);
   }
 }

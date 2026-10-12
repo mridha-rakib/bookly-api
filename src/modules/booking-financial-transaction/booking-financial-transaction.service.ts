@@ -58,6 +58,9 @@ export type ListForBusinessInput = {
 };
 
 export class BookingFinancialTransactionService {
+  public confirmRefund(id: Types.ObjectId | string, providerReference: string) {
+    return this.transactionRepository.confirmRefund(id, providerReference);
+  }
   public constructor(
     private readonly transactionRepository: BookingFinancialTransactionRepository,
   ) {}

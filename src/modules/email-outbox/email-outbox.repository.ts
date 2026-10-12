@@ -1,4 +1,4 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import { type EmailOutboxDocument, EmailOutboxModel } from "./email-outbox.model.js";
 import {
@@ -28,10 +28,17 @@ const isDuplicateKeyError = (error: unknown): boolean =>
   (error as { code?: unknown }).code === 11000;
 
 export class EmailOutboxRepository {
-  public async enqueue(input: EnqueueEmailInput): Promise<EnqueueEmailResult> {
+  public async enqueue(
+    input: EnqueueEmailInput,
+    session?: ClientSession,
+  ): Promise<EnqueueEmailResult> {
     const recipient = normalizeEmailRecipient(input.recipient);
     const dedupeKey = buildEmailDedupeKey(input.eventKey, input.templateKey, recipient);
 
+    if (session) {
+      const existing = await EmailOutboxModel.findOne({ dedupeKey }).session(session).exec();
+      if (existing) return { created: false, record: existing };
+    }
     try {
       const record = await new EmailOutboxModel({
         dedupeKey,
@@ -41,7 +48,7 @@ export class EmailOutboxRepository {
         payload: input.payload,
         status: "PENDING",
         attemptCount: 0,
-      }).save();
+      }).save(session ? { session } : undefined);
       return { created: true, record };
     } catch (error) {
       if (!isDuplicateKeyError(error)) {

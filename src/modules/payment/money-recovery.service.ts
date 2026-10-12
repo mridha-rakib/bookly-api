@@ -10,6 +10,7 @@ import type {
   PaymentAttemptProviderStatus,
 } from "./payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import { ensureRefundAccounting } from "./refund-accounting.js";
 import type { RefundOperationDocument } from "./refund-operation.model.js";
 import type { RefundOperationRepository } from "./refund-operation.repository.js";
 
@@ -181,7 +182,9 @@ export class MoneyRecoveryService {
         }
         if (
           operation.bookingId &&
-          operation.reason === "BUSINESS_CANCELLATION" &&
+          ["BUSINESS_CANCELLATION", "BUSINESS_PACKAGE_TERMINATION", "PACKAGE_VOID"].includes(
+            operation.reason,
+          ) &&
           result.status !== "pending"
         ) {
           await this.bookingRepository.updateCancellationSettlement(
@@ -190,6 +193,8 @@ export class MoneyRecoveryService {
             result.refundId,
           );
         }
+        if (result.status === "succeeded")
+          await this.refundOperationRepository.markDomainReconciled(operation._id);
       } catch (error) {
         errors += 1;
         const message = error instanceof Error ? error.message : "Unknown recovery error";
@@ -360,56 +365,14 @@ export class MoneyRecoveryService {
     operation: RefundOperationDocument,
     providerRefundId: string,
   ): Promise<void> {
-    if (
-      operation.succeededLedgerTransactionId ||
-      !operation.bookingId ||
-      !operation.businessId ||
-      !operation.businessClientId
-    ) {
-      return;
-    }
-    const idempotencyKey = `refund-operation:${String(operation._id)}:ledger`;
-    let sourceType = "COMPENSATION";
-    if (operation.sourceFinancialTransactionId) {
-      const entries = await this.financialTransactionService.listForBooking(operation.bookingId);
-      sourceType =
-        entries.find(
-          (entry) => String(entry._id) === String(operation.sourceFinancialTransactionId),
-        )?.type ?? "UNKNOWN";
-    }
-    try {
-      const ledger = await this.financialTransactionService.record({
-        businessId: operation.businessId,
-        bookingId: operation.bookingId,
-        businessClientId: operation.businessClientId,
-        ...(operation.customerUserId ? { customerUserId: operation.customerUserId } : {}),
-        type: "REFUND",
-        direction: "CREDIT",
-        amountCents: operation.expectedRefundAmountCents,
-        currency: operation.currency as "EUR",
-        status: "SUCCEEDED",
-        providerReference: providerRefundId,
-        idempotencyKey,
-        metadata: {
-          sourceType,
-          ...(operation.sourceFinancialTransactionId
-            ? { sourceTransactionId: String(operation.sourceFinancialTransactionId) }
-            : {}),
-        },
-      });
-      await this.paymentService.markRefundLedgerSucceeded(String(operation._id), ledger._id);
-    } catch {
-      const existing = await this.financialTransactionService.findByIdempotencyKey(idempotencyKey);
-      if (!existing) throw new Error("Refund ledger reconciliation failed");
-      const settled =
-        existing.status === "PENDING"
-          ? await this.financialTransactionService.settleStatus(existing._id, "SUCCEEDED")
-          : existing;
-      await this.paymentService.markRefundLedgerSucceeded(
-        String(operation._id),
-        (settled ?? existing)._id,
-      );
-    }
+    const current = await this.refundOperationRepository.findById(operation._id);
+    if (!current || current.providerRefundId !== providerRefundId)
+      throw new Error("Refund operation correlation mismatch");
+    await ensureRefundAccounting(
+      current,
+      this.financialTransactionService,
+      this.refundOperationRepository,
+    );
   }
 
   private async reconcilePackageVoid(
@@ -417,20 +380,19 @@ export class MoneyRecoveryService {
     status: "SUCCEEDED" | "FAILED",
     providerRefundId: string,
   ): Promise<void> {
-    if (!operation.packageProgressId || !this.packageProgressRepository) return;
+    if (
+      !operation.packageProgressId ||
+      !this.packageProgressRepository ||
+      !["PACKAGE_VOID", "BUSINESS_PACKAGE_TERMINATION", "BUSINESS_CANCELLATION"].includes(
+        operation.reason,
+      )
+    )
+      return;
     const progress = await this.packageProgressRepository.findByIdInternal(
       operation.packageProgressId,
     );
     if (!progress) return;
-    if (!progress.voidedAt) {
-      await this.packageProgressRepository.voidPackage(progress._id, {
-        status,
-        amountCents: operation.expectedRefundAmountCents,
-        refundOperationId: operation._id,
-        providerRefundId,
-      });
-      return;
-    }
+    if (!progress.voidedAt) return;
     await this.packageProgressRepository.settleVoidRefund(operation._id, status, providerRefundId);
   }
 }

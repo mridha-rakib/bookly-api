@@ -32,7 +32,9 @@ const financialLinesText = (data: CancellationEmailData): string[] => {
     lines.push(
       f.settlementStatus === "SUCCEEDED"
         ? `Refund of ${f.refundFormatted} for your upfront payment has been processed.`
-        : `A refund of ${f.refundFormatted} for your upfront payment is being arranged — our team will be in touch if anything is needed.`,
+        : f.settlementStatus === "FAILED"
+          ? `The refund of ${f.refundFormatted} could not be completed. Please contact the business.`
+          : `A refund of ${f.refundFormatted} for your upfront payment is being arranged — our team will be in touch if anything is needed.`,
     );
   } else if (data.cancelledBy === "CUSTOMER") {
     if (f.hasCancellationFee) {

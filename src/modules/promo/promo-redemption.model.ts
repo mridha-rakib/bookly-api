@@ -1,18 +1,8 @@
 import { model, Schema, type Types } from "mongoose";
 import type { PromoFundingOwner, PromoType } from "./promo.types.js";
 
-/**
- * Batch 13 — the immutable, permanent audit trail of one successful Promo redemption. Written
- * ONLY inside the same MongoDB transaction that persists the redeeming Booking (mirrors the
- * ledger's own append-only, transaction-scoped-write discipline) — never edited afterward, never
- * deleted on cancellation/refund (rule #13: "once redeemed, permanently consumed... a refund is
- * financial, redemption history remains historical/auditable").
- *
- * Denormalizes the Promo's code/type/value AT REDEMPTION TIME (never re-reads the live PromoCode
- * later) so this row — and every downstream usage-log/analytics read of it — stays correct even
- * if the Promo is later edited or deactivated (matches BookingServiceLine.serviceSnapshot's own
- * "a later edit/archive must never corrupt historical facts" convention).
- */
+/** Immutable redemption price/identity history. P4 adds auditable usage-restoration markers;
+ * business cancellation returns capacity without deleting the historical redemption. */
 export type PromoRedemptionDocument = {
   _id: Types.ObjectId;
   promoId: Types.ObjectId;
@@ -44,6 +34,11 @@ export type PromoRedemptionDocument = {
    * optimistic snapshot) — see booking-creation.service.ts's promo integration comment. */
   isFirstBooking: boolean;
   redeemedAt: Date;
+  /** P4: usage returned by a committed business cancellation; history is retained. */
+  usageRestoredAt?: Date | undefined;
+  /** Whether this redemption actually incremented the optional per-user cap counter. */
+  userUsageCounted?: boolean | undefined;
+  usageRestoredByUserId?: Types.ObjectId | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -64,6 +59,9 @@ const promoRedemptionSchema = new Schema<PromoRedemptionDocument>(
     fundingOwner: { type: String, required: true, default: "BOOKLY" },
     isFirstBooking: { type: Boolean, required: true },
     redeemedAt: { type: Date, required: true, default: () => new Date() },
+    usageRestoredAt: { type: Date },
+    userUsageCounted: { type: Boolean },
+    usageRestoredByUserId: { type: Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true },
 );

@@ -455,6 +455,31 @@ export const createBusinessBookingRoute = (): Router => {
     asyncHandler(controller.redeemPackageSession),
   );
 
+  router.get(
+    "/:businessId/bookings/packages/:packageProgressId",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({ params: packageProgressBusinessParamsSchema }),
+    asyncHandler(controller.getPackageForBusiness),
+  );
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/cancel-future",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({ params: packageProgressBusinessParamsSchema, body: cancelBookingBodySchema }),
+    asyncHandler(controller.packageAction("CANCEL_FUTURE")),
+  );
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/terminate",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER", "BUSINESS_OWNER"]),
+    validateRequest({ params: packageProgressBusinessParamsSchema, body: cancelBookingBodySchema }),
+    asyncHandler(controller.packageAction("TERMINATE")),
+  );
+
   router.post(
     "/:businessId/bookings/packages/:packageProgressId/void",
     authenticate,

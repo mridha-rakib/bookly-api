@@ -80,11 +80,14 @@ export class BookingRepository {
   public async findManyByIds(
     businessId: Types.ObjectId | string,
     bookingIds: Array<Types.ObjectId | string>,
+    session?: ClientSession,
   ): Promise<BookingDocument[]> {
     if (bookingIds.length === 0) {
       return [];
     }
-    return BookingModel.find({ _id: { $in: bookingIds }, businessId }).exec();
+    return BookingModel.find({ _id: { $in: bookingIds }, businessId })
+      .session(session ?? null)
+      .exec();
   }
 
   /**
@@ -97,6 +100,7 @@ export class BookingRepository {
     businessId: Types.ObjectId | string,
     bookingIds: Array<Types.ObjectId | string>,
     customerUserId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<BookingDocument[]> {
     if (bookingIds.length === 0) {
       return [];
@@ -105,7 +109,9 @@ export class BookingRepository {
       _id: { $in: bookingIds },
       businessId,
       "customer.customerUserId": customerUserId,
-    }).exec();
+    })
+      .session(session ?? null)
+      .exec();
   }
 
   /** Batch 8 (Super Admin Finance) — cross-business batched lookup, the same "no actor scoping,
@@ -313,7 +319,7 @@ export class BookingRepository {
     settlementProviderReference: string | undefined,
   ): Promise<BookingDocument | null> {
     return BookingModel.findOneAndUpdate(
-      { _id: bookingId },
+      { _id: bookingId, "cancellationOutcome.settlementStatus": { $ne: "SUCCEEDED" } },
       {
         $set: {
           "cancellationOutcome.settlementStatus": settlementStatus,

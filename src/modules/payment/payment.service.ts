@@ -13,6 +13,7 @@ import type {
 } from "./payment.types.js";
 import { isProviderCreationClosed, type PaymentAttemptDocument } from "./payment-attempt.model.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import type { CreateRefundOperationInput } from "./refund-operation.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
 
 /** P1.1.1 — Stripe's `created` and our `createdAt` come from different clocks; the existence
@@ -40,6 +41,10 @@ export type SavedCardStatus = {
  * back/refresh ever producing two real charges for the same logical request.
  */
 export class PaymentService {
+  public prepareRefund(input: CreateRefundOperationInput, session: ClientSession) {
+    return this.refundOperationRepository.prepare(input, session);
+  }
+
   public constructor(
     private readonly gateway: PaymentGateway,
     private readonly profileRepository: CustomerPaymentProfileRepository,
@@ -281,7 +286,16 @@ export class PaymentService {
         providerStatus: this.toRefundOperationStatus(recovered.status),
       });
       await this.syncCompensationStatus(operation.sourcePaymentAttemptId, stored.providerStatus);
-      return { ...recovered, refundOperationId: String(operation._id) };
+      return {
+        ...recovered,
+        status:
+          stored.providerStatus === "SUCCEEDED"
+            ? "succeeded"
+            : stored.providerStatus === "FAILED"
+              ? "failed"
+              : "pending",
+        refundOperationId: String(operation._id),
+      };
     }
 
     if (!isNew || operation.providerCallStartedAt) {
@@ -304,7 +318,16 @@ export class PaymentService {
           providerStatus: this.toRefundOperationStatus(recovered.status),
         });
         await this.syncCompensationStatus(operation.sourcePaymentAttemptId, stored.providerStatus);
-        return { ...recovered, refundOperationId: String(operation._id) };
+        return {
+          ...recovered,
+          status:
+            stored.providerStatus === "SUCCEEDED"
+              ? "succeeded"
+              : stored.providerStatus === "FAILED"
+                ? "failed"
+                : "pending",
+          refundOperationId: String(operation._id),
+        };
       }
       if (operation.providerStatus === "FAILED") {
         throw new PaymentError("PAYMENT_REFUND_FAILED", 409);
@@ -343,7 +366,16 @@ export class PaymentService {
         providerStatus: this.toRefundOperationStatus(result.status),
       });
       await this.syncCompensationStatus(operation.sourcePaymentAttemptId, stored.providerStatus);
-      return { ...result, refundOperationId: String(operation._id) };
+      return {
+        ...result,
+        status:
+          stored.providerStatus === "SUCCEEDED"
+            ? "succeeded"
+            : stored.providerStatus === "FAILED"
+              ? "failed"
+              : "pending",
+        refundOperationId: String(operation._id),
+      };
     } catch (error) {
       await this.refundOperationRepository.markReconciliationRequired(
         operation._id,

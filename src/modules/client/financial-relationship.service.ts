@@ -2,14 +2,19 @@ import type { ClientSession, Types } from "mongoose";
 
 import { logger } from "../../config/logger.js";
 import { BookingError } from "../booking/booking.errors.js";
+import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingCreationClaimRepository } from "../booking/booking-creation-claim.repository.js";
 import type {
   FinancialContract,
   RelationshipClassification,
 } from "../booking/financial-contract.js";
+import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
+import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
+import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { PaymentAttemptDocument } from "../payment/payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
+import type { RefundOperationDocument } from "../payment/refund-operation.model.js";
 import type { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import type { BusinessClientDocument } from "./client.model.js";
 import type { ClientRepository } from "./client.repository.js";
@@ -46,6 +51,219 @@ export class FinancialRelationshipService {
     private readonly claimRepository: BookingCreationClaimRepository,
     private readonly clientRepository: ClientRepository,
   ) {}
+
+  public async beginBusinessCancellation(
+    booking: BookingDocument,
+    source: BookingFinancialTransactionDocument | undefined,
+    refund: RefundOperationDocument | undefined,
+    session: ClientSession,
+    packageId?: Types.ObjectId,
+  ): Promise<void> {
+    const contract = booking.financialContract;
+    if (!contract || contract.classification !== "FIRST") return;
+    const row = await this.relationshipRepository.findByClientId(
+      booking.customer.businessClientId,
+      session,
+    );
+    const relationship = row?.financialRelationship;
+    const consumed = relationship?.consumed;
+    // Identity-incomplete legacy relationships are not guessed or restored.
+    if (!row || !relationship || !consumed) return;
+    if (relationship.state !== "CONSUMED")
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    if (
+      !row.businessId.equals(contract.businessId) ||
+      !row.linkedUserId?.equals(contract.customerUserId) ||
+      !this.matchesConsumed(booking, row._id, consumed)
+    )
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    if (contract.productKind === "PACKAGE_PURCHASE") {
+      if (!packageId) return;
+      const progress = await new PackageProgressRepository().findByIdInternal(packageId, session);
+      if (
+        !progress?.voidedAt ||
+        !progress.originBookingId.equals(booking._id) ||
+        !progress.businessClientId.equals(row._id)
+      )
+        throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    } else if (booking.status !== "CANCELLED_BY_BUSINESS")
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    if (contract.onlineChargeCents === 0) {
+      const contradictoryAttempt = await this.paymentAttemptRepository.findByLogicalKey(
+        contract.idempotencyKey,
+      );
+      if (source || refund || contradictoryAttempt)
+        throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    } else if (
+      !source ||
+      !refund ||
+      (consumed.financialTransactionId && !consumed.financialTransactionId.equals(source._id)) ||
+      !this.matchesRefundSource(booking, source, refund)
+    ) {
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    }
+    if (source && !(await this.matchesSucceededAttempt(booking, source)))
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    const changed = await this.relationshipRepository.beginBusinessRestoration(
+      row._id,
+      {
+        idempotencyKey: contract.idempotencyKey,
+        bookingId: booking._id,
+        customerUserId: contract.customerUserId,
+        productKind: contract.productKind,
+        expectedRevision: relationship.revision,
+        ...(refund ? { refundOperationId: refund._id } : {}),
+      },
+      session,
+    );
+    if (!changed) throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+  }
+
+  private matchesConsumed(
+    booking: BookingDocument,
+    clientId: Types.ObjectId,
+    consumed: NonNullable<BusinessClientDocument["financialRelationship"]>["consumed"],
+  ): boolean {
+    const c = booking.financialContract;
+    return Boolean(
+      c &&
+        consumed &&
+        c.classification === "FIRST" &&
+        c.bookingId.equals(booking._id) &&
+        c.businessId.equals(booking.businessId) &&
+        c.businessClientId.equals(clientId) &&
+        c.customerUserId.equals(booking.customer.customerUserId ?? "") &&
+        consumed.bookingId.equals(booking._id) &&
+        consumed.idempotencyKey === c.idempotencyKey &&
+        consumed.productKind === c.productKind,
+    );
+  }
+
+  private matchesRefundSource(
+    booking: BookingDocument,
+    source: BookingFinancialTransactionDocument,
+    refund: RefundOperationDocument,
+  ): boolean {
+    const c = booking.financialContract;
+    return Boolean(
+      c &&
+        source.type === "PLATFORM_FEE" &&
+        source.status === "SUCCEEDED" &&
+        source.bookingId?.equals(booking._id) &&
+        source.businessId.equals(booking.businessId) &&
+        source.businessClientId?.equals(c.businessClientId) &&
+        source.customerUserId?.equals(c.customerUserId) &&
+        source.amountCents === c.onlineChargeCents &&
+        source.currency === c.currency &&
+        source.idempotencyKey === `${c.idempotencyKey}:deposit` &&
+        source.providerReference &&
+        refund.sourcePaymentIntentId === source.providerReference &&
+        refund.sourceFinancialTransactionId?.equals(source._id) &&
+        refund.bookingId?.equals(booking._id) &&
+        refund.businessId?.equals(c.businessId) &&
+        refund.businessClientId?.equals(c.businessClientId) &&
+        refund.customerUserId?.equals(c.customerUserId) &&
+        refund.currency === c.currency &&
+        refund.expectedRefundAmountCents === c.onlineChargeCents &&
+        ["BUSINESS_CANCELLATION", "BUSINESS_PACKAGE_TERMINATION"].includes(refund.reason),
+    );
+  }
+
+  private async matchesSucceededAttempt(
+    booking: BookingDocument,
+    source: BookingFinancialTransactionDocument,
+  ): Promise<boolean> {
+    const contract = booking.financialContract;
+    if (!contract) return false;
+    const attempt = await this.paymentAttemptRepository.findByLogicalKey(contract.idempotencyKey);
+    return Boolean(
+      attempt &&
+        attempt.providerStatus === "SUCCEEDED" &&
+        attempt.providerPaymentIntentId === source.providerReference &&
+        attempt.expectedAmountCents === contract.onlineChargeCents &&
+        attempt.currency === contract.currency &&
+        attempt.relationshipClassification === "FIRST" &&
+        attempt.productKind === contract.productKind &&
+        attempt.bookingId?.equals(booking._id) &&
+        attempt.businessId?.equals(contract.businessId) &&
+        attempt.businessClientId?.equals(contract.businessClientId) &&
+        attempt.customerUserId.equals(contract.customerUserId) &&
+        attempt.succeededTransactionId?.equals(source._id),
+    );
+  }
+
+  private async reconcileBusinessCancellation(
+    booking: BookingDocument,
+    row: BusinessClientDocument,
+  ): Promise<void> {
+    const relationship = row.financialRelationship;
+    const pending = relationship?.pending;
+    if (
+      !pending?.restorationRefundOperationId ||
+      !relationship ||
+      !this.matchesConsumed(booking, row._id, relationship.consumed)
+    )
+      return;
+    const contract = booking.financialContract;
+    if (
+      !contract ||
+      !row.businessId.equals(contract.businessId) ||
+      !row.linkedUserId?.equals(contract.customerUserId) ||
+      pending.productKind !== contract.productKind ||
+      pending.idempotencyKey !== contract.idempotencyKey
+    )
+      return;
+    if (contract.productKind === "PACKAGE_PURCHASE") {
+      const packageId = booking.serviceLines.find((line) => line.pricingInput.packageProgressId)
+        ?.pricingInput.packageProgressId;
+      const progress = packageId
+        ? await new PackageProgressRepository().findByIdInternal(packageId)
+        : null;
+      if (
+        !progress?.voidedAt ||
+        !progress.originBookingId.equals(booking._id) ||
+        !progress.businessClientId.equals(row._id)
+      )
+        return;
+    } else if (booking.status !== "CANCELLED_BY_BUSINESS") return;
+    const refund = await this.refundOperationRepository.findById(
+      pending.restorationRefundOperationId,
+    );
+    if (!refund || refund.providerStatus !== "SUCCEEDED" || !refund.succeededLedgerTransactionId)
+      return;
+    const transactions = new BookingFinancialTransactionRepository();
+    const source = refund.sourceFinancialTransactionId
+      ? await transactions.findById(refund.sourceFinancialTransactionId)
+      : null;
+    const ledger = await transactions.findById(refund.succeededLedgerTransactionId);
+    if (
+      !source ||
+      !this.matchesRefundSource(booking, source, refund) ||
+      !(await this.matchesSucceededAttempt(booking, source)) ||
+      (relationship.consumed?.financialTransactionId &&
+        !relationship.consumed.financialTransactionId.equals(source._id)) ||
+      !ledger ||
+      ledger.status !== "SUCCEEDED" ||
+      ledger.type !== "REFUND" ||
+      ledger.direction !== "CREDIT" ||
+      ledger.amountCents !== refund.expectedRefundAmountCents ||
+      ledger.currency !== refund.currency ||
+      ledger.providerReference !== refund.providerRefundId ||
+      !ledger.bookingId?.equals(booking._id) ||
+      !ledger.businessId.equals(contract.businessId) ||
+      !ledger.businessClientId?.equals(contract.businessClientId) ||
+      !ledger.customerUserId?.equals(contract.customerUserId) ||
+      ledger.metadata?.["sourceType"] !== source.type ||
+      ledger.metadata?.["sourceTransactionId"] !== String(source._id)
+    )
+      return;
+    await this.relationshipRepository.finishBusinessRestoration(row._id, {
+      idempotencyKey: pending.idempotencyKey,
+      bookingId: booking._id,
+      refundOperationId: refund._id,
+      expectedRevision: relationship.revision,
+    });
+  }
 
   /**
    * Read-only ESTIMATE for previews. Never authoritative (finalize claims atomically) and never
@@ -272,6 +490,10 @@ export class FinancialRelationshipService {
 
     const booking = await this.bookingRepository.findByIdOnly(pending.bookingId);
     if (booking) {
+      if (relationship.state === "RESTORATION_PENDING" && pending.restorationRefundOperationId) {
+        await this.reconcileBusinessCancellation(booking, row);
+        return;
+      }
       // Atomic consumption makes this unreachable for a v2 operation; converge only when the
       // committed Booking provably belongs to this exact FIRST operation, never by guessing.
       const contract = booking.financialContract;

@@ -88,9 +88,10 @@ export type PackageProgressDto = {
   serviceId: string;
   totalSessions: number;
   remainingSessions: number;
+  availableSessions: number;
   completedSessions: number;
   /** Derived, never stored — see package-progress.model.ts's own doc comment on why `status`
-   * is not a persisted field. Precedence: VOIDED (refunded) > AWAITING_BALANCE (session 1 not
+   * is not a persisted field. Precedence: VOIDED (terminated) > AWAITING_BALANCE (session 1 not
    * yet settled — sessions 2..N cannot be redeemed yet) > DEPLETED (no sessions left) > ACTIVE. */
   status: "ACTIVE" | "AWAITING_BALANCE" | "DEPLETED" | "VOIDED";
   balanceSettled: boolean;
@@ -139,6 +140,7 @@ export const toPackageProgressDto = (
     serviceId: String(progress.serviceId),
     totalSessions: progress.totalSessions,
     remainingSessions: progress.remainingSessions,
+    availableSessions: progress.voidedAt ? 0 : progress.remainingSessions,
     completedSessions: progress.completedSessions,
     status,
     balanceSettled: settlement.balanceSettled,

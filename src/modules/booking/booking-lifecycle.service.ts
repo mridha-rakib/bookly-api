@@ -1,5 +1,4 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
-
 import { logger } from "../../config/logger.js";
 import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
@@ -8,18 +7,25 @@ import type { BookingFinancialTransactionService } from "../booking-financial-tr
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import { createFinancialRelationshipService } from "../client/financial-relationship.factory.js";
+import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { IntegrationService } from "../integration/integration.service.js";
 import type { BookingRescheduledCustomerNotificationPort } from "../notification/booking-rescheduled-customer.notifier.js";
 import type { StaffBookingNotificationPort } from "../notification/staff-booking.notifier.js";
 import { PackageProgressError } from "../package-progress/package-progress.errors.js";
 import type { PackageProgressDocument } from "../package-progress/package-progress.model.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import { PackageProgressRepository as PackageRepository } from "../package-progress/package-progress.repository.js";
 import {
   isPackageLinkedBooking,
   packageSessionOutcomeForBookingStatus,
 } from "../package-progress/package-progress.rules.js";
+import { PackageProgressService } from "../package-progress/package-progress.service.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
+import { ensureRefundAccounting } from "../payment/refund-accounting.js";
+import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
+import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRole } from "../user/user.types.js";
@@ -52,6 +58,12 @@ export type BookingCompletedNotificationPort = {
 
 /** Stage D mailing observer ports (optional + trailing, never throw). */
 export type BookingCancelledNotificationPort = {
+  notifyPackageTerminated?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    progress: PackageProgressDocument,
+    session?: ClientSession,
+  ): Promise<void>;
   notifyBookingCancelled(
     booking: BookingDocument,
     business: BusinessDocument,
@@ -59,10 +71,15 @@ export type BookingCancelledNotificationPort = {
     /** The real, authoritative outcome of a refund the caller just executed — see
      * BookingCancelledNotifier's own doc comment for why this must never be re-derived from the
      * booking's own persisted `cancellationOutcome`. */
-    refundOutcome?: { succeeded: boolean; amountCents: number },
+    refundOutcome?: {
+      succeeded: boolean;
+      amountCents: number;
+      status?: "PENDING" | "SUCCEEDED" | "FAILED";
+    },
     /** See BookingCancelledNotifier's own doc comment — only used when a SECOND, distinct
      * notification for the same booking must coexist with an already-enqueued plain one. */
     eventKeyOverride?: string,
+    session?: ClientSession,
   ): Promise<void>;
 };
 export type NoShowNotificationPort = {
@@ -153,7 +170,13 @@ export class BookingLifecycleService {
       | "markSessionCompleted"
       | "findByIdForCustomerAndBusiness"
       | "voidPackage"
+      | "findByIdInternal"
+      | "settleVoidRefund"
     >,
+    private readonly relationships: FinancialRelationshipService = createFinancialRelationshipService(
+      { bookingRepository },
+    ),
+    private readonly promoRedemptions = new PromoRedemptionRepository(),
   ) {}
 
   /** Best-effort — no-op for a Booking with no Package-linked line (every normal booking).
@@ -505,12 +528,25 @@ export class BookingLifecycleService {
       actorRole,
       businessId,
     );
-    const booking = await this.requireBookingForBusiness(business._id, bookingId, ["UPCOMING"]);
+    const booking = await this.requireBookingForBusiness(business._id, bookingId, [
+      "UPCOMING",
+      "CANCELLED_BY_BUSINESS",
+    ]);
     const now = new Date();
 
     const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
       booking._id,
     );
+    if (booking.status === "CANCELLED_BY_BUSINESS") {
+      if (!upfrontPayment) return booking;
+      const result = await this.executeBusinessCancellationRefund(booking, upfrontPayment);
+      await this.dispatchCancellationNotifications(result.booking, "BUSINESS", business, {
+        succeeded: result.refundSucceeded,
+        amountCents: result.refundedAmountCents,
+        status: result.settlementStatus,
+      });
+      return result.booking;
+    }
     const refundOwedCents = upfrontPayment?.amountCents ?? 0;
 
     // A Business-initiated cancellation is never the customer's fault — always FREE to the
@@ -557,185 +593,366 @@ export class BookingLifecycleService {
       booking: refunded,
       refundSucceeded,
       refundedAmountCents,
+      settlementStatus,
     } = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
     await this.dispatchCancellationNotifications(refunded, "BUSINESS", business, {
       succeeded: refundSucceeded,
       amountCents: refundedAmountCents,
+      status: settlementStatus,
     });
     await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
     return refunded;
   }
 
-  /**
-   * Whole-Package refund/void (confirmed rule): allowed ONLY for a Package that is genuinely
-   * "completely unused" — no session (including the purchase session itself) has ever reached
-   * COMPLETED or FORFEITED (late-cancelled/no-showed), and no session OTHER than the one this
-   * call itself may cancel is still SCHEDULED/unresolved (confirmed rule: an unresolved
-   * scheduled session must never let a Package look "unused"). A future session that was
-   * successfully cancelled ON TIME and restored does NOT by itself disqualify this — it leaves
-   * no COMPLETED/FORFEITED trace behind.
-   *
-   * Reuses, never reimplements:
-   *  - `cancelByCustomer` (unmodified) to resolve the origin Booking if it is still UPCOMING —
-   *    its own existing on-time/late classification decides the outcome exactly as it always
-   *    has; a LATE cancellation here FORFEITS the session (via the existing hook), which then
-   *    correctly fails this method's own "never used" check below — no separate cutoff invented.
-   *  - `executeBusinessCancellationRefund` (unmodified) for the actual Stripe refund + REFUND
-   *    ledger entry — refunds EXACTLY the amount `findSucceededUpfrontPayment` proves was really
-   *    collected (the deposit, e.g. EUR 35 of a EUR 200 bundle), never the full bundle price.
-   *
-   * The "off-platform/venue balance already recorded as paid" sub-case this rule's own audit
-   * flagged as needing infrastructure verification PROVABLY CANNOT ARISE here: recording a venue
-   * payment is only ever possible via `completeBooking`, which requires the Booking to already
-   * be COMPLETED — and a COMPLETED origin session is already excluded by the "never used" check
-   * below. So a Package that passes this method's eligibility check can only ever have an
-   * online-collected deposit at stake, never an off-platform amount — no missing infrastructure,
-   * no invented reversal mechanism.
-   */
+  /** Legacy unused-package endpoint; retains its narrower eligibility and notification key. */
   public async voidUnusedPackage(
     customerUserId: string,
     businessId: string,
     packageProgressId: string,
     reason: string | undefined,
   ): Promise<PackageProgressDocument> {
-    if (!this.packageProgressRepository) {
-      throw new Error("PackageProgressRepository must be injected to void a Package");
-    }
-
-    let progress = await this.packageProgressRepository.findByIdForCustomerAndBusiness(
-      packageProgressId,
+    const result = await this.packageAction(
+      customerUserId,
+      "CUSTOMER",
       businessId,
-      customerUserId,
+      packageProgressId,
+      "TERMINATE",
+      reason,
+      true,
     );
-    if (!progress) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
-    }
-    if (progress.voidedAt) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
-    }
-
-    const originBooking = await this.bookingRepository.findByIdForCustomer(
-      progress.originBookingId,
-      customerUserId,
-    );
-    if (!originBooking) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
-    }
-
-    // If the purchase session is still upcoming, resolve it through the SAME cancellation path
-    // any customer-initiated cancellation already goes through — its own on-time/late
-    // classification (unchanged) decides whether the session restores or forfeits, and the
-    // eligibility check below reads whatever that decision actually produced.
-    if (originBooking.status === "UPCOMING") {
-      await this.cancelByCustomer(customerUserId, String(originBooking._id), reason);
-      const refreshed = await this.packageProgressRepository.findByIdForCustomerAndBusiness(
-        packageProgressId,
-        businessId,
-        customerUserId,
-      );
-      if (refreshed) {
-        progress = refreshed;
-      }
-    }
-
-    const everUsed = progress.sessions.some(
-      (entry) => entry.status === "COMPLETED" || entry.status === "FORFEITED",
-    );
-    if (everUsed) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
-    }
-
-    const hasUnresolvedSession = progress.sessions.some((entry) => entry.status === "SCHEDULED");
-    if (hasUnresolvedSession) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
-    }
-
-    const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
-      progress.originBookingId,
-    );
-    let refundOutcome:
-      | {
-          booking: BookingDocument;
-          refundSucceeded: boolean;
-          refundedAmountCents: number;
-          settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED";
-          refundOperationId?: string | undefined;
-          providerRefundId?: string | undefined;
-        }
-      | undefined;
-    if (upfrontPayment && upfrontPayment.amountCents > 0) {
-      const currentOrigin = await this.bookingRepository.findByIdForCustomer(
+    const progress = result.packageProgress;
+    if (progress.voidRefundSettlement) {
+      const origin = await this.bookingRepository.findById(
+        progress.businessId,
         progress.originBookingId,
-        customerUserId,
       );
-      if (currentOrigin) {
-        refundOutcome = await this.executeBusinessCancellationRefund(
-          currentOrigin,
-          upfrontPayment,
+      if (origin)
+        await this.dispatchCancellationNotifications(
+          origin,
+          "CUSTOMER",
+          undefined,
           {
-            domainReason: "PACKAGE_VOID",
-            packageProgressId: progress._id,
+            succeeded: progress.voidRefundSettlement.status === "SUCCEEDED",
+            amountCents: progress.voidRefundSettlement.amountCents,
+            status: progress.voidRefundSettlement.status,
           },
+          `PACKAGE_REFUND:${String(origin._id)}`,
         );
-      }
     }
-
-    const voided = await this.packageProgressRepository.voidPackage(
-      progress._id,
-      refundOutcome
-        ? {
-            status: refundOutcome.settlementStatus,
-            amountCents: refundOutcome.refundedAmountCents,
-            ...(refundOutcome.refundOperationId
-              ? { refundOperationId: new Types.ObjectId(refundOutcome.refundOperationId) }
-              : {}),
-            ...(refundOutcome.providerRefundId
-              ? { providerRefundId: refundOutcome.providerRefundId }
-              : {}),
-          }
-        : undefined,
-    );
-    if (!voided) {
-      throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
-    }
-
-    // Phase 4B close-out fix: notify AFTER the refund attempt's authoritative result is known
-    // AND the Package is actually voided — never before, and never claiming success the refund
-    // didn't achieve (dispatchCancellationNotifications/buildCancellationEmailData's own
-    // `refundOverride` only ever describes what `executeBusinessCancellationRefund` actually
-    // did). Only sent when a real refund was actually attempted — nothing to tell the customer
-    // otherwise. Uses a distinct eventKey (never the plain `BOOKING_CANCELLED:` one) so it can
-    // never collide with — and be silently dropped by the outbox's dedupe against — the separate
-    // "booking cancelled" email the `cancelByCustomer` call above may already have enqueued for
-    // this same origin booking (see BookingCancelledNotifier's own doc comment). Best-effort:
-    // never throws, never rolls back the refund/void that already succeeded above.
-    if (refundOutcome) {
-      await this.dispatchCancellationNotifications(
-        refundOutcome.booking,
-        "CUSTOMER",
-        undefined,
-        {
-          succeeded: refundOutcome.refundSucceeded,
-          amountCents: refundOutcome.refundedAmountCents,
-        },
-        `PACKAGE_REFUND:${String(progress.originBookingId)}`,
-      );
-    }
-
-    return voided;
+    return progress;
   }
 
-  /**
-   * Stage D — enqueue the customer + Business Owner cancellation emails AFTER the cancellation
-   * and its refund/fee leg have reached their authoritative settled state. Best-effort: never
-   * throws. `cancelByBusiness` already holds the Business document; `cancelByCustomer` does not,
-   * so it is fetched once here.
-   */
+  public async getPackageForBusiness(
+    actorUserId: string,
+    role: UserRole,
+    businessId: string,
+    packageId: string,
+  ) {
+    const business = await this.bookingService.requireBookingManagementAccess(
+      actorUserId,
+      role,
+      businessId,
+    );
+    const packages = new PackageRepository();
+    const progress = Types.ObjectId.isValid(packageId)
+      ? await packages.findByIdInternal(packageId)
+      : null;
+    if (!progress?.businessId.equals(business._id))
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    return new PackageProgressService(packages, this.bookingRepository).getForCustomer(
+      String(progress.customerUserId),
+      packageId,
+    );
+  }
+
+  public async packageAction(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+    packageId: string,
+    action: "CANCEL_FUTURE" | "TERMINATE",
+    reason?: string,
+    unusedOnly = false,
+  ): Promise<{ packageProgress: PackageProgressDocument; cancelledBookingIds: string[] }> {
+    const packages = this.packageProgressRepository;
+    if (!packages || !Types.ObjectId.isValid(packageId) || !Types.ObjectId.isValid(businessId))
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    const customer = actorRole === "CUSTOMER";
+    if (!customer && action === "TERMINATE" && actorRole !== "BUSINESS_OWNER")
+      throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    const business = customer
+      ? await this.businessRepository.findById(businessId)
+      : await this.bookingService.requireBookingManagementAccess(
+          actorUserId,
+          actorRole,
+          businessId,
+        );
+    if (!business) throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    const session = await mongoose.startSession();
+    let cancelled: BookingDocument[] = [];
+    let refundBookings: BookingDocument[] = [];
+    try {
+      await session.withTransaction(async () => {
+        cancelled = [];
+        refundBookings = [];
+        const progress = await packages.findByIdInternal(packageId, session);
+        if (
+          !progress ||
+          !progress.businessId.equals(business._id) ||
+          (customer && !progress.customerUserId.equals(actorUserId))
+        )
+          throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+        if (unusedOnly && progress.voidedAt)
+          throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
+        if (
+          unusedOnly &&
+          progress.sessions.some(
+            (entry) =>
+              entry.status === "COMPLETED" ||
+              entry.status === "FORFEITED" ||
+              (entry.status === "SCHEDULED" && !entry.bookingId.equals(progress.originBookingId)),
+          )
+        )
+          throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
+        const ids = [
+          ...new Set([
+            String(progress.originBookingId),
+            ...progress.sessions.map((entry) => String(entry.bookingId)),
+          ]),
+        ];
+        const bookings = await this.bookingRepository.findManyByIdsForCustomer(
+          progress.businessId,
+          ids,
+          progress.customerUserId,
+          session,
+        );
+        const origin = bookings.find((booking) => booking._id.equals(progress.originBookingId));
+        if (
+          !origin ||
+          bookings.length !== ids.length ||
+          bookings.some(
+            (booking) =>
+              !booking.serviceLines.some(
+                (line) => String(line.pricingInput.packageProgressId) === packageId,
+              ),
+          )
+        )
+          throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+        if (progress.voidedAt) {
+          if (action === "CANCEL_FUTURE")
+            throw new PackageProgressError("PACKAGE_PROGRESS_VOIDED", 409);
+          cancelled = bookings.filter((booking) =>
+            booking.eventHistory.some((event) => event.note === `PACKAGE_TERMINATE:${packageId}`),
+          );
+          refundBookings = bookings; // Resume committed intents only; never authorize new restoration.
+          return;
+        }
+        const now = new Date();
+        if (
+          action === "TERMINATE" &&
+          bookings.some(
+            (booking) =>
+              booking.status === "PENDING" ||
+              (booking.status === "UPCOMING" &&
+                booking.schedule.startAt.getTime() <= now.getTime()),
+          )
+        )
+          throw new PackageProgressError("PACKAGE_PROGRESS_UNRESOLVED_APPOINTMENT", 409);
+        for (const booking of bookings) {
+          if (booking.status === "COMPLETED")
+            await this.syncPackageSessionOnCompletion(booking, session);
+          else await this.syncPackageSessionOnTerminalStatus(booking, session);
+        }
+        for (const booking of bookings) {
+          if (
+            booking.status !== "UPCOMING" ||
+            booking.schedule.startAt.getTime() <= now.getTime() ||
+            (action === "CANCEL_FUTURE" && booking._id.equals(progress.originBookingId))
+          )
+            continue;
+          const upfront = await this.financialTransactionService.findSucceededUpfrontPayment(
+            booking._id,
+          );
+          const classified = buildCancellationOutcome({
+            scheduledStartAt: booking.schedule.startAt,
+            now,
+            policySnapshot: booking.cancellationPolicySnapshot,
+            eligiblePlatformFeeBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
+            depositAlreadyPaidCents: upfront?.amountCents ?? 0,
+          });
+          const nextStatus: BookingStatus = customer
+            ? classified.feeMode === "PERCENTAGE"
+              ? "LATE_CANCELLATION"
+              : "CANCELLED_BY_CUSTOMER"
+            : "CANCELLED_BY_BUSINESS";
+          const outcome: BookingCancellationOutcome = customer
+            ? {
+                ...classified,
+                cancellationFeeCents: 0,
+                depositAppliedCents: 0,
+                additionalChargeCents: 0,
+                settlementStatus: "NOT_APPLICABLE",
+              }
+            : {
+                classifiedAt: now,
+                tier: "MORE_THAN_72_HOURS",
+                feeMode: "FREE",
+                cancellationFeeCents: 0,
+                depositAppliedCents: 0,
+                additionalChargeCents: 0,
+                refundOwedCents: upfront?.amountCents ?? 0,
+                settlementStatus: upfront ? "PENDING" : "NOT_APPLICABLE",
+              };
+          const updated = await this.applyCancellation(
+            {
+              booking,
+              nextStatus,
+              cancellationOutcome: outcome,
+              event: {
+                type: "STATUS_CHANGED",
+                previousStatus: "UPCOMING",
+                nextStatus,
+                actorUserId: new Types.ObjectId(actorUserId),
+                actorRole: actorRole as BookingActorRole,
+                note: `PACKAGE_${action}:${packageId}`,
+                ...(reason ? { reason } : {}),
+                createdAt: now,
+              },
+              ...(customer ? { scopedToCustomerUserId: actorUserId } : {}),
+            },
+            session,
+          );
+          cancelled.push(updated);
+          if (!unusedOnly)
+            await this.bookingCancelledNotifier?.notifyBookingCancelled(
+              updated,
+              business,
+              customer ? "CUSTOMER" : "BUSINESS",
+              undefined,
+              undefined,
+              session,
+            );
+          if (!customer && upfront) refundBookings.push(updated);
+        }
+        if (action === "TERMINATE") {
+          const refreshed = await packages.findByIdInternal(packageId, session);
+          if (!refreshed || refreshed.sessions.some((entry) => entry.status === "SCHEDULED"))
+            throw new PackageProgressError("PACKAGE_PROGRESS_UNRESOLVED_APPOINTMENT", 409);
+          const used = refreshed.sessions.some(
+            (entry) => entry.status === "COMPLETED" || entry.status === "FORFEITED",
+          );
+          if (unusedOnly && used)
+            throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
+          const source = await this.financialTransactionService.findSucceededUpfrontPayment(
+            origin._id,
+          );
+          const refundOrigin = customer
+            ? !used
+            : origin.financialContract?.classification === "FIRST" ||
+              cancelled.some((booking) => booking._id.equals(origin._id));
+          const refund = refundOrigin
+            ? await this.prepareRefundIntent(
+                origin,
+                source,
+                session,
+                customer ? "PACKAGE_VOID" : "BUSINESS_PACKAGE_TERMINATION",
+                progress._id,
+              )
+            : undefined;
+          const voided = await packages.voidPackage(
+            progress._id,
+            refund
+              ? {
+                  status:
+                    refund.providerStatus === "SUCCEEDED"
+                      ? "SUCCEEDED"
+                      : refund.providerStatus === "FAILED"
+                        ? "FAILED"
+                        : "PENDING",
+                  amountCents: refund.expectedRefundAmountCents,
+                  refundOperationId: refund._id,
+                  ...(refund.providerRefundId ? { providerRefundId: refund.providerRefundId } : {}),
+                }
+              : undefined,
+            session,
+          );
+          if (!voided) throw new PackageProgressError("PACKAGE_PROGRESS_ALREADY_VOIDED", 409);
+          if (!customer)
+            await this.relationships.beginBusinessCancellation(
+              origin,
+              source,
+              refund,
+              session,
+              progress._id,
+            );
+          if (refund) refundBookings.push(origin);
+          if (!unusedOnly)
+            await this.bookingCancelledNotifier?.notifyPackageTerminated?.(
+              origin,
+              business,
+              voided,
+              session,
+            );
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
+    for (const booking of new Map(
+      refundBookings.map((booking) => [String(booking._id), booking]),
+    ).values()) {
+      const intent = await this.paymentService.findRefundOperation(
+        `business-cancel-refund:${String(booking._id)}`,
+      );
+      if (!intent) continue;
+      const source = await this.financialTransactionService.findSucceededUpfrontPayment(
+        booking._id,
+      );
+      if (source) await this.executeBusinessCancellationRefund(booking, source);
+    }
+    for (const booking of cancelled) {
+      await this.syncBookingCancelledToGoogleCalendar(booking);
+      await this.retireAppointmentReminder(booking, `BOOKING_${booking.status}`);
+      const current = await this.bookingRepository.findById(business._id, booking._id);
+      await this.dispatchCancellationNotifications(
+        current ?? booking,
+        customer ? "CUSTOMER" : "BUSINESS",
+        business,
+      );
+      await this.dispatchStaffCancellationNotification(
+        booking,
+        customer ? "CUSTOMER" : "BUSINESS",
+        business,
+      );
+    }
+    const finalProgress = await packages.findByIdInternal(packageId);
+    if (!finalProgress) throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+    if (action === "TERMINATE") {
+      const origin = (
+        await this.bookingRepository.findManyByIds(business._id, [finalProgress.originBookingId])
+      )[0];
+      if (origin)
+        await this.bookingCancelledNotifier?.notifyPackageTerminated?.(
+          origin,
+          business,
+          finalProgress,
+        );
+    }
+    return {
+      packageProgress: finalProgress,
+      cancelledBookingIds: cancelled.map((booking) => String(booking._id)),
+    };
+  }
+
   private async dispatchCancellationNotifications(
     booking: BookingDocument,
     cancelledBy: "CUSTOMER" | "BUSINESS",
     business?: BusinessDocument,
-    refundOutcome?: { succeeded: boolean; amountCents: number },
+    refundOutcome?: {
+      succeeded: boolean;
+      amountCents: number;
+      status?: "PENDING" | "SUCCEEDED" | "FAILED";
+    },
     eventKeyOverride?: string,
   ): Promise<void> {
     if (!this.bookingCancelledNotifier) {
@@ -971,7 +1188,7 @@ export class BookingLifecycleService {
       amountCents: number;
     },
     options: {
-      domainReason?: "BUSINESS_CANCELLATION" | "PACKAGE_VOID";
+      domainReason?: "BUSINESS_CANCELLATION" | "PACKAGE_VOID" | "BUSINESS_PACKAGE_TERMINATION";
       packageProgressId?: Types.ObjectId | undefined;
     } = {},
   ): Promise<{
@@ -995,16 +1212,17 @@ export class BookingLifecycleService {
       if (!upfrontPayment.providerReference) {
         throw new Error("No provider reference to refund");
       }
+      const prepared = await this.paymentService.findRefundOperation(idempotencyKey);
       const refund = await this.paymentService.refund({
         paymentIntentId: upfrontPayment.providerReference,
         amountCents: upfrontPayment.amountCents,
         currency: booking.financials.currency,
         idempotencyKey,
         reason: "requested_by_customer",
-        domainReason: options.domainReason ?? "BUSINESS_CANCELLATION",
+        domainReason: prepared?.reason ?? options.domainReason ?? "BUSINESS_CANCELLATION",
         sourceFinancialTransactionId: upfrontPayment._id,
         bookingId: booking._id,
-        packageProgressId: options.packageProgressId,
+        packageProgressId: prepared?.packageProgressId ?? options.packageProgressId,
         businessId: booking.businessId,
         businessClientId: booking.customer.businessClientId,
         customerUserId: booking.customer.customerUserId,
@@ -1031,27 +1249,40 @@ export class BookingLifecycleService {
       refundId = operation?.providerRefundId;
     }
 
-    const refundLedger = await this.financialTransactionService.record({
-      businessId: booking.businessId,
-      bookingId: booking._id,
-      businessClientId: booking.customer.businessClientId,
-      customerUserId: booking.customer.customerUserId,
-      type: "REFUND",
-      direction: "CREDIT",
-      amountCents: upfrontPayment.amountCents,
-      currency: booking.financials.currency,
-      status: settlementStatus,
-      ...(refundId ? { providerReference: refundId } : {}),
-      idempotencyKey: refundOperationId
+    const refunds = new RefundOperationRepository();
+    const operation = refundOperationId ? await refunds.findById(refundOperationId) : null;
+    if (operation?.providerStatus === "SUCCEEDED") {
+      await ensureRefundAccounting(operation, this.financialTransactionService, refunds);
+      settlementStatus = "SUCCEEDED";
+      refundId = operation.providerRefundId;
+      await this.relationships.reconcileQuietly(booking.customer.businessClientId);
+    } else {
+      const key = refundOperationId
         ? `refund-operation:${refundOperationId}:ledger`
-        : `${idempotencyKey}:ledger`,
-      metadata: {
-        sourceType: upfrontPayment.type,
-        sourceTransactionId: String(upfrontPayment._id),
-      },
-    });
-    if (settlementStatus === "SUCCEEDED") {
-      await this.paymentService.markRefundLedgerSucceeded(refundOperationId, refundLedger._id);
+        : `${idempotencyKey}:ledger`;
+      if (!(await this.financialTransactionService.findByIdempotencyKey(key))) {
+        try {
+          await this.financialTransactionService.record({
+            businessId: booking.businessId,
+            bookingId: booking._id,
+            businessClientId: booking.customer.businessClientId,
+            customerUserId: booking.customer.customerUserId,
+            type: "REFUND",
+            direction: "CREDIT",
+            amountCents: upfrontPayment.amountCents,
+            currency: booking.financials.currency,
+            status: settlementStatus,
+            ...(refundId ? { providerReference: refundId } : {}),
+            idempotencyKey: key,
+            metadata: {
+              sourceType: upfrontPayment.type,
+              sourceTransactionId: String(upfrontPayment._id),
+            },
+          });
+        } catch (error) {
+          if (!(await this.financialTransactionService.findByIdempotencyKey(key))) throw error;
+        }
+      }
     }
 
     const updated = await this.bookingRepository.updateCancellationSettlement(
@@ -1059,14 +1290,115 @@ export class BookingLifecycleService {
       settlementStatus,
       refundId,
     );
+    if (
+      operation?.packageProgressId &&
+      this.packageProgressRepository &&
+      settlementStatus !== "PENDING"
+    ) {
+      const progress = await this.packageProgressRepository.findByIdInternal(
+        operation.packageProgressId,
+      );
+      if (progress?.voidedAt)
+        await this.packageProgressRepository.settleVoidRefund(
+          operation._id,
+          settlementStatus,
+          refundId,
+        );
+    }
     return {
-      booking: updated ?? booking,
+      booking:
+        updated ??
+        (await this.bookingRepository.findById(booking.businessId, booking._id)) ??
+        booking,
       refundSucceeded: settlementStatus === "SUCCEEDED",
       refundedAmountCents: upfrontPayment.amountCents,
       settlementStatus,
       refundOperationId,
       providerRefundId: refundId,
     };
+  }
+
+  private async prepareRefundIntent(
+    booking: BookingDocument,
+    source: BookingFinancialTransactionDocument | undefined,
+    session: ClientSession,
+    reason = "BUSINESS_CANCELLATION",
+    packageId?: Types.ObjectId,
+  ) {
+    if (!source || source.amountCents <= 0) return undefined;
+    if (!source.providerReference)
+      throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    return this.paymentService.prepareRefund(
+      {
+        logicalIdempotencyKey: `business-cancel-refund:${String(booking._id)}`,
+        sourcePaymentIntentId: source.providerReference,
+        sourceFinancialTransactionId: source._id,
+        expectedRefundAmountCents: source.amountCents,
+        currency: booking.financials.currency,
+        bookingId: booking._id,
+        businessId: booking.businessId,
+        businessClientId: booking.customer.businessClientId,
+        customerUserId: booking.customer.customerUserId,
+        reason,
+        ...(packageId ? { packageProgressId: packageId } : {}),
+      },
+      session,
+    );
+  }
+
+  private async applyCancellation(
+    params: {
+      booking: BookingDocument;
+      nextStatus: BookingStatus;
+      cancellationOutcome: BookingCancellationOutcome;
+      event: BookingEventHistoryEntry;
+      scopedToCustomerUserId?: string;
+    },
+    session: ClientSession,
+  ): Promise<BookingDocument> {
+    await this.releaseAllLines(params.booking, session);
+    const update = {
+      set: { status: params.nextStatus, cancellationOutcome: params.cancellationOutcome },
+      pushEvent: params.event,
+      extraFilter: { "schedule.startAt": params.booking.schedule.startAt },
+    };
+    const updated = params.scopedToCustomerUserId
+      ? await this.bookingRepository.casUpdateForCustomer(
+          params.booking._id,
+          params.scopedToCustomerUserId,
+          ["UPCOMING"],
+          update,
+          session,
+        )
+      : await this.bookingRepository.casUpdate(
+          params.booking.businessId,
+          params.booking._id,
+          ["UPCOMING"],
+          update,
+          session,
+        );
+    if (!updated) throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
+    await this.syncPackageSessionOnTerminalStatus(updated, session);
+    if (params.nextStatus === "CANCELLED_BY_BUSINESS") {
+      const source = await this.financialTransactionService.findSucceededUpfrontPayment(
+        updated._id,
+      );
+      const refund = await this.prepareRefundIntent(updated, source, session);
+      if (!isPackageLinkedBooking(updated)) {
+        await this.relationships.beginBusinessCancellation(updated, source, refund, session);
+        if (updated.customer.customerUserId)
+          await this.promoRedemptions.restoreBusinessCancellation(
+            {
+              bookingId: updated._id,
+              businessId: updated.businessId,
+              customerUserId: updated.customer.customerUserId,
+              actorUserId: params.event.actorUserId,
+            },
+            session,
+          );
+      }
+    }
+    return updated;
   }
 
   private async performCancellationTransaction(params: {
@@ -1081,34 +1413,7 @@ export class BookingLifecycleService {
 
     try {
       await dbSession.withTransaction(async () => {
-        await this.releaseAllLines(params.booking, dbSession);
-
-        const update = {
-          set: { status: params.nextStatus, cancellationOutcome: params.cancellationOutcome },
-          pushEvent: params.event,
-        };
-
-        updated = params.scopedToCustomerUserId
-          ? await this.bookingRepository.casUpdateForCustomer(
-              params.booking._id,
-              params.scopedToCustomerUserId,
-              ["UPCOMING"],
-              update,
-              dbSession,
-            )
-          : await this.bookingRepository.casUpdate(
-              params.booking.businessId,
-              params.booking._id,
-              ["UPCOMING"],
-              update,
-              dbSession,
-            );
-
-        if (!updated) {
-          throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
-        }
-
-        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
+        updated = await this.applyCancellation(params, dbSession);
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {

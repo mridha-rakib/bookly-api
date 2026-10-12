@@ -73,8 +73,13 @@ export class FinancialRelationshipRepository {
     return row as RelationshipRow;
   }
 
-  public async findByClientId(clientId: Types.ObjectId | string): Promise<RelationshipRow | null> {
-    const row = await BusinessClientModel.findById(clientId).exec();
+  public async findByClientId(
+    clientId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<RelationshipRow | null> {
+    const row = await BusinessClientModel.findById(clientId)
+      .session(session ?? null)
+      .exec();
     return row?.financialRelationship ? (row as RelationshipRow) : null;
   }
 
@@ -309,6 +314,101 @@ export class FinancialRelationshipRepository {
             idempotencyKey: input.idempotencyKey,
             reason: "COMPENSATION_REFUNDED",
             paymentAttemptId: new Types.ObjectId(input.paymentAttemptId),
+            refundOperationId: input.refundOperationId,
+            releasedAt: now,
+          },
+        },
+        $unset: { "financialRelationship.pending": 1 },
+        $inc: { [REVISION]: 1 },
+      },
+    ).exec();
+    return result.modifiedCount === 1;
+  }
+
+  /** P4: exact consumed purchase only; commit with the cancellation/termination. */
+  public async beginBusinessRestoration(
+    clientId: Types.ObjectId,
+    input: {
+      idempotencyKey: string;
+      bookingId: Types.ObjectId;
+      customerUserId: Types.ObjectId;
+      productKind: "NORMAL_BOOKING" | "PACKAGE_PURCHASE";
+      expectedRevision: number;
+      refundOperationId?: Types.ObjectId;
+    },
+    session: ClientSession,
+  ): Promise<boolean> {
+    const now = new Date();
+    const paid = Boolean(input.refundOperationId);
+    const result = await BusinessClientModel.updateOne(
+      {
+        _id: clientId,
+        [STATE]: "CONSUMED",
+        [REVISION]: input.expectedRevision,
+        "financialRelationship.consumed.idempotencyKey": input.idempotencyKey,
+        "financialRelationship.consumed.bookingId": input.bookingId,
+        "financialRelationship.consumed.productKind": input.productKind,
+      },
+      {
+        $set: {
+          [STATE]: paid ? "RESTORATION_PENDING" : "ELIGIBLE",
+          "financialRelationship.stateChangedAt": now,
+          ...(paid
+            ? {
+                "financialRelationship.pending": {
+                  idempotencyKey: input.idempotencyKey,
+                  bookingId: input.bookingId,
+                  customerUserId: input.customerUserId,
+                  productKind: input.productKind,
+                  claimedAt: now,
+                  claimLeaseExpiresAt: now,
+                  restorationRequiredAt: now,
+                  restorationRefundOperationId: input.refundOperationId,
+                },
+              }
+            : {
+                "financialRelationship.lastRelease": {
+                  idempotencyKey: input.idempotencyKey,
+                  reason: "BUSINESS_CANCELLATION",
+                  releasedAt: now,
+                },
+              }),
+        },
+        $inc: { [REVISION]: 1 },
+      },
+      { session },
+    ).exec();
+    return result.modifiedCount === 1;
+  }
+
+  public async finishBusinessRestoration(
+    clientId: Types.ObjectId,
+    input: {
+      idempotencyKey: string;
+      bookingId: Types.ObjectId;
+      refundOperationId: Types.ObjectId;
+      expectedRevision: number;
+    },
+  ): Promise<boolean> {
+    const now = new Date();
+    const result = await BusinessClientModel.updateOne(
+      {
+        _id: clientId,
+        [STATE]: "RESTORATION_PENDING",
+        [REVISION]: input.expectedRevision,
+        [PENDING_KEY]: input.idempotencyKey,
+        "financialRelationship.pending.bookingId": input.bookingId,
+        "financialRelationship.pending.restorationRefundOperationId": input.refundOperationId,
+        "financialRelationship.consumed.bookingId": input.bookingId,
+        "financialRelationship.consumed.idempotencyKey": input.idempotencyKey,
+      },
+      {
+        $set: {
+          [STATE]: "ELIGIBLE",
+          "financialRelationship.stateChangedAt": now,
+          "financialRelationship.lastRelease": {
+            idempotencyKey: input.idempotencyKey,
+            reason: "BUSINESS_CANCELLATION",
             refundOperationId: input.refundOperationId,
             releasedAt: now,
           },

@@ -1,8 +1,10 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import { buildCancellationEmailData } from "../email/templates/booking/cancellation-email-data.js";
 import type { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
+import type { PackageProgressDocument } from "../package-progress/package-progress.model.js";
 import type { BookingNotificationUserPort } from "./booking-created.notifier.js";
 import { normalizeRecipient } from "./notification-recipients.js";
 
@@ -11,7 +13,11 @@ type OutboxEnqueue = Pick<EmailOutboxService, "enqueue">;
 /** The real, authoritative outcome of a refund the caller just executed — see
  * cancellation-email-data.ts's own module doc comment for why this must never be re-derived
  * from the booking's own persisted `cancellationOutcome`. */
-export type BookingRefundOutcome = { succeeded: boolean; amountCents: number };
+export type BookingRefundOutcome = {
+  succeeded: boolean;
+  amountCents: number;
+  status?: "PENDING" | "SUCCEEDED" | "FAILED";
+};
 
 /** Optional observer port — see `BookingLifecycleService`. */
 export type BookingCancelledNotificationPort = {
@@ -24,6 +30,7 @@ export type BookingCancelledNotificationPort = {
      * notification for the SAME booking must coexist with an already-enqueued plain
      * "BOOKING_CANCELLED" one. */
     eventKeyOverride?: string,
+    session?: ClientSession,
   ): Promise<void>;
 };
 
@@ -60,12 +67,46 @@ export class BookingCancelledNotifier implements BookingCancelledNotificationPor
     private readonly users: Pick<BookingNotificationUserPort, "findManyByIds">,
   ) {}
 
+  public async notifyPackageTerminated(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    progress: PackageProgressDocument,
+    session?: ClientSession,
+  ): Promise<void> {
+    try {
+      const [owner] = await this.users.findManyByIds([String(business.ownerUserId)]);
+      const recipients = new Set(
+        [booking.customer.contact.normalizedEmail, owner?.normalizedEmail].filter(
+          (email): email is string => Boolean(email),
+        ),
+      );
+      for (const recipient of recipients)
+        await this.emailOutbox.enqueue(
+          {
+            eventKey: `PACKAGE_TERMINATED:${String(progress._id)}`,
+            templateKey: "PACKAGE_TERMINATED",
+            recipient,
+            payload: {
+              packageName: progress.purchaseSnapshot.name,
+              businessName: business.name,
+              refundStatus: progress.voidRefundSettlement?.status ?? "NONE",
+            },
+          },
+          session,
+        );
+    } catch (error) {
+      if (session) throw error;
+      logger.error({ err: error }, "Package notification deferred");
+    }
+  }
+
   public async notifyBookingCancelled(
     booking: BookingDocument,
     business: BusinessDocument,
     cancelledBy: "CUSTOMER" | "BUSINESS",
     refundOutcome?: BookingRefundOutcome,
     eventKeyOverride?: string,
+    session?: ClientSession,
   ): Promise<void> {
     try {
       const data = buildCancellationEmailData(booking, {
@@ -76,6 +117,7 @@ export class BookingCancelledNotifier implements BookingCancelledNotificationPor
               refundOverride: {
                 succeeded: refundOutcome.succeeded,
                 amountCents: refundOutcome.amountCents,
+                ...(refundOutcome.status ? { status: refundOutcome.status } : {}),
               },
             }
           : {}),
@@ -114,14 +156,18 @@ export class BookingCancelledNotifier implements BookingCancelledNotificationPor
           continue;
         }
         seen.add(key);
-        await this.emailOutbox.enqueue({
-          eventKey,
-          templateKey: plan.templateKey,
-          recipient: plan.email,
-          payload: data as unknown as Record<string, unknown>,
-        });
+        await this.emailOutbox.enqueue(
+          {
+            eventKey,
+            templateKey: plan.templateKey,
+            recipient: plan.email,
+            payload: data as unknown as Record<string, unknown>,
+          },
+          session,
+        );
       }
     } catch (error) {
+      if (session) throw error;
       logger.error(
         { err: error, bookingId: String(booking._id) },
         "Failed to enqueue cancellation notifications (the cancellation is unaffected)",

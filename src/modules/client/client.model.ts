@@ -35,8 +35,9 @@ export type BusinessClientAddress = {
  *
  * Every transition is a compare-and-set on `state` + the pending operation identity (and
  * `revision` for recovery), so a stale worker can never release a claim another operation now
- * owns, never turn CONSUMED back into ELIGIBLE, and never restore on the wrong refund. CONSUMED
- * is terminal in P1 (successful-booking cancellation/void restoration is P4).
+ * owns and never restore on the wrong refund. CONSUMED
+ * may enter RESTORATION_PENDING on qualifying P4 business cancellation; zero-money restoration
+ * is committed directly with cancellation.
  */
 export const financialRelationshipStates = [
   "ELIGIBLE",
@@ -96,7 +97,8 @@ export type BusinessClientFinancialRelationship = {
           | "PRE_MONEY_FAILURE"
           | "PRE_DISPATCH_ABANDONED"
           | "PROVIDER_CANCELED"
-          | "COMPENSATION_REFUNDED";
+          | "COMPENSATION_REFUNDED"
+          | "BUSINESS_CANCELLATION";
         paymentAttemptId?: Types.ObjectId | undefined;
         refundOperationId?: Types.ObjectId | undefined;
         releasedAt: Date;
@@ -247,6 +249,7 @@ const financialRelationshipSchema = new Schema<BusinessClientFinancialRelationsh
               "PRE_DISPATCH_ABANDONED",
               "PROVIDER_CANCELED",
               "COMPENSATION_REFUNDED",
+              "BUSINESS_CANCELLATION",
             ],
             required: true,
           },

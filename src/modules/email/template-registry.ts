@@ -35,6 +35,10 @@ import { renderNoShowChargedEmail } from "./templates/booking/no-show-charged.te
 import type { NoShowEmailData } from "./templates/booking/no-show-email-data.js";
 import { renderNoShowWaivedEmail } from "./templates/booking/no-show-waived.template.js";
 import {
+  type PackageTerminatedPayload,
+  renderPackageTerminatedEmail,
+} from "./templates/booking/package-terminated.template.js";
+import {
   renderSessionEndReminderEmail,
   type SessionEndReminderEmailData,
 } from "./templates/booking/session-end-reminder.template.js";
@@ -77,6 +81,7 @@ import {
  * renderer TODAY. Stage C/D add the rest — no placeholder bodies are registered now.
  */
 export type EmailTemplateKey =
+  | "PACKAGE_TERMINATED"
   // Customer account lifecycle
   | "ACCOUNT_CLOSED"
   | "OTP_VERIFICATION"
@@ -125,6 +130,7 @@ const asRenderer = <P>(fn: (payload: P) => RenderedEmail): EmailTemplateRenderer
   fn as EmailTemplateRenderer<never>;
 
 const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> = {
+  PACKAGE_TERMINATED: asRenderer<PackageTerminatedPayload>(renderPackageTerminatedEmail),
   ACCOUNT_CLOSED: asRenderer<AccountClosedPayload>(renderAccountClosedEmail),
   OTP_VERIFICATION: asRenderer<OtpVerificationPayload>(renderOtpVerificationEmail),
   CLIENT_CREATED: asRenderer<ClientCreatedEmailData>(renderClientCreatedEmail),

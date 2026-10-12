@@ -145,6 +145,7 @@ export class PromoApplicationService {
         customerChargeNowCents: input.requiredUpfrontCents,
         fundingOwner: "BUSINESS",
         isFirstBooking: input.isFirstBooking,
+        userUsageCounted: promo.perUserUsageLimit !== undefined,
       },
       session,
     );

@@ -380,6 +380,59 @@ export class BookingController {
    * own doc comment for the full eligibility rule. Returns just the entitlement's own updated
    * fields (never a Booking DTO — voiding may resolve zero, one, or leave several Bookings
    * untouched depending on what was actually scheduled). */
+  private requirePackageActor(request: Request): { userId: string; role: UserRole } {
+    if (request.auth?.role === "CUSTOMER")
+      return { userId: this.requireCustomerId(request), role: "CUSTOMER" };
+    return this.requireBusinessActor(request);
+  }
+
+  public getPackageForBusiness = async (request: Request, response: Response): Promise<void> => {
+    const actor = this.requireBusinessActor(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    sendSuccess(
+      response,
+      200,
+      "Package",
+      await this.lifecycleService.getPackageForBusiness(
+        actor.userId,
+        actor.role,
+        params.businessId,
+        params.packageProgressId,
+      ),
+    );
+  };
+
+  public packageAction =
+    (action: "CANCEL_FUTURE" | "TERMINATE") =>
+    async (request: Request, response: Response): Promise<void> => {
+      const actor = this.requirePackageActor(request);
+      const params = request.validated?.params as PackageProgressBusinessParams;
+      const body = request.validated?.body as CancelBookingBody;
+      const result = await this.lifecycleService.packageAction(
+        actor.userId,
+        actor.role,
+        params.businessId,
+        params.packageProgressId,
+        action,
+        body.reason,
+      );
+      sendSuccess(
+        response,
+        200,
+        action === "TERMINATE" ? "Package cancelled" : "Future appointments cancelled",
+        {
+          packageProgressId: String(result.packageProgress._id),
+          voidedAt: result.packageProgress.voidedAt?.toISOString(),
+          cancelledBookingIds: result.cancelledBookingIds,
+          remainingSessions: result.packageProgress.remainingSessions,
+          availableSessions: result.packageProgress.voidedAt
+            ? 0
+            : result.packageProgress.remainingSessions,
+          refundSettlement: result.packageProgress.voidRefundSettlement,
+        },
+      );
+    };
+
   public voidPackage = async (request: Request, response: Response): Promise<void> => {
     const userId = this.requireCustomerId(request);
     const params = request.validated?.params as PackageProgressBusinessParams;
@@ -392,10 +445,12 @@ export class BookingController {
       body.reason,
     );
 
-    sendSuccess(response, 200, "Package refunded and voided", {
+    sendSuccess(response, 200, "Package cancelled", {
       packageProgressId: String(voided._id),
       voidedAt: voided.voidedAt?.toISOString(),
       remainingSessions: voided.remainingSessions,
+      availableSessions: 0,
+      refundSettlement: voided.voidRefundSettlement,
       totalSessions: voided.totalSessions,
     });
   };

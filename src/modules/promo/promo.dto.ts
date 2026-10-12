@@ -65,6 +65,8 @@ export type PromoRedemptionRowDto = {
   customerChargeNowCents: number;
   isFirstBooking: boolean;
   redeemedAt: string;
+  usageRestoredAt?: string | undefined;
+  usageRestoredByUserId?: string | undefined;
 };
 
 export const toPromoRedemptionRowDto = (
@@ -84,4 +86,8 @@ export const toPromoRedemptionRowDto = (
   customerChargeNowCents: redemption.customerChargeNowCents,
   isFirstBooking: redemption.isFirstBooking,
   redeemedAt: redemption.redeemedAt.toISOString(),
+  usageRestoredAt: redemption.usageRestoredAt?.toISOString(),
+  usageRestoredByUserId: redemption.usageRestoredByUserId
+    ? String(redemption.usageRestoredByUserId)
+    : undefined,
 });

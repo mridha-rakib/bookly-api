@@ -101,11 +101,8 @@ export type PackageProgressDocument = {
   /** The purchase Booking — session 1, the one Booking that actually carried a real charge. */
   originBookingId: Types.ObjectId;
   purchaseSnapshot: PackageProgressPurchaseSnapshot;
-  /** Set once, only by BookingLifecycleService.voidUnusedPackage, when a genuinely completely
-   * unused Package is refunded/void — see that method's own doc comment for the exact
-   * eligibility rule. Once set, the entitlement can never be redeemed against again
-   * (redeemPackageSession's own guard checks this). Never set for a partially-used Package —
-   * this is a hard block, not a soft status a later action can clear. */
+  /** P4: terminal package marker for unused void or full termination. Historical counters and
+   * completed/forfeited entries remain; claimSession atomically rejects this marker. */
   voidedAt?: Date | undefined;
   voidRefundSettlement?:
     | {

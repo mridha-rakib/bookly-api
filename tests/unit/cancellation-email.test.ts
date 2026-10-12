@@ -139,7 +139,7 @@ describe("cancellation email data + templates", () => {
     expect(data.financialOutcome.settlementStatus).toBe("FAILED");
     const text = renderBookingCancelledCustomerEmail(data).text;
     expect(text).not.toContain("has been processed");
-    expect(text).toContain("is being arranged");
+    expect(text).toContain("could not be completed");
   });
 
   it("without refundOverride, existing normal-booking behavior (persisted cancellationOutcome) is unchanged", () => {

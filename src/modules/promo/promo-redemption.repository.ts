@@ -1,6 +1,8 @@
 import type { ClientSession, Types } from "mongoose";
+import { PromoCodeModel } from "./promo.model.js";
 import type { PromoFundingOwner, PromoType } from "./promo.types.js";
 import { type PromoRedemptionDocument, PromoRedemptionModel } from "./promo-redemption.model.js";
+import { PromoUserUsageModel } from "./promo-user-usage.model.js";
 
 export type CreatePromoRedemptionInput = {
   promoId: Types.ObjectId;
@@ -16,9 +18,72 @@ export type CreatePromoRedemptionInput = {
   customerChargeNowCents: number;
   fundingOwner: PromoFundingOwner;
   isFirstBooking: boolean;
+  userUsageCounted?: boolean | undefined;
 };
 
 export class PromoRedemptionRepository {
+  public async restoreBusinessCancellation(
+    input: {
+      bookingId: Types.ObjectId;
+      businessId: Types.ObjectId;
+      customerUserId: Types.ObjectId;
+      actorUserId: Types.ObjectId;
+    },
+    session: ClientSession,
+  ): Promise<void> {
+    const redemption = await PromoRedemptionModel.findOneAndUpdate(
+      {
+        bookingId: input.bookingId,
+        businessId: input.businessId,
+        customerUserId: input.customerUserId,
+        usageRestoredAt: { $exists: false },
+      },
+      { $set: { usageRestoredAt: new Date(), usageRestoredByUserId: input.actorUserId } },
+      { session, returnDocument: "after" },
+    ).exec();
+    if (!redemption) return;
+    const global = await PromoCodeModel.updateOne(
+      { _id: redemption.promoId, redeemedCount: { $gte: 1 } },
+      { $inc: { redeemedCount: -1 } },
+      { session },
+    ).exec();
+    let counted = redemption.userUsageCounted;
+    if (counted === undefined) {
+      const usage = await PromoUserUsageModel.findOne({
+        promoId: redemption.promoId,
+        customerUserId: redemption.customerUserId,
+      }).session(session);
+      if (!usage) counted = false;
+      else {
+        // Historical rows lack the cap snapshot. Only restore when all still-active possible
+        // counter contributors are accounted for; mixed ambiguous history fails closed.
+        const possible = await PromoRedemptionModel.countDocuments({
+          promoId: redemption.promoId,
+          customerUserId: redemption.customerUserId,
+          usageRestoredAt: { $exists: false },
+          userUsageCounted: { $ne: false },
+        }).session(session);
+        if (usage.count !== possible + 1)
+          throw new Error("Historical promo counter attribution is ambiguous");
+        counted = true;
+      }
+    }
+    const user = counted
+      ? await PromoUserUsageModel.updateOne(
+          {
+            promoId: redemption.promoId,
+            customerUserId: redemption.customerUserId,
+            count: { $gte: 1 },
+          },
+          { $inc: { count: -1 } },
+          { session },
+        ).exec()
+      : undefined;
+    if (global.modifiedCount !== 1 || (counted && user?.modifiedCount !== 1)) {
+      throw new Error("Promo usage restoration requires consistent positive counters");
+    }
+  }
+
   public async create(
     input: CreatePromoRedemptionInput,
     session: ClientSession,

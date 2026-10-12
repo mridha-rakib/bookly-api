@@ -21,7 +21,9 @@ const settlementLine = (data: CancellationEmailData): string | undefined => {
   if (f.hasRefund) {
     return f.settlementStatus === "SUCCEEDED"
       ? `Upfront payment of ${f.refundFormatted} refunded to the customer.`
-      : `Refund of ${f.refundFormatted} did not complete automatically and is flagged for manual follow-up.`;
+      : f.settlementStatus === "PENDING"
+        ? `Refund of ${f.refundFormatted} is pending.`
+        : `Refund of ${f.refundFormatted} did not complete automatically and is flagged for manual follow-up.`;
   }
   if (data.cancelledBy === "CUSTOMER") {
     if (!f.hasCancellationFee) {
