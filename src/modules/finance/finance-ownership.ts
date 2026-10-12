@@ -50,17 +50,57 @@ export const classifyProcessingFeeOwner = (sourceType: string | null): Financial
  * PROMO_SUBSIDY (Batch 13) joins this set: Bookly's compensating CREDIT for a Promo-discounted
  * returning booking is, by construction, always Business-owned money — never ambiguous, never
  * `sourceType`-dependent like PROCESSING_FEE/REFUND. */
-const BUSINESS_OWNED_GROSS_TYPES = new Set([
+export const BUSINESS_OWNED_GROSS_TYPES: ReadonlySet<string> = new Set([
   "DEPOSIT",
   "CANCELLATION_FEE",
   "NO_SHOW_FEE",
   "PROMO_SUBSIDY",
 ]);
 
+/** P6 — the dispute money-movement types; their owner is the disputed principal's owner
+ * (`metadata.sourceType`), exactly like REFUND. */
+export const DISPUTE_LEDGER_TYPES: ReadonlySet<string> = new Set([
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
+]);
+
+/**
+ * P6 — a dispute row's signed effect on its owner's net loss: a withdrawal or fee increases the
+ * loss, a reinstatement or returned fee decreases it by the exact provider-confirmed amount.
+ */
+export const disputeLossCents = (type: string, amountCents: number): number =>
+  type === "DISPUTE_WITHDRAWAL" || type === "DISPUTE_FEE" ? amountCents : -amountCents;
+
+/**
+ * P6 — THE single entry-level owner classification, shared by the payout claim and every
+ * payable preview so the two can never drift: PLATFORM_FEE is Bookly's; DEPOSIT/penalties/
+ * PROMO_SUBSIDY are the Business's; PROCESSING_FEE/REFUND/dispute rows follow the owner of the
+ * underlying principal recorded in `metadata.sourceType`.
+ */
+export const classifyLedgerEntryOwner = (entry: {
+  type: string;
+  metadata?: Record<string, string | number | boolean> | undefined;
+}): FinancialOwner => {
+  if (entry.type === "PLATFORM_FEE") return "BOOKLY";
+  if (BUSINESS_OWNED_GROSS_TYPES.has(entry.type)) return "BUSINESS";
+  const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
+  if (entry.type === "PROCESSING_FEE") return classifyProcessingFeeOwner(sourceType);
+  if (entry.type === "REFUND" || DISPUTE_LEDGER_TYPES.has(entry.type)) {
+    return classifySourceOwner(sourceType);
+  }
+  return "UNKNOWN";
+};
+
 export type OwnedTotals = {
   grossCents: number;
   processingFeesCents: number;
   refundsCents: number;
+  /** P6 — net provider dispute effect on this owner: withdrawals + dispute fees − reinstatements
+   * − returned fees. Deducted from `netCents`; may be negative only after reinstatements exceed
+   * still-open withdrawals within the aggregated set (carry-forward). */
+  disputeAdjustmentsCents: number;
   netCents: number;
   /** Batch 13 — the portion of `grossCents` (Business side) or the cost against `netCents`
    * (Bookly side) that came from Bookly-funded PROMO_SUBSIDY entries, broken out for
@@ -82,6 +122,7 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
   let grossCents = 0;
   let processingFeesCents = 0;
   let refundsCents = 0;
+  let disputeAdjustmentsCents = 0;
   let promoSubsidyCents = 0;
 
   for (const bucket of buckets) {
@@ -97,6 +138,11 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
       processingFeesCents += bucket.totalCents;
     } else if (bucket.type === "REFUND" && classifySourceOwner(bucket.sourceType) === "BUSINESS") {
       refundsCents += bucket.totalCents;
+    } else if (
+      DISPUTE_LEDGER_TYPES.has(bucket.type) &&
+      classifySourceOwner(bucket.sourceType) === "BUSINESS"
+    ) {
+      disputeAdjustmentsCents += disputeLossCents(bucket.type, bucket.totalCents);
     }
   }
 
@@ -104,7 +150,8 @@ export const combineBusinessOwnedBuckets = (buckets: OwnershipAggregateBucket[])
     grossCents,
     processingFeesCents,
     refundsCents,
-    netCents: grossCents - processingFeesCents - refundsCents,
+    disputeAdjustmentsCents,
+    netCents: grossCents - processingFeesCents - refundsCents - disputeAdjustmentsCents,
     promoSubsidyCents,
   };
 };
@@ -117,6 +164,7 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
   let grossCents = 0;
   let processingFeesCents = 0;
   let refundsCents = 0;
+  let disputeAdjustmentsCents = 0;
   let promoSubsidyCents = 0;
 
   for (const bucket of buckets) {
@@ -129,6 +177,11 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
       processingFeesCents += bucket.totalCents;
     } else if (bucket.type === "REFUND" && classifySourceOwner(bucket.sourceType) === "BOOKLY") {
       refundsCents += bucket.totalCents;
+    } else if (
+      DISPUTE_LEDGER_TYPES.has(bucket.type) &&
+      classifySourceOwner(bucket.sourceType) === "BOOKLY"
+    ) {
+      disputeAdjustmentsCents += disputeLossCents(bucket.type, bucket.totalCents);
     } else if (bucket.type === "PROMO_SUBSIDY") {
       // Batch 13 — Bookly's own cost of subsidizing a returning-booking Promo Code, always
       // Bookly-borne by construction (never `sourceType`-classified). Reduces Bookly's net the
@@ -141,7 +194,9 @@ export const combineBooklyOwnedBuckets = (buckets: OwnershipAggregateBucket[]): 
     grossCents,
     processingFeesCents,
     refundsCents,
-    netCents: grossCents - processingFeesCents - refundsCents - promoSubsidyCents,
+    disputeAdjustmentsCents,
+    netCents:
+      grossCents - processingFeesCents - refundsCents - disputeAdjustmentsCents - promoSubsidyCents,
     promoSubsidyCents,
   };
 };
@@ -178,6 +233,23 @@ export const ALL_OWNERSHIP_RELEVANT_TYPES = [
   "PROCESSING_FEE",
   "REFUND",
   "PROMO_SUBSIDY",
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
+] as const;
+
+/** P6 — the Bookly-revenue aggregation inputs used by Super Admin finance/analytics: the existing
+ * PLATFORM_FEE / PROCESSING_FEE / REFUND set plus the dispute movements (a Bookly-owned dispute
+ * reduces Bookly revenue). Legacy PROMO_SUBSIDY handling in those reports is unchanged. */
+export const BOOKLY_REVENUE_TYPES = [
+  "PLATFORM_FEE",
+  "PROCESSING_FEE",
+  "REFUND",
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
 ] as const;
 
 /** Just the Business-owned gross-generating types plus their two possible deduction types —
@@ -192,4 +264,10 @@ export const BUSINESS_PAYABLE_TYPES = [
   "PROCESSING_FEE",
   "REFUND",
   "PROMO_SUBSIDY",
+  // P6 — Business-owned dispute movements reduce (or, on reinstatement, restore) payable and
+  // carry forward into the next payout like any other unclaimed row.
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
 ] as const;

@@ -479,6 +479,31 @@ export class PaymentAttemptRepository {
   }
 
   /**
+   * P6 (Phase 21) — Session 2+ extras counterpart of `listStaleFirstUnsent`: a non-FIRST package
+   * redemption charge (never contract-correlated, never bound to a relationship claim) with no
+   * recorded PaymentIntent, older than `staleBefore`. Only the strongly consistent customer-scoped
+   * provider list may resolve it; without this its same-key retry stayed 503 forever.
+   */
+  public async listStaleSessionExtrasUnsent(
+    limit: number,
+    staleBefore: Date,
+  ): Promise<PaymentAttemptDocument[]> {
+    return PaymentAttemptModel.find({
+      purpose: "PACKAGE_SESSION_EXTRAS",
+      relationshipClassification: { $exists: false },
+      providerStatus: { $in: ["NOT_CREATED", "UNKNOWN"] },
+      providerPaymentIntentId: { $exists: false },
+      persistenceStatus: "NOT_STARTED",
+      compensationStatus: "NOT_REQUIRED",
+      createdAt: { $lte: staleBefore },
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /**
    * P5 — penalty attempts whose provider outcome is a definitive failure but whose obligation has
    * not been converged yet (a crash between recording the provider result and settling the
    * ledger). `listRecoverable` deliberately never scans FAILED/CANCELED/REQUIRES_ACTION.

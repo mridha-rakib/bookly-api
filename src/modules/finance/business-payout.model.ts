@@ -54,8 +54,12 @@ export type BusinessPayoutDocument = {
    * field rather than folded into `processingFeesCents` so a refund is never misrepresented as
    * a processing cost (rule #23 auditability). */
   refundsCents: number;
-  /** grossBusinessOwnedCents - processingFeesCents - refundsCents — the amount the Super Admin
-   * is attesting they transferred. */
+  /** P6 — net Business-owned provider dispute effect settled by this payout (withdrawals +
+   * dispute fees − reinstatements − returned fees); negative when the payout carries a
+   * reinstatement of an earlier, already-settled withdrawal. Absent (0) on pre-P6 payouts. */
+  disputeAdjustmentsCents?: number | undefined;
+  /** grossBusinessOwnedCents - processingFeesCents - refundsCents - disputeAdjustmentsCents —
+   * the amount the Super Admin is attesting they transferred. */
   netPayoutCents: number;
   currency: BookingCurrency;
   status: BusinessPayoutStatus;
@@ -104,6 +108,7 @@ const businessPayoutSchema = new Schema<BusinessPayoutDocument>(
     grossBusinessOwnedCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     processingFeesCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     refundsCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    disputeAdjustmentsCents: { type: Number, default: 0, validate: Number.isInteger },
     netPayoutCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
     currency: { type: String, enum: bookingCurrencies, required: true, default: "EUR" },
     status: { type: String, enum: businessPayoutStatuses, required: true, default: "PENDING" },

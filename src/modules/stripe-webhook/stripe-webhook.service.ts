@@ -19,8 +19,18 @@ import {
 } from "../payment/payment-intent-metadata.js";
 import type { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
 import { isPenaltyPurpose } from "../payment/penalty-attempt.js";
+import {
+  ensureProcessingFeeAccounting,
+  ProcessingFeeCurrencyMismatchError,
+  ProcessingFeePersistenceError,
+  ProcessingFeeUnavailableError,
+} from "../payment/processing-fee-accounting.js";
 import { ensureRefundAccounting } from "../payment/refund-accounting.js";
 import type { RefundOperationRepository } from "../payment/refund-operation.repository.js";
+import {
+  ProviderReversalCorrelationError,
+  type ProviderReversalService,
+} from "../provider-reversal/provider-reversal.service.js";
 import type { StripeWebhookEventRepository } from "./stripe-webhook-event.repository.js";
 
 const HANDLED_EVENT_TYPES = new Set([
@@ -29,7 +39,29 @@ const HANDLED_EVENT_TYPES = new Set([
   "payment_intent.canceled",
   "setup_intent.succeeded",
   "charge.refunded",
+  // P6 — provider-originated reversals: the dispute lifecycle and refunds made outside Bookly.
+  "charge.dispute.created",
+  "charge.dispute.updated",
+  "charge.dispute.closed",
+  "charge.dispute.funds_withdrawn",
+  "charge.dispute.funds_reinstated",
+  "charge.refund.updated",
 ]);
+
+const DISPUTE_EVENT_TYPES = new Set([
+  "charge.dispute.created",
+  "charge.dispute.updated",
+  "charge.dispute.closed",
+  "charge.dispute.funds_withdrawn",
+  "charge.dispute.funds_reinstated",
+]);
+
+export type WebhookReplayOutcome =
+  | "NOT_FOUND"
+  | "NOT_FAILED"
+  | "PROCESSED"
+  | "RETRYABLE"
+  | "FAILED";
 
 /** A 5xx is intentional for this class: Stripe must redeliver when durable domain state or a
  * provider settlement dependency has not caught up yet. */
@@ -75,6 +107,13 @@ export class StripeWebhookService {
     // SAME convergence the request/worker/recovery use, correlated by its PaymentAttempt — never
     // by a pre-existing ledger providerReference. Optional trailing dep.
     private readonly penaltyCollection?: Pick<PenaltyCollectionService, "convergeAttempt">,
+    // P6 — disputes / external refunds (accounting + support visibility only) and the terminal
+    // FAILED support alert. Optional trailing dep: without it the pre-P6 behaviour is unchanged
+    // (dispute events stay retryable for a process that has it).
+    private readonly providerReversals?: Pick<
+      ProviderReversalService,
+      "syncDispute" | "reconcileRefundsForPaymentIntent" | "alertWebhookFailed"
+    >,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -140,10 +179,16 @@ export class StripeWebhookService {
         case "charge.refunded":
           await this.handleChargeRefunded(event.data.object as Stripe.Charge);
           break;
+        case "charge.refund.updated":
+          await this.handleRefundUpdated(event.data.object as Stripe.Refund);
+          break;
         case "setup_intent.succeeded":
           // Informational only — see this class's own doc comment.
           break;
         default:
+          if (DISPUTE_EVENT_TYPES.has(event.type)) {
+            await this.handleDisputeEvent(event.data.object as Stripe.Dispute);
+          }
           break;
       }
       await this.eventRepository.markProcessed(event.id, processingLeaseToken);
@@ -151,11 +196,60 @@ export class StripeWebhookService {
       const message = error instanceof Error ? error.message : "Unknown error";
       if (error instanceof InvestigationWebhookError) {
         await this.eventRepository.markFailed(event.id, processingLeaseToken, message);
+        await this.alertIfFailed(event, message);
         return;
       }
       await this.eventRepository.markRetryable(event.id, processingLeaseToken, message);
+      await this.alertIfFailed(event, message);
       throw error;
     }
+  }
+
+  /** P6 — Support learns of every event that reaches the terminal FAILED state (investigation, or
+   * the retry limit). Best-effort: never changes the event's own outcome. */
+  private async alertIfFailed(event: Stripe.Event, message: string): Promise<void> {
+    if (!this.providerReversals) return;
+    try {
+      const stored = await this.eventRepository.findByEventId(event.id);
+      if (stored?.status !== "FAILED") return;
+      const object = event.data.object as { id?: unknown };
+      await this.providerReversals.alertWebhookFailed({
+        eventId: event.id,
+        type: event.type,
+        error: stored.error ?? message,
+        providerObjectId: typeof object?.id === "string" ? object.id : undefined,
+        replayCount: stored.replayCount ?? 0,
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, eventId: event.id },
+        "Failed to alert support of a FAILED webhook",
+      );
+    }
+  }
+
+  /**
+   * P6 — Super Admin replay of a terminal FAILED event from its stored replay payload. The handlers
+   * are idempotent (ledger keys, CAS state transitions), so a replay can only converge, never
+   * double-account. A replay that fails retryably is left RETRYABLE for the recovery worker.
+   */
+  public async replayEvent(eventId: string, actorUserId: string): Promise<WebhookReplayOutcome> {
+    const existing = await this.eventRepository.findByEventId(eventId);
+    if (!existing) return "NOT_FOUND";
+    const reset = await this.eventRepository.resetFailedForReplay(eventId, actorUserId);
+    if (!reset) return "NOT_FAILED";
+    const claimed = await this.eventRepository.claimStoredEvent(eventId);
+    if (!claimed) return "RETRYABLE";
+    try {
+      await this.processClaimed(
+        claimed.payload as unknown as Stripe.Event,
+        claimed.processingLeaseToken as string,
+      );
+    } catch {
+      // Recorded as RETRYABLE (or FAILED at the limit) by processClaimed itself.
+    }
+    const after = await this.eventRepository.findByEventId(eventId);
+    return after?.status === "PROCESSED" || after?.status === "FAILED" ? after.status : "RETRYABLE";
   }
 
   private toReplayPayload(event: Stripe.Event): Record<string, unknown> {
@@ -208,6 +302,46 @@ export class StripeWebhookService {
                 metadata: refund.metadata,
               })),
             },
+          },
+        },
+      };
+    }
+    if (DISPUTE_EVENT_TYPES.has(event.type)) {
+      const dispute = object as Stripe.Dispute;
+      return {
+        id: event.id,
+        type: event.type,
+        data: {
+          object: {
+            id: dispute.id,
+            charge: typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id,
+            payment_intent:
+              typeof dispute.payment_intent === "string"
+                ? dispute.payment_intent
+                : dispute.payment_intent?.id,
+            amount: dispute.amount,
+            currency: dispute.currency,
+            status: dispute.status,
+          },
+        },
+      };
+    }
+    if (event.type === "charge.refund.updated") {
+      const refund = object as Stripe.Refund;
+      return {
+        id: event.id,
+        type: event.type,
+        data: {
+          object: {
+            id: refund.id,
+            payment_intent:
+              typeof refund.payment_intent === "string"
+                ? refund.payment_intent
+                : refund.payment_intent?.id,
+            amount: refund.amount,
+            currency: refund.currency,
+            status: refund.status,
+            metadata: refund.metadata,
           },
         },
       };
@@ -325,58 +459,26 @@ export class StripeWebhookService {
     settledEntry: BookingFinancialTransactionDocument,
     paymentIntent: Stripe.PaymentIntent,
   ): Promise<void> {
-    let fee: Awaited<ReturnType<PaymentGateway["retrieveProcessingFeeForPaymentIntent"]>>;
+    // P6 — the shared processing-fee path (also used by the money-recovery backstop); the
+    // retry/investigation mapping below is the pre-existing webhook contract, unchanged.
     try {
-      fee = await this.gateway.retrieveProcessingFeeForPaymentIntent(paymentIntent.id);
-    } catch {
-      throw new RetryableWebhookError("Stripe processing fee is temporarily unavailable");
-    }
-
-    if (!fee) {
-      throw new RetryableWebhookError("Stripe balance transaction is not available yet");
-    }
-    if (fee.feeCents <= 0) {
-      return;
-    }
-
-    const piCurrency = paymentIntent.currency?.toUpperCase();
-    if (
-      !piCurrency ||
-      piCurrency !== settledEntry.currency ||
-      fee.currency.toUpperCase() !== settledEntry.currency
-    ) {
-      throw new InvestigationWebhookError(
-        `Processing-fee currency mismatch (pi=${piCurrency ?? "missing"}, booking=${settledEntry.currency}, balance=${fee.currency})`,
+      await ensureProcessingFeeAccounting(
+        settledEntry,
+        { paymentIntentId: paymentIntent.id, paymentIntentCurrency: paymentIntent.currency },
+        this.gateway,
+        this.financialTransactionService,
       );
-    }
-
-    try {
-      await this.financialTransactionService.record({
-        businessId: settledEntry.businessId,
-        bookingId: settledEntry.bookingId,
-        businessClientId: settledEntry.businessClientId,
-        customerUserId: settledEntry.customerUserId,
-        type: "PROCESSING_FEE",
-        direction: "DEBIT",
-        amountCents: fee.feeCents,
-        currency: settledEntry.currency,
-        status: "SUCCEEDED",
-        providerReference: paymentIntent.id,
-        idempotencyKey: `processing-fee:${paymentIntent.id}`,
-        // Batch 8 — records WHICH underlying payment this processing fee belongs to, the sole
-        // mechanism FinanceOwnership uses to decide who bears it ("the owner of the underlying
-        // payment bears its Stripe processing fee" — see finance-ownership.ts). Without this,
-        // Batch 7's assumption that every PROCESSING_FEE is Business-borne was wrong for a
-        // first-booking PLATFORM_FEE charge.
-        metadata: { sourceType: settledEntry.type, sourceTransactionId: String(settledEntry._id) },
-      });
-    } catch {
-      const existing = await this.financialTransactionService.findByIdempotencyKey(
-        `processing-fee:${paymentIntent.id}`,
-      );
-      if (!existing) {
-        throw new RetryableWebhookError("Processing-fee ledger persistence failed");
+    } catch (error) {
+      if (error instanceof ProcessingFeeCurrencyMismatchError) {
+        throw new InvestigationWebhookError(error.message);
       }
+      if (
+        error instanceof ProcessingFeeUnavailableError ||
+        error instanceof ProcessingFeePersistenceError
+      ) {
+        throw new RetryableWebhookError(error.message);
+      }
+      throw error;
     }
   }
 
@@ -621,22 +723,64 @@ export class StripeWebhookService {
         }
       }
     }
-    if (!bookingId) return;
-
-    const entries = await this.financialTransactionService.listForBooking(bookingId);
-    const succeededRefundIds = new Set(
-      (charge.refunds?.data ?? [])
-        .filter((refund) => refund.status === "succeeded")
-        .map((refund) => refund.id),
-    );
-    for (const pending of entries.filter(
-      (entry) =>
-        entry.type === "REFUND" &&
-        entry.status === "PENDING" &&
-        entry.providerReference !== undefined &&
-        succeededRefundIds.has(entry.providerReference),
-    )) {
-      await this.financialTransactionService.settleStatus(pending._id, "SUCCEEDED");
+    if (bookingId) {
+      const entries = await this.financialTransactionService.listForBooking(bookingId);
+      const succeededRefundIds = new Set(
+        (charge.refunds?.data ?? [])
+          .filter((refund) => refund.status === "succeeded")
+          .map((refund) => refund.id),
+      );
+      for (const pending of entries.filter(
+        (entry) =>
+          entry.type === "REFUND" &&
+          entry.status === "PENDING" &&
+          entry.providerReference !== undefined &&
+          succeededRefundIds.has(entry.providerReference),
+      )) {
+        await this.financialTransactionService.settleStatus(pending._id, "SUCCEEDED");
+      }
     }
+
+    // P6 — AFTER every Bookly-authorized refund above is attached to its RefundOperation: any
+    // remaining provider refund of this PaymentIntent was made outside Bookly (Dashboard / API).
+    await this.reconcileExternalRefunds(paymentIntentId);
+  }
+
+  /** P6 — a refund's later status change (e.g. pending -> succeeded / failed) re-reads the
+   * PaymentIntent's provider refunds; Bookly-authorized refunds keep their own paths. */
+  private async handleRefundUpdated(refund: Stripe.Refund): Promise<void> {
+    const paymentIntentId =
+      typeof refund.payment_intent === "string" ? refund.payment_intent : refund.payment_intent?.id;
+    if (!paymentIntentId) return;
+    await this.reconcileExternalRefunds(paymentIntentId);
+  }
+
+  private async reconcileExternalRefunds(paymentIntentId: string): Promise<void> {
+    if (!this.providerReversals) return;
+    try {
+      await this.providerReversals.reconcileRefundsForPaymentIntent(paymentIntentId, "WEBHOOK");
+    } catch (error) {
+      throw this.toReversalWebhookError(error, "External refund reconciliation failed");
+    }
+  }
+
+  /** P6 — every dispute event re-reads the dispute from the provider (authoritative current
+   * state), so duplicate / out-of-order dispute events converge to the same accounting. */
+  private async handleDisputeEvent(dispute: Stripe.Dispute): Promise<void> {
+    if (!this.providerReversals) {
+      throw new RetryableWebhookError("Dispute reconciliation is not available in this process");
+    }
+    try {
+      await this.providerReversals.syncDispute(dispute.id, "WEBHOOK");
+    } catch (error) {
+      throw this.toReversalWebhookError(error, "Dispute reconciliation failed");
+    }
+  }
+
+  private toReversalWebhookError(error: unknown, fallback: string): Error {
+    const message = error instanceof Error ? error.message : fallback;
+    return error instanceof ProviderReversalCorrelationError
+      ? new InvestigationWebhookError(message)
+      : new RetryableWebhookError(message);
   }
 }

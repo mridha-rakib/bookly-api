@@ -4,6 +4,7 @@ import type { PenaltyCollectionService } from "../booking/penalty-collection.ser
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import type { ProviderReversalService } from "../provider-reversal/provider-reversal.service.js";
 import type { StripeWebhookService } from "../stripe-webhook/stripe-webhook.service.js";
 import type { PaymentService } from "./payment.service.js";
 import type {
@@ -51,6 +52,9 @@ export class MoneyRecoveryService {
     // logic the request, worker and webhook use. Optional trailing dep; without it penalty
     // attempts are only backed off, never compensated or treated as checkout.
     private readonly penaltyCollection?: Pick<PenaltyCollectionService, "convergeAttempt">,
+    // P6 — provider-originated reversal backstop (open-dispute resync, bounded provider sweep of
+    // disputes / external refunds, missing processing fees). Accounting only; optional trailing dep.
+    private readonly providerReversals?: Pick<ProviderReversalService, "runBackstop">,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
@@ -59,10 +63,15 @@ export class MoneyRecoveryService {
     staleFirstRequiresAction: number;
     stalePenaltyUnsent: number;
     penaltyFailuresConverged: number;
+    staleSessionExtrasUnsent: number;
     refundOperations: number;
     relationshipsScanned: number;
     webhooksProcessed: number;
     webhooksFailed: number;
+    disputesResynced: number;
+    disputesSwept: number;
+    refundsSwept: number;
+    processingFeesRecorded: number;
     errors: number;
   }> {
     let paymentAttempts = 0;
@@ -79,6 +88,9 @@ export class MoneyRecoveryService {
     const stalePenalty = await this.resolveStalePenaltyUnsent(limit);
     const penaltyFailures = await this.convergePenaltyFailures(limit);
     errors += stalePenalty.errors + penaltyFailures.errors;
+    // P6 — non-FIRST Session 2+ extras with no recorded PaymentIntent: the same strong proof.
+    const staleExtras = await this.resolveStaleSessionExtrasUnsent(limit);
+    errors += staleExtras.errors;
 
     const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
     for (const candidate of attempts) {
@@ -264,16 +276,39 @@ export class MoneyRecoveryService {
     errors += relationshipCounts.errors;
 
     const webhookCounts = await this.webhookService.recoverDue(limit);
+
+    // P6 — AFTER webhook recovery, so a recovered dispute/refund event is applied first and the
+    // backstop only catches what no event delivered. Isolated: a provider outage here never
+    // fails the pass.
+    let reversals = {
+      disputesResynced: 0,
+      disputesSwept: 0,
+      refundsSwept: 0,
+      processingFeesRecorded: 0,
+    };
+    if (this.providerReversals) {
+      try {
+        const { errors: reversalErrors, ...counts } =
+          await this.providerReversals.runBackstop(limit);
+        reversals = counts;
+        errors += reversalErrors;
+      } catch (error) {
+        errors += 1;
+        logger.warn({ err: error }, "Provider reversal backstop failed");
+      }
+    }
     return {
       paymentAttempts,
       staleFirstUnsent: staleUnsent.reconciled,
       staleFirstRequiresAction: staleFirst.reconciled,
       stalePenaltyUnsent: stalePenalty.reconciled,
       penaltyFailuresConverged: penaltyFailures.reconciled,
+      staleSessionExtrasUnsent: staleExtras.reconciled,
       refundOperations,
       relationshipsScanned: relationshipCounts.scanned,
       webhooksProcessed: webhookCounts.processed,
       webhooksFailed: webhookCounts.failed,
+      ...reversals,
       errors,
     };
   }
@@ -354,6 +389,60 @@ export class MoneyRecoveryService {
         ? "UNRESOLVED"
         : this.convergePenalty(attempt._id);
     });
+  }
+
+  /**
+   * P6 (Phase 21) — Session 2+ extras counterpart of resolveStaleFirstUnsent (no relationship
+   * claim to release): resolved ONLY by the strongly consistent customer-scoped provider list.
+   *   PaymentIntent found -> recorded through the monotonic CAS; the generic pass below then
+   *                          follows it (persistence / P0 orphan compensation, unchanged)
+   *   proven absent       -> FAILED + PROVIDER_NOT_CREATED (closed for creation: a same-key
+   *                          retry gets the existing "expired, try again" answer, never a 503 loop)
+   *   provider error      -> backed off; nothing written
+   * Never dispatches; never part of the search-based generic NOT_FOUND handling.
+   */
+  private async resolveStaleSessionExtrasUnsent(
+    limit: number,
+  ): Promise<{ reconciled: number; errors: number }> {
+    const candidates = await this.paymentAttemptRepository.listStaleSessionExtrasUnsent(
+      limit,
+      new Date(Date.now() - STALE_FIRST_UNSENT_MS),
+    );
+    let reconciled = 0;
+    let errors = 0;
+    for (const candidate of candidates) {
+      try {
+        const attempt = await this.paymentService.resolveUnsentPaymentAttempt(candidate._id);
+        reconciled += 1;
+        if (attempt.providerStatus === "NOT_CREATED" || attempt.providerStatus === "UNKNOWN") {
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            candidate._id,
+            "Session extras provider state is not resolved yet",
+          );
+        }
+      } catch (error) {
+        errors += 1;
+        const message = error instanceof Error ? error.message : "Unknown recovery error";
+        await this.paymentAttemptRepository
+          .scheduleRecoveryRetry(candidate._id, message)
+          .catch((scheduleError: unknown) =>
+            logger.error(
+              { err: scheduleError, recordType: "PaymentAttempt", recordId: String(candidate._id) },
+              "Could not schedule money recovery retry",
+            ),
+          );
+        logger.warn(
+          {
+            recordType: "PaymentAttempt",
+            recordId: String(candidate._id),
+            state: candidate.providerStatus,
+            errorCategory: error instanceof Error ? error.name : "UNKNOWN",
+          },
+          "Stale session extras unsent recovery item failed",
+        );
+      }
+    }
+    return { reconciled, errors };
   }
 
   /** P5 — definitive penalty failures (FAILED / CANCELED / REQUIRES_ACTION, incl. proven

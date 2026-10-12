@@ -22,6 +22,7 @@ describe("MoneyRecoveryService", () => {
     } as unknown as PaymentService;
     const paymentAttemptRepository = {
       listRecoverable: vi.fn(async () => [first, second] as PaymentAttemptDocument[]),
+      listStaleSessionExtrasUnsent: vi.fn(async () => []),
       scheduleRecoveryRetry: vi.fn(async () => undefined),
     } as unknown as PaymentAttemptRepository;
     const refundOperationRepository = {

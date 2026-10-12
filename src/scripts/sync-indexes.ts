@@ -28,6 +28,8 @@ import "../modules/marketing/marketing-campaign-recipient.model.js";
 import "../modules/payment/customer-payment-profile.model.js";
 import "../modules/payment/payment-attempt.model.js";
 import "../modules/payment/refund-operation.model.js";
+import "../modules/provider-reversal/external-refund.model.js";
+import "../modules/provider-reversal/payment-dispute.model.js";
 import "../modules/registration-session/registration-session.model.js";
 import "../modules/services/service-category.model.js";
 import "../modules/services/service.model.js";

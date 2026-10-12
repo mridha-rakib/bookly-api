@@ -19,11 +19,15 @@ import {
   type PlatformTransactionType,
 } from "./finance.types.js";
 import {
+  BOOKLY_REVENUE_TYPES,
   BUSINESS_PAYABLE_TYPES,
+  classifyLedgerEntryOwner,
   classifyProcessingFeeOwner,
   classifySourceOwner,
   combineBooklyOwnedBuckets,
   combineBusinessOwnedBuckets,
+  DISPUTE_LEDGER_TYPES,
+  disputeLossCents,
   groupBucketsByBusiness,
 } from "./finance-ownership.js";
 
@@ -101,6 +105,16 @@ export class FinanceService {
     return this.buildBusinessPayable(business);
   }
 
+  /** P6 — the same Owner-only check, for Business-facing reads served outside this service
+   * (provider reversals). Returns the verified businessId. */
+  public async requireOwnedFinanceBusinessId(
+    actorUserId: string,
+    businessId: string,
+  ): Promise<string> {
+    const business = await this.requireOwnedFinanceBusiness(actorUserId, businessId);
+    return String(business._id);
+  }
+
   // --- Super Admin surface (Batch 8) --------------------------------------------------------
   // No ownership check in any of these — authorization is the SUPER_ADMIN route-level gate
   // (see super-admin.route.ts's own comment); these reuse the EXACT SAME `buildX` core methods
@@ -148,7 +162,7 @@ export class FinanceService {
     to: Date;
   }): Promise<PlatformFinanceSummary> {
     const periodBuckets = await this.financialTransactionService.aggregateOwnedBySource({
-      types: ["PLATFORM_FEE", "NO_SHOW_FEE", "CANCELLATION_FEE", "PROCESSING_FEE", "REFUND"],
+      types: [...BOOKLY_REVENUE_TYPES, "NO_SHOW_FEE", "CANCELLATION_FEE"],
       unclaimedOnly: false,
       from: period.from,
       to: period.to,
@@ -234,6 +248,7 @@ export class FinanceService {
         grossCents: totals.grossCents,
         processingFeesCents: totals.processingFeesCents,
         refundsCents: totals.refundsCents,
+        disputeAdjustmentsCents: totals.disputeAdjustmentsCents,
         netCents: totals.netCents,
         transactionCount: businessBuckets.reduce((sum, b) => sum + b.count, 0),
         noShowAmountCents: businessBuckets.find((b) => b.type === "NO_SHOW_FEE")?.totalCents ?? 0,
@@ -302,6 +317,7 @@ export class FinanceService {
         periodEnd: item.periodEnd,
         grossBusinessOwnedCents: item.grossBusinessOwnedCents,
         processingFeesCents: item.processingFeesCents,
+        disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
         netPayoutCents: item.netPayoutCents,
         currency: item.currency,
         status: item.status,
@@ -414,6 +430,7 @@ export class FinanceService {
         periodEnd: item.periodEnd,
         grossBusinessOwnedCents: item.grossBusinessOwnedCents,
         processingFeesCents: item.processingFeesCents,
+        disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
         netPayoutCents: item.netPayoutCents,
         currency: item.currency,
         status: item.status,
@@ -431,6 +448,7 @@ export class FinanceService {
     let grossCents = 0;
     let processingFeesCents = 0;
     let refundsCents = 0;
+    let disputeAdjustmentsCents = 0;
     let noShowAmountCents = 0;
     let cancellationAmountCents = 0;
     let depositAmountCents = 0;
@@ -464,6 +482,12 @@ export class FinanceService {
             refundsCents += entry.amountCents;
           }
         }
+      } else if (
+        DISPUTE_LEDGER_TYPES.has(entry.type) &&
+        classifyLedgerEntryOwner(entry) === "BUSINESS"
+      ) {
+        // P6 — Business-owned provider dispute movements (exact provider-confirmed amounts).
+        disputeAdjustmentsCents += disputeLossCents(entry.type, entry.amountCents);
       }
     }
 
@@ -475,7 +499,8 @@ export class FinanceService {
       grossCents,
       processingFeesCents,
       refundsCents,
-      netCents: grossCents - processingFeesCents - refundsCents,
+      disputeAdjustmentsCents,
+      netCents: grossCents - processingFeesCents - refundsCents - disputeAdjustmentsCents,
       transactionCount: entries.length,
       noShowAmountCents,
       cancellationAmountCents,
@@ -540,6 +565,14 @@ export class FinanceService {
       status: entry.status as "SUCCEEDED" | "FAILED" | "WAIVED" | "PENDING",
       payoutId: entry.payoutId ? String(entry.payoutId) : undefined,
       currency: entry.currency,
+      ...(entry.type === "REFUND"
+        ? {
+            refundOrigin:
+              entry.metadata?.["refundOrigin"] === "PROVIDER_EXTERNAL"
+                ? ("PROVIDER_EXTERNAL" as const)
+                : ("BOOKLY" as const),
+          }
+        : {}),
     };
   }
 

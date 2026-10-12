@@ -3,7 +3,11 @@ import type { BookingFinancialTransactionService } from "../booking-financial-tr
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessStatus } from "../business/business.types.js";
 import type { ClientRepository } from "../client/client.repository.js";
-import { combineBooklyOwnedBuckets, groupBucketsByBusiness } from "../finance/finance-ownership.js";
+import {
+  BOOKLY_REVENUE_TYPES,
+  combineBooklyOwnedBuckets,
+  groupBucketsByBusiness,
+} from "../finance/finance-ownership.js";
 import {
   aggregateOwnershipForPeriod,
   resolveAnalyticsPeriod,
@@ -67,7 +71,7 @@ export class SuperAdminBusinessAnalyticsService {
         this.bookingRepository.aggregateBusinessBookingStats(from, to),
         this.clientRepository.aggregateNewActivationsByBusiness(from, to),
         aggregateOwnershipForPeriod(this.financialTransactionService, {
-          types: ["PLATFORM_FEE", "PROCESSING_FEE", "REFUND"],
+          types: [...BOOKLY_REVENUE_TYPES],
           period,
           groupByBusiness: true,
         }),

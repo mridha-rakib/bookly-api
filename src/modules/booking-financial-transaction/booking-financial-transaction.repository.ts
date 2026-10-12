@@ -141,6 +141,49 @@ export class BookingFinancialTransactionRepository {
     ).exec();
   }
 
+  /**
+   * P6 — processing-fee backstop candidates: succeeded provider-backed principal rows (created in
+   * [createdAfter, createdBefore]) whose PaymentIntent has no `processing-fee:<pi>` row yet. The
+   * fee is normally captured by the payment_intent.succeeded webhook; this finds the ones a lost
+   * or permanently failed webhook left behind. Bounded by the window and `limit`.
+   */
+  public async listPrincipalRowsMissingProcessingFee(input: {
+    createdAfter: Date;
+    createdBefore: Date;
+    limit: number;
+  }): Promise<BookingFinancialTransactionDocument[]> {
+    const rows = await BookingFinancialTransactionModel.aggregate<{ _id: Types.ObjectId }>([
+      {
+        $match: {
+          type: { $in: ["PLATFORM_FEE", "DEPOSIT", "CANCELLATION_FEE", "NO_SHOW_FEE"] },
+          status: "SUCCEEDED",
+          providerReference: { $regex: /^pi_/ },
+          createdAt: { $gte: input.createdAfter, $lte: input.createdBefore },
+        },
+      },
+      {
+        $lookup: {
+          from: BookingFinancialTransactionModel.collection.name,
+          let: { feeKey: { $concat: ["processing-fee:", "$providerReference"] } },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$idempotencyKey", "$$feeKey"] } } },
+            { $limit: 1 },
+            { $project: { _id: 1 } },
+          ],
+          as: "fee",
+        },
+      },
+      { $match: { fee: { $size: 0 } } },
+      { $sort: { createdAt: 1 } },
+      { $limit: input.limit },
+      { $project: { _id: 1 } },
+    ]).exec();
+    if (rows.length === 0) return [];
+    return BookingFinancialTransactionModel.find({ _id: { $in: rows.map((row) => row._id) } })
+      .sort({ createdAt: 1 })
+      .exec();
+  }
+
   /** Looks up the single ledger row claiming a given idempotencyKey — used by callers (the
    * no-show worker's charge branch, BookingLifecycleService.waiveFee) after their own INSERT
    * lost a duplicate-key race, to decide what the winning row actually settled as. */

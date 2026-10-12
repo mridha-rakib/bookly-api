@@ -94,6 +94,8 @@ export type FinancePayoutHistoryItem = {
   periodEnd: Date;
   grossBusinessOwnedCents: number;
   processingFeesCents: number;
+  /** P6 — net Business-owned dispute effect settled by this payout (0 for pre-P6 payouts). */
+  disputeAdjustmentsCents: number;
   netPayoutCents: number;
   currency: BookingCurrency;
   status: BusinessPayoutStatus;
@@ -116,6 +118,9 @@ export type BusinessPayableSummary = {
   grossCents: number;
   processingFeesCents: number;
   refundsCents: number;
+  /** P6 — net Business-owned provider dispute effect (withdrawals + dispute fees −
+   * reinstatements − returned fees), deducted from `netCents`. */
+  disputeAdjustmentsCents: number;
   netCents: number;
   transactionCount: number;
   /** Business-owned gross split by source, for display parity with the existing Super Admin
@@ -144,6 +149,9 @@ export type PlatformFinanceSummary = {
     grossCents: number;
     processingFeesCents: number;
     refundsCents: number;
+    /** P6 — net Bookly-owned dispute loss (withdrawals + fees − reinstatements − fee
+     * reversals) in the period; already subtracted from `netCents`. */
+    disputeAdjustmentsCents: number;
     netCents: number;
   };
   /** No-show + late-cancellation fees collected on Businesses' behalf this period (gross,
@@ -188,6 +196,9 @@ export type PlatformTransactionRow = {
   status: FinanceTransactionStatus;
   payoutId?: string | undefined;
   currency: BookingCurrency;
+  /** P6 — REFUND rows only: PROVIDER_EXTERNAL for a refund made outside Bookly (Stripe
+   * Dashboard/API), BOOKLY for every Bookly-authorized refund. */
+  refundOrigin?: "BOOKLY" | "PROVIDER_EXTERNAL" | undefined;
 };
 
 export type PlatformTransactionPage = {

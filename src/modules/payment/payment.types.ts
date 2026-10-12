@@ -98,6 +98,38 @@ export type RefundResult = {
   amountCents?: number | undefined;
   currency?: string | undefined;
   metadata?: Record<string, string> | undefined;
+  /** P6 — provider creation time, when the provider reported it (listing/retrieval). */
+  createdAt?: Date | undefined;
+};
+
+/**
+ * P6 — one provider-confirmed money movement of a dispute (a Stripe balance transaction listed on
+ * the dispute): `amountCents` is the signed principal movement (negative = withdrawn from the
+ * merchant, positive = reinstated) and `feeCents` the signed dispute fee (positive = charged,
+ * negative = returned). Never estimated — exactly what the provider reports.
+ */
+export type DisputeBalanceTransaction = {
+  balanceTransactionId: string;
+  amountCents: number;
+  feeCents: number;
+  currency: string;
+  createdAt: Date;
+  reportingCategory?: string | undefined;
+};
+
+/** P6 — provider-neutral view of a Stripe Dispute (no evidence content is ever read or kept). */
+export type DisputeSnapshot = {
+  disputeId: string;
+  chargeId?: string | undefined;
+  paymentIntentId?: string | undefined;
+  amountCents: number;
+  currency: string;
+  status: string;
+  reason?: string | undefined;
+  evidenceDueAt?: Date | undefined;
+  isChargeRefundable?: boolean | undefined;
+  createdAt: Date;
+  balanceTransactions: DisputeBalanceTransaction[];
 };
 
 export type BalanceTransactionFee = {
@@ -165,6 +197,20 @@ export interface PaymentGateway {
   retrieveBalanceTransactionFee(
     balanceTransactionId: string,
   ): Promise<BalanceTransactionFee | null>;
+
+  /** P6 — the current provider state of one dispute, with its balance transactions. */
+  retrieveDispute?(disputeId: string): Promise<DisputeSnapshot>;
+
+  /** P6 — bounded backstop listing: disputes created since `createdSince`, newest first, at
+   * most `maxItems` (a narrow, time-bounded sweep — never an unbounded account crawl). */
+  listDisputesCreatedSince?(createdSince: Date, maxItems: number): Promise<DisputeSnapshot[]>;
+
+  /** P6 — every provider Refund of one PaymentIntent (charge.refunded only carries cumulative
+   * state; each refund id is accounted individually). */
+  listRefundsForPaymentIntent?(paymentIntentId: string): Promise<RefundResult[]>;
+
+  /** P6 — bounded backstop listing of refunds created since `createdSince` (at most `maxItems`). */
+  listRefundsCreatedSince?(createdSince: Date, maxItems: number): Promise<RefundResult[]>;
 
   /** Batch 7 (Finance) — resolves the real Stripe processing-fee amount for an already-succeeded
    * PaymentIntent by re-fetching it with `latest_charge.balance_transaction` expanded (the

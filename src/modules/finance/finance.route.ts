@@ -6,6 +6,8 @@ import { BookingRepository } from "../booking/booking.repository.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
+import { createProviderReversalQueryService } from "../provider-reversal/provider-reversal.factory.js";
+import { businessReversalListQuerySchema } from "../provider-reversal/provider-reversal.schema.js";
 import { BusinessPayoutRepository } from "./business-payout.repository.js";
 import { FinanceController } from "./finance.controller.js";
 import {
@@ -41,7 +43,10 @@ export const createFinanceRoute = (): Router => {
     bookingRepository,
     businessPayoutRepository,
   );
-  const controller = new FinanceController(service);
+  const controller = new FinanceController(
+    service,
+    createProviderReversalQueryService(financialTransactionService),
+  );
 
   router.get(
     "/:businessId/finance/summary",
@@ -60,6 +65,23 @@ export const createFinanceRoute = (): Router => {
       query: financePayoutHistoryQuerySchema,
     }),
     asyncHandler(controller.listPayoutHistory),
+  );
+  // P6 — provider reversals this Business bears (disputes, refunds made outside Bookly).
+  router.get(
+    "/:businessId/finance/disputes",
+    validateRequest({
+      params: financeBusinessParamsSchema,
+      query: businessReversalListQuerySchema,
+    }),
+    asyncHandler(controller.listDisputes),
+  );
+  router.get(
+    "/:businessId/finance/external-refunds",
+    validateRequest({
+      params: financeBusinessParamsSchema,
+      query: businessReversalListQuerySchema,
+    }),
+    asyncHandler(controller.listExternalRefunds),
   );
 
   return router;

@@ -5,7 +5,7 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessStatus } from "../business/business.types.js";
 import type { BusinessPayoutRepository } from "../finance/business-payout.repository.js";
 import type { FinanceService } from "../finance/finance.service.js";
-import { combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
+import { BOOKLY_REVENUE_TYPES, combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
 import type { UserRepository } from "../user/user.repository.js";
 
 export type SuperAdminDashboardSummaryDto = {
@@ -53,7 +53,7 @@ export class SuperAdminDashboardService {
       this.userRepository.countByRole("CUSTOMER"),
       this.bookingRepository.countAllByStatus(),
       this.financialTransactionService.aggregateAllTimeOwnedBySource({
-        types: ["PLATFORM_FEE", "PROCESSING_FEE", "REFUND"],
+        types: [...BOOKLY_REVENUE_TYPES],
       }),
       this.financeService.listPendingPayouts(),
       this.businessPayoutRepository.sumPaidTotal(),

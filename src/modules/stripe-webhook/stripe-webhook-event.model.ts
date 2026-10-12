@@ -27,6 +27,10 @@ export type StripeWebhookEventDocument = {
   attemptCount: number;
   nextAttemptAt?: Date | undefined;
   error?: string | undefined;
+  /** P6 — Super Admin replays of a terminal FAILED event (audit trail; alert identity). */
+  replayCount?: number | undefined;
+  lastReplayedAt?: Date | undefined;
+  lastReplayedByUserId?: Types.ObjectId | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -48,6 +52,9 @@ const stripeWebhookEventSchema = new Schema<StripeWebhookEventDocument>(
     processingLeaseToken: { type: String, trim: true },
     attemptCount: { type: Number, required: true, min: 0, default: 0 },
     nextAttemptAt: { type: Date },
+    replayCount: { type: Number, min: 0 },
+    lastReplayedAt: { type: Date },
+    lastReplayedByUserId: { type: Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true },
 );

@@ -7,6 +7,7 @@ import type {
   CreatePaymentIntentInput,
   CreateRefundInput,
   CreateSetupIntentResult,
+  DisputeSnapshot,
   PaymentGateway,
   PaymentIntentResult,
   PaymentIntentSnapshot,
@@ -344,15 +345,224 @@ export class FakePaymentGateway implements PaymentGateway {
       amountCents: input.amountCents,
       currency: "EUR",
       metadata: input.metadata,
+      createdAt: new Date(),
     };
     this.idempotentRefunds.set(input.idempotencyKey, result);
     return result;
   }
 
   public async retrieveRefund(refundId: string): Promise<RefundResult> {
-    const found = [...this.idempotentRefunds.values()].find((entry) => entry.refundId === refundId);
+    const found = [...this.idempotentRefunds.values(), ...this.externalRefunds].find(
+      (entry) => entry.refundId === refundId,
+    );
     if (!found) throw new Error("Unknown fake Refund");
     return found;
+  }
+
+  // --- P6: provider-originated reversals (disputes, refunds made outside Bookly) ------------
+
+  private externalRefunds: RefundResult[] = [];
+  private disputes = new Map<string, DisputeSnapshot>();
+  private nextDisputeRetrieveError: Error | undefined;
+  public disputeRetrieveCalls = 0;
+  public refundListCalls = 0;
+
+  /** Test control: a refund created OUTSIDE Bookly (Stripe Dashboard / direct API) — no
+   * idempotency key, no Bookly metadata unless given. */
+  public createExternalRefund(
+    paymentIntentId: string,
+    amountCents: number,
+    options: {
+      status?: RefundResult["status"];
+      currency?: string;
+      metadata?: Record<string, string>;
+      createdAt?: Date;
+    } = {},
+  ): RefundResult {
+    const refund: RefundResult = {
+      refundId: `re_ext_${randomUUID()}`,
+      status: options.status ?? "succeeded",
+      paymentIntentId,
+      amountCents,
+      currency: options.currency ?? "EUR",
+      metadata: options.metadata ?? {},
+      createdAt: options.createdAt ?? new Date(),
+    };
+    this.externalRefunds.push(refund);
+    return refund;
+  }
+
+  /** Test control: moves any fake refund (Bookly or external) to another provider status. */
+  public setRefundStatus(refundId: string, status: RefundResult["status"]): void {
+    for (const [key, value] of this.idempotentRefunds) {
+      if (value.refundId === refundId) {
+        this.idempotentRefunds.set(key, { ...value, status });
+        return;
+      }
+    }
+    const index = this.externalRefunds.findIndex((entry) => entry.refundId === refundId);
+    if (index < 0) throw new Error("Unknown fake Refund");
+    this.externalRefunds[index] = { ...(this.externalRefunds[index] as RefundResult), status };
+  }
+
+  private allRefunds(): RefundResult[] {
+    return [...this.idempotentRefunds.values(), ...this.externalRefunds];
+  }
+
+  public async listRefundsForPaymentIntent(paymentIntentId: string): Promise<RefundResult[]> {
+    this.refundListCalls += 1;
+    return this.allRefunds().filter((entry) => entry.paymentIntentId === paymentIntentId);
+  }
+
+  public async listRefundsCreatedSince(
+    createdSince: Date,
+    maxItems: number,
+  ): Promise<RefundResult[]> {
+    return this.allRefunds()
+      .filter((entry) => (entry.createdAt?.getTime() ?? 0) >= createdSince.getTime())
+      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0))
+      .slice(0, maxItems);
+  }
+
+  /** Test control: opens a dispute on a PaymentIntent. `withdraw` adds the usual immediate
+   * withdrawal balance transaction (principal + dispute fee). */
+  public openDispute(
+    paymentIntentId: string,
+    amountCents: number,
+    options: {
+      status?: string;
+      reason?: string;
+      currency?: string;
+      withdraw?: boolean;
+      feeCents?: number;
+      createdAt?: Date;
+    } = {},
+  ): string {
+    const disputeId = `dp_fake_${randomUUID().replaceAll("-", "")}`;
+    const createdAt = options.createdAt ?? new Date();
+    this.disputes.set(disputeId, {
+      disputeId,
+      chargeId: `ch_fake_${paymentIntentId}`,
+      paymentIntentId,
+      amountCents,
+      currency: options.currency ?? "EUR",
+      status: options.status ?? "needs_response",
+      reason: options.reason ?? "fraudulent",
+      evidenceDueAt: new Date(createdAt.getTime() + 7 * 24 * 60 * 60_000),
+      isChargeRefundable: false,
+      createdAt,
+      balanceTransactions: [],
+    });
+    if (options.withdraw) {
+      this.withdrawDisputeFunds(disputeId, {
+        ...(options.feeCents !== undefined ? { feeCents: options.feeCents } : {}),
+      });
+    }
+    return disputeId;
+  }
+
+  /** Test control: a provider balance transaction withdrawing the disputed funds (+ fee). */
+  public withdrawDisputeFunds(
+    disputeId: string,
+    options: { amountCents?: number; feeCents?: number; currency?: string; at?: Date } = {},
+  ): string {
+    const dispute = this.requireDispute(disputeId);
+    return this.addDisputeMovement(dispute, {
+      amountCents: -(options.amountCents ?? dispute.amountCents),
+      feeCents: options.feeCents ?? 1_500,
+      currency: options.currency ?? dispute.currency,
+      at: options.at,
+      reportingCategory: "dispute",
+    });
+  }
+
+  /** Test control: a provider balance transaction reinstating funds (dispute won). */
+  public reinstateDisputeFunds(
+    disputeId: string,
+    options: { amountCents?: number; feeCents?: number; currency?: string; at?: Date } = {},
+  ): string {
+    const dispute = this.requireDispute(disputeId);
+    return this.addDisputeMovement(dispute, {
+      amountCents: options.amountCents ?? dispute.amountCents,
+      feeCents: options.feeCents ?? -1_500,
+      currency: options.currency ?? dispute.currency,
+      at: options.at,
+      reportingCategory: "dispute_reversal",
+    });
+  }
+
+  public setDisputeStatus(disputeId: string, status: string): void {
+    const dispute = this.requireDispute(disputeId);
+    this.disputes.set(disputeId, { ...dispute, status });
+  }
+
+  /** Test control: the next `retrieveDispute` call throws (a transient provider error). */
+  public failNextDisputeRetrieve(error = new Error("Stripe unavailable (test)")): void {
+    this.nextDisputeRetrieveError = error;
+  }
+
+  public async retrieveDispute(disputeId: string): Promise<DisputeSnapshot> {
+    this.disputeRetrieveCalls += 1;
+    if (this.nextDisputeRetrieveError) {
+      const error = this.nextDisputeRetrieveError;
+      this.nextDisputeRetrieveError = undefined;
+      throw error;
+    }
+    return this.copyDispute(this.requireDispute(disputeId));
+  }
+
+  public async listDisputesCreatedSince(
+    createdSince: Date,
+    maxItems: number,
+  ): Promise<DisputeSnapshot[]> {
+    return [...this.disputes.values()]
+      .filter((entry) => entry.createdAt.getTime() >= createdSince.getTime())
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, maxItems)
+      .map((entry) => this.copyDispute(entry));
+  }
+
+  private requireDispute(disputeId: string): DisputeSnapshot {
+    const dispute = this.disputes.get(disputeId);
+    if (!dispute) throw new Error("Unknown fake Dispute");
+    return dispute;
+  }
+
+  private copyDispute(dispute: DisputeSnapshot): DisputeSnapshot {
+    return {
+      ...dispute,
+      balanceTransactions: dispute.balanceTransactions.map((bt) => ({ ...bt })),
+    };
+  }
+
+  private addDisputeMovement(
+    dispute: DisputeSnapshot,
+    movement: {
+      amountCents: number;
+      feeCents: number;
+      currency: string;
+      at?: Date | undefined;
+      reportingCategory: string;
+    },
+  ): string {
+    const balanceTransactionId = `txn_dp_${randomUUID()}`;
+    const last = dispute.balanceTransactions.at(-1)?.createdAt.getTime() ?? 0;
+    this.disputes.set(dispute.disputeId, {
+      ...dispute,
+      balanceTransactions: [
+        ...dispute.balanceTransactions,
+        {
+          balanceTransactionId,
+          amountCents: movement.amountCents,
+          feeCents: movement.feeCents,
+          currency: movement.currency,
+          // Strictly increasing so provider ordering is deterministic in tests.
+          createdAt: movement.at ?? new Date(Math.max(Date.now(), last + 1_000)),
+          reportingCategory: movement.reportingCategory,
+        },
+      ],
+    });
+    return balanceTransactionId;
   }
 
   public async findRefundByMetadata(input: {

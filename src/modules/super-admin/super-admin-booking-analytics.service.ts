@@ -1,7 +1,7 @@
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingStatus } from "../booking/booking.types.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
-import { combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
+import { BOOKLY_REVENUE_TYPES, combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
 import {
   aggregateOwnershipForPeriod,
   resolveAnalyticsPeriod,
@@ -53,7 +53,7 @@ export class SuperAdminBookingAnalyticsService {
         this.bookingRepository.aggregateClientTypeSplit(from, to),
         this.bookingRepository.aggregateFulfilmentSplit(from, to),
         aggregateOwnershipForPeriod(this.financialTransactionService, {
-          types: ["PLATFORM_FEE", "PROCESSING_FEE", "REFUND"],
+          types: [...BOOKLY_REVENUE_TYPES],
           period,
         }),
       ]);

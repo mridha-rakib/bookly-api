@@ -52,6 +52,12 @@ import {
   renderClientCreatedEmail,
 } from "./templates/client/client-created.template.js";
 import {
+  type FinanceSupportAlertEmailData,
+  type ProviderReversalBusinessEmailData,
+  renderFinanceSupportAlertEmail,
+  renderProviderReversalBusinessEmail,
+} from "./templates/finance/provider-reversal.template.js";
+import {
   type OtpVerificationPayload,
   renderOtpVerificationEmail,
 } from "./templates/otp/otp-verification.template.js";
@@ -114,6 +120,9 @@ export type EmailTemplateKey =
   // P5 — durable late-cancellation / no-show fee settlement follow-up
   | "PENALTY_SETTLEMENT_CUSTOMER"
   | "PENALTY_SETTLEMENT_OWNER"
+  // P6 — provider-originated reversals (disputes / refunds made outside Bookly)
+  | "PROVIDER_REVERSAL_BUSINESS"
+  | "FINANCE_SUPPORT_ALERT"
   | "BUSINESS_REGISTERED"
   // Important staff notifications — assigned-booking lifecycle + team-access removal
   | "STAFF_BOOKING_CANCELLED"
@@ -169,6 +178,10 @@ const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> 
   PENALTY_SETTLEMENT_OWNER: asRenderer<PenaltySettlementEmailData>(
     renderPenaltySettlementOwnerEmail,
   ),
+  PROVIDER_REVERSAL_BUSINESS: asRenderer<ProviderReversalBusinessEmailData>(
+    renderProviderReversalBusinessEmail,
+  ),
+  FINANCE_SUPPORT_ALERT: asRenderer<FinanceSupportAlertEmailData>(renderFinanceSupportAlertEmail),
   BUSINESS_REGISTERED: asRenderer<BusinessRegisteredEmailData>(renderBusinessRegisteredEmail),
   STAFF_BOOKING_CANCELLED: asRenderer<StaffBookingCancelledPayload>(
     renderStaffBookingCancelledEmail,

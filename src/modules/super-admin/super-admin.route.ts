@@ -92,6 +92,14 @@ import {
 } from "../promo/promo.schema.js";
 import { PromoService } from "../promo/promo.service.js";
 import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
+import { createProviderReversalQueryService } from "../provider-reversal/provider-reversal.factory.js";
+import {
+  disputeListQuerySchema,
+  disputeParamsSchema,
+  externalRefundListQuerySchema,
+  webhookEventListQuerySchema,
+  webhookEventParamsSchema,
+} from "../provider-reversal/provider-reversal.schema.js";
 import { ReviewRepository } from "../review/review.repository.js";
 import {
   listModerationReviewsQuerySchema,
@@ -103,6 +111,8 @@ import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
+import { createStripeWebhookService } from "../stripe-webhook/stripe-webhook.factory.js";
+import { StripeWebhookEventRepository } from "../stripe-webhook/stripe-webhook-event.repository.js";
 import {
   changeSupportTicketStatusBodySchema,
   listAdminSupportTicketsQuerySchema,
@@ -148,6 +158,7 @@ import { SuperAdminDashboardService } from "./super-admin-dashboard.service.js";
 import { SuperAdminFinanceController } from "./super-admin-finance.controller.js";
 import { SuperAdminPromoController } from "./super-admin-promo.controller.js";
 import { SuperAdminPromoService } from "./super-admin-promo.service.js";
+import { SuperAdminReversalController } from "./super-admin-reversal.controller.js";
 import { SuperAdminReviewController } from "./super-admin-review.controller.js";
 import { SuperAdminReviewService } from "./super-admin-review.service.js";
 import { SuperAdminServiceAnalyticsService } from "./super-admin-service-analytics.service.js";
@@ -230,6 +241,12 @@ export const createSuperAdminRoute = (): Router => {
     financeService,
     businessPayoutService,
     payoutDestinationService,
+  );
+  // P6 — provider-originated reversals + Stripe webhook queue (support visibility, FAILED replay).
+  const reversalController = new SuperAdminReversalController(
+    createProviderReversalQueryService(financialTransactionService),
+    new StripeWebhookEventRepository(),
+    createStripeWebhookService(),
   );
 
   const businessLifecycleService = new BusinessLifecycleService(businessRepository);
@@ -677,6 +694,33 @@ export const createSuperAdminRoute = (): Router => {
     "/finance/payouts",
     validateRequest({ query: financePayoutHistoryQuerySchema }),
     asyncHandler(controller.listPlatformPayoutHistory),
+  );
+
+  // --- P6: provider-originated reversals (disputes / external refunds) + webhook queue ---
+  router.get(
+    "/finance/disputes",
+    validateRequest({ query: disputeListQuerySchema }),
+    asyncHandler(reversalController.listDisputes),
+  );
+  router.get(
+    "/finance/disputes/:disputeId",
+    validateRequest({ params: disputeParamsSchema }),
+    asyncHandler(reversalController.getDispute),
+  );
+  router.get(
+    "/finance/external-refunds",
+    validateRequest({ query: externalRefundListQuerySchema }),
+    asyncHandler(reversalController.listExternalRefunds),
+  );
+  router.get(
+    "/finance/webhook-events",
+    validateRequest({ query: webhookEventListQuerySchema }),
+    asyncHandler(reversalController.listWebhookEvents),
+  );
+  router.post(
+    "/finance/webhook-events/:eventId/replay",
+    validateRequest({ params: webhookEventParamsSchema }),
+    asyncHandler(reversalController.replayWebhookEvent),
   );
 
   // --- Per-Business (Business Detail Finance tab) ---

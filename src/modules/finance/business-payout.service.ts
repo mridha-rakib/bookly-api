@@ -10,17 +10,16 @@ import type {
   CreateBusinessPayoutInput,
 } from "./business-payout.repository.js";
 import { FinanceError } from "./finance.errors.js";
-import { classifyProcessingFeeOwner, classifySourceOwner } from "./finance-ownership.js";
-
-const BUSINESS_PAYABLE_TYPES = [
-  "DEPOSIT",
-  "CANCELLATION_FEE",
-  "NO_SHOW_FEE",
-  "PROCESSING_FEE",
-  "REFUND",
-] as const;
-
-const BUSINESS_OWNED_GROSS_TYPES = new Set(["DEPOSIT", "CANCELLATION_FEE", "NO_SHOW_FEE"]);
+// P6 — the payout claim uses the SAME canonical payable types and entry-owner classification as
+// every payable preview (a former local copy of these lists had drifted: it omitted
+// PROMO_SUBSIDY, so legacy subsidies were previewed but never paid out).
+import {
+  BUSINESS_OWNED_GROSS_TYPES,
+  BUSINESS_PAYABLE_TYPES,
+  classifyLedgerEntryOwner,
+  DISPUTE_LEDGER_TYPES,
+  disputeLossCents,
+} from "./finance-ownership.js";
 
 /**
  * Batch 8 — the ONLY write path that ever creates a real payout. Manual, Super-Admin-triggered,
@@ -112,6 +111,7 @@ export class BusinessPayoutService {
           grossBusinessOwnedCents: totals.grossCents,
           processingFeesCents: totals.processingFeesCents,
           refundsCents: totals.refundsCents,
+          disputeAdjustmentsCents: totals.disputeAdjustmentsCents,
           netPayoutCents: totals.netCents,
           currency: "EUR",
           status: "PAID",
@@ -161,20 +161,7 @@ export class BusinessPayoutService {
   private filterBusinessOwned(
     entries: BookingFinancialTransactionDocument[],
   ): BookingFinancialTransactionDocument[] {
-    return entries.filter((entry) => {
-      if (BUSINESS_OWNED_GROSS_TYPES.has(entry.type)) {
-        return true;
-      }
-      if (entry.type === "PROCESSING_FEE" || entry.type === "REFUND") {
-        const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        return (
-          (entry.type === "PROCESSING_FEE"
-            ? classifyProcessingFeeOwner(sourceType)
-            : classifySourceOwner(sourceType)) === "BUSINESS"
-        );
-      }
-      return false;
-    });
+    return entries.filter((entry) => classifyLedgerEntryOwner(entry) === "BUSINESS");
   }
 
   /** Read-only preview of the exact same formula `executePayout` claims against — used by
@@ -185,25 +172,24 @@ export class BusinessPayoutService {
     grossCents: number;
     processingFeesCents: number;
     refundsCents: number;
+    disputeAdjustmentsCents: number;
     netCents: number;
   } {
     let grossCents = 0;
     let processingFeesCents = 0;
     let refundsCents = 0;
+    let disputeAdjustmentsCents = 0;
 
     for (const entry of entries) {
+      if (classifyLedgerEntryOwner(entry) !== "BUSINESS") continue;
       if (BUSINESS_OWNED_GROSS_TYPES.has(entry.type)) {
         grossCents += entry.amountCents;
       } else if (entry.type === "PROCESSING_FEE") {
-        const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        if (classifyProcessingFeeOwner(sourceType) === "BUSINESS") {
-          processingFeesCents += entry.amountCents;
-        }
+        processingFeesCents += entry.amountCents;
       } else if (entry.type === "REFUND") {
-        const sourceType = (entry.metadata?.["sourceType"] as string | undefined) ?? null;
-        if (classifySourceOwner(sourceType) === "BUSINESS") {
-          refundsCents += entry.amountCents;
-        }
+        refundsCents += entry.amountCents;
+      } else if (DISPUTE_LEDGER_TYPES.has(entry.type)) {
+        disputeAdjustmentsCents += disputeLossCents(entry.type, entry.amountCents);
       }
     }
 
@@ -211,7 +197,8 @@ export class BusinessPayoutService {
       grossCents,
       processingFeesCents,
       refundsCents,
-      netCents: grossCents - processingFeesCents - refundsCents,
+      disputeAdjustmentsCents,
+      netCents: grossCents - processingFeesCents - refundsCents - disputeAdjustmentsCents,
     };
   }
 }

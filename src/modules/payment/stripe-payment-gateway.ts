@@ -7,6 +7,7 @@ import type {
   CreatePaymentIntentInput,
   CreateRefundInput,
   CreateSetupIntentResult,
+  DisputeSnapshot,
   PaymentGateway,
   PaymentIntentResult,
   PaymentIntentSnapshot,
@@ -294,6 +295,74 @@ export class StripePaymentGateway implements PaymentGateway {
     return { outcome: "FOUND_ONE", value: this.toRefundResult(matches[0] as Stripe.Refund) };
   }
 
+  /** P6 — the dispute's current provider state; its balance transactions are always included. */
+  public async retrieveDispute(disputeId: string): Promise<DisputeSnapshot> {
+    const dispute = await this.wrap(() => this.client.disputes.retrieve(disputeId));
+    return this.toDisputeSnapshot(dispute);
+  }
+
+  public async listDisputesCreatedSince(
+    createdSince: Date,
+    maxItems: number,
+  ): Promise<DisputeSnapshot[]> {
+    const disputes: DisputeSnapshot[] = [];
+    let startingAfter: string | undefined;
+    do {
+      const page = await this.wrap(() =>
+        this.client.disputes.list({
+          created: { gte: Math.floor(createdSince.getTime() / 1000) },
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        }),
+      );
+      for (const dispute of page.data) {
+        disputes.push(this.toDisputeSnapshot(dispute));
+        if (disputes.length >= maxItems) return disputes;
+      }
+      startingAfter = page.has_more ? page.data.at(-1)?.id : undefined;
+    } while (startingAfter);
+    return disputes;
+  }
+
+  public async listRefundsForPaymentIntent(paymentIntentId: string): Promise<RefundResult[]> {
+    return this.listRefunds({ payment_intent: paymentIntentId }, Number.POSITIVE_INFINITY);
+  }
+
+  public async listRefundsCreatedSince(
+    createdSince: Date,
+    maxItems: number,
+  ): Promise<RefundResult[]> {
+    return this.listRefunds(
+      { created: { gte: Math.floor(createdSince.getTime() / 1000) } },
+      maxItems,
+    );
+  }
+
+  private async listRefunds(
+    filter: Pick<Stripe.RefundListParams, "payment_intent" | "created">,
+    maxItems: number,
+  ): Promise<RefundResult[]> {
+    const refunds: RefundResult[] = [];
+    let startingAfter: string | undefined;
+    do {
+      const page = await this.wrap(
+        () =>
+          this.client.refunds.list({
+            ...filter,
+            limit: 100,
+            ...(startingAfter ? { starting_after: startingAfter } : {}),
+          }),
+        "PAYMENT_REFUND_FAILED",
+      );
+      for (const refund of page.data) {
+        refunds.push(this.toRefundResult(refund));
+        if (refunds.length >= maxItems) return refunds;
+      }
+      startingAfter = page.has_more ? page.data.at(-1)?.id : undefined;
+    } while (startingAfter);
+    return refunds;
+  }
+
   public async retrieveBalanceTransactionFee(
     balanceTransactionId: string,
   ): Promise<BalanceTransactionFee | null> {
@@ -454,6 +523,34 @@ export class StripePaymentGateway implements PaymentGateway {
       amountCents: refund.amount,
       currency: refund.currency.toUpperCase(),
       metadata: refund.metadata ?? undefined,
+      createdAt: new Date(refund.created * 1000),
+    };
+  }
+
+  private toDisputeSnapshot(dispute: Stripe.Dispute): DisputeSnapshot {
+    const dueBy = dispute.evidence_details?.due_by;
+    return {
+      disputeId: dispute.id,
+      chargeId: typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id,
+      paymentIntentId:
+        typeof dispute.payment_intent === "string"
+          ? dispute.payment_intent
+          : (dispute.payment_intent?.id ?? undefined),
+      amountCents: dispute.amount,
+      currency: dispute.currency.toUpperCase(),
+      status: dispute.status,
+      reason: dispute.reason,
+      ...(dueBy ? { evidenceDueAt: new Date(dueBy * 1000) } : {}),
+      isChargeRefundable: dispute.is_charge_refundable,
+      createdAt: new Date(dispute.created * 1000),
+      balanceTransactions: (dispute.balance_transactions ?? []).map((transaction) => ({
+        balanceTransactionId: transaction.id,
+        amountCents: transaction.amount,
+        feeCents: transaction.fee,
+        currency: transaction.currency.toUpperCase(),
+        createdAt: new Date(transaction.created * 1000),
+        reportingCategory: transaction.reporting_category,
+      })),
     };
   }
 

@@ -45,6 +45,13 @@ const fixedDirectionByType: Partial<
   // position (here, Bookly making the Business whole for a promo shortfall), never a second
   // debit against what the customer owes.
   PROMO_SUBSIDY: "CREDIT",
+  // P6 — a dispute withdrawal returns principal to the cardholder (CREDIT, like REFUND); a
+  // reinstatement brings it back (DEBIT). The fee is a cost like PROCESSING_FEE (DEBIT); a
+  // returned fee is its CREDIT counterpart.
+  DISPUTE_WITHDRAWAL: "CREDIT",
+  DISPUTE_REINSTATEMENT: "DEBIT",
+  DISPUTE_FEE: "DEBIT",
+  DISPUTE_FEE_REVERSAL: "CREDIT",
 };
 
 export type RecordTransactionInput = CreateBookingFinancialTransactionInput;
@@ -131,6 +138,15 @@ export class BookingFinancialTransactionService {
     session?: ClientSession,
   ): Promise<BookingFinancialTransactionDocument | null> {
     return this.transactionRepository.settlePenaltyObligation(id, outcome, session);
+  }
+
+  /** P6 — see BookingFinancialTransactionRepository.listPrincipalRowsMissingProcessingFee. */
+  public async listPrincipalRowsMissingProcessingFee(input: {
+    createdAfter: Date;
+    createdBefore: Date;
+    limit: number;
+  }): Promise<BookingFinancialTransactionDocument[]> {
+    return this.transactionRepository.listPrincipalRowsMissingProcessingFee(input);
   }
 
   public async findById(

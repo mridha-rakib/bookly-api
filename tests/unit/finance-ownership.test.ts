@@ -26,6 +26,7 @@ describe("Cyprus VAT ownership foundation", () => {
       refundsCents: 0,
       netCents: 0,
       promoSubsidyCents: 0,
+      disputeAdjustmentsCents: 0,
     });
     expect(combineBooklyOwnedBuckets(buckets)).toEqual({
       grossCents: 0,
@@ -33,6 +34,7 @@ describe("Cyprus VAT ownership foundation", () => {
       refundsCents: 0,
       netCents: 0,
       promoSubsidyCents: 0,
+      disputeAdjustmentsCents: 0,
     });
     expect(classifySourceOwner("TAX_LIABILITY")).toBe("UNKNOWN");
     expect(ALL_OWNERSHIP_RELEVANT_TYPES).not.toContain("TAX_LIABILITY");

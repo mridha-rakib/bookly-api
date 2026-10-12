@@ -15,6 +15,7 @@ import { PaymentAttemptRepository } from "../modules/payment/payment-attempt.rep
 import { PaymentTaxAssociationReconciler } from "../modules/payment/payment-tax-association-reconciler.js";
 import { RefundOperationRepository } from "../modules/payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../modules/payment/stripe-payment-gateway.js";
+import { createProviderReversalService } from "../modules/provider-reversal/provider-reversal.factory.js";
 import { StripeWebhookService } from "../modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventRepository } from "../modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserRepository } from "../modules/user/user.repository.js";
@@ -48,6 +49,13 @@ const buildService = (): MoneyRecoveryService => {
     refundOperationRepository: refunds,
     bookingRepository,
   });
+  const providerReversals = createProviderReversalService({
+    gateway,
+    financialTransactionService: financials,
+    paymentAttemptRepository: attempts,
+    refundOperationRepository: refunds,
+    bookingRepository,
+  });
   const webhookService = new StripeWebhookService(
     gateway,
     new StripeWebhookEventRepository(),
@@ -59,6 +67,7 @@ const buildService = (): MoneyRecoveryService => {
     bookingRepository,
     relationshipService,
     penaltyCollection,
+    providerReversals,
   );
   return new MoneyRecoveryService(
     paymentService,
@@ -70,6 +79,7 @@ const buildService = (): MoneyRecoveryService => {
     packageProgressRepository,
     relationshipService,
     penaltyCollection,
+    providerReversals,
   );
 };
 

@@ -13,6 +13,11 @@ const defaultMessages: Record<string, string> = {
     "This Business has not configured payout bank details yet — a payout cannot be recorded",
   FINANCE_PAYOUT_CONFLICT:
     "This Business's pending balance changed while processing the payout — please try again",
+  // P6 — Super Admin provider-reversal support surface
+  FINANCE_DISPUTE_NOT_FOUND: "Dispute not found",
+  FINANCE_WEBHOOK_EVENT_NOT_FOUND: "Webhook event not found",
+  FINANCE_WEBHOOK_EVENT_NOT_REPLAYABLE:
+    "Only a FAILED webhook event with a stored payload can be replayed",
 };
 
 export class FinanceError extends AppError {

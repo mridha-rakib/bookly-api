@@ -60,8 +60,31 @@ export const bookingFinancialTransactionTypes = [
    * no processing fee or refund ever applies to it directly.
    */
   "PROMO_SUBSIDY",
+  /**
+   * P6 — provider-originated dispute (chargeback) money movements, one row per provider-confirmed
+   * balance-transaction component, never a mutation of an earlier row. Like REFUND/
+   * PROCESSING_FEE they are attributed to the economic owner of the disputed principal via
+   * `metadata.sourceType` (finance-ownership.ts):
+   *   DISPUTE_WITHDRAWAL    — principal Stripe withdrew for the dispute (reduces the owner).
+   *   DISPUTE_REINSTATEMENT — principal Stripe returned (reverses a withdrawal, exact amount).
+   *   DISPUTE_FEE           — Stripe's dispute fee (cost to the owner).
+   *   DISPUTE_FEE_REVERSAL  — a dispute fee Stripe returned.
+   */
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
 ] as const;
 export type BookingFinancialTransactionType = (typeof bookingFinancialTransactionTypes)[number];
+
+/** P6 — the four dispute money-movement types above. */
+export const disputeLedgerTypes = [
+  "DISPUTE_WITHDRAWAL",
+  "DISPUTE_REINSTATEMENT",
+  "DISPUTE_FEE",
+  "DISPUTE_FEE_REVERSAL",
+] as const;
+export type DisputeLedgerType = (typeof disputeLedgerTypes)[number];
 
 /** The source types valid for Stripe processing-cost ownership. TAX_LIABILITY is intentionally
  * included here even though the liability principal has no revenue owner: it means only that

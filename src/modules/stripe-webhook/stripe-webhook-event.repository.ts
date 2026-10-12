@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import { Types } from "mongoose";
+
 import {
   type StripeWebhookEventDocument,
   StripeWebhookEventModel,
@@ -139,6 +141,81 @@ export class StripeWebhookEventRepository {
       },
     ).exec();
     return result.modifiedCount === 1;
+  }
+
+  // --- P6 — support visibility and replay ------------------------------------------------------
+
+  public async findByEventId(eventId: string): Promise<StripeWebhookEventDocument | null> {
+    return StripeWebhookEventModel.findOne({ eventId }).exec();
+  }
+
+  public async listByStatus(input: {
+    status?: StripeWebhookEventDocument["status"] | undefined;
+    page: number;
+    limit: number;
+  }): Promise<{ items: StripeWebhookEventDocument[]; total: number }> {
+    const filter = input.status ? { status: input.status } : {};
+    const [items, total] = await Promise.all([
+      StripeWebhookEventModel.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((input.page - 1) * input.limit)
+        .limit(input.limit)
+        .exec(),
+      StripeWebhookEventModel.countDocuments(filter).exec(),
+    ]);
+    return { items, total };
+  }
+
+  /** CAS FAILED -> RETRYABLE with a fresh retry budget; only an event with a stored replay payload
+   * can be replayed. Returns false when the event is not (or no longer) FAILED. */
+  public async resetFailedForReplay(eventId: string, actorUserId: string): Promise<boolean> {
+    const now = new Date();
+    const result = await StripeWebhookEventModel.updateOne(
+      { eventId, status: "FAILED", payload: { $exists: true } },
+      {
+        $set: {
+          status: "RETRYABLE",
+          attemptCount: 0,
+          nextAttemptAt: now,
+          lastReplayedAt: now,
+          lastReplayedByUserId: new Types.ObjectId(actorUserId),
+        },
+        $inc: { replayCount: 1 },
+      },
+    ).exec();
+    return result.modifiedCount === 1;
+  }
+
+  /** Claims one specific stored event under the same rules as claimNextDue. */
+  public async claimStoredEvent(eventId: string): Promise<StripeWebhookEventDocument | null> {
+    const now = new Date();
+    const token = randomUUID();
+    return StripeWebhookEventModel.findOneAndUpdate(
+      {
+        eventId,
+        payload: { $exists: true },
+        $or: [
+          { status: "RECEIVED" },
+          {
+            status: "RETRYABLE",
+            attemptCount: { $lt: MAX_ATTEMPTS },
+            $or: [{ nextAttemptAt: { $lte: now } }, { nextAttemptAt: null }],
+          },
+          { status: "PROCESSING", leaseExpiresAt: { $lte: now } },
+        ],
+      },
+      {
+        $set: {
+          status: "PROCESSING",
+          processingStartedAt: now,
+          leaseExpiresAt: new Date(now.getTime() + LEASE_MS),
+          processingLeaseToken: token,
+        },
+        $inc: { attemptCount: 1 },
+        $unset: { error: 1, nextAttemptAt: 1 },
+      },
+      { returnDocument: "after" },
+    ).exec();
   }
 
   private isDuplicateKeyError(error: unknown): boolean {

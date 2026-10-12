@@ -66,6 +66,7 @@ export type FinancePayoutHistoryItemDto = {
   periodEnd: string;
   grossBusinessOwnedCents: number;
   processingFeesCents: number;
+  disputeAdjustmentsCents: number;
   netPayoutCents: number;
   currency: FinancePayoutHistoryPage["items"][number]["currency"];
   status: FinancePayoutHistoryPage["items"][number]["status"];
@@ -81,6 +82,7 @@ export const toFinancePayoutHistoryItemDto = (
   periodEnd: item.periodEnd.toISOString(),
   grossBusinessOwnedCents: item.grossBusinessOwnedCents,
   processingFeesCents: item.processingFeesCents,
+  disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
   netPayoutCents: item.netPayoutCents,
   currency: item.currency,
   status: item.status,
@@ -124,6 +126,7 @@ export const toPlatformTransactionRowDto = (row: PlatformTransactionPage["rows"]
   status: row.status,
   payoutId: row.payoutId,
   currency: row.currency,
+  ...(row.refundOrigin ? { refundOrigin: row.refundOrigin } : {}),
 });
 
 export const toPlatformPayoutHistoryItemDto = (
@@ -136,6 +139,7 @@ export const toPlatformPayoutHistoryItemDto = (
   periodEnd: item.periodEnd.toISOString(),
   grossBusinessOwnedCents: item.grossBusinessOwnedCents,
   processingFeesCents: item.processingFeesCents,
+  disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
   netPayoutCents: item.netPayoutCents,
   currency: item.currency,
   status: item.status,
@@ -151,6 +155,7 @@ export const toBusinessPayoutDto = (payout: BusinessPayoutDocument) => ({
   grossBusinessOwnedCents: payout.grossBusinessOwnedCents,
   processingFeesCents: payout.processingFeesCents,
   refundsCents: payout.refundsCents,
+  disputeAdjustmentsCents: payout.disputeAdjustmentsCents ?? 0,
   netPayoutCents: payout.netPayoutCents,
   currency: payout.currency,
   status: payout.status,
