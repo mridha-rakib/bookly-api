@@ -49,6 +49,21 @@ export class FakePaymentGateway implements PaymentGateway {
     this.nextRefundOutcome = outcome;
   }
 
+  private nextChargeLostResponse: Error | undefined;
+  private nextChargeThrowBeforeCreate: Error | undefined;
+
+  /** Test control (P5): the next PaymentIntent IS created at the provider (with the queued
+   * outcome) but the response is lost — the call throws like a timeout/connection error. */
+  public queueNextChargeLostResponse(error = new Error("Request timed out (test)")): void {
+    this.nextChargeLostResponse = error;
+  }
+
+  /** Test control (P5): the next create call throws WITHOUT creating any PaymentIntent (e.g. a
+   * detached card rejected before a PI exists, or a network failure before reaching Stripe). */
+  public queueNextChargeThrowBeforeCreate(error = new Error("No such PaymentMethod (test)")): void {
+    this.nextChargeThrowBeforeCreate = error;
+  }
+
   public succeedRefund(refundId: string): void {
     for (const [key, value] of this.idempotentRefunds) {
       if (value.refundId === refundId) {
@@ -177,6 +192,11 @@ export class FakePaymentGateway implements PaymentGateway {
   public async createAndConfirmPaymentIntent(
     input: CreatePaymentIntentInput,
   ): Promise<PaymentIntentResult> {
+    if (this.nextChargeThrowBeforeCreate) {
+      const error = this.nextChargeThrowBeforeCreate;
+      this.nextChargeThrowBeforeCreate = undefined;
+      throw error;
+    }
     this.paymentIntentInputs.push(input);
     const existing = this.idempotentPaymentIntents.get(input.idempotencyKey);
     if (existing) {
@@ -210,7 +230,17 @@ export class FakePaymentGateway implements PaymentGateway {
     }
 
     this.idempotentPaymentIntents.set(input.idempotencyKey, result);
+    if (this.nextChargeLostResponse) {
+      const error = this.nextChargeLostResponse;
+      this.nextChargeLostResponse = undefined;
+      throw error;
+    }
     return result;
+  }
+
+  /** Every PaymentIntent the fake has created, in creation order (P5 one-PI-per-attempt checks). */
+  public createdPaymentIntentIds(): string[] {
+    return [...new Set([...this.idempotentPaymentIntents.values()].map((r) => r.paymentIntentId))];
   }
 
   public async retrievePaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot> {

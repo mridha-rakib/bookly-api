@@ -186,18 +186,35 @@ describe("PaymentService", () => {
     ).rejects.toMatchObject({ statusCode: 402 });
   });
 
-  it("chargeOffSession throws PAYMENT_METHOD_REQUIRED when no card is saved", async () => {
-    const profileRepository = makeMockProfileRepository({ findByUserId: async () => null });
+  it("P5: a penalty has no payment source when no card is saved (definitive, nothing dispatched)", async () => {
+    const profileRepository = makeMockProfileRepository({
+      findByUserId: async () => ({ userId: "u1", stripeCustomerId: "cus_1" }),
+    });
+    let created = 0;
+    gateway.createAndConfirmPaymentIntent = async () => {
+      created += 1;
+      return { paymentIntentId: "pi_1", status: "succeeded" };
+    };
     const service = new PaymentService(gateway, profileRepository, makeMockUserRepository());
 
-    await expect(
-      service.chargeOffSession({
+    await expect(service.resolvePenaltyPaymentSource("u1")).resolves.toBeNull();
+    expect(created).toBe(0);
+  });
+
+  it("P5: the penalty payment source is the profile's current default card and Stripe customer", async () => {
+    const profileRepository = makeMockProfileRepository({
+      findByUserId: async () => ({
         userId: "u1",
-        amountCents: 2000,
-        idempotencyKey: "key-1",
-        metadata: {},
+        stripeCustomerId: "cus_1",
+        defaultPaymentMethodId: "pm_current",
       }),
-    ).rejects.toMatchObject({ statusCode: 402 });
+    });
+    const service = new PaymentService(gateway, profileRepository, makeMockUserRepository());
+
+    await expect(service.resolvePenaltyPaymentSource("u1")).resolves.toEqual({
+      stripeCustomerId: "cus_1",
+      paymentMethodId: "pm_current",
+    });
   });
 
   it("confirmSavedPaymentMethod rejects a SetupIntent that is not actually succeeded server-side", async () => {

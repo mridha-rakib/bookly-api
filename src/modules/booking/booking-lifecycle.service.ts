@@ -22,7 +22,6 @@ import {
 } from "../package-progress/package-progress.rules.js";
 import { PackageProgressService } from "../package-progress/package-progress.service.js";
 import type { PaymentService } from "../payment/payment.service.js";
-import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
 import { ensureRefundAccounting } from "../payment/refund-accounting.js";
 import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
@@ -46,6 +45,16 @@ import {
   NO_SHOW_RESOLUTION_WINDOW_MINUTES,
 } from "./booking.types.js";
 import { buildCancellationOutcome } from "./booking-cancellation-classification.js";
+import {
+  cancellationObligationKey,
+  computeNoShowPenalty,
+  isDuplicateLedgerKeyError,
+  isPenaltyCollectible,
+  noShowObligationKey,
+  PenaltyCollectionService,
+  type PenaltyGate,
+  type PreparedPenalty,
+} from "./penalty-collection.service.js";
 
 /**
  * Stage C mailing observer. Optional + trailing so every existing construction site is
@@ -99,6 +108,32 @@ export type CompleteVenuePaymentInput =
   | { settlement: "FULL"; note?: string | undefined }
   | { settlement: "PARTIAL"; amountCents: number; note?: string | undefined }
   | { settlement: "NOT_PAID"; note?: string | undefined };
+
+/** What a waiver forgives: the obligation type, the shortfall it would have charged, the
+ * canonical obligation key (the SAME gate as the charge) and the Booking's own transition. */
+type FeeWaiverPlan = {
+  type: "NO_SHOW_FEE" | "CANCELLATION_FEE";
+  amountCents: number;
+  idempotencyKey: string;
+  directSet: Record<string, unknown>;
+  nextStatus?: BookingStatus;
+};
+
+/**
+ * P5 — a positive customer cancellation shortfall: the durable obligation (+ its one
+ * PaymentAttempt) and the "fee collection pending" notification commit with the cancellation.
+ * `result.prepared` is overwritten on every transaction attempt (withTransaction may retry).
+ */
+type CancellationPenaltyPlan = {
+  amounts: {
+    amountCents: number;
+    grossFeeCents: number;
+    upfrontAppliedCents: number;
+    feePercentage: number | undefined;
+  };
+  business: BusinessDocument | null;
+  result: { prepared?: PreparedPenalty | undefined };
+};
 
 /**
  * Batch 3's canonical, non-bypassable status-transition surface — every mutation here (a) CAS's
@@ -177,6 +212,16 @@ export class BookingLifecycleService {
       { bookingRepository },
     ),
     private readonly promoRedemptions = new PromoRedemptionRepository(),
+    // P5 — durable customer penalty collection (obligation in the lifecycle transaction, one
+    // PaymentAttempt, shared convergence, waiver/reversal gate). Defaults to one built from the
+    // dependencies above; production passes the fully wired instance (settlement notifier).
+    private readonly penaltyCollection: PenaltyCollectionService = new PenaltyCollectionService({
+      paymentService,
+      financialTransactionService,
+      bookingRepository,
+      businessRepository,
+      packageProgressRepository,
+    }),
   ) {}
 
   /** Best-effort — no-op for a Booking with no Package-linked line (every normal booking).
@@ -421,10 +466,15 @@ export class BookingLifecycleService {
    * CANCELLED_BY_CUSTOMER, and the slot release) happens FIRST and unconditionally — the
    * appointment IS cancelled and the slot IS released regardless of whether fee collection
    * later succeeds (rule: "Do not conflate booking lifecycle status with payment settlement
-   * status"). If a fee applies, the off-session charge is attempted SECOND, as an independent
-   * step OUTSIDE the Mongo transaction (Stripe calls never belong inside a DB transaction) —
-   * its real outcome is recorded into `cancellationOutcome.settlementStatus` via a dedicated
-   * follow-up write, never assumed.
+   * status").
+   *
+   * P5 — a positive shortfall is collected DURABLY: the PENDING CANCELLATION_FEE obligation, its
+   * single PaymentAttempt and the "booking cancelled, fee collection pending" notification all
+   * commit inside the cancellation transaction. Only after commit is the one off-session
+   * provider attempt dispatched (Stripe calls never belong inside a DB transaction), and its
+   * outcome is settled through the shared penalty convergence — the same logic the webhook and
+   * money recovery use if this process dies or the provider answer is ambiguous — which records
+   * `cancellationOutcome.settlementStatus` and the truthful follow-up exactly once.
    */
   public async cancelByCustomer(
     customerUserId: string,
@@ -462,15 +512,20 @@ export class BookingLifecycleService {
     // suppressed. A $0 redeemed session already produces a $0 fee here regardless (its
     // `eligiblePlatformFeeBasisCents` is 0), so this only has a real effect for the Package
     // purchase Booking (session 1), which carries the genuine bundle-price basis.
-    const outcome: BookingCancellationOutcome = isPackageLinkedBooking(booking)
-      ? {
-          ...classifiedOutcome,
-          cancellationFeeCents: 0,
-          depositAppliedCents: 0,
-          additionalChargeCents: 0,
-          settlementStatus: "NOT_APPLICABLE",
-        }
-      : classifiedOutcome;
+    //
+    // P5 Rule 6 — a MANUAL booking is financially outside Bookly (rule E, matching the no-show
+    // worker's existing MANUAL skip): it keeps its lifecycle classification, but automatic
+    // off-session collection is NOT_APPLICABLE, so a linked customer's saved card is never used.
+    const outcome: BookingCancellationOutcome =
+      isPackageLinkedBooking(booking) || booking.source === "MANUAL"
+        ? {
+            ...classifiedOutcome,
+            cancellationFeeCents: 0,
+            depositAppliedCents: 0,
+            additionalChargeCents: 0,
+            settlementStatus: "NOT_APPLICABLE",
+          }
+        : classifiedOutcome;
 
     const event: BookingEventHistoryEntry = {
       type: "STATUS_CHANGED",
@@ -482,27 +537,52 @@ export class BookingLifecycleService {
       createdAt: now,
     };
 
+    // Zero shortfall (fee fully covered by the retained upfront, FREE tier, Package, MANUAL):
+    // no obligation, no PaymentAttempt, no provider call.
+    const penalty =
+      outcome.settlementStatus === "PENDING" &&
+      outcome.additionalChargeCents > 0 &&
+      isPenaltyCollectible(booking)
+        ? {
+            amounts: {
+              amountCents: outcome.additionalChargeCents,
+              grossFeeCents: outcome.cancellationFeeCents,
+              upfrontAppliedCents: outcome.depositAppliedCents,
+              feePercentage: outcome.feePercentage,
+            },
+            business: await this.businessRepository.findById(booking.businessId),
+          }
+        : undefined;
+    const penaltyResult: { prepared?: PreparedPenalty | undefined } = {};
+
     const cancelled = await this.performCancellationTransaction({
       booking,
       nextStatus,
       cancellationOutcome: outcome,
       event,
       scopedToCustomerUserId: customerUserId,
+      ...(penalty ? { penalty: { ...penalty, result: penaltyResult } } : {}),
     });
 
     await this.syncBookingCancelledToGoogleCalendar(cancelled);
     await this.retireAppointmentReminder(cancelled, `BOOKING_${cancelled.status}`);
 
-    if (outcome.settlementStatus !== "PENDING" || outcome.additionalChargeCents <= 0) {
+    const prepared = penaltyResult.prepared;
+    if (!prepared) {
       await this.dispatchCancellationNotifications(cancelled, "CUSTOMER");
       await this.dispatchStaffCancellationNotification(cancelled, "CUSTOMER");
       return cancelled;
     }
 
-    const charged = await this.executeCancellationFeeCharge(cancelled);
-    await this.dispatchCancellationNotifications(charged, "CUSTOMER");
-    await this.dispatchStaffCancellationNotification(charged, "CUSTOMER");
-    return charged;
+    // The cancellation (and its pending notification) is already committed and final. Send the
+    // one durable provider attempt and converge it; an ambiguous outcome stays PENDING for
+    // recovery and is never retried here.
+    if (prepared.attempt) {
+      await this.penaltyCollection.collect(prepared.obligation._id);
+    }
+    const settled = (await this.bookingRepository.findByIdOnly(cancelled._id)) ?? cancelled;
+    await this.dispatchStaffCancellationNotification(settled, "CUSTOMER");
+    return settled;
   }
 
   /**
@@ -1101,78 +1181,8 @@ export class BookingLifecycleService {
     }
   }
 
-  /**
-   * Attempts the off-session cancellation-fee charge and records the REAL outcome — never
-   * inside the cancellation's own transaction (a Stripe call must never sit inside a Mongo
-   * transaction). A charge FAILURE deliberately does NOT change the Booking's own status (it is
-   * already CANCELLED_BY_CUSTOMER/LATE_CANCELLATION, which is correct regardless) — only
-   * `cancellationOutcome.settlementStatus` reflects it, leaving a clear FAILED ledger entry for
-   * manual follow-up (no automatic retry/dunning is built this batch — see the Batch 4 final
-   * report).
-   */
-  private async executeCancellationFeeCharge(booking: BookingDocument): Promise<BookingDocument> {
-    const customerUserId = booking.customer.customerUserId;
-    const idempotencyKey = `cancellation-fee:${String(booking._id)}`;
-    // Nets against the deposit already held (see BookingCancellationOutcome's own doc comment) —
-    // never the gross `cancellationFeeCents`, which double-charges the portion already collected
-    // as the first-booking deposit.
-    const amountCents = booking.cancellationOutcome?.additionalChargeCents ?? 0;
-
-    if (!customerUserId || amountCents <= 0) {
-      return booking;
-    }
-
-    let settlementStatus: "SUCCEEDED" | "FAILED" = "FAILED";
-    let providerReference: string | undefined;
-
-    try {
-      const result = await this.paymentService.chargeOffSession({
-        userId: customerUserId,
-        amountCents,
-        idempotencyKey,
-        metadata: buildPaymentIntentMetadata({
-          bookingId: String(booking._id),
-          businessId: String(booking.businessId),
-          businessClientId: String(booking.customer.businessClientId),
-          purpose: "CANCELLATION_FEE",
-          preTaxChargeCents: amountCents,
-          taxCents: 0,
-          chargedAmountCents: amountCents,
-          taxMode: "PRE_ACTIVATION",
-        }),
-      });
-      providerReference = result.paymentIntentId;
-      settlementStatus = result.status === "succeeded" ? "SUCCEEDED" : "FAILED";
-    } catch {
-      // A hard failure before any PaymentIntent existed (e.g. no saved card at all — should not
-      // happen given booking creation required one, but a card can be removed later) — recorded
-      // as FAILED with no provider reference, never thrown: cancellation itself already
-      // succeeded and must not be undone by a fee-collection problem.
-    }
-
-    await this.financialTransactionService.record({
-      businessId: booking.businessId,
-      bookingId: booking._id,
-      businessClientId: booking.customer.businessClientId,
-      customerUserId,
-      type: "CANCELLATION_FEE",
-      direction: "DEBIT",
-      amountCents,
-      currency: booking.financials.currency,
-      status: settlementStatus === "SUCCEEDED" ? "SUCCEEDED" : "FAILED",
-      ...(providerReference ? { providerReference } : {}),
-      idempotencyKey: `${idempotencyKey}:ledger`,
-    });
-
-    const updated = await this.bookingRepository.updateCancellationSettlement(
-      booking._id,
-      settlementStatus,
-      providerReference,
-    );
-    return updated ?? booking;
-  }
-
-  /** Symmetric to executeCancellationFeeCharge, for the refund leg of a Business cancellation.
+  /** The refund leg of a Business cancellation (a customer's penalty is collected by
+   * PenaltyCollectionService instead).
    * `upfrontPayment` is whichever of PLATFORM_FEE/DEPOSIT actually settled for this booking —
    * the full amount is refunded regardless of which type it was (see cancelByBusiness's own
    * doc comment). `_id`/`type` (Batch 8) are recorded on the REFUND entry's own metadata so
@@ -1353,6 +1363,7 @@ export class BookingLifecycleService {
       cancellationOutcome: BookingCancellationOutcome;
       event: BookingEventHistoryEntry;
       scopedToCustomerUserId?: string;
+      penalty?: CancellationPenaltyPlan;
     },
     session: ClientSession,
   ): Promise<BookingDocument> {
@@ -1398,7 +1409,46 @@ export class BookingLifecycleService {
           );
       }
     }
+    if (params.penalty) {
+      return this.prepareCancellationPenalty(updated, params.penalty, session);
+    }
     return updated;
+  }
+
+  /** P5 — inside the cancellation transaction: the canonical PENDING CANCELLATION_FEE
+   * obligation (`cancellation-fee:<bookingId>`) and its single PaymentAttempt, then the durable
+   * cancellation notification. With no usable saved card the obligation is created definitively
+   * FAILED and the settlement records FAILED in the same transaction (nothing is ever sent). */
+  private async prepareCancellationPenalty(
+    cancelled: BookingDocument,
+    penalty: CancellationPenaltyPlan,
+    session: ClientSession,
+  ): Promise<BookingDocument> {
+    penalty.result.prepared = undefined;
+    const prepared = await this.penaltyCollection.prepareObligation(
+      { booking: cancelled, type: "CANCELLATION_FEE", ...penalty.amounts },
+      session,
+    );
+    penalty.result.prepared = prepared;
+    const current = prepared.attempt
+      ? cancelled
+      : ((await this.bookingRepository.settleCancellationPenalty(
+          cancelled._id,
+          "FAILED",
+          undefined,
+          session,
+        )) ?? cancelled);
+    if (penalty.business && this.bookingCancelledNotifier) {
+      await this.bookingCancelledNotifier.notifyBookingCancelled(
+        current,
+        penalty.business,
+        "CUSTOMER",
+        undefined,
+        undefined,
+        session,
+      );
+    }
+    return current;
   }
 
   private async performCancellationTransaction(params: {
@@ -1407,6 +1457,7 @@ export class BookingLifecycleService {
     cancellationOutcome: BookingCancellationOutcome;
     event: BookingEventHistoryEntry;
     scopedToCustomerUserId?: string;
+    penalty?: CancellationPenaltyPlan;
   }): Promise<BookingDocument> {
     const dbSession = await mongoose.startSession();
     let updated: BookingDocument | null = null;
@@ -1524,14 +1575,14 @@ export class BookingLifecycleService {
    * Applicable to exactly two states (mirrors NoShowResolutionService's own "nothing
    * chargeable" branches, extended to a NEW explicit-cancellation-fee-waiver case this batch
    * introduces):
-   *  - `PENDING` (the no-show timer is running) — waives the no-show fee, stops the timer
-   *    (status leaves PENDING, so the worker's own `{status:"PENDING", noShowDeadlineAt}` query
-   *    naturally excludes it going forward).
-   *  - `LATE_CANCELLATION` with `cancellationOutcome.settlementStatus === "PENDING"` — waives
-   *    the still-uncollected cancellation fee; the Booking's own lifecycle `status` does NOT
-   *    change (it is already correctly LATE_CANCELLATION regardless of settlement — Batch 4's
-   *    "never conflate booking status with payment settlement status" rule), only
-   *    `cancellationOutcome.settlementStatus` moves to `"WAIVED"`.
+   *  - `PENDING` (the no-show timer is running, or a claimed no-show awaits manual resolution) —
+   *    waives the no-show fee and resolves the no-show as NO_SHOW_WAIVED.
+   *  - `LATE_CANCELLATION` whose fee is still outstanding (`settlementStatus` PENDING with no
+   *    charge ever started, or FAILED after a definitive collection failure — P5 Rule 3) — the
+   *    Booking's own lifecycle `status` does NOT change (it is already correctly
+   *    LATE_CANCELLATION regardless of settlement — Batch 4's "never conflate booking status
+   *    with payment settlement status" rule), only `cancellationOutcome.settlementStatus` moves
+   *    to `"WAIVED"`.
    *
    * Both branches net against the deposit already collected exactly like a real charge would
    * (see BookingCancellationOutcome's own doc comment) — `additionalChargeCents` (not the gross
@@ -1540,15 +1591,16 @@ export class BookingLifecycleService {
    * the Booking is resolved directly with no ledger entry: there is nothing to waive.
    *
    * CONCURRENCY (required guarantee): waive-vs-charge can never both settle the same
-   * obligation. Reuses the exact ledger-unique-`idempotencyKey` claim this codebase already
-   * established for retry-safe charging (`no-show:{id}` / `cancellation-fee:{id}` — see
-   * NoShowResolutionService and executeCancellationFeeCharge) as the SAME atomic gate for
-   * waiving: a WAIVED row is inserted under that identical key, inside the same Mongo
-   * transaction as the Booking status/settlement CAS, so a racing charge attempt and a racing
-   * waive attempt can never both win — see `claimAndApplyWaiver`/`resolveWaiverConflict` for the
-   * exact conflict-resolution rules (repeated waive is idempotent; a charge that already
-   * succeeded blocks a later waive; a charge that already definitively failed may still be
-   * waived afterward).
+   * obligation. The waiver uses the SAME canonical obligation key as the charge
+   * (`no-show:{id}` / `cancellation-fee:{id}`) — P5 removed the old parallel `…:ledger` charge
+   * key — and decides from PenaltyCollectionService.inspectGate:
+   *  - no obligation: a WAIVED row is inserted under that key in the same transaction as the
+   *    Booking CAS, so a racing claim and a racing waive can never both win;
+   *  - PENDING / UNKNOWN / in flight: refused (charge in progress);
+   *  - SUCCEEDED: refused (a collected fee can never be waived);
+   *  - definitive failure (failed / canceled / provider-not-created / no usable card): that SAME
+   *    FAILED row becomes WAIVED, exactly once;
+   *  - already WAIVED: idempotent.
    */
   public async waiveFee(
     actorUserId: string,
@@ -1585,12 +1637,18 @@ export class BookingLifecycleService {
       createdAt: now,
     };
 
-    if (plan.amountCents <= 0) {
+    if (plan.amountCents <= 0 && !booking.noShowChargeClaimedAt) {
       const updated = await this.bookingRepository.casUpdate(
         business._id,
         booking._id,
         [booking.status],
-        { set: plan.directSet, pushEvent: event },
+        {
+          set: plan.directSet,
+          pushEvent: event,
+          ...(plan.type === "NO_SHOW_FEE"
+            ? { extraFilter: { noShowChargeClaimedAt: { $exists: false } } }
+            : {}),
+        },
       );
       if (!updated) {
         throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
@@ -1600,7 +1658,7 @@ export class BookingLifecycleService {
       return updated;
     }
 
-    const result = await this.claimAndApplyWaiver(business._id, booking, plan, event, reason);
+    const result = await this.applyGatedWaiver(business, booking, plan, event);
     await this.dispatchNoShowWaivedNotification(result, business.name);
     return result;
   }
@@ -1608,7 +1666,8 @@ export class BookingLifecycleService {
   /**
    * Stage D — the customer NO_SHOW_WAIVED email. Only fires when the waiver actually resolved
    * a NO-SHOW (status now NO_SHOW_WAIVED); a LATE_CANCELLATION fee waiver keeps its own status
-   * and is out of Stage D scope. Best-effort.
+   * and gets the P5 penalty settlement follow-up instead (enqueued with the waiver itself).
+   * Best-effort.
    */
   private async dispatchNoShowWaivedNotification(
     booking: BookingDocument,
@@ -1620,46 +1679,37 @@ export class BookingLifecycleService {
     await this.noShowNotifier.notifyNoShowWaived(booking, { businessName });
   }
 
-  private async planFeeWaiver(booking: BookingDocument): Promise<{
-    type: "NO_SHOW_FEE" | "CANCELLATION_FEE";
-    amountCents: number;
-    idempotencyKey: string;
-    directSet: Record<string, unknown>;
-    nextStatus?: BookingStatus;
-  } | null> {
+  private async planFeeWaiver(booking: BookingDocument): Promise<FeeWaiverPlan | null> {
     if (booking.status === "PENDING") {
       // Package rule (confirmed): "the lost session IS the penalty" — a Package-linked no-show
       // never carries an additional base-service percentage fee, matching autoResolve's own
-      // suppression in NoShowResolutionService (the two paths must agree, so a manual waive and
-      // the worker's own auto-resolution never disagree on what was ever owed).
-      const noShowPercentage = isPackageLinkedBooking(booking)
-        ? undefined
-        : booking.cancellationPolicySnapshot?.noShowPercentage;
-      const grossFee = noShowPercentage
-        ? Math.round((booking.financials.eligiblePlatformFeeBasisCents * noShowPercentage) / 100)
-        : 0;
+      // suppression in NoShowResolutionService (the two paths share computeNoShowPenalty, so a
+      // manual waive and the worker's own auto-resolution never disagree on what was ever owed).
+      // P5 — a MANUAL booking (or one with no linked customer) was never collectible either, so
+      // there is no obligation to waive for it.
       const upfrontPayment = await this.financialTransactionService.findSucceededUpfrontPayment(
         booking._id,
       );
-      const amountCents = Math.max(0, grossFee - (upfrontPayment?.amountCents ?? 0));
-
+      const penalty = computeNoShowPenalty(booking, upfrontPayment?.amountCents ?? 0);
       return {
         type: "NO_SHOW_FEE",
-        amountCents,
-        idempotencyKey: `no-show:${String(booking._id)}`,
+        amountCents: isPenaltyCollectible(booking) ? penalty.amountCents : 0,
+        idempotencyKey: noShowObligationKey(booking._id),
         directSet: { status: "NO_SHOW_WAIVED" },
         nextStatus: "NO_SHOW_WAIVED",
       };
     }
 
+    const settlementStatus = booking.cancellationOutcome?.settlementStatus;
     if (
       booking.status === "LATE_CANCELLATION" &&
-      booking.cancellationOutcome?.settlementStatus === "PENDING"
+      booking.cancellationOutcome &&
+      (settlementStatus === "PENDING" || settlementStatus === "FAILED")
     ) {
       return {
         type: "CANCELLATION_FEE",
         amountCents: booking.cancellationOutcome.additionalChargeCents,
-        idempotencyKey: `cancellation-fee:${String(booking._id)}`,
+        idempotencyKey: cancellationObligationKey(booking._id),
         directSet: { "cancellationOutcome.settlementStatus": "WAIVED" },
       };
     }
@@ -1667,29 +1717,62 @@ export class BookingLifecycleService {
     return null;
   }
 
-  private async claimAndApplyWaiver(
-    businessId: Types.ObjectId,
+  /** P5 — the waiver decided by the canonical obligation's gate (see waiveFee's own comment). */
+  private async applyGatedWaiver(
+    business: BusinessDocument,
     booking: BookingDocument,
-    plan: {
-      type: "NO_SHOW_FEE" | "CANCELLATION_FEE";
-      amountCents: number;
-      idempotencyKey: string;
-      directSet: Record<string, unknown>;
-      nextStatus?: BookingStatus;
-    },
+    plan: FeeWaiverPlan,
     event: BookingEventHistoryEntry,
-    reason: string,
+    retried = false,
   ): Promise<BookingDocument> {
-    const dbSession = await mongoose.startSession();
-    let updated: BookingDocument | null = null;
-    let duplicateKey = false;
+    const gate = await this.penaltyCollection.inspectGate(plan.type, booking._id);
+    switch (gate.state) {
+      case "SUCCEEDED":
+        throw new BookingError("BOOKING_FEE_ALREADY_CHARGED", 409);
+      case "IN_PROGRESS":
+        throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
+      case "RECONCILIATION_REQUIRED":
+        throw new BookingError("BOOKING_FEE_RECONCILIATION_REQUIRED", 409);
+      case "WAIVED": {
+        // Idempotent: this exact waiver (possibly this same caller, retried after a dropped
+        // response) already won. Report the Booking's current state, not an error.
+        const current = await this.bookingRepository.findById(business._id, booking._id);
+        if (!current) throw new BookingError("BOOKING_NOT_FOUND", 404);
+        return current;
+      }
+      case "DEFINITIVE_FAILURE":
+        return this.convertFailedFeeToWaiver(business, booking, plan, event, gate.obligation);
+      case "NONE":
+        if (
+          plan.type === "CANCELLATION_FEE" &&
+          booking.cancellationOutcome?.settlementStatus !== "PENDING"
+        ) {
+          // A FAILED settlement with no obligation at all is a pre-P5 record whose charge
+          // outcome cannot be proven — never waived blind.
+          throw new BookingError("BOOKING_FEE_RECONCILIATION_REQUIRED", 409);
+        }
+        return this.insertFeeWaiver(business, booking, plan, event, retried);
+    }
+  }
 
+  /** No obligation exists yet: the WAIVED row is inserted under the canonical key in the SAME
+   * transaction as the Booking CAS, so a concurrent claim (same unique key, same booking
+   * document) and this waiver can never both commit. A lost race re-reads the gate once. */
+  private async insertFeeWaiver(
+    business: BusinessDocument,
+    booking: BookingDocument,
+    plan: FeeWaiverPlan,
+    event: BookingEventHistoryEntry,
+    retried: boolean,
+  ): Promise<BookingDocument> {
+    let duplicateKey = false;
+    let updated: BookingDocument | null = null;
     try {
-      await dbSession.withTransaction(async () => {
+      updated = await this.runWaiverTransaction(async (dbSession) => {
         try {
           await this.financialTransactionService.record(
             {
-              businessId,
+              businessId: business._id,
               bookingId: booking._id,
               businessClientId: booking.customer.businessClientId,
               customerUserId: booking.customer.customerUserId,
@@ -1699,38 +1782,105 @@ export class BookingLifecycleService {
               currency: booking.financials.currency,
               status: "WAIVED",
               idempotencyKey: plan.idempotencyKey,
-              metadata: { reason },
+              metadata: { reason: event.reason ?? "" },
             },
             dbSession,
           );
         } catch (error) {
-          if (this.isDuplicateIdempotencyKeyError(error)) {
-            duplicateKey = true;
-            // Deliberately swallowed here — the throw below aborts the transaction (nothing
-            // committed), and the actual conflict is resolved OUTSIDE it, in
-            // resolveWaiverConflict, once we know nothing from this attempt persisted.
-            throw error;
-          }
+          // Deliberately rethrown — the transaction aborts (nothing committed) and the gate is
+          // re-read outside it, once we know nothing from this attempt persisted.
+          if (isDuplicateLedgerKeyError(error)) duplicateKey = true;
           throw error;
         }
-
-        updated = await this.bookingRepository.casUpdate(
-          businessId,
-          booking._id,
-          [booking.status],
-          { set: plan.directSet, pushEvent: event },
-          dbSession,
-        );
-        if (!updated) {
-          throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
-        }
-
-        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
+        return this.applyWaiverBookingTransition(business, booking, plan, event, dbSession, {
+          ...(plan.type === "NO_SHOW_FEE"
+            ? { noShowChargeClaimedAt: { $exists: false } }
+            : { "cancellationOutcome.settlementStatus": "PENDING" }),
+        });
       });
     } catch (error) {
-      if (duplicateKey) {
-        return this.resolveWaiverConflict(businessId, booking, plan, event);
+      if (duplicateKey && !retried) {
+        return this.applyGatedWaiver(business, booking, plan, event, true);
       }
+      if (duplicateKey) throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
+      throw error;
+    }
+    return updated;
+  }
+
+  /** A definitive collection failure (P5 Rule 3) — converts that SAME FAILED obligation row to
+   * WAIVED (never a second ledger row under the key) and applies the Booking transition
+   * atomically. `settleFailedAsWaived` is CAS'd on FAILED, so this happens exactly once. */
+  private async convertFailedFeeToWaiver(
+    business: BusinessDocument,
+    booking: BookingDocument,
+    plan: FeeWaiverPlan,
+    event: BookingEventHistoryEntry,
+    obligation: BookingFinancialTransactionDocument,
+  ): Promise<BookingDocument> {
+    return this.runWaiverTransaction(async (dbSession) => {
+      const converted = await this.financialTransactionService.settleFailedAsWaived(
+        obligation._id,
+        dbSession,
+      );
+      if (!converted) {
+        // Someone else converted/claimed it between our read and this write.
+        throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
+      }
+      return this.applyWaiverBookingTransition(
+        business,
+        booking,
+        plan,
+        event,
+        dbSession,
+        plan.type === "CANCELLATION_FEE"
+          ? { "cancellationOutcome.settlementStatus": { $in: ["PENDING", "FAILED"] } }
+          : undefined,
+      );
+    });
+  }
+
+  private async applyWaiverBookingTransition(
+    business: BusinessDocument,
+    booking: BookingDocument,
+    plan: FeeWaiverPlan,
+    event: BookingEventHistoryEntry,
+    dbSession: ClientSession,
+    extraFilter: Record<string, unknown> | undefined,
+  ): Promise<BookingDocument> {
+    const updated = await this.bookingRepository.casUpdate(
+      business._id,
+      booking._id,
+      [booking.status],
+      { set: plan.directSet, pushEvent: event, ...(extraFilter ? { extraFilter } : {}) },
+      dbSession,
+    );
+    if (!updated) {
+      throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
+    }
+    await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
+    if (plan.type === "CANCELLATION_FEE") {
+      // P5 Rule 5 — the truthful "fee waived" follow-up, committed with the waiver itself.
+      await this.penaltyCollection.notifySettlement(
+        updated,
+        business,
+        { kind: "CANCELLATION_FEE", outcome: "WAIVED", amountCents: plan.amountCents },
+        dbSession,
+      );
+    }
+    return updated;
+  }
+
+  private async runWaiverTransaction(
+    work: (dbSession: ClientSession) => Promise<BookingDocument>,
+  ): Promise<BookingDocument> {
+    const dbSession = await mongoose.startSession();
+    let updated: BookingDocument | null = null;
+    try {
+      await dbSession.withTransaction(async () => {
+        updated = await work(dbSession);
+      });
+    } catch (error) {
       if (this.isTransactionUnsupported(error)) {
         throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
       }
@@ -1738,101 +1888,10 @@ export class BookingLifecycleService {
     } finally {
       await dbSession.endSession();
     }
-
     if (!updated) {
       throw new Error("Fee waiver failed without throwing");
     }
     return updated;
-  }
-
-  /**
-   * Reached only after `claimAndApplyWaiver`'s own ledger insert lost a duplicate-`idempotencyKey`
-   * race (the whole transaction aborted, so nothing from that attempt persisted) — decides the
-   * outcome from whatever row actually won the claim.
-   */
-  private async resolveWaiverConflict(
-    businessId: Types.ObjectId,
-    booking: BookingDocument,
-    plan: {
-      type: "NO_SHOW_FEE" | "CANCELLATION_FEE";
-      amountCents: number;
-      idempotencyKey: string;
-      directSet: Record<string, unknown>;
-      nextStatus?: BookingStatus;
-    },
-    event: BookingEventHistoryEntry,
-  ): Promise<BookingDocument> {
-    const existing = await this.financialTransactionService.findByIdempotencyKey(
-      plan.idempotencyKey,
-    );
-
-    if (!existing || existing.status === "PENDING") {
-      throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
-    }
-
-    if (existing.status === "WAIVED") {
-      // Idempotent: this exact waiver (possibly this same caller, retried after a dropped
-      // response) already won. Report the Booking's current state, not an error.
-      const current = await this.bookingRepository.findById(businessId, booking._id);
-      if (!current) {
-        throw new BookingError("BOOKING_NOT_FOUND", 404);
-      }
-      return current;
-    }
-
-    if (existing.status === "SUCCEEDED") {
-      throw new BookingError("BOOKING_FEE_ALREADY_CHARGED", 409);
-    }
-
-    // existing.status === "FAILED": a prior charge attempt definitively failed (nothing was
-    // ever collected) — the Business may still waive it now. Converts that SAME row (never a
-    // second ledger entry under the same key) and applies the Booking transition atomically.
-    const dbSession = await mongoose.startSession();
-    let updated: BookingDocument | null = null;
-
-    try {
-      await dbSession.withTransaction(async () => {
-        const converted = await this.financialTransactionService.settleFailedAsWaived(
-          existing._id,
-          dbSession,
-        );
-        if (!converted) {
-          // Someone else converted/claimed it between our read and this write.
-          throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
-        }
-
-        updated = await this.bookingRepository.casUpdate(
-          businessId,
-          booking._id,
-          [booking.status],
-          { set: plan.directSet, pushEvent: event },
-          dbSession,
-        );
-        if (!updated) {
-          throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
-        }
-
-        await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
-      });
-    } finally {
-      await dbSession.endSession();
-    }
-
-    if (!updated) {
-      throw new Error("Fee waiver conflict resolution failed without throwing");
-    }
-    return updated;
-  }
-
-  private isDuplicateIdempotencyKeyError(error: unknown): boolean {
-    return (
-      error instanceof Error &&
-      "details" in error &&
-      Array.isArray((error as { details?: unknown }).details) &&
-      (error as { details: Array<{ code?: string }> }).details.some(
-        (detail) => detail.code === "BOOKING_FINANCIAL_TRANSACTION_DUPLICATE_IDEMPOTENCY_KEY",
-      )
-    );
   }
 
   /** Business cancels the no-show resolution outright (e.g. the appointment is confirmed to
@@ -1853,6 +1912,13 @@ export class BookingLifecycleService {
     );
   }
 
+  /**
+   * P5 Rule 1 — the reversal is no longer a bare status CAS: it consults the canonical NO_SHOW_FEE
+   * obligation first and is refused while a charge is pending / in flight / UNKNOWN, or once a
+   * fee was collected (no automatic refund exists). It proceeds only with no obligation at all —
+   * then its CAS also requires `noShowChargeClaimedAt` absent, so it is atomic against a worker
+   * claim — or after a definitive collection failure.
+   */
   private async resolveNoShowByBusiness(
     actorUserId: string,
     actorRole: UserRole,
@@ -1867,17 +1933,27 @@ export class BookingLifecycleService {
     );
     const booking = await this.requireBookingForBusiness(business._id, bookingId, ["PENDING"]);
 
-    const updated = await this.bookingRepository.casUpdate(business._id, booking._id, ["PENDING"], {
-      set: { status: nextStatus },
-      pushEvent: {
-        type: "STATUS_CHANGED",
-        previousStatus: "PENDING",
-        nextStatus,
-        actorUserId: new Types.ObjectId(actorUserId),
-        actorRole: actorRole as BookingActorRole,
-        createdAt: new Date(),
-      },
-    });
+    let updated: BookingDocument | null = null;
+    for (let attempt = 0; attempt < 2 && !updated; attempt += 1) {
+      const gate = await this.penaltyCollection.inspectGate("NO_SHOW_FEE", booking._id);
+      this.assertNoShowReversible(gate);
+      updated = await this.bookingRepository.casUpdate(business._id, booking._id, ["PENDING"], {
+        set: { status: nextStatus },
+        pushEvent: {
+          type: "STATUS_CHANGED",
+          previousStatus: "PENDING",
+          nextStatus,
+          actorUserId: new Types.ObjectId(actorUserId),
+          actorRole: actorRole as BookingActorRole,
+          createdAt: new Date(),
+        },
+        ...(gate.state === "NONE"
+          ? { extraFilter: { noShowChargeClaimedAt: { $exists: false } } }
+          : {}),
+      });
+      // A CAS lost to a claim that committed after the gate read re-reads the gate once.
+      if (!updated && gate.state !== "NONE") break;
+    }
 
     if (!updated) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
@@ -1895,6 +1971,18 @@ export class BookingLifecycleService {
     }
 
     return updated;
+  }
+
+  private assertNoShowReversible(gate: PenaltyGate): void {
+    if (gate.state === "SUCCEEDED") {
+      throw new BookingError("BOOKING_NO_SHOW_FEE_ALREADY_CHARGED", 409);
+    }
+    if (gate.state === "IN_PROGRESS") {
+      throw new BookingError("BOOKING_FEE_CHARGE_IN_PROGRESS", 409);
+    }
+    if (gate.state === "RECONCILIATION_REQUIRED") {
+      throw new BookingError("BOOKING_FEE_RECONCILIATION_REQUIRED", 409);
+    }
   }
 
   private async releaseAllLines(

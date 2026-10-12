@@ -2,6 +2,10 @@ import type { Types } from "mongoose";
 import type Stripe from "stripe";
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import {
+  type PenaltyCollectionService,
+  PenaltyCorrelationError,
+} from "../booking/penalty-collection.service.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
@@ -14,6 +18,7 @@ import {
   parsePaymentIntentMetadata,
 } from "../payment/payment-intent-metadata.js";
 import type { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
+import { isPenaltyPurpose } from "../payment/penalty-attempt.js";
 import { ensureRefundAccounting } from "../payment/refund-accounting.js";
 import type { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import type { StripeWebhookEventRepository } from "./stripe-webhook-event.repository.js";
@@ -66,6 +71,10 @@ export class StripeWebhookService {
       "reconcileForPaymentAttempt"
     > &
       Partial<Pick<FinancialRelationshipService, "reconcile">>,
+    // P5 — settles a customer penalty PaymentIntent (CANCELLATION_FEE / NO_SHOW_FEE) through the
+    // SAME convergence the request/worker/recovery use, correlated by its PaymentAttempt — never
+    // by a pre-existing ledger providerReference. Optional trailing dep.
+    private readonly penaltyCollection?: Pick<PenaltyCollectionService, "convergeAttempt">,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -228,6 +237,16 @@ export class StripeWebhookService {
     ) {
       throw new InvestigationWebhookError("PaymentAttempt provider correlation mismatch");
     }
+    // P5 — a penalty PaymentIntent must carry its attempt's own purpose: a mismatch is corrupt
+    // correlation, retained for investigation before anything is recorded or settled.
+    if (
+      isPenaltyPurpose(attempt.purpose) &&
+      paymentIntent.metadata?.["purpose"] !== attempt.purpose
+    ) {
+      throw new InvestigationWebhookError(
+        "Penalty PaymentIntent purpose does not match its attempt",
+      );
+    }
     return attempt;
   }
 
@@ -241,6 +260,11 @@ export class StripeWebhookService {
       });
       if (storedAttempt && storedAttempt.providerStatus !== "SUCCEEDED") {
         throw new InvestigationWebhookError("PaymentAttempt terminal provider state conflict");
+      }
+      // P5 — a penalty success settles its obligation (exact PI as providerReference) BEFORE the
+      // processing-fee step below, which then finds that row like any other settled charge.
+      if (isPenaltyPurpose(attempt.purpose)) {
+        await this.convergePenalty(attempt._id, "SUCCEEDED");
       }
     }
     let metadata: ParsedPaymentIntentMetadata | undefined;
@@ -398,6 +422,11 @@ export class StripeWebhookService {
         providerStatus: "FAILED",
       });
       if (storedAttempt && storedAttempt.providerStatus !== "FAILED") return;
+      // P5 — penalty attempts never touch the FIRST relationship.
+      if (isPenaltyPurpose(attempt.purpose)) {
+        await this.convergePenalty(attempt._id, "FAILED");
+        return;
+      }
       await this.reconcileRelationship(attempt._id);
     }
     await this.settlePendingLedgerAsFailed(paymentIntent);
@@ -424,9 +453,43 @@ export class StripeWebhookService {
       if (storedAttempt && storedAttempt.providerStatus !== "CANCELED") {
         throw new InvestigationWebhookError("PaymentAttempt terminal provider state conflict");
       }
+      if (isPenaltyPurpose(attempt.purpose)) {
+        await this.convergePenalty(attempt._id, "FAILED");
+        return;
+      }
       await this.reconcileRelationship(attempt._id);
     }
     await this.settlePendingLedgerAsFailed(paymentIntent);
+  }
+
+  /**
+   * P5 — penalty convergence from a webhook (purpose already verified by findCorrelatedAttempt).
+   * A success that did not converge yet (another path holds the persistence lease, or a
+   * transient error) is retried by redelivery so the processing fee is still captured
+   * afterwards; a definitive local outcome that contradicts the provider is investigation,
+   * never a regression.
+   */
+  private async convergePenalty(
+    paymentAttemptId: Types.ObjectId,
+    expected: "SUCCEEDED" | "FAILED",
+  ): Promise<void> {
+    if (!this.penaltyCollection) {
+      throw new RetryableWebhookError("Penalty convergence is not available in this process");
+    }
+    let outcome: string;
+    try {
+      outcome = await this.penaltyCollection.convergeAttempt(paymentAttemptId);
+    } catch (error) {
+      if (error instanceof PenaltyCorrelationError) {
+        throw new InvestigationWebhookError(error.message);
+      }
+      throw new RetryableWebhookError(
+        error instanceof Error ? error.message : "Penalty convergence failed",
+      );
+    }
+    if (expected === "SUCCEEDED" && outcome !== "SUCCEEDED") {
+      throw new RetryableWebhookError("Penalty success is not converged yet");
+    }
   }
 
   private async settlePendingLedgerAsFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {

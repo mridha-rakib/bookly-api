@@ -481,15 +481,15 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
   it("a fee whose only charge attempt FAILED can still be waived afterward", async () => {
     const { owner, business, booking, customer } = await bookFirstBookingWithNoShowPolicy(80);
 
-    // Simulate a declined/removed card: strip the saved default payment method so
-    // chargeOffSession throws PAYMENT_METHOD_REQUIRED (mirrors payment.service.ts's own guard).
+    // Simulate a removed card: strip the saved default payment method — P5 records a definitive
+    // FAILED obligation with no PaymentAttempt (nothing can ever be dispatched for it).
     await CustomerPaymentProfileModel.updateOne(
       { userId: customer._id },
       { $unset: { defaultPaymentMethodId: "" } },
     ).exec();
 
     const outcome = await noShowService.autoResolve(booking._id);
-    expect(outcome).toBe("skipped_already_resolved");
+    expect(outcome).toBe("charge_failed");
 
     const afterFailedCharge = await bookingRepository.findByIdOnly(booking._id);
     expect(afterFailedCharge?.status).toBe("PENDING");

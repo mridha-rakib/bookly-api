@@ -39,6 +39,11 @@ import {
   renderPackageTerminatedEmail,
 } from "./templates/booking/package-terminated.template.js";
 import {
+  renderPenaltySettlementCustomerEmail,
+  renderPenaltySettlementOwnerEmail,
+} from "./templates/booking/penalty-settlement.template.js";
+import type { PenaltySettlementEmailData } from "./templates/booking/penalty-settlement-email-data.js";
+import {
   renderSessionEndReminderEmail,
   type SessionEndReminderEmailData,
 } from "./templates/booking/session-end-reminder.template.js";
@@ -106,6 +111,9 @@ export type EmailTemplateKey =
   | "NO_SHOW_CHARGED"
   | "NO_SHOW_WAIVED"
   | "NO_SHOW_CANCELLED"
+  // P5 — durable late-cancellation / no-show fee settlement follow-up
+  | "PENALTY_SETTLEMENT_CUSTOMER"
+  | "PENALTY_SETTLEMENT_OWNER"
   | "BUSINESS_REGISTERED"
   // Important staff notifications — assigned-booking lifecycle + team-access removal
   | "STAFF_BOOKING_CANCELLED"
@@ -155,6 +163,12 @@ const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> 
   NO_SHOW_CHARGED: asRenderer<NoShowEmailData>(renderNoShowChargedEmail),
   NO_SHOW_WAIVED: asRenderer<NoShowEmailData>(renderNoShowWaivedEmail),
   NO_SHOW_CANCELLED: asRenderer<NoShowEmailData>(renderNoShowCancelledEmail),
+  PENALTY_SETTLEMENT_CUSTOMER: asRenderer<PenaltySettlementEmailData>(
+    renderPenaltySettlementCustomerEmail,
+  ),
+  PENALTY_SETTLEMENT_OWNER: asRenderer<PenaltySettlementEmailData>(
+    renderPenaltySettlementOwnerEmail,
+  ),
   BUSINESS_REGISTERED: asRenderer<BusinessRegisteredEmailData>(renderBusinessRegisteredEmail),
   STAFF_BOOKING_CANCELLED: asRenderer<StaffBookingCancelledPayload>(
     renderStaffBookingCancelledEmail,

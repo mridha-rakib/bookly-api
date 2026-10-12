@@ -510,7 +510,8 @@ describe("database-backed Business Finance (Batch 7)", () => {
 
     paymentGateway.queueNextChargeOutcome("failed");
     const outcome = await noShowService.autoResolve(second.booking._id);
-    expect(outcome).toBe("skipped_already_resolved");
+    // P5 — the worker reports the definitive collection failure truthfully.
+    expect(outcome).toBe("charge_failed");
 
     const summary = await financeService.getSummary(
       String(owner._id),

@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
 import { BookingRepository } from "../modules/booking/booking.repository.js";
+import { createPenaltyCollectionService } from "../modules/booking/penalty-collection.factory.js";
 import { BookingFinancialTransactionRepository } from "../modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { createFinancialRelationshipService } from "../modules/client/financial-relationship.factory.js";
@@ -36,6 +37,12 @@ const buildService = (): MoneyRecoveryService => {
     attempts,
     refunds,
   );
+  const penaltyCollection = createPenaltyCollectionService({
+    paymentService,
+    financialTransactionService: financials,
+    bookingRepository,
+    packageProgressRepository,
+  });
   const relationshipService = createFinancialRelationshipService({
     paymentAttemptRepository: attempts,
     refundOperationRepository: refunds,
@@ -51,6 +58,7 @@ const buildService = (): MoneyRecoveryService => {
     packageProgressRepository,
     bookingRepository,
     relationshipService,
+    penaltyCollection,
   );
   return new MoneyRecoveryService(
     paymentService,
@@ -61,6 +69,7 @@ const buildService = (): MoneyRecoveryService => {
     webhookService,
     packageProgressRepository,
     relationshipService,
+    penaltyCollection,
   );
 };
 

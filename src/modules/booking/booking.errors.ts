@@ -57,6 +57,13 @@ const defaultMessages: Record<string, string> = {
   BOOKING_FEE_ALREADY_CHARGED: "This fee has already been charged and can no longer be waived",
   BOOKING_FEE_CHARGE_IN_PROGRESS:
     "A charge for this fee is already in progress — please try again shortly",
+  // P5 — a collected no-show fee is never refunded automatically, so the no-show stands.
+  BOOKING_NO_SHOW_FEE_ALREADY_CHARGED:
+    "The no-show fee has already been charged, so this no-show can no longer be cancelled",
+  // P5 — a pre-P5 penalty record whose provider outcome cannot be proven. Never auto-charged,
+  // never silently resolved: it needs manual reconciliation by support.
+  BOOKING_FEE_RECONCILIATION_REQUIRED:
+    "This fee's payment status needs manual reconciliation before it can be changed — please contact support",
   // P1 — another first booking/package purchase for this customer at this business is still
   // unresolved. Retryable: nothing was charged for this request. Deliberately does not say
   // "returning" — that is only true once the other operation actually completes.

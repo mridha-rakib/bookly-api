@@ -480,6 +480,15 @@ export type BookingDocument = {
    * the worker nor the "mark as no-show" action itself is implemented in this phase. */
   noShowStartedAt?: Date | undefined;
   noShowDeadlineAt?: Date | undefined;
+  /**
+   * P5 — set exactly once, atomically with the no-show penalty claim (status still PENDING): a
+   * charge obligation now exists for this no-show, so the overdue worker must never select or
+   * charge it again. While the booking stays PENDING (a definitively failed charge awaits manual
+   * waive/reversal) this is what separates "manual resolution required" from "eligible, not yet
+   * claimed". Absent on every booking that was never claimed (and on legacy bookings, which the
+   * worker marks lazily when it meets their pre-existing claim row).
+   */
+  noShowChargeClaimedAt?: Date | undefined;
   cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
   noShowEligibilitySnapshot?: BookingNoShowEligibilitySnapshot | undefined;
   sessionEndReminderSnapshot?: BookingSessionEndReminderSnapshot | undefined;
@@ -973,6 +982,7 @@ const bookingSchema = new Schema<BookingDocument>(
     eventHistory: { type: [bookingEventHistoryEntrySchema], required: true, default: [] },
     noShowStartedAt: { type: Date },
     noShowDeadlineAt: { type: Date },
+    noShowChargeClaimedAt: { type: Date },
     cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
     noShowEligibilitySnapshot: { type: bookingNoShowEligibilitySnapshotSchema },
     sessionEndReminderSnapshot: { type: bookingSessionEndReminderSnapshotSchema },

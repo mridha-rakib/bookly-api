@@ -132,8 +132,13 @@ export class BookingRepository {
    * HTTP caller must always go through `findById`/`findByIdForCustomer`'s ownership scoping).
    * The worker itself finds candidate ids via `findManyOverdueNoShows` below; this is the
    * single-document re-fetch it uses to re-verify current state right before acting. */
-  public async findByIdOnly(bookingId: Types.ObjectId | string): Promise<BookingDocument | null> {
-    return BookingModel.findOne({ _id: bookingId }).exec();
+  public async findByIdOnly(
+    bookingId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<BookingDocument | null> {
+    return BookingModel.findOne({ _id: bookingId }, undefined, {
+      ...(session ? { session } : {}),
+    }).exec();
   }
 
   /** The no-show worker's own bounded, index-backed query — relies entirely on the existing
@@ -146,9 +151,67 @@ export class BookingRepository {
     now: Date,
     limit: number,
   ): Promise<Array<{ _id: Types.ObjectId }>> {
-    return BookingModel.find({ status: "PENDING", noShowDeadlineAt: { $lte: now } }, { _id: 1 })
+    // P5 — a claimed no-show (charge obligation exists, possibly awaiting manual resolution) is
+    // never a candidate again, so stuck rows can no longer fill the batch and starve newer
+    // overdue no-shows. Oldest deadline first, deterministically (the partial index's own order).
+    return BookingModel.find(
+      {
+        status: "PENDING",
+        noShowDeadlineAt: { $lte: now },
+        noShowChargeClaimedAt: { $exists: false },
+      },
+      { _id: 1 },
+    )
+      .sort({ noShowDeadlineAt: 1, _id: 1 })
       .limit(limit)
       .exec();
+  }
+
+  /**
+   * P5 — the no-show penalty claim's booking half: stamps `noShowChargeClaimedAt` only while the
+   * booking is still PENDING and unclaimed, with the same session as the obligation insert, so
+   * "still PENDING" and "now claimed" commit as one atomic fact. A concurrent reversal, waiver or
+   * second worker either commits first (this CAS returns null) or loses to this one.
+   */
+  public async claimNoShowCharge(
+    bookingId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<BookingDocument | null> {
+    return BookingModel.findOneAndUpdate(
+      { _id: bookingId, status: "PENDING", noShowChargeClaimedAt: { $exists: false } },
+      { $set: { noShowChargeClaimedAt: new Date() } },
+      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
+    ).exec();
+  }
+
+  /**
+   * P5 — the cancellation penalty's booking settlement, written only by the penalty convergence
+   * (or the definitive no-card branch inside the cancellation transaction). CAS'd on
+   * LATE_CANCELLATION + settlement PENDING, so it is monotonic: SUCCEEDED/FAILED/WAIVED are never
+   * overwritten by a stale or duplicate writer.
+   */
+  public async settleCancellationPenalty(
+    bookingId: Types.ObjectId | string,
+    settlementStatus: "SUCCEEDED" | "FAILED",
+    settlementProviderReference: string | undefined,
+    session?: ClientSession,
+  ): Promise<BookingDocument | null> {
+    return BookingModel.findOneAndUpdate(
+      {
+        _id: bookingId,
+        status: "LATE_CANCELLATION",
+        "cancellationOutcome.settlementStatus": "PENDING",
+      },
+      {
+        $set: {
+          "cancellationOutcome.settlementStatus": settlementStatus,
+          ...(settlementProviderReference
+            ? { "cancellationOutcome.settlementProviderReference": settlementProviderReference }
+            : {}),
+        },
+      },
+      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
+    ).exec();
   }
 
   /**
@@ -318,8 +381,9 @@ export class BookingRepository {
     settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED",
     settlementProviderReference: string | undefined,
   ): Promise<BookingDocument | null> {
+    // P5 — WAIVED is terminal too: a late provider result can never overwrite a recorded waiver.
     return BookingModel.findOneAndUpdate(
-      { _id: bookingId, "cancellationOutcome.settlementStatus": { $ne: "SUCCEEDED" } },
+      { _id: bookingId, "cancellationOutcome.settlementStatus": { $nin: ["SUCCEEDED", "WAIVED"] } },
       {
         $set: {
           "cancellationOutcome.settlementStatus": settlementStatus,

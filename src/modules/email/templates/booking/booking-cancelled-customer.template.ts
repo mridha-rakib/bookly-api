@@ -41,8 +41,19 @@ const financialLinesText = (data: CancellationEmailData): string[] => {
       lines.push(`Cancellation fee: ${f.cancellationFeeFormatted}`);
       if (f.hasDepositApplied)
         lines.push(`Applied from your deposit already paid: ${f.depositAppliedFormatted}`);
-      if (f.hasAdditionalCharge)
+      if (f.hasAdditionalCharge) {
         lines.push(`Additional amount charged: ${f.additionalChargeFormatted}`);
+      } else if (f.hasAdditionalChargeDue) {
+        // P5 — truthful staged wording: this email is sent when the cancellation commits, before
+        // the card charge settles; the settlement follow-up reports the final outcome.
+        lines.push(
+          f.settlementStatus === "WAIVED"
+            ? `The additional amount of ${f.additionalChargeFormatted} has been waived.`
+            : f.settlementStatus === "FAILED"
+              ? `Additional amount of ${f.additionalChargeFormatted}: collection failed — no successful charge has been confirmed.`
+              : `Additional amount due: ${f.additionalChargeFormatted} — fee collection pending.`,
+        );
+      }
     } else {
       lines.push("No cancellation fee applies to this cancellation.");
     }

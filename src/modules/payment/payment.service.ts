@@ -13,6 +13,7 @@ import type {
 } from "./payment.types.js";
 import { isProviderCreationClosed, type PaymentAttemptDocument } from "./payment-attempt.model.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import { isPenaltyPurpose, type PenaltyPurpose } from "./penalty-attempt.js";
 import type { CreateRefundOperationInput } from "./refund-operation.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
 
@@ -208,30 +209,113 @@ export class PaymentService {
     });
   }
 
-  /** Cancellation/no-show auto-charges — the customer is not present, so this is always
-   * off-session against the previously-saved default payment method. */
-  public async chargeOffSession(input: {
-    userId: Types.ObjectId | string;
-    amountCents: number;
-    idempotencyKey: string;
-    metadata: Record<string, string>;
-  }): Promise<PaymentIntentResult> {
-    const profile = await this.profileRepository.findByUserId(input.userId);
-    const paymentMethodId = profile?.defaultPaymentMethodId;
-    if (!profile || !paymentMethodId) {
-      throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
-    }
-
-    return this.gateway.createAndConfirmPaymentIntent({
+  /**
+   * P5 — the customer's current saved card for an off-session penalty charge (single-card
+   * semantics: the profile's default payment method, read when the charge is prepared and again
+   * when it is dispatched). `null` means no usable card: the penalty fails definitively without
+   * any provider object.
+   */
+  public async resolvePenaltyPaymentSource(
+    userId: Types.ObjectId | string,
+  ): Promise<{ stripeCustomerId: string; paymentMethodId: string } | null> {
+    const profile = await this.profileRepository.findByUserId(userId);
+    if (!profile?.defaultPaymentMethodId) return null;
+    return {
       stripeCustomerId: profile.stripeCustomerId,
-      paymentMethodId,
-      amountCents: input.amountCents,
-      currency: "eur",
-      idempotencyKey: input.idempotencyKey,
-      offSession: true,
-      saveForFutureUse: false,
-      metadata: input.metadata,
-    });
+      paymentMethodId: profile.defaultPaymentMethodId,
+    };
+  }
+
+  /**
+   * P5 — the durable PaymentAttempt for one penalty obligation, written inside the caller's
+   * lifecycle transaction (so the obligation and its attempt commit together, before any
+   * provider call). No FIRST contract, classification or product kind is ever attached.
+   */
+  public async preparePenaltyAttempt(
+    input: {
+      logicalIdempotencyKey: string;
+      purpose: PenaltyPurpose;
+      customerUserId: Types.ObjectId | string;
+      businessId: Types.ObjectId | string;
+      bookingId: Types.ObjectId | string;
+      businessClientId: Types.ObjectId | string;
+      amountCents: number;
+      providerCustomerId: string;
+    },
+    session: ClientSession,
+  ): Promise<PaymentAttemptDocument> {
+    const { attempt } = await this.paymentAttemptRepository.createOrResumeWithDisposition(
+      {
+        logicalIdempotencyKey: input.logicalIdempotencyKey,
+        customerUserId: input.customerUserId,
+        businessId: input.businessId,
+        bookingId: input.bookingId,
+        businessClientId: input.businessClientId,
+        purpose: input.purpose,
+        currency: "EUR",
+        expectedAmountCents: input.amountCents,
+        providerCustomerId: input.providerCustomerId,
+      },
+      session,
+    );
+    return attempt;
+  }
+
+  /**
+   * P5 — sends the ONE off-session provider request of a prepared penalty attempt, through the
+   * same durable path as checkout (`payment-attempt:<id>` Stripe idempotency, attempt id in the
+   * metadata, any throw recorded as UNKNOWN). Dispatches only from NOT_CREATED with no recorded
+   * PaymentIntent: an UNKNOWN, recorded or closed attempt is never sent again — recovery resolves
+   * it against the same provider object instead.
+   */
+  public async dispatchPenaltyAttempt(
+    paymentAttemptId: Types.ObjectId | string,
+    input: { stripeCustomerId: string; paymentMethodId: string; metadata: Record<string, string> },
+  ): Promise<PaymentAttemptDocument> {
+    const attempt = await this.paymentAttemptRepository.findById(paymentAttemptId);
+    if (!attempt || !isPenaltyPurpose(attempt.purpose)) {
+      throw new PaymentError("PAYMENT_FAILED", 404);
+    }
+    if (
+      attempt.providerPaymentIntentId ||
+      attempt.providerStatus !== "NOT_CREATED" ||
+      isProviderCreationClosed(attempt) ||
+      attempt.providerCustomerId !== input.stripeCustomerId
+    ) {
+      return attempt;
+    }
+    const result = await this.createProviderPaymentIntent(
+      {
+        stripeCustomerId: input.stripeCustomerId,
+        paymentMethodId: input.paymentMethodId,
+        amountCents: attempt.expectedAmountCents,
+        currency: attempt.currency,
+        idempotencyKey: attempt.logicalIdempotencyKey,
+        offSession: true,
+        saveForFutureUse: false,
+        metadata: input.metadata,
+      },
+      attempt,
+    );
+    return this.paymentAttemptRepository.recordProviderResult(
+      attempt._id,
+      this.toProviderResultRecord(result),
+    );
+  }
+
+  public async findPaymentAttemptById(paymentAttemptId: Types.ObjectId | string) {
+    return this.paymentAttemptRepository.findById(paymentAttemptId);
+  }
+
+  public async findPaymentAttemptByLogicalKey(key: string, session?: ClientSession) {
+    return this.paymentAttemptRepository.findByLogicalKey(key, session);
+  }
+
+  public async markPenaltyFailureConverged(
+    paymentAttemptId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<boolean> {
+    return this.paymentAttemptRepository.markPenaltyFailureConverged(paymentAttemptId, session);
   }
 
   public async refund(input: {

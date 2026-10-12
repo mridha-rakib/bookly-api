@@ -54,8 +54,10 @@ export type ListByBusinessIdInput = {
 };
 
 export class BookingFinancialTransactionRepository {
-  public findById(id: Types.ObjectId | string) {
-    return BookingFinancialTransactionModel.findById(id).exec();
+  public findById(id: Types.ObjectId | string, session?: ClientSession) {
+    return BookingFinancialTransactionModel.findById(id, undefined, {
+      ...(session ? { session } : {}),
+    }).exec();
   }
 
   /** Only a confirmed provider refund may repair its own failed accounting projection. */
@@ -115,13 +117,40 @@ export class BookingFinancialTransactionRepository {
     ).exec();
   }
 
+  /**
+   * P5 — settles a durable penalty obligation (CANCELLATION_FEE / NO_SHOW_FEE) from its provider
+   * PaymentAttempt, in the same narrow spirit as `confirmRefund`: PENDING -> SUCCEEDED records
+   * the exact PaymentIntent as `providerReference`; PENDING -> FAILED records a definitive
+   * failure. CAS'd on PENDING, so SUCCEEDED never regresses, WAIVED is never overwritten and a
+   * FAILED row can only ever become WAIVED (settleFailedAsWaived, the manual waive path).
+   */
+  public async settlePenaltyObligation(
+    id: Types.ObjectId | string,
+    outcome: { status: "SUCCEEDED"; providerReference: string } | { status: "FAILED" },
+    session?: ClientSession,
+  ): Promise<BookingFinancialTransactionDocument | null> {
+    return BookingFinancialTransactionModel.findOneAndUpdate(
+      { _id: id, type: { $in: ["CANCELLATION_FEE", "NO_SHOW_FEE"] }, status: "PENDING" },
+      {
+        $set:
+          outcome.status === "SUCCEEDED"
+            ? { status: "SUCCEEDED", providerReference: outcome.providerReference }
+            : { status: "FAILED" },
+      },
+      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
+    ).exec();
+  }
+
   /** Looks up the single ledger row claiming a given idempotencyKey — used by callers (the
    * no-show worker's charge branch, BookingLifecycleService.waiveFee) after their own INSERT
    * lost a duplicate-key race, to decide what the winning row actually settled as. */
   public async findByIdempotencyKey(
     idempotencyKey: string,
+    session?: ClientSession,
   ): Promise<BookingFinancialTransactionDocument | null> {
-    return BookingFinancialTransactionModel.findOne({ idempotencyKey }).exec();
+    return BookingFinancialTransactionModel.findOne({ idempotencyKey }, undefined, {
+      ...(session ? { session } : {}),
+    }).exec();
   }
 
   /** A Booking's full financial history in creation order — inherently small and bounded

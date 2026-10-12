@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import {
@@ -24,6 +25,7 @@ export type NoShowNotificationPort = {
   notifyNoShowCharged(
     booking: BookingDocument,
     context: { businessName: string; amounts: NoShowChargedAmounts },
+    session?: ClientSession,
   ): Promise<void>;
   notifyNoShowWaived(booking: BookingDocument, context: { businessName: string }): Promise<void>;
   notifyNoShowCancelled(booking: BookingDocument, context: { businessName: string }): Promise<void>;
@@ -34,7 +36,9 @@ export type NoShowNotificationPort = {
  *   CHARGED   — after `NoShowResolutionService.autoResolve` confirms a SUCCEEDED card charge
  *   WAIVED    — status NO_SHOW_WAIVED (business waiver or the auto-resolver's no-charge branches)
  *   CANCELLED — status NO_SHOW_CANCELLED (`cancelNoShowByBusiness`)
- * Never on `markNoShow` / timer start / a failed charge. Never throws.
+ * Never on `markNoShow` / timer start / a failed charge. Never throws — except inside a
+ * caller's transaction (P5: CHARGED is enqueued with the penalty settlement itself), where an
+ * enqueue failure must abort that settlement rather than let the two diverge.
  */
 export class NoShowNotifier implements NoShowNotificationPort {
   public constructor(private readonly emailOutbox: OutboxEnqueue) {}
@@ -42,8 +46,9 @@ export class NoShowNotifier implements NoShowNotificationPort {
   public notifyNoShowCharged(
     booking: BookingDocument,
     context: { businessName: string; amounts: NoShowChargedAmounts },
+    session?: ClientSession,
   ): Promise<void> {
-    return this.enqueue(booking, "CHARGED", context.businessName, context.amounts);
+    return this.enqueue(booking, "CHARGED", context.businessName, context.amounts, session);
   }
 
   public notifyNoShowWaived(
@@ -65,6 +70,7 @@ export class NoShowNotifier implements NoShowNotificationPort {
     outcome: NoShowOutcome,
     businessName: string,
     amounts?: NoShowChargedAmounts,
+    session?: ClientSession,
   ): Promise<void> {
     try {
       const recipient = normalizeRecipient(booking.customer.contact.normalizedEmail);
@@ -81,13 +87,17 @@ export class NoShowNotifier implements NoShowNotificationPort {
         ...(amounts ? { amounts } : {}),
       });
       const templateKey = TEMPLATE_BY_OUTCOME[outcome];
-      await this.emailOutbox.enqueue({
-        eventKey: `${templateKey}:${String(booking._id)}`,
-        templateKey,
-        recipient,
-        payload: data as unknown as Record<string, unknown>,
-      });
+      await this.emailOutbox.enqueue(
+        {
+          eventKey: `${templateKey}:${String(booking._id)}`,
+          templateKey,
+          recipient,
+          payload: data as unknown as Record<string, unknown>,
+        },
+        session,
+      );
     } catch (error) {
+      if (session) throw error;
       logger.error(
         { err: error, bookingId: String(booking._id), outcome },
         "Failed to enqueue no-show notification (the no-show outcome is unaffected)",

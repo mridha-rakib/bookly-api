@@ -1,5 +1,6 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
+import { logger } from "../../config/logger.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
@@ -8,15 +9,26 @@ import {
   packageSessionOutcomeForBookingStatus,
 } from "../package-progress/package-progress.rules.js";
 import type { PaymentService } from "../payment/payment.service.js";
-import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
 import type { BookingDocument, BookingEventHistoryEntry } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
+import {
+  computeNoShowPenalty,
+  isPenaltyCollectible,
+  PenaltyCollectionService,
+} from "./penalty-collection.service.js";
 
+/** `charge_failed` — the one durable attempt definitively failed (or no usable card): the
+ * booking stays PENDING, claimed, for manual resolution. `charge_pending` — the provider outcome
+ * is not confirmed yet; recovery reconciles the same attempt. `error` — the item threw and was
+ * isolated so the rest of the batch still ran. */
 export type NoShowResolutionOutcome =
   | "charged"
+  | "charge_failed"
+  | "charge_pending"
   | "waived_no_policy"
   | "waived_no_charge_possible"
-  | "skipped_already_resolved";
+  | "skipped_already_resolved"
+  | "error";
 
 /**
  * The no-show AUTO-resolution processor (Batch 4, Phase 8) — deliberately separate from
@@ -55,6 +67,7 @@ export type NoShowResolutionNotificationPort = {
         additionalChargeCents: number;
       };
     },
+    session?: ClientSession,
   ): Promise<void>;
   notifyNoShowWaived(booking: BookingDocument, context: { businessName: string }): Promise<void>;
 };
@@ -63,7 +76,7 @@ export class NoShowResolutionService {
   public constructor(
     private readonly bookingRepository: BookingRepository,
     private readonly businessRepository: BusinessRepository,
-    private readonly paymentService: PaymentService,
+    paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
     // Stage D mailing — same optional-trailing pattern as elsewhere. Absent in the integration
     // suites that construct this service directly.
@@ -76,6 +89,16 @@ export class NoShowResolutionService {
       PackageProgressRepository,
       "resolveSessionOnTerminalStatus"
     >,
+    // P5 — durable penalty collection (claim, single attempt, shared convergence). Defaults to
+    // one built from the dependencies above; production passes the fully wired instance.
+    private readonly penaltyCollection: PenaltyCollectionService = new PenaltyCollectionService({
+      paymentService,
+      financialTransactionService,
+      bookingRepository,
+      businessRepository,
+      noShowNotifier,
+      packageProgressRepository,
+    }),
   ) {}
 
   /** Best-effort, non-transactional (matching this worker's own existing write style — see
@@ -97,12 +120,11 @@ export class NoShowResolutionService {
    *  - The "nothing to charge" branches (no policy / no possible charge) use
    *    `BookingRepository.casUpdate`'s own CAS-on-status guarantee — only one concurrent caller
    *    can ever win the `PENDING -> NO_SHOW_WAIVED` transition.
-   *  - The "attempt a real charge" branch claims FIRST via the ledger's existing unique
-   *    `idempotencyKey` index (`booking-financial-transaction.model.ts`) — the exact same
-   *    proven primitive this codebase already uses for retry-safe charges — before ever calling
-   *    Stripe, so two workers racing the same overdue Booking can never both attempt the charge;
-   *    the loser's `record()` call throws a duplicate-key-mapped error and this method returns
-   *    `skipped_already_resolved`.
+   *  - The "attempt a real charge" branch (P5) claims FIRST in one transaction: a CAS on the
+   *    booking (still PENDING, `noShowChargeClaimedAt` absent) plus the obligation's unique
+   *    ledger `idempotencyKey`, before ever calling Stripe — so two workers racing the same
+   *    overdue Booking can never both attempt the charge, and a reversal/waiver that committed
+   *    first always wins. The loser returns `skipped_already_resolved`.
    * Never scans the full Booking collection — the caller (`runOnce`) already selected candidate
    * ids via the index-backed `findManyOverdueNoShows`; this method re-fetches and re-verifies
    * the SINGLE document fresh, so a stale batch read never drives an action.
@@ -113,22 +135,17 @@ export class NoShowResolutionService {
       !booking ||
       booking.status !== "PENDING" ||
       !booking.noShowDeadlineAt ||
-      booking.noShowDeadlineAt.getTime() > Date.now()
+      booking.noShowDeadlineAt.getTime() > Date.now() ||
+      booking.noShowChargeClaimedAt
     ) {
       return "skipped_already_resolved";
     }
 
     // Package rule (confirmed): "the lost session IS the penalty" — a Package-linked no-show
     // (the purchase session OR a redeemed session) never carries an additional base-service
-    // percentage fee. Forcing `noShowPercentage` to undefined here reuses the EXISTING
-    // "nothing chargeable" branch below verbatim (no new code path, no Stripe call ever
-    // attempted) rather than inventing a second no-show outcome.
-    const noShowPercentage = isPackageLinkedBooking(booking)
-      ? undefined
-      : booking.cancellationPolicySnapshot?.noShowPercentage;
-    const grossFeeCents = noShowPercentage
-      ? Math.round((booking.financials.eligiblePlatformFeeBasisCents * noShowPercentage) / 100)
-      : 0;
+    // percentage fee (computeNoShowPenalty forces no percentage), which reuses the EXISTING
+    // "nothing chargeable" branch below verbatim (no Stripe call ever attempted).
+    //
     // Nets against the deposit already collected at booking time — ledgered as PLATFORM_FEE
     // (first booking) OR DEPOSIT (returning booking, Batch 6.5 correction: this customer still
     // paid a real deposit online even though Bookly didn't keep it as platform revenue — the
@@ -137,20 +154,16 @@ export class NoShowResolutionService {
     // BookingFinancialTransactionService.findSucceededUpfrontPayment and
     // BookingCancellationOutcome's own doc comment in booking.model.ts for the exact formula.
     // Only the shortfall beyond the already-held deposit is ever newly charged here.
+    const noShowPercentage = computeNoShowPenalty(booking, 0).noShowPercentage;
     const upfrontPayment = noShowPercentage
       ? await this.financialTransactionService.findSucceededUpfrontPayment(booking._id)
       : undefined;
-    const amountCents = Math.max(0, grossFeeCents - (upfrontPayment?.amountCents ?? 0));
+    const penalty = computeNoShowPenalty(booking, upfrontPayment?.amountCents ?? 0);
 
     // Nothing chargeable: no policy was ever snapshotted for this Business at booking time, no
     // possible charge amount, a MANUAL Booking (no Stripe integration by design — rule #8), or
     // no linked Customer identity to charge (should not happen for BOOKLY_MANAGED, defensive).
-    if (
-      !noShowPercentage ||
-      amountCents <= 0 ||
-      booking.source === "MANUAL" ||
-      !booking.customer.customerUserId
-    ) {
+    if (!noShowPercentage || penalty.amountCents <= 0 || !isPenaltyCollectible(booking)) {
       const waived = await this.transitionViaOwner(booking, "NO_SHOW_WAIVED", {
         note: isPackageLinkedBooking(booking)
           ? "Auto-resolved: Package base-service no-show — the forfeited session is the only penalty, no additional fee applies"
@@ -180,86 +193,28 @@ export class NoShowResolutionService {
         : "skipped_already_resolved";
     }
 
-    const idempotencyKey = `no-show:${String(booking._id)}`;
-    let claim: { _id: Types.ObjectId };
-    try {
-      claim = await this.financialTransactionService.record({
-        businessId: booking.businessId,
-        bookingId: booking._id,
-        businessClientId: booking.customer.businessClientId,
-        customerUserId: booking.customer.customerUserId,
-        type: "NO_SHOW_FEE",
-        direction: "DEBIT",
-        amountCents,
-        currency: booking.financials.currency,
-        status: "PENDING",
-        idempotencyKey,
-      });
-    } catch {
-      // Another worker instance already claimed this Booking's resolution.
+    // P5 — the claim is ONE transaction: the booking must still be PENDING and unclaimed while
+    // `noShowChargeClaimedAt`, the PENDING NO_SHOW_FEE obligation and its single PaymentAttempt
+    // are written. A concurrent worker, waiver or reversal either commits first (no charge) or
+    // loses to this claim. The provider call happens only after commit.
+    const claim = await this.penaltyCollection.claimNoShowPenalty(booking, penalty);
+    if (!claim) {
       return "skipped_already_resolved";
     }
-
-    let succeeded = false;
-    let providerReference: string | undefined;
-    try {
-      const result = await this.paymentService.chargeOffSession({
-        userId: booking.customer.customerUserId,
-        amountCents,
-        idempotencyKey,
-        metadata: buildPaymentIntentMetadata({
-          bookingId: String(booking._id),
-          businessId: String(booking.businessId),
-          businessClientId: String(booking.customer.businessClientId),
-          purpose: "NO_SHOW_FEE",
-          preTaxChargeCents: amountCents,
-          taxCents: 0,
-          chargedAmountCents: amountCents,
-          taxMode: "PRE_ACTIVATION",
-        }),
-      });
-      providerReference = result.paymentIntentId;
-      succeeded = result.status === "succeeded";
-    } catch {
-      succeeded = false;
+    if (!claim.attempt) {
+      // No usable saved card: the obligation is definitively FAILED (nothing was ever sent);
+      // the booking stays PENDING, claimed, awaiting the Business's waive/reversal.
+      return "charge_failed";
     }
 
-    // Settle the PENDING ledger row this claim created — the one narrow allowed mutation (see
-    // BookingFinancialTransactionRepository.updateStatus's own comment).
-    await this.financialTransactionService.settleStatus(
-      claim._id,
-      succeeded ? "SUCCEEDED" : "FAILED",
-    );
-
-    if (!succeeded) {
-      // The charge genuinely failed (declined, no valid card, etc.) — the Booking stays PENDING
-      // (never falsely marked NO_SHOW_CHARGED — see this module's own doc comment and
-      // BookingLifecycleService's parallel cancellation-fee discipline). A human must waive or
-      // cancel it manually; no automatic retry/dunning is built this batch.
-      return "skipped_already_resolved";
-    }
-
-    const charged = await this.transitionViaOwner(booking, "NO_SHOW_CHARGED", {
-      note: providerReference ? `Charged via ${providerReference}` : undefined,
-    });
-    if (charged) {
-      await this.syncPackageSessionOnResolvedNoShow(charged);
-    }
-
-    // Stage D — the customer NO_SHOW_CHARGED email, only after the charge SUCCEEDED and the
-    // status transition won its CAS. Amounts are this method's OWN already-computed domain
-    // values — the notifier/template runs no formula and applies no clamp.
-    if (charged && noShowPercentage) {
-      await this.dispatchNoShowCharged(charged, {
-        noShowPercentage,
-        eligibleBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
-        grossFeeCents,
-        upfrontAppliedCents: upfrontPayment?.amountCents ?? 0,
-        additionalChargeCents: amountCents,
-      });
-    }
-
-    return "charged";
+    // One durable off-session attempt, converged through the shared penalty logic: SUCCEEDED
+    // moves the booking to NO_SHOW_CHARGED (and sends the CHARGED email) atomically with the
+    // ledger settlement; a definitive failure leaves it PENDING for manual resolution and is
+    // never charged again; an ambiguous outcome stays recoverable and is never re-dispatched.
+    const outcome = await this.penaltyCollection.collect(claim.obligation._id);
+    if (outcome === "SUCCEEDED") return "charged";
+    if (outcome === "FAILED") return "charge_failed";
+    return "charge_pending";
   }
 
   private async dispatchNoShowWaived(booking: BookingDocument): Promise<void> {
@@ -272,26 +227,6 @@ export class NoShowResolutionService {
     });
   }
 
-  private async dispatchNoShowCharged(
-    booking: BookingDocument,
-    amounts: {
-      noShowPercentage: number;
-      eligibleBasisCents: number;
-      grossFeeCents: number;
-      upfrontAppliedCents: number;
-      additionalChargeCents: number;
-    },
-  ): Promise<void> {
-    if (!this.noShowNotifier) {
-      return;
-    }
-    const business = await this.businessRepository.findById(booking.businessId);
-    await this.noShowNotifier.notifyNoShowCharged(booking, {
-      businessName: business?.name ?? "the business",
-      amounts,
-    });
-  }
-
   /** Bounded, index-backed batch entry point — see BookingRepository.findManyOverdueNoShows's
    * own comment for why this never scans the full collection. */
   public async runOnce(batchSize: number): Promise<Record<NoShowResolutionOutcome, number>> {
@@ -300,14 +235,27 @@ export class NoShowResolutionService {
 
     const counts: Record<NoShowResolutionOutcome, number> = {
       charged: 0,
+      charge_failed: 0,
+      charge_pending: 0,
       waived_no_policy: 0,
       waived_no_charge_possible: 0,
       skipped_already_resolved: 0,
+      error: 0,
     };
 
+    // P5 — per-item isolation: one booking that throws (provider, database or data problem) is
+    // reported and skipped; every other eligible overdue no-show in the batch is still processed.
     for (const candidate of candidates) {
-      const outcome = await this.autoResolve(candidate._id);
-      counts[outcome] += 1;
+      try {
+        const outcome = await this.autoResolve(candidate._id);
+        counts[outcome] += 1;
+      } catch (error) {
+        counts.error += 1;
+        logger.error(
+          { err: error, bookingId: String(candidate._id) },
+          "No-show worker item failed — continuing with the rest of the batch",
+        );
+      }
     }
 
     return counts;
@@ -315,7 +263,7 @@ export class NoShowResolutionService {
 
   private async transitionViaOwner(
     booking: BookingDocument,
-    nextStatus: "NO_SHOW_WAIVED" | "NO_SHOW_CHARGED",
+    nextStatus: "NO_SHOW_WAIVED",
     extra: { note?: string | undefined },
   ): Promise<BookingDocument | null> {
     const business = await this.businessRepository.findById(booking.businessId);
@@ -333,9 +281,12 @@ export class NoShowResolutionService {
       createdAt: new Date(),
     };
 
+    // Never on a claimed booking: once a charge obligation exists only the penalty gate may
+    // resolve it (P5).
     return this.bookingRepository.casUpdate(booking.businessId, booking._id, ["PENDING"], {
       set: { status: nextStatus },
       pushEvent: event,
+      extraFilter: { noShowChargeClaimedAt: { $exists: false } },
     });
   }
 }

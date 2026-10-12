@@ -35,6 +35,12 @@ const settlementLine = (data: CancellationEmailData): string | undefined => {
     if (f.settlementStatus === "FAILED") {
       return `Cancellation fee ${f.cancellationFeeFormatted} classified — the additional card charge did not go through and is flagged for manual follow-up.`;
     }
+    if (f.settlementStatus === "WAIVED" && f.hasAdditionalChargeDue) {
+      return `Cancellation fee ${f.cancellationFeeFormatted} classified — the additional ${f.additionalChargeFormatted} was waived.`;
+    }
+    if (f.settlementStatus === "PENDING" && f.hasAdditionalChargeDue) {
+      return `Cancellation fee ${f.cancellationFeeFormatted} classified — collection of the additional ${f.additionalChargeFormatted} is pending.`;
+    }
     return `Cancellation fee ${f.cancellationFeeFormatted} classified.`;
   }
   return "No upfront payment was held, so no refund was required.";

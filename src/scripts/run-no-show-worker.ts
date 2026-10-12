@@ -5,6 +5,7 @@ import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
 import { BookingRepository } from "../modules/booking/booking.repository.js";
 import { NoShowResolutionService } from "../modules/booking/no-show-resolution.service.js";
+import { createPenaltyCollectionService } from "../modules/booking/penalty-collection.factory.js";
 import { BookingFinancialTransactionRepository } from "../modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BusinessRepository } from "../modules/business/business.repository.js";
@@ -48,13 +49,21 @@ const buildService = (): NoShowResolutionService => {
     new BookingFinancialTransactionRepository(),
   );
 
+  const packageProgressRepository = new PackageProgressRepository();
   return new NoShowResolutionService(
     bookingRepository,
     businessRepository,
     paymentService,
     financialTransactionService,
     new NoShowNotifier(new EmailOutboxService()),
-    new PackageProgressRepository(),
+    packageProgressRepository,
+    createPenaltyCollectionService({
+      paymentService,
+      financialTransactionService,
+      bookingRepository,
+      businessRepository,
+      packageProgressRepository,
+    }),
   );
 };
 

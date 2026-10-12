@@ -90,6 +90,7 @@ import { BookingService } from "./booking.service.js";
 import { BookingCreationService } from "./booking-creation.service.js";
 import { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "./booking-lifecycle.service.js";
+import { createPenaltyCollectionService } from "./penalty-collection.factory.js";
 
 const buildController = (): BookingController => {
   const businessRepository = new BusinessRepository();
@@ -219,6 +220,16 @@ const buildController = (): BookingController => {
     appointmentReminderScheduler,
     new BookingRescheduledCustomerNotifier(new EmailOutboxService()),
     packageProgressRepository,
+    undefined,
+    undefined,
+    createPenaltyCollectionService({
+      paymentService,
+      financialTransactionService,
+      bookingRepository,
+      businessRepository,
+      packageProgressRepository,
+      userRepository,
+    }),
   );
 
   return new BookingController(bookingService, creationService, lifecycleService);

@@ -9,6 +9,12 @@ import {
   type PaymentAttemptProviderStatus,
   PROVIDER_NOT_CREATED,
 } from "./payment-attempt.model.js";
+import {
+  isPenaltyPurpose,
+  PENALTY_ATTEMPT_KEY_PREFIX,
+  PENALTY_DEFINITIVE_FAILURE_STATUSES,
+  PENALTY_PURPOSES,
+} from "./penalty-attempt.js";
 
 export type CreatePaymentAttemptInput = {
   logicalIdempotencyKey: string;
@@ -33,7 +39,16 @@ export class PaymentAttemptRepository {
 
   public async createOrResumeWithDisposition(
     input: CreatePaymentAttemptInput,
+    session?: ClientSession,
   ): Promise<{ attempt: PaymentAttemptDocument; isNew: boolean }> {
+    // P5 — the penalty namespace is server-only: a client-supplied checkout key can never occupy
+    // it, and a penalty attempt can never use a client-shaped key.
+    if (
+      input.logicalIdempotencyKey.startsWith(PENALTY_ATTEMPT_KEY_PREFIX) !==
+      isPenaltyPurpose(input.purpose)
+    ) {
+      throw new PaymentError("PAYMENT_IDEMPOTENCY_CONFLICT", 409);
+    }
     try {
       const attempt = await new PaymentAttemptModel({
         ...input,
@@ -47,7 +62,7 @@ export class PaymentAttemptRepository {
           ? { businessClientId: new Types.ObjectId(input.businessClientId) }
           : {}),
         currency: input.currency.toUpperCase(),
-      }).save();
+      }).save(session ? { session } : undefined);
       return { attempt, isNew: true };
     } catch (error) {
       if (!this.isDuplicateKeyError(error)) throw error;
@@ -63,8 +78,13 @@ export class PaymentAttemptRepository {
     return PaymentAttemptModel.findById(id).exec();
   }
 
-  public async findByLogicalKey(key: string): Promise<PaymentAttemptDocument | null> {
-    return PaymentAttemptModel.findOne({ logicalIdempotencyKey: key }).exec();
+  public async findByLogicalKey(
+    key: string,
+    session?: ClientSession,
+  ): Promise<PaymentAttemptDocument | null> {
+    return PaymentAttemptModel.findOne({ logicalIdempotencyKey: key }, undefined, {
+      ...(session ? { session } : {}),
+    }).exec();
   }
 
   public async findByProviderPaymentIntentId(id: string): Promise<PaymentAttemptDocument | null> {
@@ -433,6 +453,71 @@ export class PaymentAttemptRepository {
       .sort({ updatedAt: 1 })
       .limit(limit)
       .exec();
+  }
+
+  /**
+   * P5 — penalty counterpart of `listStaleFirstUnsent`: a dispatched-or-crashed penalty attempt
+   * with no recorded PaymentIntent, older than `staleBefore` (beyond any in-flight request), that
+   * only the strongly consistent customer-scoped provider list may resolve. Never dispatches.
+   */
+  public async listStalePenaltyUnsent(
+    limit: number,
+    staleBefore: Date,
+  ): Promise<PaymentAttemptDocument[]> {
+    return PaymentAttemptModel.find({
+      purpose: { $in: PENALTY_PURPOSES },
+      providerStatus: { $in: ["NOT_CREATED", "UNKNOWN"] },
+      providerPaymentIntentId: { $exists: false },
+      persistenceStatus: "NOT_STARTED",
+      compensationStatus: "NOT_REQUIRED",
+      createdAt: { $lte: staleBefore },
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /**
+   * P5 — penalty attempts whose provider outcome is a definitive failure but whose obligation has
+   * not been converged yet (a crash between recording the provider result and settling the
+   * ledger). `listRecoverable` deliberately never scans FAILED/CANCELED/REQUIRES_ACTION.
+   */
+  public async listPenaltyFailureConvergencePending(
+    limit: number,
+  ): Promise<PaymentAttemptDocument[]> {
+    return PaymentAttemptModel.find({
+      purpose: { $in: PENALTY_PURPOSES },
+      providerStatus: { $in: PENALTY_DEFINITIVE_FAILURE_STATUSES },
+      persistenceStatus: "NOT_STARTED",
+      compensationStatus: "NOT_REQUIRED",
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /** P5 — the penalty domain (obligation FAILED) has absorbed this attempt's definitive failure.
+   * CAS'd on the failure state, so a recorded success is never marked converged as a failure. */
+  public async markPenaltyFailureConverged(
+    id: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<boolean> {
+    const result = await PaymentAttemptModel.updateOne(
+      {
+        _id: id,
+        purpose: { $in: PENALTY_PURPOSES },
+        providerStatus: { $in: PENALTY_DEFINITIVE_FAILURE_STATUSES },
+        persistenceStatus: "NOT_STARTED",
+      },
+      {
+        $set: { persistenceStatus: "COMPLETED" },
+        $unset: { reconciliationNeededAt: 1, nextRecoveryAt: 1 },
+      },
+      session ? { session } : {},
+    ).exec();
+    return result.modifiedCount === 1;
   }
 
   /**

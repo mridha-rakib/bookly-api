@@ -1,5 +1,6 @@
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import type { PenaltyCollectionService } from "../booking/penalty-collection.service.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
@@ -10,6 +11,7 @@ import type {
   PaymentAttemptProviderStatus,
 } from "./payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import { isPenaltyPurpose } from "./penalty-attempt.js";
 import { ensureRefundAccounting } from "./refund-accounting.js";
 import type { RefundOperationDocument } from "./refund-operation.model.js";
 import type { RefundOperationRepository } from "./refund-operation.repository.js";
@@ -45,12 +47,18 @@ export class MoneyRecoveryService {
       FinancialRelationshipService,
       "reconcilePending" | "reconcileForPaymentAttempt" | "ownsPendingFirstClaim"
     >,
+    // P5 — converges customer penalty attempts (CANCELLATION_FEE / NO_SHOW_FEE) through the SAME
+    // logic the request, worker and webhook use. Optional trailing dep; without it penalty
+    // attempts are only backed off, never compensated or treated as checkout.
+    private readonly penaltyCollection?: Pick<PenaltyCollectionService, "convergeAttempt">,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
     paymentAttempts: number;
     staleFirstUnsent: number;
     staleFirstRequiresAction: number;
+    stalePenaltyUnsent: number;
+    penaltyFailuresConverged: number;
     refundOperations: number;
     relationshipsScanned: number;
     webhooksProcessed: number;
@@ -66,6 +74,11 @@ export class MoneyRecoveryService {
     const staleUnsent = await this.resolveStaleFirstUnsent(limit);
     const staleFirst = await this.reconcileStaleFirstRequiresAction(limit);
     errors += staleUnsent.errors + staleFirst.errors;
+    // P5 — penalty attempts: strongly resolve stale unsent ones, then converge definitive
+    // failures the original request/worker did not get to settle. Never dispatches.
+    const stalePenalty = await this.resolveStalePenaltyUnsent(limit);
+    const penaltyFailures = await this.convergePenaltyFailures(limit);
+    errors += stalePenalty.errors + penaltyFailures.errors;
 
     const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
     for (const candidate of attempts) {
@@ -74,6 +87,25 @@ export class MoneyRecoveryService {
           candidate._id,
         );
         paymentAttempts += 1;
+        // P5 — a penalty attempt is never checkout: it has no booking-persistence step and is
+        // NEVER compensation-refunded. Its recorded provider state is converged by the penalty
+        // logic (success settles the obligation exactly once; UNKNOWN keeps being reconciled
+        // against the same provider object; nothing here ever creates another PaymentIntent).
+        if (isPenaltyPurpose(attempt.purpose)) {
+          const outcome =
+            snapshot && this.penaltyCollection
+              ? await this.penaltyCollection.convergeAttempt(attempt._id)
+              : "UNRESOLVED";
+          if (outcome === "UNRESOLVED") {
+            await this.paymentAttemptRepository.scheduleRecoveryRetry(
+              attempt._id,
+              snapshot
+                ? "Penalty provider outcome is not settled yet"
+                : "No provider PaymentIntent found for this penalty attempt yet",
+            );
+          }
+          continue;
+        }
         if (!snapshot) {
           // P1.1.1 — queue fairness only: NOT_FOUND changes no provider meaning, but the row
           // must rotate out instead of staying oldest forever and starving later work.
@@ -236,6 +268,8 @@ export class MoneyRecoveryService {
       paymentAttempts,
       staleFirstUnsent: staleUnsent.reconciled,
       staleFirstRequiresAction: staleFirst.reconciled,
+      stalePenaltyUnsent: stalePenalty.reconciled,
+      penaltyFailuresConverged: penaltyFailures.reconciled,
       refundOperations,
       relationshipsScanned: relationshipCounts.scanned,
       webhooksProcessed: webhookCounts.processed,
@@ -295,6 +329,92 @@ export class MoneyRecoveryService {
     return this.runFirstOwnedPass(candidates, "Stale FIRST unsent", (candidate) =>
       this.paymentService.resolveUnsentPaymentAttempt(candidate._id),
     );
+  }
+
+  /**
+   * P5 — penalty counterpart of resolveStaleFirstUnsent: a penalty attempt with no recorded
+   * PaymentIntent older than STALE_FIRST_UNSENT_MS (a crash before/at dispatch, or an ambiguous
+   * create) is resolved ONLY by the strongly consistent customer-scoped provider list:
+   *   PaymentIntent found -> recorded through the monotonic CAS, then converged
+   *   proven absent       -> FAILED + PROVIDER_NOT_CREATED (closed for creation), obligation FAILED
+   *   provider error      -> backed off; nothing settled
+   * No new provider attempt is ever created here.
+   */
+  private async resolveStalePenaltyUnsent(
+    limit: number,
+  ): Promise<{ reconciled: number; errors: number }> {
+    if (!this.penaltyCollection) return { reconciled: 0, errors: 0 };
+    const candidates = await this.paymentAttemptRepository.listStalePenaltyUnsent(
+      limit,
+      new Date(Date.now() - STALE_FIRST_UNSENT_MS),
+    );
+    return this.runPenaltyPass(candidates, "Stale penalty unsent", async (candidate) => {
+      const attempt = await this.paymentService.resolveUnsentPaymentAttempt(candidate._id);
+      return attempt.providerStatus === "NOT_CREATED" || attempt.providerStatus === "UNKNOWN"
+        ? "UNRESOLVED"
+        : this.convergePenalty(attempt._id);
+    });
+  }
+
+  /** P5 — definitive penalty failures (FAILED / CANCELED / REQUIRES_ACTION, incl. proven
+   * provider-not-created) whose obligation was not settled yet. No provider call. */
+  private async convergePenaltyFailures(
+    limit: number,
+  ): Promise<{ reconciled: number; errors: number }> {
+    if (!this.penaltyCollection) return { reconciled: 0, errors: 0 };
+    const candidates =
+      await this.paymentAttemptRepository.listPenaltyFailureConvergencePending(limit);
+    return this.runPenaltyPass(candidates, "Penalty failure convergence", (candidate) =>
+      this.convergePenalty(candidate._id),
+    );
+  }
+
+  private async convergePenalty(paymentAttemptId: PaymentAttemptDocument["_id"]): Promise<string> {
+    if (!this.penaltyCollection) return "UNRESOLVED";
+    return this.penaltyCollection.convergeAttempt(paymentAttemptId);
+  }
+
+  private async runPenaltyPass(
+    candidates: PaymentAttemptDocument[],
+    label: string,
+    resolve: (candidate: PaymentAttemptDocument) => Promise<string>,
+  ): Promise<{ reconciled: number; errors: number }> {
+    let reconciled = 0;
+    let errors = 0;
+    for (const candidate of candidates) {
+      try {
+        const outcome = await resolve(candidate);
+        reconciled += 1;
+        if (outcome === "UNRESOLVED") {
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            candidate._id,
+            "Penalty provider state is not resolved yet",
+          );
+        }
+      } catch (error) {
+        errors += 1;
+        const message = error instanceof Error ? error.message : "Unknown recovery error";
+        await this.paymentAttemptRepository
+          .scheduleRecoveryRetry(candidate._id, message)
+          .catch((scheduleError: unknown) =>
+            logger.error(
+              { err: scheduleError, recordType: "PaymentAttempt", recordId: String(candidate._id) },
+              "Could not schedule money recovery retry",
+            ),
+          );
+        logger.warn(
+          {
+            recordType: "PaymentAttempt",
+            recordId: String(candidate._id),
+            providerId: candidate.providerPaymentIntentId,
+            state: candidate.providerStatus,
+            errorCategory: error instanceof Error ? error.name : "UNKNOWN",
+          },
+          `${label} recovery item failed`,
+        );
+      }
+    }
+    return { reconciled, errors };
   }
 
   /** Shared driver of the FIRST-only passes: verifies the candidate still owns its FIRST_PENDING

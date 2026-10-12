@@ -124,10 +124,27 @@ export class BookingFinancialTransactionService {
     return this.transactionRepository.settleFailedAsWaived(id, session);
   }
 
+  /** P5 — see BookingFinancialTransactionRepository.settlePenaltyObligation's own comment. */
+  public async settlePenaltyObligation(
+    id: Types.ObjectId | string,
+    outcome: { status: "SUCCEEDED"; providerReference: string } | { status: "FAILED" },
+    session?: ClientSession,
+  ): Promise<BookingFinancialTransactionDocument | null> {
+    return this.transactionRepository.settlePenaltyObligation(id, outcome, session);
+  }
+
+  public async findById(
+    id: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<BookingFinancialTransactionDocument | null> {
+    return this.transactionRepository.findById(id, session);
+  }
+
   public async findByIdempotencyKey(
     idempotencyKey: string,
+    session?: ClientSession,
   ): Promise<BookingFinancialTransactionDocument | null> {
-    return this.transactionRepository.findByIdempotencyKey(idempotencyKey);
+    return this.transactionRepository.findByIdempotencyKey(idempotencyKey, session);
   }
 
   public async listForBooking(

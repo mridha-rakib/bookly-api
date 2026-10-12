@@ -49,9 +49,14 @@ export type CancellationEmailData = {
     additionalChargeFormatted: string;
     refundFormatted: string;
     hasDepositApplied: boolean;
+    /** SETTLED with the provider — the only state that may be worded as "charged". */
     hasAdditionalCharge: boolean;
+    /** P5 — a positive shortfall exists, whatever its settlement state (pending / failed /
+     * waived wording is chosen from `settlementStatus`, never inferred from the amount). */
+    hasAdditionalChargeDue: boolean;
     hasRefund: boolean;
-    /** NOT_APPLICABLE | SUCCEEDED | FAILED — the persisted cancellationOutcome.settlementStatus,
+    /** NOT_APPLICABLE | PENDING | SUCCEEDED | FAILED | WAIVED — the persisted
+     * cancellationOutcome.settlementStatus,
      * or (only when the caller passed `refundOverride`) that refund's own real outcome. */
     settlementStatus: string;
   };
@@ -112,6 +117,7 @@ export const buildCancellationEmailData = (
       hasDepositApplied: depositAppliedCents > 0,
       // Only claim an additional charge when it was actually settled with the provider.
       hasAdditionalCharge: additionalChargeCents > 0 && chargeSettled,
+      hasAdditionalChargeDue: additionalChargeCents > 0,
       // Unchanged from before this fix: `hasRefund` means "there is a refund amount worth
       // mentioning" — the templates below already correctly branch wording on `settlementStatus`
       // ("has been processed" only for SUCCEEDED, "is being arranged" otherwise), so a FAILED
