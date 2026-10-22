@@ -7,6 +7,7 @@ import {
   createBusinessBookingRoute,
   createCustomerBookingRoute,
 } from "../modules/booking/booking.route.js";
+import { createPackageConsentRoute } from "../modules/booking/package-consent.route.js";
 import { createBusinessRoute } from "../modules/business/business.route.js";
 import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
@@ -87,6 +88,7 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Customer self-service "My Bookings" surface — cross-business, never nested under
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).
   router.use("/me", createCustomerBookingRoute());
+  router.use("/package-consent", createPackageConsentRoute());
   // Batch 14 — Customer self-service Review surface, same "/me" prefix/rationale as "My
   // Bookings" above (own booking-scoped review, cross-business).
   router.use("/me", createCustomerReviewRoute());

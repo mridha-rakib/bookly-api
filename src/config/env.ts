@@ -250,6 +250,14 @@ export const env = createEnv({
       .regex(/^v\d+$/)
       .default("v1"),
     MONGODB_URI: mongodbUriSchema,
+    // Consent only. Owner-approved 30-minute quote lifetime, anchored to original UTC issuance.
+    PACKAGE_CONSENT_ENABLED: booleanString,
+    PACKAGE_CONSENT_QUOTE_LIFETIME_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(Number.MAX_SAFE_INTEGER)
+      .default(30 * 60 * 1000),
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default(rawNodeEnv === "development" ? "debug" : "info"),
