@@ -5,8 +5,15 @@ import { BookingError } from "./booking.errors.js";
 import {
   type BookingCreationClaimDocument,
   BookingCreationClaimModel,
+  commitPackageCheckoutClaimGrant,
 } from "./booking-creation-claim.model.js";
 import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
+import { assertPackageAccepted, assertPackagePresentation } from "./package-checkout-acceptance.js";
+import {
+  type PackageCheckoutClaimGrant,
+  type PackageCheckoutCustomer,
+  readPackageCheckoutCustomer,
+} from "./package-checkout-customer-authority.js";
 import {
   normalizePackageCheckoutIntent,
   type PackageCheckoutRetention,
@@ -31,6 +38,40 @@ export type ClaimBookingCreationResult = {
 };
 
 export class BookingCreationClaimRepository {
+  public async findPackageCheckoutForCustomer(
+    customerProof: PackageCheckoutCustomer,
+    businessId: Types.ObjectId,
+    idempotencyKey: string,
+  ) {
+    const customer = readPackageCheckoutCustomer(customerProof);
+    const row = await BookingCreationClaimModel.findOne({
+      idempotencyKey,
+      businessId,
+      actorUserId: customer.userId,
+    }).exec();
+    if (!row?.packageCheckoutRetention || row.financialContract || row.packageRequestBinding)
+      throw new Error("Owned retained Package checkout required");
+    const retention = packageCheckoutRetentionSchema.parse(row.toObject().packageCheckoutRetention);
+    if (
+      !retention.seed.businessId.equals(businessId) ||
+      !retention.seed.customerUserId.equals(customer.userId) ||
+      retention.seed.idempotencyKey !== idempotencyKey ||
+      !retention.quote.payload.originBookingId.equals(row.bookingId)
+    )
+      throw new Error("Checkout claim identity mismatch");
+    const presentation = row.packageCheckoutPresentation
+      ? assertPackagePresentation(retention, row.toObject().packageCheckoutPresentation)
+      : undefined;
+    const accepted = row.packageCheckoutAcceptance
+      ? assertPackageAccepted(retention, presentation, row.toObject().packageCheckoutAcceptance)
+      : undefined;
+    return { retention, presentation, accepted };
+  }
+
+  public async commitPackageCheckoutGrant(grant: PackageCheckoutClaimGrant): Promise<boolean> {
+    return commitPackageCheckoutClaimGrant(grant);
+  }
+
   /** Internal unaccepted checkout read. The unique operation namespace is shared with
    * ordinary creation, so a collision with any other claim kind fails closed. */
   public async findRetainedPackageCheckout(input: {

@@ -21,12 +21,13 @@ const canonical = (value: unknown): unknown => {
     );
   return value;
 };
-export const hashPackageCheckoutQuote = (input: unknown): string => {
-  const quote = packageCheckoutQuoteSchema.parse(input);
-  return createHash("sha256")
-    .update(JSON.stringify(canonical(quote)))
+/** Same canonical serialization for separately correlated quote/disclosure digests. */
+export const hashCanonicalPackageCheckoutContent = (input: unknown): string =>
+  createHash("sha256")
+    .update(JSON.stringify(canonical(input)))
     .digest("hex");
-};
+export const hashPackageCheckoutQuote = (input: unknown): string =>
+  hashCanonicalPackageCheckoutContent(packageCheckoutQuoteSchema.parse(input));
 export const packageCheckoutEnvelopeSchema = z
   .object({
     version: z.literal(1),

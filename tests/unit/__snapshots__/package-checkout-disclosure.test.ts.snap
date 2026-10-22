@@ -1,0 +1,61 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`versioned exact server disclosure, not consent > renders the exact supported English snapshot 1`] = `
+"Package: Hair3 Facial2 Massage1. Purchased package price: EUR 200.00.
+
+Included Services and quantities:
+
+Hair: 3 sessions; independent monetary penalty basis per included session EUR 50.00. Reference price EUR 100.00 is for comparison, not the penalty basis.
+
+Facial: 2 sessions; independent monetary penalty basis per included session EUR 30.00. Reference price EUR 100.00 is for comparison, not the penalty basis.
+
+Massage: 1 sessions; independent monetary penalty basis per included session EUR 0.00. Reference price EUR 100.00 is for comparison, not the penalty basis.
+
+Initially selected appointments (each is a separate appointment):
+
+Hair with Stylist 1: 2026-01-10T15:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: Synthetic add-on EUR 5.00. Travel: EUR 0.00.
+
+Hair with Stylist 2: 2026-01-10T17:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: none. Travel: EUR 0.00.
+
+Hair with Stylist 1: 2026-01-10T19:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: none. Travel: EUR 0.00.
+
+Facial with Stylist 2: 2026-01-11T15:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: none. Travel: EUR 0.00.
+
+Facial with Stylist 1: 2026-01-11T17:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: none. Travel: EUR 0.00.
+
+Massage with Stylist 2: 2026-01-12T15:00:00.000+06:00 (Asia/Dhaka); at Business location: Larnaca, Center, Main, 1; occupied 85 minutes. Add-ons: none. Travel: EUR 0.00.
+
+Validity: FOREVER. No Package-specific expiry; ordinary scheduling and eligibility rules still apply.
+
+Cancellation policy:
+
+72 hours or more before the appointment: free cancellation; no cancellation monetary fee.
+
+24 hours to less than 72 hours before the appointment: 40% of the included Service's independent penalty basis, subject to the monetary caps.
+
+12 hours to less than 24 hours before the appointment: 60% of the included Service's independent penalty basis, subject to the monetary caps.
+
+2 hours to less than 12 hours before the appointment: 80% of the included Service's independent penalty basis, subject to the monetary caps.
+
+less than 2 hours before the appointment: 100% of the included Service's independent penalty basis, subject to the monetary caps.
+
+A qualifying late cancellation or no-show may forfeit the included credit PLUS produce a separate monetary penalty. A free cancellation does not create a monetary penalty. Credit handling and monetary assessment are separate consequences.
+
+Business cancellation does not impose a Customer cancellation/no-show penalty. A restored credit remains subject to the original validity; after the deadline it is expired. Cancellation does not restart Package validity.
+
+Business no-show percentage: 100% of the independent included-session penalty basis.
+
+No-show eligibility timing for BEAUTY_WELLNESS: opens 15 minutes after appointment start; closes 120 minutes after start. Resolution window: 90 minutes. Timing alone does not establish that a no-show occurred.
+
+Maximum additional monetary charge per appointment: EUR 25.00. Purchased Package lifetime monetary cap: EUR 100.00 (the smaller of EUR 100.00 and half the sold Package price, rounded down in cents).
+
+The FIRST Package deposit does not offset a monetary penalty. Only the included-session basis applies, not reference prices, add-ons or travel. An applicable separately assessed monetary penalty may be collected using the saved card, subject to the appointment and remaining lifetime caps.
+
+A possible contractual monetary assessment is not an actual provider charge. Credit forfeiture is not payment. Package expiry alone never charges money. These prospective terms do not authorize monetary collection for historical/legacy Packages.
+
+Normal payment estimate: FIRST; estimated required Package upfront deposit EUR 35.00. Final classification and required payment must be confirmed before purchase; changed terms require a new disclosure and acceptance.
+
+Initial add-on dues: EUR 5.00. Initial travel dues: EUR 0.00. Normal total: EUR 205.00. Estimated remaining manual venue dues after the required upfront: EUR 170.00. These normal outstanding dues are not automatically collected from the saved card and are separate from possible penalties.
+
+Accepting these terms is not payment, slot reservation or successful Package purchase. Saved-card setup and ordinary login do not establish acceptance."
+`;

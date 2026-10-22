@@ -3,6 +3,16 @@ import { model, Schema, type Types } from "mongoose";
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 import {
+  assertPackageAccepted,
+  assertPackagePresentation,
+  type PackageCheckoutAccepted,
+  type PackageCheckoutPresentation,
+} from "./package-checkout-acceptance.js";
+import {
+  type PackageCheckoutClaimGrant,
+  readPackageCheckoutClaimGrant,
+} from "./package-checkout-customer-authority.js";
+import {
   type PackageCheckoutRetention,
   packageCheckoutRetentionSchema,
 } from "./package-checkout-retention.js";
@@ -30,6 +40,8 @@ import {
  * second provider operation.
  */
 export type BookingCreationClaimDocument = {
+  packageCheckoutPresentation?: PackageCheckoutPresentation | undefined;
+  packageCheckoutAcceptance?: PackageCheckoutAccepted | undefined;
   /** P3-B1: durable unaccepted offer only; excluded from ordinary release/payment paths. */
   packageCheckoutRetention?: PackageCheckoutRetention | undefined;
   packageRequestBinding?: PackageRequestBinding | undefined;
@@ -47,6 +59,8 @@ export type BookingCreationClaimDocument = {
 
 const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
   {
+    packageCheckoutPresentation: { type: Schema.Types.Mixed },
+    packageCheckoutAcceptance: { type: Schema.Types.Mixed },
     packageCheckoutRetention: { type: Schema.Types.Mixed },
     packageRequestBinding: { type: packageRequestBindingMongooseSchema },
     idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
@@ -60,7 +74,49 @@ const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
 );
 
 bookingCreationClaimSchema.index({ idempotencyKey: 1 }, { unique: true });
+const checkoutTransitions = new WeakSet<object>();
+// Save guards also run when a caller disables Mongoose validation.
+bookingCreationClaimSchema.pre("save", function () {
+  if (
+    (this.isNew && (this.packageCheckoutPresentation || this.packageCheckoutAcceptance)) ||
+    (!this.isNew &&
+      [
+        "packageCheckoutRetention",
+        "packageCheckoutPresentation",
+        "packageCheckoutAcceptance",
+        "idempotencyKey",
+        "businessId",
+        "actorUserId",
+        "bookingId",
+      ].some((key) => this.isModified(key))) ||
+    (this.packageCheckoutRetention && (this.financialContract || this.packageRequestBinding))
+  )
+    throw new Error(
+      "Checkout claim identity/evidence is immutable; use verified canonical transition",
+    );
+});
 bookingCreationClaimSchema.pre("validate", function () {
+  if (
+    (this.isNew && (this.packageCheckoutPresentation || this.packageCheckoutAcceptance)) ||
+    (!this.isNew &&
+      ["packageCheckoutPresentation", "packageCheckoutAcceptance"].some((key) =>
+        this.isModified(key),
+      ))
+  )
+    this.invalidate("packageCheckoutAcceptance", "Use verified canonical checkout transition");
+  if (this.packageCheckoutPresentation || this.packageCheckoutAcceptance) {
+    try {
+      assertPackagePresentation(this.packageCheckoutRetention, this.packageCheckoutPresentation);
+      if (this.packageCheckoutAcceptance)
+        assertPackageAccepted(
+          this.packageCheckoutRetention,
+          this.packageCheckoutPresentation,
+          this.packageCheckoutAcceptance,
+        );
+    } catch (error) {
+      this.invalidate("packageCheckoutAcceptance", String(error));
+    }
+  }
   if (
     !this.isNew &&
     ["packageCheckoutRetention", "idempotencyKey", "businessId", "actorUserId", "bookingId"].some(
@@ -113,8 +169,11 @@ bookingCreationClaimSchema.pre(["replaceOne", "findOneAndReplace"], () => {
   throw new Error("Creation claim identity/retention is immutable");
 });
 bookingCreationClaimSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"], function () {
+  if (checkoutTransitions.has(this)) return;
   const update = this.getUpdate();
   const protectedRoots = [
+    "packageCheckoutPresentation",
+    "packageCheckoutAcceptance",
     "packageCheckoutRetention",
     "idempotencyKey",
     "businessId",
@@ -185,7 +244,71 @@ bookingCreationClaimSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"], 
   }
 });
 
+bookingCreationClaimSchema.pre("bulkWrite", () => {
+  throw new Error("Use canonical single-claim operations");
+});
+bookingCreationClaimSchema.pre("insertMany", () => {
+  throw new Error("Use validated canonical claim creation");
+});
+bookingCreationClaimSchema.pre(["deleteOne", "deleteMany", "findOneAndDelete"], function () {
+  this.and([
+    {
+      packageCheckoutPresentation: { $exists: false },
+      packageCheckoutAcceptance: { $exists: false },
+    },
+  ]);
+});
+bookingCreationClaimSchema.pre("deleteOne", { document: true, query: false }, function () {
+  if (this.packageCheckoutPresentation || this.packageCheckoutAcceptance)
+    throw new Error("Checkout evidence is immutable");
+});
+
 export const BookingCreationClaimModel = model<BookingCreationClaimDocument>(
   "BookingCreationClaim",
   bookingCreationClaimSchema,
 );
+
+/** The only query capability for appending presentation/acceptance. No caller-supplied
+ * mutation/options can bypass the hook. The grant is issued by verified Customer authority.
+ * The original retention remains intact, so all existing financial exclusions still apply.
+ */
+export const commitPackageCheckoutClaimGrant = async (
+  grant: PackageCheckoutClaimGrant,
+): Promise<boolean> => {
+  const authorized = readPackageCheckoutClaimGrant(grant);
+  const { retention, presentation } = authorized;
+  assertPackagePresentation(retention, presentation);
+  if (authorized.kind === "ACCEPT")
+    assertPackageAccepted(retention, presentation, authorized.accepted);
+  const q = retention.quote.payload;
+  const filter = {
+    idempotencyKey: q.idempotencyKey,
+    businessId: q.businessId,
+    actorUserId: q.actorUserId,
+    bookingId: q.originBookingId,
+    "packageCheckoutRetention.quote.termsHash": retention.quote.termsHash,
+    financialContract: { $exists: false },
+    packageRequestBinding: { $exists: false },
+    packageCheckoutAcceptance: { $exists: false },
+    ...(authorized.kind === "PRESENT"
+      ? { packageCheckoutPresentation: { $exists: false } }
+      : {
+          "packageCheckoutPresentation.presentationId": presentation.presentationId,
+          "packageCheckoutPresentation.challenge": presentation.challenge,
+          "packageCheckoutPresentation.sessionFamilyId": presentation.sessionFamilyId,
+          "packageCheckoutPresentation.disclosure.contentHash": presentation.disclosure.contentHash,
+        }),
+  };
+  const query = BookingCreationClaimModel.updateOne(
+    filter,
+    {
+      $set:
+        authorized.kind === "PRESENT"
+          ? { packageCheckoutPresentation: presentation }
+          : { packageCheckoutAcceptance: authorized.accepted },
+    },
+    { runValidators: true },
+  );
+  checkoutTransitions.add(query);
+  return (await query).matchedCount === 1;
+};
