@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { mongo } from "mongoose";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
+import { PackageCheckoutConflictError } from "../../../src/modules/booking/package-checkout.errors.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
@@ -110,7 +112,7 @@ describe("30-minute consent cutoff, real persisted CAS, controlled server quote 
       if (fact === "policy") s.f.configuredPolicy.noShowPercentage = 99;
       if (fact === "availability")
         vi.spyOn(s.f.dependencies.availability, "getAvailability").mockRejectedValue(
-          new Error("No slot"),
+          new PackageCheckoutConflictError("No slot"),
         );
       expect((await s.accept(s.event)).status).toBe(409);
       expect((await row()).packageCheckoutAcceptance).toBeUndefined();
@@ -226,10 +228,10 @@ describe("30-minute consent cutoff, real persisted CAS, controlled server quote 
     vi.spyOn(s.services.claims, "commitPackageCheckoutGrant").mockImplementationOnce(
       async (grant) => {
         await commit(grant);
-        throw new Error("Injected lost acknowledgement");
+        throw new mongo.MongoNetworkError("Injected lost acknowledgement");
       },
     );
-    expect((await s.accept(s.event)).status).toBe(409);
+    expect((await s.accept(s.event)).status).toBe(503);
     const original = (await row()).packageCheckoutAcceptance;
     expect(original).toBeTruthy();
     expect((await s.accept(s.event)).body.data.acceptanceId).toBe(

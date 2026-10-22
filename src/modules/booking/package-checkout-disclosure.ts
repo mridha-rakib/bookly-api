@@ -2,6 +2,7 @@ import { DateTime } from "luxon";
 import { Types } from "mongoose";
 import { z } from "zod";
 import { cancellationTiers } from "../business-cancellation-policy/business-cancellation-policy.model.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { hashCanonicalPackageCheckoutContent } from "./package-checkout-binding.js";
 import { comparePackageCheckoutIds } from "./package-checkout-contract.js";
 import { packageCheckoutRetentionSchema } from "./package-checkout-retention.js";
@@ -77,11 +78,13 @@ export const buildPackageCheckoutDisclosure = (
     new Set(providers.map((row) => row.staffMembershipId.toHexString())).size !== selected.size ||
     providers.some((row) => !selected.has(row.staffMembershipId.toHexString()))
   )
-    throw new Error("Exact selected staff names required");
+    throw new PackageCheckoutConflictError("Exact selected staff names required");
   const positivePenalties =
     q.penalty.lifetimeCapCents > 0 && q.items.some((row) => row.penaltyBasisCents > 0);
   if (positivePenalties && (!q.policy.cancellation || !q.policy.noShowWindow))
-    throw new Error("Configured cancellation/no-show disclosure required for positive penalties");
+    throw new PackageCheckoutConflictError(
+      "Configured cancellation/no-show disclosure required for positive penalties",
+    );
   const lines = [
     `Package: ${q.packageName}. Purchased package price: ${euros(q.financials.bundlePriceCents)}.`,
     "Included Services and quantities:",
@@ -94,7 +97,8 @@ export const buildPackageCheckoutDisclosure = (
       const item = q.items.find((item) => item.packageItemId.equals(row.packageItemId));
       const provider = providers.find((p) => p.staffMembershipId.equals(row.staffMembershipId));
       const local = DateTime.fromJSDate(row.startAt, { zone: q.businessTimezone }).toISO();
-      if (!local || !item || !provider) throw new Error("Incomplete appointment disclosure");
+      if (!local || !item || !provider)
+        throw new PackageCheckoutConflictError("Incomplete appointment disclosure");
       const address =
         row.location.mode === "AT_BUSINESS_LOCATION"
           ? row.location.businessLocation
@@ -164,6 +168,6 @@ export const assertPackageDisclosureMatches = (retained: unknown, input: unknown
     snapshot.content.providers,
   );
   if (rebuilt.contentHash !== snapshot.contentHash)
-    throw new Error("Disclosure does not match retained terms/template");
+    throw new PackageCheckoutConflictError("Disclosure does not match retained terms/template");
   return snapshot;
 };

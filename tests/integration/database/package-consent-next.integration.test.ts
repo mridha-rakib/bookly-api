@@ -35,7 +35,7 @@ afterAll(async () => {
   if (artifacts) await stopIsolatedReplicaSet();
 });
 
-it.skipIf(!artifacts).each(["price", "policy", "availability"])(
+it.skipIf(!artifacts).each(["price", "revision", "policy", "availability"])(
   "actual persisted %s change blocks acceptance before the 30-minute expiry",
   async (fact) => {
     const f = checkoutFixture();
@@ -86,6 +86,9 @@ it.skipIf(!artifacts).each(["price", "policy", "availability"])(
     const p = (await post(`${path}/presentation`, {})).body.data;
     if (fact === "price") {
       f.definition.bundlePriceCents = (f.definition.bundlePriceCents ?? 1) - 1;
+      await f.definition.save();
+    }
+    if (fact === "revision") {
       f.definition.revision += 1;
       await f.definition.save();
     }

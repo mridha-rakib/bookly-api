@@ -28,6 +28,7 @@ import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { BookingService } from "./booking.service.js";
 import { NO_SHOW_RESOLUTION_WINDOW_MINUTES } from "./booking.types.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { bindPackageCheckoutQuote } from "./package-checkout-binding.js";
 import {
   comparePackageCheckoutIds,
@@ -93,16 +94,16 @@ export class PackageCheckoutQuotePreparer {
       !seed.customerUserId.equals(context.customerUserId) ||
       !seed.businessId.equals(context.businessId)
     )
-      throw new Error("Authenticated checkout scope mismatch");
+      throw new PackageCheckoutConflictError("Authenticated checkout scope mismatch");
     const now = new Date(this.clock().getTime());
     if (!Number.isFinite(now.getTime()) || now < seed.issuedAt || now >= seed.expiresAt)
-      throw new Error("Quote seed expired");
+      throw new PackageCheckoutConflictError("Quote seed expired");
     const business = await this.reads.businesses.findById(context.businessId);
     if (
       !business?._id.equals(context.businessId) ||
       !["APPROVED", "WARNING"].includes(business.status)
     )
-      throw new Error("Business unavailable");
+      throw new PackageCheckoutConflictError("Business unavailable");
     const definition = await this.reads.packages.findById(
       business._id,
       intent.packageId.toHexString(),
@@ -115,13 +116,13 @@ export class PackageCheckoutQuotePreparer {
       !definition.contractTerms ||
       definition.bundlePriceCents === undefined
     )
-      throw new Error("Package offer unavailable or stale");
+      throw new PackageCheckoutConflictError("Package offer unavailable or stale");
     calculatePackagePricing(definition.items, definition.bundlePriceCents);
     if (
       seed.items.length !== definition.items.length ||
       seed.appointments.length !== intent.selections.length
     )
-      throw new Error("Batch identity membership mismatch");
+      throw new PackageCheckoutConflictError("Batch identity membership mismatch");
     const [services, providers, client, configuredPolicy, windows, card] = await Promise.all([
       this.reads.services.findManyByIdsForBusiness(
         business._id,
@@ -138,9 +139,9 @@ export class PackageCheckoutQuotePreparer {
       (!client.businessId.equals(business._id) ||
         !client.linkedUserId?.equals(context.customerUserId))
     )
-      throw new Error("Customer relationship scope mismatch");
+      throw new PackageCheckoutConflictError("Customer relationship scope mismatch");
     if (configuredPolicy && !configuredPolicy.businessId.equals(business._id))
-      throw new Error("Foreign policy");
+      throw new PackageCheckoutConflictError("Foreign policy");
     const classification = this.reads.relationships.peekClassification(client);
     const terms = copyPackageDefinitionContractTerms(definition.contractTerms);
     const selectedValidity =
@@ -148,7 +149,7 @@ export class PackageCheckoutQuotePreparer {
         ? { mode: "FINITE" as const, months: terms.validityMonths }
         : terms.validity;
     if (selectedValidity.mode === "FINITE" && !seed.temporalProofRef)
-      throw new Error("Finite guarantee retention reference required");
+      throw new PackageCheckoutConflictError("Finite guarantee retention reference required");
     const validity =
       selectedValidity.mode === "FOREVER"
         ? { mode: "FOREVER" as const }
@@ -184,7 +185,7 @@ export class PackageCheckoutQuotePreparer {
           row.referenceUnitPriceCents === undefined ||
           row.penaltyBasisCents === undefined
         )
-          throw new Error("Package item is not new-contract eligible");
+          throw new PackageCheckoutConflictError("Package item is not new-contract eligible");
         return {
           version: 1 as const,
           packageId: definition._id,
@@ -229,7 +230,7 @@ export class PackageCheckoutQuotePreparer {
     const travelSettings =
       mode === "TRAVEL_TO_CUSTOMER" ? await this.reads.travel.findByBusinessId(business._id) : null;
     if (mode === "TRAVEL_TO_CUSTOMER" && !travelSettings?.businessId.equals(business._id))
-      throw new Error("Travel settings unavailable or foreign");
+      throw new PackageCheckoutConflictError("Travel settings unavailable or foreign");
     const staffCache = new Map<
       string,
       Awaited<ReturnType<BookingService["validateResponsibleStaff"]>>
@@ -256,9 +257,9 @@ export class PackageCheckoutQuotePreparer {
         !item.eligibleProviderIds.some((id) => id.equals(selection.staffMembershipId)) ||
         selection.startAt <= now
       )
-        throw new Error("Selected item/provider/start unavailable");
+        throw new PackageCheckoutConflictError("Selected item/provider/start unavailable");
       if (new Set(selection.addonIds.map(String)).size !== selection.addonIds.length)
-        throw new Error("Duplicate selected add-on");
+        throw new PackageCheckoutConflictError("Duplicate selected add-on");
       const staffKey = `${item.serviceId}:${selection.staffMembershipId}`;
       let resolved = staffCache.get(staffKey);
       if (!resolved) {
@@ -277,7 +278,7 @@ export class PackageCheckoutQuotePreparer {
         !staffMembership.businessId.equals(business._id) ||
         !service.fixedPricing
       )
-        throw new Error("Resolved staff/service mismatch");
+        throw new PackageCheckoutConflictError("Resolved staff/service mismatch");
       const addonKey = `${item.serviceId}:${selection.addonIds.map(String).sort().join(",")}`;
       let addons = addonCache.get(addonKey);
       if (!addons) {
@@ -292,7 +293,7 @@ export class PackageCheckoutQuotePreparer {
         addons.length !== selection.addonIds.length ||
         addons.some((addon) => !selection.addonIds.some((id) => id.equals(addon.addonId)))
       )
-        throw new Error("Resolved add-on membership mismatch");
+        throw new PackageCheckoutConflictError("Resolved add-on membership mismatch");
       const timing = {
         version: 1 as const,
         baseDurationMin: item.baseDurationMin,
@@ -332,12 +333,12 @@ export class PackageCheckoutQuotePreparer {
         (mode === "AT_BUSINESS_LOCATION" && selection.travelAddress) ||
         (mode === "TRAVEL_TO_CUSTOMER" && !selection.travelAddress)
       )
-        throw new Error("Location mode mismatch");
+        throw new PackageCheckoutConflictError("Location mode mismatch");
       this.reads.booking.validateFulfilmentSnapshot(business, location);
       const city = selection.travelAddress?.city;
       const travelCity = travelSettings?.cities.find((row) => row.city === city && row.active);
       if (mode === "TRAVEL_TO_CUSTOMER" && !travelCity)
-        throw new Error("Travel city quote changed");
+        throw new PackageCheckoutConflictError("Travel city quote changed");
       const cityKey = `${item.serviceId}:${city}`;
       if (mode === "TRAVEL_TO_CUSTOMER" && !servedCache.has(cityKey)) {
         await this.reads.availability.requireServedCity(business, service, city);
@@ -365,7 +366,7 @@ export class PackageCheckoutQuotePreparer {
         available.timezone !== business.timezone ||
         available.capacityMax !== 1
       )
-        throw new Error("Availability context mismatch");
+        throw new PackageCheckoutConflictError("Availability context mismatch");
       const slot = available.days
         .flatMap((day) => day.slots)
         .find(
@@ -374,7 +375,7 @@ export class PackageCheckoutQuotePreparer {
             new Date(slot.endAt).getTime() === endAt.getTime() &&
             slot.eligibleStaffMembershipIds.includes(String(selection.staffMembershipId)),
         );
-      if (!slot) throw new Error("Selected slot no longer available");
+      if (!slot) throw new PackageCheckoutConflictError("Selected slot no longer available");
       appointments.push({
         selectionId: selection.selectionId,
         bookingId: planned.bookingId,
@@ -405,7 +406,7 @@ export class PackageCheckoutQuotePreparer {
       finish >= seed.expiresAt ||
       appointments.some((row) => row.startAt <= finish)
     )
-      throw new Error("Quote expired during preparation");
+      throw new PackageCheckoutConflictError("Quote expired during preparation");
     return bindPackageCheckoutQuote({
       version: 1,
       quoteId: seed.quoteId,

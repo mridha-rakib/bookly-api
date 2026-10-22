@@ -36,3 +36,9 @@ semantics, quote TTL, disclosure text or feature defaults are changed by these t
 
 Purchase/payment/penalty activation remains outside this harness. This is automated test
 consent from synthetic accounts, not evidence of a production person's agreement.
+
+V2 adds typed domain-versus-storage HTTP regressions and real Mongo clock probes to this
+runner. The probes establish updateOne support for `$expr`/`$$NOW`, but also demonstrate
+that its query timestamp survives a write-conflict wait past expiry. A passing probe is
+evidence against using that predicate as a strict mutation-time fence. The canonical
+acceptance CAS remains unchanged; the atomic expiry finding remains unresolved.

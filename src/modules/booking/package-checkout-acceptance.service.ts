@@ -3,6 +3,7 @@ import { Types } from "mongoose";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { packageCheckoutAffirmativeActionSchema } from "./package-checkout-acceptance.js";
 import { assertPackageCheckoutCurrent } from "./package-checkout-binding.js";
 import {
@@ -48,12 +49,13 @@ export class PackageCheckoutAcceptanceService {
           row.removedAt,
       )
     )
-      throw new Error("Selected staff context unavailable");
+      throw new PackageCheckoutConflictError("Selected staff context unavailable");
     const profiles = await this.users.findProfilesByUserIds(staff.map((row) => row.userId));
     return ids.map((id) => {
       const member = staff.find((row) => row._id.equals(id));
       const profile = profiles.find((row) => row.userId.equals(member?.userId));
-      if (!profile) throw new Error("Selected staff display name unavailable");
+      if (!profile)
+        throw new PackageCheckoutConflictError("Selected staff display name unavailable");
       return {
         staffMembershipId: id,
         displayName: `${profile.firstName} ${profile.lastName}`.trim(),
@@ -91,7 +93,9 @@ export class PackageCheckoutAcceptanceService {
     const owner = readPackageCheckoutCustomer(customer);
     if (row.presentation) {
       if (!row.accepted && row.presentation.sessionFamilyId !== owner.sessionFamilyId)
-        throw new Error("Presentation is bound to another session; new checkout required");
+        throw new PackageCheckoutConflictError(
+          "Presentation is bound to another session; new checkout required",
+        );
       if (!row.accepted) {
         await this.fresh(customer, row.retention);
         const disclosure = buildPackageCheckoutDisclosure(
@@ -100,7 +104,7 @@ export class PackageCheckoutAcceptanceService {
           await this.names(row.retention),
         );
         if (disclosure.contentHash !== row.presentation.disclosure.contentHash)
-          throw new Error("Disclosure facts changed; new quote required");
+          throw new PackageCheckoutConflictError("Disclosure facts changed; new quote required");
       }
       return row.presentation;
     }
@@ -119,7 +123,7 @@ export class PackageCheckoutAcceptanceService {
       operationKey,
     );
     if (!winner.presentation || winner.presentation.sessionFamilyId !== owner.sessionFamilyId)
-      throw new Error("Concurrent presentation/session conflict");
+      throw new PackageCheckoutConflictError("Concurrent presentation/session conflict");
     return winner.presentation;
   }
 
@@ -139,14 +143,16 @@ export class PackageCheckoutAcceptanceService {
     // Committed matching replay precedes stale reads. Identity/time/evidence never regenerate.
     if (row.accepted) {
       if (!isDeepStrictEqual(row.accepted.event, action))
-        throw new Error("Conflicting acceptance event");
+        throw new PackageCheckoutConflictError("Conflicting acceptance event");
       return row.accepted;
     }
     if (
       !row.presentation ||
       row.presentation.sessionFamilyId !== readPackageCheckoutCustomer(customer).sessionFamilyId
     )
-      throw new Error("Owned session-bound disclosure presentation required");
+      throw new PackageCheckoutConflictError(
+        "Owned session-bound disclosure presentation required",
+      );
     const fresh = await this.fresh(customer, row.retention);
     const disclosure = buildPackageCheckoutDisclosure(
       row.retention,
@@ -154,7 +160,7 @@ export class PackageCheckoutAcceptanceService {
       await this.names(row.retention),
     );
     if (disclosure.contentHash !== row.presentation.disclosure.contentHash)
-      throw new Error("Disclosure facts changed; new quote required");
+      throw new PackageCheckoutConflictError("Disclosure facts changed; new quote required");
     const grant = this.authority.accept(
       await this.authority.authenticate(authorization),
       row.retention,
@@ -169,7 +175,7 @@ export class PackageCheckoutAcceptanceService {
       operationKey,
     );
     if (!winner.accepted || !isDeepStrictEqual(winner.accepted.event, action))
-      throw new Error("Concurrent acceptance conflict");
+      throw new PackageCheckoutConflictError("Concurrent acceptance conflict");
     return winner.accepted;
   }
 }

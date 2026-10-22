@@ -69,6 +69,8 @@ if (process.env.BOOKLY_CONSENT_NETWORK_GUARD === "1") {
     NODE_OPTIONS: `--require="${__filename.replaceAll("\\", "/")}"`,
   });
   const tests = [
+    "tests/integration/database/package-consent-errors.integration.test.ts",
+    "tests/integration/database/package-consent-mongo-clock.integration.test.ts",
     "tests/integration/database/package-consent-boundaries.integration.test.ts",
     "tests/integration/database/package-consent-http.integration.test.ts",
     "tests/integration/database/package-checkout-acceptance.integration.test.ts",

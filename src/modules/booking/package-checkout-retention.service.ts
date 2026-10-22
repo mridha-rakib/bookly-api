@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import type { PackageRepository } from "../packages/package.repository.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { assertPackageCheckoutCurrent } from "./package-checkout-binding.js";
 import { packageCheckoutSeedSchema } from "./package-checkout-contract.js";
 import type { PackageCheckoutQuotePreparer } from "./package-checkout-quote.service.js";
@@ -32,10 +33,11 @@ export class PackageCheckoutRetentionService {
 
   public async prepareAndRetain(context: Context, operationKey: string, input: unknown) {
     if (context.role !== "CUSTOMER" || !context.actorUserId.equals(context.customerUserId))
-      throw new Error("Authenticated Customer required");
+      throw new PackageCheckoutConflictError("Authenticated Customer required");
     const intent = normalizePackageCheckoutIntent(input);
     const idempotencyKey = operationKey.trim();
-    if (!idempotencyKey || idempotencyKey.length > 200) throw new Error("Invalid operation key");
+    if (!idempotencyKey || idempotencyKey.length > 200)
+      throw new PackageCheckoutConflictError("Invalid operation key");
     const scope = {
       idempotencyKey,
       businessId: context.businessId,
@@ -53,7 +55,7 @@ export class PackageCheckoutRetentionService {
       definition.revision !== intent.expectedRevision ||
       definition.status !== "ACTIVE"
     )
-      throw new Error("Package offer unavailable or stale");
+      throw new PackageCheckoutConflictError("Package offer unavailable or stale");
     const issuedAt = new Date(this.clock().getTime());
     const seed = packageCheckoutSeedSchema.parse({
       version: 1,

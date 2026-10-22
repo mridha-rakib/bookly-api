@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import { z } from "zod";
 import { purchasedAcceptanceEvidenceSchema } from "../package-progress/purchased-package-contract.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import {
   assertPackageDisclosureMatches,
   PACKAGE_DISCLOSURE_TEMPLATE_ID,
@@ -61,7 +62,7 @@ export const assertPackagePresentation = (retainedInput: unknown, input: unknown
     presentation.presentedAt < q.issuedAt ||
     presentation.presentedAt >= q.expiresAt
   )
-    throw new Error("Presentation ownership/window mismatch");
+    throw new PackageCheckoutConflictError("Presentation ownership/window mismatch");
   return presentation;
 };
 export const assertPackageAccepted = (
@@ -94,7 +95,7 @@ export const assertPackageAccepted = (
       (e.acceptedAt < q.validity.activationNotBefore ||
         e.acceptedAt >= q.validity.activationNotAfterExclusive))
   )
-    throw new Error("Accepted disclosure/event mismatch");
+    throw new PackageCheckoutConflictError("Accepted disclosure/event mismatch");
   for (const key of [
     "quoteId",
     "batchId",
@@ -104,7 +105,8 @@ export const assertPackageAccepted = (
     "actorUserId",
     "packageId",
   ] as const)
-    if (!e[key].equals(q[key])) throw new Error("Accepted ownership mismatch");
+    if (!e[key].equals(q[key]))
+      throw new PackageCheckoutConflictError("Accepted ownership mismatch");
   if (
     e.packageRevision !== q.definitionRevision ||
     e.items.length !== q.items.length ||
@@ -118,6 +120,6 @@ export const assertPackageAccepted = (
         ),
     )
   )
-    throw new Error("Accepted membership mismatch");
+    throw new PackageCheckoutConflictError("Accepted membership mismatch");
   return accepted;
 };

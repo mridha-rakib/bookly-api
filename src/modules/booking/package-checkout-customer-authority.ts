@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mongo, Types } from "mongoose";
 import type { TokenService } from "../auth/token.service.js";
 import type { UserRepository } from "../user/user.repository.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import {
   assertPackageAccepted,
   assertPackagePresentation,
@@ -40,12 +41,13 @@ const grantChecks = new WeakMap<object, () => void>();
 const copy = <T>(value: T): T => mongo.BSON.deserialize(mongo.BSON.serialize(value as object)) as T;
 export const readPackageCheckoutCustomer = (proof: PackageCheckoutCustomer) => {
   const customer = customers.get(proof);
-  if (!customer) throw new Error("Verified Customer capability required");
+  if (!customer) throw new PackageCheckoutConflictError("Verified Customer capability required");
   return { ...customer, userId: new Types.ObjectId(customer.userId.toHexString()) };
 };
 export const readPackageCheckoutClaimGrant = (grant: PackageCheckoutClaimGrant) => {
   const authorized = grants.get(grant);
-  if (!authorized) throw new Error("Verified checkout transition capability required");
+  if (!authorized)
+    throw new PackageCheckoutConflictError("Verified checkout transition capability required");
   grantChecks.get(grant)?.();
   grants.delete(grant);
   grantChecks.delete(grant);
@@ -65,10 +67,10 @@ export class PackageCheckoutCustomerAuthority {
 
   public async authenticate(authorization: string | undefined): Promise<PackageCheckoutCustomer> {
     if (!authorization?.startsWith("Bearer "))
-      throw new Error("Customer Bearer authentication required");
+      throw new PackageCheckoutConflictError("Customer Bearer authentication required");
     const claims = await this.tokens.verifyAccessToken(authorization.slice(7));
     if (!claims.sid || claims.role !== "CUSTOMER")
-      throw new Error("Session-bound Customer required");
+      throw new PackageCheckoutConflictError("Session-bound Customer required");
     const [user, live] = await Promise.all([
       this.users.findById(claims.sub),
       this.tokens.isAccessTokenSessionLive(claims),
@@ -80,7 +82,7 @@ export class PackageCheckoutCustomerAuthority {
       user.status !== "ACTIVE" ||
       String(user._id) !== claims.sub
     )
-      throw new Error("Active Customer session required");
+      throw new PackageCheckoutConflictError("Active Customer session required");
     const proof = Object.freeze({}) as PackageCheckoutCustomer;
     customers.set(proof, { userId: new Types.ObjectId(claims.sub), sessionFamilyId: claims.sid });
     return proof;
@@ -96,7 +98,7 @@ export class PackageCheckoutCustomerAuthority {
     const retention = packageCheckoutRetentionSchema.parse(retainedInput);
     const now = new Date(this.clock().getTime());
     if (!retention.seed.customerUserId.equals(customer.userId))
-      throw new Error("Foreign checkout Customer");
+      throw new PackageCheckoutConflictError("Foreign checkout Customer");
     assertPackageCheckoutCurrent(retention.quote, freshQuote, now);
     const presentation = assertPackagePresentation(retention, {
       version: 1,
@@ -130,7 +132,9 @@ export class PackageCheckoutCustomerAuthority {
       !presentation.customerUserId.equals(customer.userId) ||
       presentation.sessionFamilyId !== customer.sessionFamilyId
     )
-      throw new Error("Disclosure presentation belongs to another Customer/session");
+      throw new PackageCheckoutConflictError(
+        "Disclosure presentation belongs to another Customer/session",
+      );
     const event = packageCheckoutAffirmativeActionSchema.parse(actionInput);
     const acceptedAt = new Date(this.clock().getTime());
     assertPackageCheckoutCurrent(retention.quote, freshQuote, acceptedAt);

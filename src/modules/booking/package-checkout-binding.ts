@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Types } from "mongoose";
 import { z } from "zod";
 import { purchasedAcceptanceEvidenceSchema } from "../package-progress/purchased-package-contract.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import {
   type PackageCheckoutQuote,
   packageCheckoutQuoteSchema,
@@ -73,18 +74,18 @@ export const assertPackageCheckoutCurrent = (
     now >= retained.payload.expiresAt ||
     fresh.payload.appointments.some((row) => row.startAt <= now || row.availabilityCheckedAt > now)
   )
-    throw new Error("Checkout quote/schedule expired");
+    throw new PackageCheckoutConflictError("Checkout quote/schedule expired");
   const normalized: PackageCheckoutQuote = {
     ...fresh.payload,
     appointments: fresh.payload.appointments.map((row) => {
       const old = retained.payload.appointments.find((old) => old.bookingId.equals(row.bookingId));
       if (!old || row.availabilityCheckedAt < old.availabilityCheckedAt)
-        throw new Error("Checkout observation is stale");
+        throw new PackageCheckoutConflictError("Checkout observation is stale");
       return { ...row, availabilityCheckedAt: old.availabilityCheckedAt };
     }),
   };
   if (hashPackageCheckoutQuote(normalized) !== retained.termsHash)
-    throw new Error("Checkout facts changed; reprice and reaccept");
+    throw new PackageCheckoutConflictError("Checkout facts changed; reprice and reaccept");
 };
 
 /** Consistency check over externally retained evidence, NEVER a consent constructor.
@@ -107,7 +108,7 @@ export const assertPackageCheckoutAcceptance = (input: {
     !input.authenticatedActor.userId.equals(quote.customerUserId) ||
     evidence.scope !== "PURCHASE"
   )
-    throw new Error("Customer purchase acceptance required");
+    throw new PackageCheckoutConflictError("Customer purchase acceptance required");
   for (const key of [
     "quoteId",
     "batchId",
@@ -117,7 +118,8 @@ export const assertPackageCheckoutAcceptance = (input: {
     "actorUserId",
     "packageId",
   ] as const)
-    if (!evidence[key].equals(quote[key])) throw new Error(`Checkout acceptance ${key} mismatch`);
+    if (!evidence[key].equals(quote[key]))
+      throw new PackageCheckoutConflictError(`Checkout acceptance ${key} mismatch`);
   if (
     evidence.contractVersion !== quote.version ||
     evidence.packageRevision !== quote.definitionRevision ||
@@ -136,5 +138,5 @@ export const assertPackageCheckoutAcceptance = (input: {
         ),
     )
   )
-    throw new Error("Checkout acceptance payload/membership/time mismatch");
+    throw new PackageCheckoutConflictError("Checkout acceptance payload/membership/time mismatch");
 };

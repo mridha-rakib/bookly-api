@@ -8,6 +8,7 @@ import {
   commitPackageCheckoutClaimGrant,
 } from "./booking-creation-claim.model.js";
 import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { assertPackageAccepted, assertPackagePresentation } from "./package-checkout-acceptance.js";
 import {
   type PackageCheckoutClaimGrant,
@@ -50,7 +51,7 @@ export class BookingCreationClaimRepository {
       actorUserId: customer.userId,
     }).exec();
     if (!row?.packageCheckoutRetention || row.financialContract || row.packageRequestBinding)
-      throw new Error("Owned retained Package checkout required");
+      throw new PackageCheckoutConflictError("Owned retained Package checkout required");
     const retention = packageCheckoutRetentionSchema.parse(row.toObject().packageCheckoutRetention);
     if (
       !retention.seed.businessId.equals(businessId) ||
@@ -58,7 +59,7 @@ export class BookingCreationClaimRepository {
       retention.seed.idempotencyKey !== idempotencyKey ||
       !retention.quote.payload.originBookingId.equals(row.bookingId)
     )
-      throw new Error("Checkout claim identity mismatch");
+      throw new PackageCheckoutConflictError("Checkout claim identity mismatch");
     const presentation = row.packageCheckoutPresentation
       ? assertPackagePresentation(retention, row.toObject().packageCheckoutPresentation)
       : undefined;

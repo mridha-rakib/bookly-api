@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { Types } from "mongoose";
+import { Error as MongooseError, mongo, Types } from "mongoose";
 import { z } from "zod";
 import { AppError } from "../../common/errors/app-error.js";
 import { sendSuccess } from "../../common/http/responses.js";
@@ -10,6 +10,7 @@ import {
   requireActiveUser,
   requireRoles,
 } from "../auth/auth.middleware.js";
+import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { packageCheckoutAffirmativeActionSchema } from "./package-checkout-acceptance.js";
 import { packageCheckoutIntentSchema } from "./package-checkout-contract.js";
 import { readPackageCheckoutCustomer } from "./package-checkout-customer-authority.js";
@@ -95,20 +96,23 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         await fn(req, res, next);
       } catch (error) {
         if (error instanceof AppError || error instanceof z.ZodError) throw error;
+        if (error instanceof PackageCheckoutConflictError)
+          throw consentError(
+            "These terms or your session have changed. Start a fresh terms review.",
+            409,
+            "PACKAGE_CONSENT_CHANGED",
+          );
         if (
-          error instanceof Error &&
-          (error.name.includes("Mongo") || /outage|unavailable/i.test(error.message))
+          error instanceof mongo.MongoError ||
+          error instanceof MongooseError.MongooseServerSelectionError
         )
           throw consentError(
             "Terms review is temporarily unavailable. Please try again later.",
             503,
             "PACKAGE_CONSENT_UNAVAILABLE",
           );
-        throw consentError(
-          "These terms or your session have changed. Start a fresh terms review.",
-          409,
-          "PACKAGE_CONSENT_CHANGED",
-        );
+        // Unknown failures retain the shared safe 500/logging path, not a fabricated conflict.
+        throw error;
       }
     });
   const get = () => {
