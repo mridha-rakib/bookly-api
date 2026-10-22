@@ -8,6 +8,11 @@ import {
 } from "./booking-creation-claim.model.js";
 import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
 import {
+  normalizePackageCheckoutIntent,
+  type PackageCheckoutRetention,
+  packageCheckoutRetentionSchema,
+} from "./package-checkout-retention.js";
+import {
   type PackageRequestBinding,
   packageRequestBindingSchema,
 } from "./package-request-binding.js";
@@ -26,6 +31,70 @@ export type ClaimBookingCreationResult = {
 };
 
 export class BookingCreationClaimRepository {
+  /** Internal unaccepted checkout read. The unique operation namespace is shared with
+   * ordinary creation, so a collision with any other claim kind fails closed. */
+  public async findRetainedPackageCheckout(input: {
+    idempotencyKey: string;
+    businessId: Types.ObjectId;
+    actorUserId: Types.ObjectId;
+    intent: unknown;
+  }): Promise<PackageCheckoutRetention | null> {
+    const existing = await BookingCreationClaimModel.findOne({
+      idempotencyKey: input.idempotencyKey,
+    }).exec();
+    if (!existing) return null;
+    if (
+      !existing.businessId.equals(input.businessId) ||
+      !existing.actorUserId.equals(input.actorUserId) ||
+      existing.financialContract ||
+      existing.packageRequestBinding ||
+      !existing.packageCheckoutRetention
+    )
+      throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    const retained = packageCheckoutRetentionSchema.parse(
+      existing.toObject().packageCheckoutRetention,
+    );
+    if (
+      !isDeepStrictEqual(
+        normalizePackageCheckoutIntent(retained.intent),
+        normalizePackageCheckoutIntent(input.intent),
+      ) ||
+      retained.seed.idempotencyKey !== existing.idempotencyKey ||
+      !retained.seed.businessId.equals(existing.businessId) ||
+      !retained.seed.actorUserId.equals(existing.actorUserId) ||
+      !retained.quote.payload.originBookingId.equals(existing.bookingId)
+    )
+      throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    return retained;
+  }
+
+  /** Insert-only retention. A concurrent winner's entire seed/quote is returned;
+   * the losing proposal never changes the operation or financial origin. */
+  public async retainPackageCheckout(input: unknown): Promise<PackageCheckoutRetention> {
+    const retained = packageCheckoutRetentionSchema.parse(input);
+    const scope = {
+      idempotencyKey: retained.seed.idempotencyKey,
+      businessId: retained.seed.businessId,
+      actorUserId: retained.seed.actorUserId,
+      intent: retained.intent,
+    };
+    try {
+      await new BookingCreationClaimModel({
+        idempotencyKey: scope.idempotencyKey,
+        businessId: scope.businessId,
+        actorUserId: scope.actorUserId,
+        bookingId: retained.quote.payload.originBookingId,
+        packageCheckoutRetention: retained,
+      }).save();
+      return retained;
+    } catch (error) {
+      if (!this.isDuplicateKeyError(error)) throw error;
+      const winner = await this.findRetainedPackageCheckout(scope);
+      if (!winner) throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+      return winner;
+    }
+  }
+
   /** See booking-creation-claim.model.ts for the full idempotency-contract rationale. */
   public async claim(input: ClaimBookingCreationInput): Promise<ClaimBookingCreationResult> {
     try {
@@ -46,6 +115,8 @@ export class BookingCreationClaimRepository {
         throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       }
       const storedBinding = existing.toObject().packageRequestBinding;
+      if (existing.packageCheckoutRetention)
+        throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       if (
         !isDeepStrictEqual(
           storedBinding ? packageRequestBindingSchema.parse(storedBinding) : undefined,
@@ -66,6 +137,7 @@ export class BookingCreationClaimRepository {
     await BookingCreationClaimModel.deleteOne({
       idempotencyKey,
       packageRequestBinding: { $exists: false },
+      packageCheckoutRetention: { $exists: false },
     }).exec();
   }
 
@@ -75,6 +147,7 @@ export class BookingCreationClaimRepository {
     return BookingCreationClaimModel.findOne({
       idempotencyKey,
       packageRequestBinding: { $exists: false },
+      packageCheckoutRetention: { $exists: false },
     }).exec();
   }
 
@@ -89,6 +162,7 @@ export class BookingCreationClaimRepository {
       businessId,
       actorUserId,
       packageRequestBinding: { $exists: true },
+      packageCheckoutRetention: { $exists: false },
     }).exec();
   }
 
@@ -111,6 +185,7 @@ export class BookingCreationClaimRepository {
         idempotencyKey,
         bookingId: contract.bookingId,
         financialContract: { $exists: false },
+        packageCheckoutRetention: { $exists: false },
       },
       { $set: { financialContract: contract } },
       { returnDocument: "after", runValidators: true },
@@ -118,7 +193,11 @@ export class BookingCreationClaimRepository {
     if (recorded?.financialContract) return recorded.financialContract;
 
     const existing = await BookingCreationClaimModel.findOne({ idempotencyKey }).exec();
-    if (!existing?.financialContract || !existing.bookingId.equals(contract.bookingId)) {
+    if (
+      !existing?.financialContract ||
+      existing.packageCheckoutRetention ||
+      !existing.bookingId.equals(contract.bookingId)
+    ) {
       throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
     }
     if (findFinancialContractMismatch(existing.financialContract, contract)) {

@@ -3,6 +3,10 @@ import { model, Schema, type Types } from "mongoose";
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 import {
+  type PackageCheckoutRetention,
+  packageCheckoutRetentionSchema,
+} from "./package-checkout-retention.js";
+import {
   type PackageRequestBinding,
   packageRequestBindingMongooseSchema,
   packageRequestBindingSchema,
@@ -26,6 +30,8 @@ import {
  * second provider operation.
  */
 export type BookingCreationClaimDocument = {
+  /** P3-B1: durable unaccepted offer only; excluded from ordinary release/payment paths. */
+  packageCheckoutRetention?: PackageCheckoutRetention | undefined;
   packageRequestBinding?: PackageRequestBinding | undefined;
   _id: Types.ObjectId;
   idempotencyKey: string;
@@ -41,6 +47,7 @@ export type BookingCreationClaimDocument = {
 
 const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
   {
+    packageCheckoutRetention: { type: Schema.Types.Mixed },
     packageRequestBinding: { type: packageRequestBindingMongooseSchema },
     idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
@@ -54,6 +61,34 @@ const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
 
 bookingCreationClaimSchema.index({ idempotencyKey: 1 }, { unique: true });
 bookingCreationClaimSchema.pre("validate", function () {
+  if (
+    !this.isNew &&
+    ["packageCheckoutRetention", "idempotencyKey", "businessId", "actorUserId", "bookingId"].some(
+      (key) => this.isModified(key),
+    )
+  )
+    this.invalidate("packageCheckoutRetention", "Creation claim identity/retention is immutable");
+  if (this.packageCheckoutRetention) {
+    const result = packageCheckoutRetentionSchema.safeParse(
+      this.toObject().packageCheckoutRetention,
+    );
+    if (!result.success) this.invalidate("packageCheckoutRetention", result.error.message);
+    else {
+      const quote = result.data.quote.payload;
+      if (
+        this.packageRequestBinding ||
+        this.financialContract ||
+        this.idempotencyKey !== quote.idempotencyKey ||
+        !this.businessId.equals(quote.businessId) ||
+        !this.actorUserId.equals(quote.actorUserId) ||
+        !this.bookingId.equals(quote.originBookingId)
+      )
+        this.invalidate(
+          "packageCheckoutRetention",
+          "Unaccepted checkout claim scope/authority mismatch",
+        );
+    }
+  }
   if (!this.isNew && this.isModified("packageRequestBinding"))
     this.invalidate("packageRequestBinding", "Accepted request binding is immutable");
   if (this.packageRequestBinding) {
@@ -74,27 +109,81 @@ bookingCreationClaimSchema.pre("validate", function () {
     }
   }
 });
-bookingCreationClaimSchema.pre(
-  ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"],
-  function () {
-    const update = this.getUpdate();
-    if (
-      update &&
-      (Array.isArray(update) ||
-        Object.hasOwn(update, "packageRequestBinding") ||
-        Object.values(update).some(
-          (fields) =>
-            fields &&
+bookingCreationClaimSchema.pre(["replaceOne", "findOneAndReplace"], () => {
+  throw new Error("Creation claim identity/retention is immutable");
+});
+bookingCreationClaimSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"], function () {
+  const update = this.getUpdate();
+  const protectedRoots = [
+    "packageCheckoutRetention",
+    "idempotencyKey",
+    "businessId",
+    "actorUserId",
+    "bookingId",
+  ];
+  const touchesIdentity = (fields: object) =>
+    Object.keys(fields).some((key) =>
+      protectedRoots.some((root) => key === root || key.startsWith(`${root}.`)),
+    );
+  if (
+    update &&
+    (Array.isArray(update) ||
+      touchesIdentity(update) ||
+      Object.entries(update).some(
+        ([operator, fields]) =>
+          operator.startsWith("$") &&
+          fields &&
+          typeof fields === "object" &&
+          (touchesIdentity(fields) ||
+            Object.values(fields).some(
+              (target) =>
+                typeof target === "string" &&
+                protectedRoots.some((root) => target === root || target.startsWith(`${root}.`)),
+            )),
+      ))
+  )
+    throw new Error("Creation claim identity/retention is immutable");
+  // An unaccepted retained checkout must never acquire money authority through a generic writer.
+  const touchesFinancialContract = (fields: object) =>
+    Object.keys(fields).some(
+      (key) => key === "financialContract" || key.startsWith("financialContract."),
+    ) ||
+    Object.values(fields).some(
+      (target) =>
+        typeof target === "string" &&
+        (target === "financialContract" || target.startsWith("financialContract.")),
+    );
+  if (
+    update &&
+    (touchesFinancialContract(update) ||
+      Object.values(update).some(
+        (fields) => fields && typeof fields === "object" && touchesFinancialContract(fields),
+      ))
+  )
+    this.where({ packageCheckoutRetention: { $exists: false } });
+  if (
+    update &&
+    (Array.isArray(update) ||
+      Object.hasOwn(update, "packageRequestBinding") ||
+      Object.values(update).some(
+        (fields) =>
+          (fields &&
             typeof fields === "object" &&
             Object.keys(fields).some(
               (key) => key === "packageRequestBinding" || key.startsWith("packageRequestBinding."),
-            ),
-        ))
-    ) {
-      throw new Error("Accepted request binding is immutable");
-    }
-  },
-);
+            )) ||
+          (fields &&
+            typeof fields === "object" &&
+            Object.values(fields).some(
+              (target) =>
+                typeof target === "string" &&
+                (target === "packageRequestBinding" || target.startsWith("packageRequestBinding.")),
+            )),
+      ))
+  ) {
+    throw new Error("Accepted request binding is immutable");
+  }
+});
 
 export const BookingCreationClaimModel = model<BookingCreationClaimDocument>(
   "BookingCreationClaim",
