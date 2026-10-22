@@ -28,12 +28,12 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
-import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
   stopIsolatedReplicaSet,
-} from "./mongo-replset-helper.js";
+} from "../../helpers/consent-isolated-database.js";
+import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
 
 const actionFor = (p: PackageCheckoutPresentation): PackageCheckoutAffirmativeAction => ({
   version: 1,
@@ -128,7 +128,7 @@ const setup = async (mode: "FINITE" | "FOREVER" = "FOREVER", months: 6 | 12 = 6)
 describe("inactive authenticated acceptance foundation with synthetic affirmative events", () => {
   beforeAll(async () => {
     const database = await connectIsolatedDatabase();
-    expect(database).toMatch(/^bookly_auth_\d+_[a-f0-9]+$/);
+    expect(database).toMatch(/^bookly_consent_v1_\d+_[a-f0-9]+$/);
     expect(mongoose.connection.host).toBe("127.0.0.1");
     const hello = await mongoose.connection.db?.admin().command({ hello: 1 });
     expect(hello?.["setName"]).toBeTruthy();

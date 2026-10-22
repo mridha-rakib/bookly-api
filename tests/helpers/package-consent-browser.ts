@@ -8,7 +8,11 @@ import { setTimeout as delay } from "node:timers/promises";
  * HTTP adapter. Artifacts/profile remain in test temp for review; no real account is used.
  */
 export const openPackageConsentBrowser = async (url: string, artifactDirectory: string) => {
-  if (!/^http:\/\/127\.0\.0\.1:\d+\/browser-fixture$/.test(url))
+  if (
+    !/^http:\/\/127\.0\.0\.1:\d+\/(browser-fixture|customer\/package-consent\/[a-f0-9]{24}\/[a-f0-9]{24})$/.test(
+      url,
+    )
+  )
     throw new Error("Disposable local browser URL required");
   const profile = await mkdtemp(join(tmpdir(), "bookly-consent-browser-"));
   const child = spawn(
@@ -71,7 +75,21 @@ export const openPackageConsentBrowser = async (url: string, artifactDirectory: 
     const command = (method: string, params: object = {}) =>
       new Promise<unknown>((resolve, reject) => {
         const id = ++sequence;
-        pending.set(id, { resolve, reject });
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`CDP timeout: ${method}`));
+        }, 120000);
+        timer.unref();
+        pending.set(id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        });
         socket?.send(JSON.stringify({ id, method, params }));
       });
     await command("Network.enable");
@@ -92,9 +110,12 @@ export const openPackageConsentBrowser = async (url: string, artifactDirectory: 
         throw new Error(`Browser evaluation failed: ${JSON.stringify(reply.exceptionDetails)}`);
       return reply.result.value;
     };
-    const waitFor = async (expression: string) => {
-      for (let n = 0; n < 150; n++) {
-        if (await evaluate(expression)) return;
+    const waitFor = async (expression: string, timeoutMs = 10000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (await evaluate(`Boolean(${expression})`)) return;
+        if (browserErrors.length)
+          throw new Error(`Browser runtime error: ${JSON.stringify(browserErrors).slice(-5000)}`);
         await delay(40);
       }
       throw new Error(
@@ -128,6 +149,8 @@ export const openPackageConsentBrowser = async (url: string, artifactDirectory: 
       await command("Input.dispatchKeyEvent", { ...params, type: "keyUp" });
     };
     return {
+      command,
+      debuggingPort: port,
       evaluate,
       waitFor,
       screenshot,

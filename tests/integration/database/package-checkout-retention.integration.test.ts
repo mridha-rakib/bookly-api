@@ -6,12 +6,12 @@ import type { FinancialContract } from "../../../src/modules/booking/financial-c
 import { packageCheckoutRetentionSchema } from "../../../src/modules/booking/package-checkout-retention.js";
 import { PackageCheckoutRetentionService } from "../../../src/modules/booking/package-checkout-retention.service.js";
 import { BusinessTravelSettingsModel } from "../../../src/modules/business-travel-settings/business-travel-settings.model.js";
-import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
   stopIsolatedReplicaSet,
-} from "./mongo-replset-helper.js";
+} from "../../helpers/consent-isolated-database.js";
+import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
 
 const claims = new BookingCreationClaimRepository();
 const setup = (mode: "FOREVER" | "FINITE" = "FOREVER", count = 6) => {
@@ -39,7 +39,7 @@ const setup = (mode: "FOREVER" | "FINITE" = "FOREVER", count = 6) => {
 describe("inactive canonical package checkout retention (real local Mongo persistence)", () => {
   beforeAll(async () => {
     const name = await connectIsolatedDatabase();
-    expect(name).toMatch(/^bookly_auth_\d+_[a-f0-9]+$/);
+    expect(name).toMatch(/^bookly_consent_v1_\d+_[a-f0-9]+$/);
     expect(["127.0.0.1", "localhost", "::1"]).toContain(mongoose.connection.host);
     const hello = await mongoose.connection.db?.admin().command({ hello: 1 });
     expect(hello?.["setName"]).toBeTruthy();

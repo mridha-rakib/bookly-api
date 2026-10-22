@@ -30,13 +30,13 @@ import { daysOfWeek } from "../../../src/modules/staff/staff-schedule.types.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
-import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
-import { openPackageConsentBrowser } from "../../helpers/package-consent-browser.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
   stopIsolatedReplicaSet,
-} from "./mongo-replset-helper.js";
+} from "../../helpers/consent-isolated-database.js";
+import { CHECK_TIME, checkoutFixture } from "../../helpers/package-checkout-fixture.js";
+import { openPackageConsentBrowser } from "../../helpers/package-consent-browser.js";
 
 const setup = async () => {
   const f = checkoutFixture();
@@ -157,7 +157,7 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
   beforeAll(async () => {
     const database = await connectIsolatedDatabase();
     expect(mongoose.connection.host).toBe("127.0.0.1");
-    expect(database).toMatch(/^bookly_auth_/);
+    expect(database).toMatch(/^bookly_consent_v1_/);
     const hello = await mongoose.connection.db?.admin().command({ hello: 1 });
     expect(hello?.["setName"]).toBeTruthy();
     const session = await mongoose.startSession();
