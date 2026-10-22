@@ -1,6 +1,10 @@
 import type { ClientSession, Types } from "mongoose";
 
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
+import {
+  assertBusinessPackageMode,
+  withPackageEligibility,
+} from "../package-progress/package-eligibility.js";
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import { type BusinessDocument, BusinessModel } from "./business.model.js";
 import type { BusinessStatus, BusinessVisitType } from "./business.types.js";
@@ -99,12 +103,21 @@ export class BusinessRepository {
     ownerUserId: Types.ObjectId | string,
     businessId: Types.ObjectId | string,
     update: Record<string, unknown>,
+    session?: ClientSession,
   ): Promise<BusinessDocument | null> {
-    return BusinessModel.findOneAndUpdate(
-      { _id: businessId, ownerUserId },
-      { $set: update },
-      { returnDocument: "after", runValidators: true },
-    ).exec();
+    // Preserve the previous masked not-found result without disclosing dependency state.
+    const owned = await BusinessModel.exists({ _id: businessId, ownerUserId }).session(
+      session ?? null,
+    );
+    if (!owned) return null;
+    return withPackageEligibility(businessId, session, async (transaction) => {
+      await assertBusinessPackageMode(businessId, update["visitType"], transaction);
+      return BusinessModel.findOneAndUpdate(
+        { _id: businessId, ownerUserId },
+        { $set: update },
+        { returnDocument: "after", runValidators: true, session: transaction },
+      ).exec();
+    });
   }
 
   /**

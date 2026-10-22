@@ -1,33 +1,63 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 
+import { logger } from "../../config/logger.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { UserRole } from "../user/user.types.js";
 import { AuthError } from "./auth.errors.js";
 import type { TokenService } from "./token.service.js";
 
+/**
+ * The single access-token resolution path shared by required and optional authentication.
+ * A request authenticates only when the JWT verifies, its user exists, and the refresh-token
+ * family it is bound to (`sid`) is still live. Credential failures are 401 SESSION_EXPIRED;
+ * a database failure while checking is 503 AUTHENTICATION_UNAVAILABLE — still fail-closed, but
+ * not reported as a revoked session (which would make clients refresh/log out on an outage).
+ */
+const resolveAccessToken = async (
+  tokenService: TokenService,
+  userRepository: UserRepository,
+  authorization: string | undefined,
+): Promise<NonNullable<Request["auth"]>> => {
+  if (!authorization?.startsWith("Bearer ")) {
+    throw new AuthError("SESSION_EXPIRED", 401);
+  }
+
+  let claims: Awaited<ReturnType<TokenService["verifyAccessToken"]>>;
+  try {
+    claims = await tokenService.verifyAccessToken(authorization.slice("Bearer ".length));
+  } catch {
+    throw new AuthError("SESSION_EXPIRED", 401);
+  }
+
+  let user: Awaited<ReturnType<UserRepository["findById"]>>;
+  let sessionLive: boolean;
+  try {
+    [user, sessionLive] = await Promise.all([
+      userRepository.findById(claims.sub),
+      tokenService.isAccessTokenSessionLive(claims),
+    ]);
+  } catch (error) {
+    logger.error({ err: error }, "Access token session check failed");
+    throw new AuthError("AUTHENTICATION_UNAVAILABLE", 503);
+  }
+
+  if (!user || !sessionLive) {
+    throw new AuthError("SESSION_EXPIRED", 401);
+  }
+
+  return { userId: String(user._id), role: user.role, status: user.status };
+};
+
 export const createAuthenticateAccessTokenMiddleware =
   (tokenService: TokenService, userRepository: UserRepository): RequestHandler =>
   async (request: Request, _response: Response, next: NextFunction): Promise<void> => {
     try {
-      const authorization = request.headers.authorization;
-
-      if (!authorization?.startsWith("Bearer ")) {
-        throw new AuthError("SESSION_EXPIRED", 401);
-      }
-
-      const claims = await tokenService.verifyAccessToken(authorization.slice("Bearer ".length));
-      const user = await userRepository.findById(claims.sub);
-
-      if (!user) {
-        throw new AuthError("SESSION_EXPIRED", 401);
-      }
-
-      request.auth = {
-        userId: String(user._id),
-        role: user.role,
-        status: user.status,
-      };
+      request.auth = await resolveAccessToken(
+        tokenService,
+        userRepository,
+        request.headers.authorization,
+      );
       next();
     } catch (error) {
       next(error instanceof AuthError ? error : new AuthError("SESSION_EXPIRED", 401));
@@ -41,25 +71,25 @@ export const createAuthenticateAccessTokenMiddleware =
  * malformed, expired, revoked — is a silent fall-through to the anonymous path, never a 401:
  * the endpoint is fully usable logged-out, so a stale token must degrade to "not personalized",
  * not to an error. It never throws and never calls `next(error)`.
+ *
+ * Phase 1A: uses the same resolution as required auth, so a revoked session family is never
+ * attached as authenticated. Falling back to anonymous (rather than 401/503) is safe here because
+ * these routes only serve public data when `request.auth` is absent.
  */
 export const createOptionalAuthenticateAccessTokenMiddleware =
   (tokenService: TokenService, userRepository: UserRepository): RequestHandler =>
   async (request: Request, _response: Response, next: NextFunction): Promise<void> => {
     try {
-      const authorization = request.headers.authorization;
-      if (authorization?.startsWith("Bearer ")) {
-        const claims = await tokenService.verifyAccessToken(authorization.slice("Bearer ".length));
-        const user = await userRepository.findById(claims.sub);
-        if (user) {
-          request.auth = {
-            userId: String(user._id),
-            role: user.role,
-            status: user.status,
-          };
-        }
+      if (request.headers.authorization?.startsWith("Bearer ")) {
+        request.auth = await resolveAccessToken(
+          tokenService,
+          userRepository,
+          request.headers.authorization,
+        );
       }
     } catch {
       // Intentionally swallowed — see doc comment. The request continues anonymously.
+      delete request.auth;
     }
     next();
   };

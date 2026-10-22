@@ -22,6 +22,8 @@ export type BusinessAddress = {
 };
 
 export type BusinessDocument = {
+  /** Internal coordination only; not exposed through Business profile DTOs. */
+  packageEligibilityVersion: number;
   _id: Types.ObjectId;
   ownerUserId: Types.ObjectId;
   name: string;
@@ -98,6 +100,13 @@ export type BusinessDocument = {
 
 const businessSchema = new Schema<BusinessDocument>(
   {
+    packageEligibilityVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: Number.MAX_SAFE_INTEGER,
+      validate: Number.isSafeInteger,
+    },
     ownerUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     name: { type: String, required: true, trim: true },
     ownerName: { type: String, required: true, trim: true },

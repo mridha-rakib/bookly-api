@@ -33,6 +33,13 @@ import {
   DEPOSIT_MIN_CENTS,
   MAX_CUSTOMER_RESCHEDULE_COUNT,
 } from "./booking.types.js";
+import {
+  type BookingPackageContext,
+  type BookingSchedulingSnapshot,
+  bookingPackageContextSchema,
+  bookingSchedulingSnapshotSchema,
+  validPackageSchedulingSnapshot,
+} from "./booking-package-foundation.js";
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 
@@ -146,6 +153,7 @@ export type BookingServiceLineStaffSnapshot = {
  * in this phase; see booking.service.ts's module doc comment for the planned shape.
  */
 export type BookingServiceLinePricingInput = {
+  packageItemId?: Types.ObjectId | undefined;
   hours?: number | undefined;
   personCount?: number | undefined;
   sessionsInPackage?: number | undefined;
@@ -154,6 +162,8 @@ export type BookingServiceLinePricingInput = {
 };
 
 export type BookingServiceLine = {
+  packageContext?: BookingPackageContext | undefined;
+  schedulingSnapshot?: BookingSchedulingSnapshot | undefined;
   serviceId: Types.ObjectId;
   serviceSnapshot: BookingServiceLineServiceSnapshot;
   pricingInput: BookingServiceLinePricingInput;
@@ -620,6 +630,7 @@ const bookingServiceLineStaffSnapshotSchema = new Schema<BookingServiceLineStaff
 
 const bookingServiceLinePricingInputSchema = new Schema<BookingServiceLinePricingInput>(
   {
+    packageItemId: { type: Schema.Types.ObjectId },
     hours: { type: Number, min: 0 },
     personCount: { type: Number, min: 1, validate: Number.isInteger },
     sessionsInPackage: { type: Number, min: 1, validate: Number.isInteger },
@@ -633,6 +644,20 @@ const bookingServiceLinePricingInputSchema = new Schema<BookingServiceLinePricin
 const pricingInputMatchesMode = (line: BookingServiceLine): boolean => {
   const input = line.pricingInput;
   const mode = line.serviceSnapshot.pricingMode;
+  if (input.packageItemId || line.packageContext || line.schedulingSnapshot) {
+    return (
+      mode === "PACKAGE" &&
+      !!input.packageItemId &&
+      !!input.packageProgressId &&
+      !!line.packageContext &&
+      !!line.schedulingSnapshot &&
+      validPackageSchedulingSnapshot(line.schedulingSnapshot) &&
+      line.serviceSnapshot.durationMin === line.schedulingSnapshot.baseDurationMin &&
+      input.hours === undefined &&
+      input.personCount === undefined &&
+      (line.packageContext.role !== "REDEMPTION" || line.amountCents === 0)
+    );
+  }
 
   if (mode === "FIXED") {
     return (
@@ -677,6 +702,8 @@ const pricingInputMatchesMode = (line: BookingServiceLine): boolean => {
 
 const bookingServiceLineSchema = new Schema<BookingServiceLine>(
   {
+    packageContext: { type: bookingPackageContextSchema },
+    schedulingSnapshot: { type: bookingSchedulingSnapshotSchema },
     serviceId: { type: Schema.Types.ObjectId, ref: "Service", required: true },
     serviceSnapshot: { type: bookingServiceLineServiceSnapshotSchema, required: true },
     pricingInput: { type: bookingServiceLinePricingInputSchema, required: true, default: {} },
@@ -963,7 +990,9 @@ const bookingSchema = new Schema<BookingDocument>(
       required: true,
       validate: {
         validator: (lines: BookingServiceLine[]) =>
-          lines.length > 0 && lines.every((line) => pricingInputMatchesMode(line)),
+          lines.length > 0 &&
+          (!lines.some((line) => line.pricingInput.packageItemId) || lines.length === 1) &&
+          lines.every((line) => pricingInputMatchesMode(line)),
         message:
           "A Booking must have at least one Service line, and each line's pricing input must match its pricing mode",
       },

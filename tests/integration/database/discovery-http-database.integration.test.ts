@@ -11,6 +11,7 @@ import { createDiscoveryRoute } from "../../../src/modules/discovery/discovery.r
 import { createFavoriteRoute } from "../../../src/modules/favorite/favorite.route.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -95,7 +96,7 @@ describe("HTTP-level Discovery/Favorites/Book Again endpoints (Batch 16)", () =>
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Discovery: genuinely public -----------------------------------------------------------
 

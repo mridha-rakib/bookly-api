@@ -15,6 +15,7 @@ import { ClientIdentityService } from "../../../src/modules/client/client-identi
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -165,7 +166,7 @@ describe("database-backed BusinessClient integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "CUSTOMER",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Index invariants -------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import type { StorageService } from "../../../src/modules/storage/storage.service.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -82,7 +83,7 @@ describe("HTTP-level Content Manager Blog (Phase 2)", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const basePost = {
     title: "Meet Our Founding Partners",

@@ -1,4 +1,8 @@
 import type { ClientSession, Types } from "mongoose";
+import {
+  assertStaffPackageDependencies,
+  withPackageEligibility,
+} from "../package-progress/package-eligibility.js";
 
 import { type StaffMembershipDocument, StaffMembershipModel } from "./staff.model.js";
 import type { StaffCreatableRole } from "./staff.types.js";
@@ -80,21 +84,29 @@ export class StaffRepository {
     update: Partial<Pick<StaffMembershipDocument, "role" | "employmentActive">>,
     session?: ClientSession,
   ): Promise<StaffMembershipDocument | null> {
-    return StaffMembershipModel.findOneAndUpdate(
-      { _id: staffId, businessId, removedAt: { $exists: false } },
-      { $set: update },
-      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
-    ).exec();
+    return withPackageEligibility(businessId, session, async (transaction) => {
+      if (update.employmentActive === false)
+        await assertStaffPackageDependencies(businessId, staffId, transaction);
+      return StaffMembershipModel.findOneAndUpdate(
+        { _id: staffId, businessId, removedAt: { $exists: false } },
+        { $set: update },
+        { returnDocument: "after", runValidators: true, session: transaction },
+      ).exec();
+    });
   }
 
   public async softRemoveById(
     businessId: Types.ObjectId | string,
     staffId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<StaffMembershipDocument | null> {
-    return StaffMembershipModel.findOneAndUpdate(
-      { _id: staffId, businessId, removedAt: { $exists: false } },
-      { $set: { removedAt: new Date(), employmentActive: false } },
-      { returnDocument: "after" },
-    ).exec();
+    return withPackageEligibility(businessId, session, async (transaction) => {
+      await assertStaffPackageDependencies(businessId, staffId, transaction);
+      return StaffMembershipModel.findOneAndUpdate(
+        { _id: staffId, businessId, removedAt: { $exists: false } },
+        { $set: { removedAt: new Date(), employmentActive: false } },
+        { returnDocument: "after", session: transaction },
+      ).exec();
+    });
   }
 }

@@ -85,6 +85,8 @@ export type PackageFulfilmentEntitlement = {
 };
 
 export type PackageProgressDocument = {
+  /** Absent on original records. Absence and explicit 1 are both legacy, never v2. */
+  schemaVersion?: 1 | undefined;
   _id: Types.ObjectId;
   businessId: Types.ObjectId;
   customerUserId: Types.ObjectId;
@@ -162,6 +164,7 @@ const sessionSchema = new Schema<PackageProgressSession>(
 
 const packageProgressSchema = new Schema<PackageProgressDocument>(
   {
+    schemaVersion: { type: Number, enum: [1] },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     customerUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     businessClientId: { type: Schema.Types.ObjectId, ref: "BusinessClient", required: true },
@@ -212,6 +215,27 @@ packageProgressSchema.index({ businessId: 1, customerUserId: 1, serviceId: 1 });
 // Booking belong to". Non-unique: a given bookingId only ever appears in one document by
 // construction, but nothing here relies on the index itself enforcing that.
 packageProgressSchema.index({ "sessions.bookingId": 1 });
+packageProgressSchema.index({ businessId: 1, customerUserId: 1, "items.serviceId": 1 });
+packageProgressSchema.index({ businessId: 1, "items.serviceId": 1 });
+
+// Explicit isolation also covers exists(), deletes and terminal hooks. No default version
+// is written onto old records and legacy DTOs never receive a v2 shape.
+packageProgressSchema.pre(
+  [
+    "find",
+    "findOne",
+    "countDocuments",
+    "findOneAndUpdate",
+    "updateOne",
+    "updateMany",
+    "deleteOne",
+    "deleteMany",
+    "replaceOne",
+  ],
+  function () {
+    this.and([{ schemaVersion: { $in: [null, 1] } }]);
+  },
+);
 
 export const PackageProgressModel = model<PackageProgressDocument>(
   "PackageProgress",

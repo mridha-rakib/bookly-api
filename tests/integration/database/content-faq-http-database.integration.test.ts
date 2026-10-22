@@ -9,6 +9,7 @@ import { createPublicContentRoute } from "../../../src/modules/content/content.r
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -59,7 +60,7 @@ describe("HTTP-level Content Manager FAQ (Phase 1)", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const createFaq = async (app: express.Express, token: string, body: Record<string, unknown>) => {
     const response = await request(app)

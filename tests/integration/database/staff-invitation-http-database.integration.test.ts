@@ -1,4 +1,5 @@
 import express from "express";
+import { decodeJwt } from "jose";
 import type { Types } from "mongoose";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import { StaffInvitationService } from "../../../src/modules/staff-invitation/st
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { expectSessionRevokedByLogout } from "../../helpers/session-binding.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -192,6 +194,20 @@ describe("HTTP-level Staff/Supervisor invitation acceptance (password + Google)"
     expect(acceptedInvite.authProvider).toBe("PASSWORD");
 
     expect(await SessionModel.countDocuments({ userId: user._id })).toBe(1);
+
+    // Phase 1A — the access token minted inside the acceptance transaction is bound to the
+    // session it created, and dies with that session's family on logout.
+    const session = await SessionModel.findOne({ userId: user._id }).orFail();
+    const issued = `Bearer ${res.body.data.accessToken}`;
+    expect(decodeJwt(res.body.data.accessToken)).toMatchObject({ sid: session.tokenFamilyId });
+    expect(
+      (await request(buildApp()).get("/api/v1/auth/me").set("Authorization", issued)).status,
+    ).toBe(200);
+    await expectSessionRevokedByLogout(buildApp(), res, "SUPERVISOR");
+    const afterLogout = await request(buildApp())
+      .get("/api/v1/auth/me")
+      .set("Authorization", issued);
+    expect(afterLogout.status).toBe(401);
   });
 
   it("a role field in the accept body is rejected (strict schema) and the role always comes from the invitation", async () => {
@@ -319,6 +335,7 @@ describe("HTTP-level Staff/Supervisor invitation acceptance (password + Google)"
     expect(accepted.status).toBe("ACCEPTED");
     expect(accepted.authProvider).toBe("GOOGLE");
     expect(accepted.googleProviderAccountId).toBe("google-sub-staff-1");
+    await expectSessionRevokedByLogout(buildApp(), cb, "STAFF");
   });
 
   it("GET /auth/me returns linkedAccounts for a SUPERVISOR/STAFF (Phase 3 P0 — was CUSTOMER/OWNER only)", async () => {

@@ -12,6 +12,7 @@ import { PromoCodeModel } from "../../../src/modules/promo/promo.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -26,7 +27,7 @@ app.use(createErrorHandler({ isProduction: true }));
 const tokenService = new TokenService(new SessionRepository());
 
 const bearer = async (userId: Types.ObjectId, role: string) =>
-  `Bearer ${await tokenService.createAccessToken({ userId, role: role as never })}`;
+  `Bearer ${await issueTestAccessToken(tokenService, { userId, role: role as never })}`;
 
 const seedSuperAdmin = async () => {
   const user = await UserModel.create({

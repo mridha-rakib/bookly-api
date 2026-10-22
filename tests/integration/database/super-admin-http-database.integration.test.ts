@@ -19,6 +19,7 @@ import { StaffRepository } from "../../../src/modules/staff/staff.repository.js"
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -262,7 +263,7 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Cross-role authorization: every /super-admin route is SUPER_ADMIN-only ------------------
 

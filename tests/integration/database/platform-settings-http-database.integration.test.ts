@@ -26,6 +26,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { UserRole } from "../../../src/modules/user/user.types.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -74,7 +75,7 @@ describe("HTTP-level Super Admin Platform Settings (Batch 21)", () => {
       emailVerifiedAt: new Date(),
       phoneVerifiedAt: new Date(),
     });
-    return `Bearer ${await tokenService.createAccessToken({ userId: user._id, role })}`;
+    return `Bearer ${await issueTestAccessToken(tokenService, { userId: user._id, role })}`;
   };
 
   it("rejects an unauthenticated GET with 401", async () => {

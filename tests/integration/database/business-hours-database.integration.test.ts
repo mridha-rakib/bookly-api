@@ -17,6 +17,7 @@ import { createBusinessHoursRoute } from "../../../src/modules/business-hours/bu
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -93,7 +94,7 @@ describe("database-backed BusinessOpeningHours integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   it("enforces one BusinessOpeningHours document per Business at the database level", async () => {
     const indexes = (await BusinessOpeningHoursModel.collection.indexes()) as DbIndex[];

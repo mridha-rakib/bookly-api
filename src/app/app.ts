@@ -13,6 +13,7 @@ import { buildErrorResponse } from "../common/http/responses.js";
 import { createErrorHandler } from "../common/middleware/error-handler.js";
 import { httpLoggerMiddleware } from "../common/middleware/http-logger.js";
 import { notFoundMiddleware } from "../common/middleware/not-found.js";
+import { attributeRateLimitRejections } from "../common/middleware/rate-limit-attribution.js";
 import { requestIdMiddleware } from "../common/middleware/request-id.js";
 import { env } from "../config/env.js";
 import { createSwaggerHtml, openApiDocument } from "../config/openapi.js";
@@ -88,16 +89,24 @@ export class ExpressApplication {
         callback(new Error("CORS origin is not allowed"));
       },
       credentials: true,
+      // The frontend runs on another origin; without this, browser JS cannot read the limiter's
+      // Retry-After on a 429 (it is not a CORS-safelisted header). Used to schedule logout retries.
+      exposedHeaders: ["Retry-After"],
     });
   }
 
   private createRateLimiter() {
-    return rateLimit({
+    const limiter = rateLimit({
       windowMs: env.RATE_LIMIT_WINDOW_MS,
       limit: env.RATE_LIMIT_MAX,
       standardHeaders: "draft-8",
       legacyHeaders: false,
       message: buildErrorResponse("Too many requests"),
+    });
+    return attributeRateLimitRejections(limiter, {
+      name: "global-api",
+      limit: env.RATE_LIMIT_MAX,
+      windowMs: env.RATE_LIMIT_WINDOW_MS,
     });
   }
 

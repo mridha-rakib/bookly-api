@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 
 import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
+import { attributeRateLimitRejections } from "../../common/middleware/rate-limit-attribution.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { createOptionalAuthenticateAccessTokenMiddleware } from "../auth/auth.middleware.js";
@@ -31,13 +32,17 @@ export const createDiscoveryRoute = (): Router => {
     ),
   );
 
-  const discoveryLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    limit: env.RATE_LIMIT_MAX,
-    standardHeaders: "draft-8",
-    legacyHeaders: false,
-    message: buildErrorResponse("Too many requests"),
-  });
+  const discoveryLimiterWindowMs = 60 * 1000;
+  const discoveryLimiter = attributeRateLimitRejections(
+    rateLimit({
+      windowMs: discoveryLimiterWindowMs,
+      limit: env.RATE_LIMIT_MAX,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: buildErrorResponse("Too many requests"),
+    }),
+    { name: "discovery", limit: env.RATE_LIMIT_MAX, windowMs: discoveryLimiterWindowMs },
+  );
 
   // Optional auth — the route stays fully usable logged-out; a valid CUSTOMER token only
   // personalizes the "Recommended" row (see discovery.controller.ts homeSections).

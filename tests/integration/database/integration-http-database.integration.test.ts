@@ -10,6 +10,7 @@ import { signOAuthState } from "../../../src/modules/integration/integration.sta
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -87,7 +88,7 @@ describe("HTTP-level Google Calendar integration routing", () => {
   };
 
   const bearerFor = async (userId: Types.ObjectId | string, role: "CUSTOMER" | "BUSINESS_OWNER") =>
-    `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+    `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const callbackPath = "/api/v1/businesses/integrations/google-calendar/callback";
 

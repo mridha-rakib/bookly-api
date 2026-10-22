@@ -2,6 +2,11 @@ import { model, Schema, type Types } from "mongoose";
 
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
+import {
+  type PackageRequestBinding,
+  packageRequestBindingMongooseSchema,
+  packageRequestBindingSchema,
+} from "./package-request-binding.js";
 
 /**
  * Booking-creation idempotency contract (Batch 3) — mirrors
@@ -21,6 +26,7 @@ import { financialContractSchema } from "./financial-contract.model.js";
  * second provider operation.
  */
 export type BookingCreationClaimDocument = {
+  packageRequestBinding?: PackageRequestBinding | undefined;
   _id: Types.ObjectId;
   idempotencyKey: string;
   businessId: Types.ObjectId;
@@ -35,6 +41,7 @@ export type BookingCreationClaimDocument = {
 
 const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
   {
+    packageRequestBinding: { type: packageRequestBindingMongooseSchema },
     idempotencyKey: { type: String, required: true, trim: true, maxlength: 200 },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
@@ -46,6 +53,48 @@ const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
 );
 
 bookingCreationClaimSchema.index({ idempotencyKey: 1 }, { unique: true });
+bookingCreationClaimSchema.pre("validate", function () {
+  if (!this.isNew && this.isModified("packageRequestBinding"))
+    this.invalidate("packageRequestBinding", "Accepted request binding is immutable");
+  if (this.packageRequestBinding) {
+    const result = packageRequestBindingSchema.safeParse(this.toObject().packageRequestBinding);
+    if (!result.success) {
+      this.invalidate("packageRequestBinding", result.error.message);
+      return;
+    }
+    const binding = result.data;
+    if (
+      binding.operation === "PURCHASE" &&
+      binding.acceptedPurchaseSnapshot &&
+      (!binding.acceptedPurchaseSnapshot.businessId.equals(this.businessId) ||
+        !binding.acceptedPurchaseSnapshot.customerUserId.equals(this.actorUserId) ||
+        !binding.acceptedPurchaseSnapshot.originBookingId.equals(this.bookingId))
+    ) {
+      this.invalidate("packageRequestBinding", "Accepted snapshot does not belong to this claim");
+    }
+  }
+});
+bookingCreationClaimSchema.pre(
+  ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"],
+  function () {
+    const update = this.getUpdate();
+    if (
+      update &&
+      (Array.isArray(update) ||
+        Object.hasOwn(update, "packageRequestBinding") ||
+        Object.values(update).some(
+          (fields) =>
+            fields &&
+            typeof fields === "object" &&
+            Object.keys(fields).some(
+              (key) => key === "packageRequestBinding" || key.startsWith("packageRequestBinding."),
+            ),
+        ))
+    ) {
+      throw new Error("Accepted request binding is immutable");
+    }
+  },
+);
 
 export const BookingCreationClaimModel = model<BookingCreationClaimDocument>(
   "BookingCreationClaim",

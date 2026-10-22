@@ -1,4 +1,8 @@
 import { type ClientSession, Types } from "mongoose";
+import {
+  assertServicePackageDependencies,
+  withPackageEligibility,
+} from "../package-progress/package-eligibility.js";
 import { type ServiceDocument, ServiceModel } from "./service.model.js";
 import type { ServiceScheduleMode, ServiceStatus } from "./service.types.js";
 
@@ -131,6 +135,7 @@ export class ServiceRepository {
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
     fields: ReplaceServiceFields,
+    session?: ClientSession,
   ): Promise<ServiceDocument | null> {
     const setFields = this.stripUndefined(fields);
 
@@ -165,10 +170,18 @@ export class ServiceRepository {
       update["$unset"] = unset;
     }
 
-    return ServiceModel.findOneAndUpdate({ _id: serviceId, businessId }, update, {
-      returnDocument: "after",
-      runValidators: true,
-    }).exec();
+    return withPackageEligibility(businessId, session, async (transaction) => {
+      const existing = await ServiceModel.findOne({ _id: serviceId, businessId }).session(
+        transaction,
+      );
+      if (!existing) return null;
+      await assertServicePackageDependencies(businessId, serviceId, fields, transaction);
+      return ServiceModel.findOneAndUpdate({ _id: serviceId, businessId }, update, {
+        returnDocument: "after",
+        runValidators: true,
+        session: transaction,
+      }).exec();
+    });
   }
 
   /**
@@ -181,35 +194,54 @@ export class ServiceRepository {
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
     status: Extract<ServiceStatus, "ACTIVE" | "INACTIVE">,
+    session?: ClientSession,
   ): Promise<ServiceDocument | null> {
-    return ServiceModel.findOneAndUpdate(
-      { _id: serviceId, businessId, status: { $in: ["ACTIVE", "INACTIVE"] } },
-      { $set: { status } },
-      { returnDocument: "after", runValidators: true },
-    ).exec();
+    return withPackageEligibility(businessId, session, (transaction) =>
+      ServiceModel.findOneAndUpdate(
+        { _id: serviceId, businessId, status: { $in: ["ACTIVE", "INACTIVE"] } },
+        { $set: { status } },
+        { returnDocument: "after", runValidators: true, session: transaction },
+      ).exec(),
+    );
   }
 
   public async archiveById(
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<ServiceDocument | null> {
-    return ServiceModel.findOneAndUpdate(
-      { _id: serviceId, businessId, status: { $ne: "ARCHIVED" } },
-      { $set: { status: "ARCHIVED", archivedAt: new Date() } },
-      { returnDocument: "after", runValidators: true },
-    ).exec();
+    return withPackageEligibility(businessId, session, async (transaction) => {
+      const existing = await ServiceModel.findOne({ _id: serviceId, businessId }).session(
+        transaction,
+      );
+      if (!existing) return null;
+      await assertServicePackageDependencies(
+        businessId,
+        serviceId,
+        { ...existing.toObject(), status: "ARCHIVED" },
+        transaction,
+      );
+      return ServiceModel.findOneAndUpdate(
+        { _id: serviceId, businessId, status: { $ne: "ARCHIVED" } },
+        { $set: { status: "ARCHIVED", archivedAt: new Date() } },
+        { returnDocument: "after", runValidators: true, session: transaction },
+      ).exec();
+    });
   }
 
   public async restoreById(
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
     status: Extract<ServiceStatus, "ACTIVE" | "INACTIVE">,
+    session?: ClientSession,
   ): Promise<ServiceDocument | null> {
-    return ServiceModel.findOneAndUpdate(
-      { _id: serviceId, businessId, status: "ARCHIVED" },
-      { $set: { status }, $unset: { archivedAt: "" } },
-      { returnDocument: "after", runValidators: true },
-    ).exec();
+    return withPackageEligibility(businessId, session, (transaction) =>
+      ServiceModel.findOneAndUpdate(
+        { _id: serviceId, businessId, status: "ARCHIVED" },
+        { $set: { status }, $unset: { archivedAt: "" } },
+        { returnDocument: "after", runValidators: true, session: transaction },
+      ).exec(),
+    );
   }
 
   private stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {

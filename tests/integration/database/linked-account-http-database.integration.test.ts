@@ -15,6 +15,7 @@ import {
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -109,7 +110,7 @@ describe("HTTP-level Customer → Google account linking", () => {
     });
 
   const bearerFor = (userId: Types.ObjectId | string, role: TestRole) =>
-    tokenService.createAccessToken({ userId, role }).then((token) => `Bearer ${token}`);
+    issueTestAccessToken(tokenService, { userId, role }).then((token) => `Bearer ${token}`);
 
   const AUTHORIZE_URL = "/api/v1/auth/me/linked-accounts/google/authorize-url";
   const UNLINK_URL = "/api/v1/auth/me/linked-accounts/google";
@@ -461,7 +462,7 @@ describe("HTTP-level Customer → Facebook account linking (linking only, never 
     });
 
   const bearerFor = (userId: Types.ObjectId | string, role: TestRole) =>
-    tokenService.createAccessToken({ userId, role }).then((token) => `Bearer ${token}`);
+    issueTestAccessToken(tokenService, { userId, role }).then((token) => `Bearer ${token}`);
 
   const AUTHORIZE_URL = "/api/v1/auth/me/linked-accounts/facebook/authorize-url";
   const UNLINK_URL = "/api/v1/auth/me/linked-accounts/facebook";

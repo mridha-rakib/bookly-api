@@ -5,6 +5,7 @@ import multer from "multer";
 
 import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
+import { attributeRateLimitRejections } from "../../common/middleware/rate-limit-attribution.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { AppointmentReminderRepository } from "../appointment-reminder/appointment-reminder.repository.js";
@@ -120,14 +121,17 @@ const uploadSingleAvatarImage: RequestHandler = (
   });
 };
 
-const authRateLimit = (limit: number, windowMs = 15 * 60 * 1000) =>
-  rateLimit({
-    windowMs,
-    limit,
-    standardHeaders: "draft-8",
-    legacyHeaders: false,
-    message: buildErrorResponse("Too many authentication requests"),
-  });
+const authRateLimit = (name: string, limit: number, windowMs = 15 * 60 * 1000) =>
+  attributeRateLimitRejections(
+    rateLimit({
+      windowMs,
+      limit,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: buildErrorResponse("Too many authentication requests"),
+    }),
+    { name, limit, windowMs },
+  );
 
 export const createAuthRoute = (): Router => {
   const router = Router();
@@ -290,11 +294,15 @@ export const createAuthRoute = (): Router => {
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
 
-  const entryLimiter = authRateLimit(env.AUTH_ENTRY_RATE_LIMIT_MAX);
-  const loginLimiter = authRateLimit(env.AUTH_LOGIN_RATE_LIMIT_MAX);
-  const otpSendLimiter = authRateLimit(env.AUTH_OTP_SEND_RATE_LIMIT_MAX, 60 * 60 * 1000);
-  const otpVerifyLimiter = authRateLimit(env.AUTH_OTP_VERIFY_RATE_LIMIT_MAX);
-  const refreshLimiter = authRateLimit(env.AUTH_REFRESH_RATE_LIMIT_MAX);
+  const entryLimiter = authRateLimit("auth-entry", env.AUTH_ENTRY_RATE_LIMIT_MAX);
+  const loginLimiter = authRateLimit("auth-login", env.AUTH_LOGIN_RATE_LIMIT_MAX);
+  const otpSendLimiter = authRateLimit(
+    "auth-otp-send",
+    env.AUTH_OTP_SEND_RATE_LIMIT_MAX,
+    60 * 60 * 1000,
+  );
+  const otpVerifyLimiter = authRateLimit("auth-otp-verify", env.AUTH_OTP_VERIFY_RATE_LIMIT_MAX);
+  const refreshLimiter = authRateLimit("auth-refresh", env.AUTH_REFRESH_RATE_LIMIT_MAX);
 
   router.post(
     "/customer/entry",

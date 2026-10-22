@@ -30,6 +30,7 @@ import { StaffAvatarRepository } from "../../../src/modules/staff-avatar/staff-a
 import { StaffAvatarService } from "../../../src/modules/staff-avatar/staff-avatar.service.js";
 import { createDeferredStorageServiceFromEnv } from "../../../src/modules/storage/storage.service.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -154,7 +155,7 @@ describe("database-backed Service integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const createCategory = async (ownerId: string, businessId: string, name = "Hair Treatment") =>
     serviceService.createCategory(ownerId, businessId, name);

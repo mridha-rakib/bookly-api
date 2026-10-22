@@ -39,11 +39,8 @@ export async function issueAuthSession(
   context: RequestContext,
   session?: ClientSession,
 ): Promise<AuthResult> {
-  const accessToken = await tokenService.createAccessToken({
-    userId: user.userId,
-    role: user.role,
-  });
-
+  // The refresh family comes first: the access token is bound to it (`sid`), so revoking the
+  // family (logout, reuse detection, credential changes) also ends this access token.
   const refreshSession = await tokenService.createRefreshSession(
     {
       userId: user.userId,
@@ -52,6 +49,12 @@ export async function issueAuthSession(
     },
     session,
   );
+
+  const accessToken = await tokenService.createAccessToken({
+    userId: user.userId,
+    role: user.role,
+    sessionFamilyId: refreshSession.tokenFamilyId,
+  });
 
   return {
     accessToken,

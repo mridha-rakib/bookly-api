@@ -54,6 +54,7 @@ import type {
   EmailOtpProvider,
   EmailOtpPurpose,
 } from "../../../src/modules/verification/email-otp.provider.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { seedStaffMember } from "../../helpers/seed-staff.js";
 import {
   clearIsolatedDatabase,
@@ -212,7 +213,7 @@ describe("database-backed StaffMembership integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   /** Narrows a StaffMemberDto's membershipId (null only for the synthesized owner row). */
   const requireMembershipId = (member: { membershipId: string | null }): string => {

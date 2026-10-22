@@ -1,11 +1,20 @@
 import express from "express";
+import { decodeJwt, SignJWT } from "jose";
 import mongoose, { type ClientSession } from "mongoose";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
+import { env } from "../../../src/config/env.js";
 import { AppointmentReminderRepository } from "../../../src/modules/appointment-reminder/appointment-reminder.repository.js";
+import { AuthController } from "../../../src/modules/auth/auth.controller.js";
 import { AuthError } from "../../../src/modules/auth/auth.errors.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  createOptionalAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+  requireRoles,
+} from "../../../src/modules/auth/auth.middleware.js";
 import {
   businessDetailsBodySchema,
   categorySelectionBodySchema,
@@ -57,10 +66,12 @@ import {
   UserProfileModel,
 } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import type { UserRole } from "../../../src/modules/user/user.types.js";
 import type { EmailOtpProvider } from "../../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../../src/modules/verification/phone-otp.provider.js";
 import { seedDemoCustomer } from "../../../src/scripts/seed-demo-customer.js";
 import { seedSuperAdmin } from "../../../src/scripts/seed-super-admin.js";
+import { hasLocalBrowser, startTestBrowser } from "./browser-cdp-helper.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -1051,7 +1062,8 @@ describe("database-backed authentication integration", () => {
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
     expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
     expect(await SessionModel.countDocuments()).toBe(2);
-    expect(await SessionModel.countDocuments({ revokedAt: { $exists: false } })).toBe(1);
+    // A concurrent consumed-token replay must revoke the winner as well.
+    expect(await SessionModel.countDocuments({ revokedAt: { $exists: false } })).toBe(0);
   });
 
   it("the token-reuse-detection breach response (revokeFamily) uses the {tokenFamilyId, revokedAt} index, not a collection scan", async () => {
@@ -1068,7 +1080,6 @@ describe("database-backed authentication integration", () => {
 
     const explanation = await SessionModel.find({
       tokenFamilyId: session.tokenFamilyId,
-      revokedAt: { $exists: false },
     })
       .explain("executionStats")
       .then((result) => result as { executionStats?: { executionStages?: { stage?: string } } });
@@ -1134,6 +1145,137 @@ describe("database-backed authentication integration", () => {
     ).toBe(0);
   });
 
+  describe("Phase 1B intended-family HTTP logout", () => {
+    const fixture = async () => {
+      const parts = await completeCustomer("family-contract@example.com");
+      const familyId = decodeJwt(parts.result.accessToken)["sid"] as string;
+      const intent = { intentId: "original-intent", familyId };
+      const controller = new AuthController(parts.authService);
+      const app = express();
+      app.use(express.json());
+      app.post("/logout", controller.logout);
+      app.post("/refresh", controller.refresh);
+      app.use(createErrorHandler({ isProduction: true }));
+      const cookie = (token: string) => `${env.AUTH_COOKIE_NAME}=${token}`;
+      return { parts, intent, app, cookie };
+    };
+
+    it("rejects same-account different-family cookies before revocation and preserves usable newer cookie", async () => {
+      const { parts, intent, app, cookie } = await fixture();
+      const newer = await parts.authService.login(
+        "CUSTOMER",
+        { email: "family-contract@example.com", password: testPassword },
+        context,
+      );
+      const response = await request(app)
+        .post("/logout")
+        .set("Cookie", cookie(newer.refreshToken))
+        .send(intent);
+      expect(response.status).toBe(409);
+      expect(response.body.errors[0].code).toBe("LOGOUT_FAMILY_MISMATCH");
+      expect(response.headers["set-cookie"]).toBeUndefined();
+      expect(
+        await parts.tokenService.isAccessTokenSessionLive(
+          await parts.tokenService.verifyAccessToken(parts.result.accessToken),
+        ),
+      ).toBe(true);
+      expect(
+        await parts.tokenService.isAccessTokenSessionLive(
+          await parts.tokenService.verifyAccessToken(newer.accessToken),
+        ),
+      ).toBe(true);
+      expect(
+        (await request(app).post("/refresh").set("Cookie", cookie(newer.refreshToken))).status,
+      ).toBe(200);
+    });
+
+    it.each(["missing", "unknown", "malformed-intent"])(
+      "%s cannot fabricate confirmation or change cookies",
+      async (kind) => {
+        const { parts, intent, app, cookie } = await fixture();
+        let req = request(app).post("/logout");
+        if (kind !== "missing")
+          req = req.set(
+            "Cookie",
+            cookie(kind === "unknown" ? "unrecognized" : parts.result.refreshToken),
+          );
+        const response = await req.send(kind === "malformed-intent" ? {} : intent);
+        expect(response.status).toBe(kind === "malformed-intent" ? 400 : 409);
+        expect(response.headers["set-cookie"]).toBeUndefined();
+        expect(
+          await parts.sessionRepository.hasLiveFamily(
+            intent.familyId,
+            String(parts.result.user.id),
+          ),
+        ).toBe(true);
+      },
+    );
+
+    it("R0 and rotated R1 prove the same family; repeated revoked-cookie acknowledgement is authoritative", async () => {
+      const { parts, intent, app, cookie } = await fixture();
+      const rotated = await parts.authService.refresh(parts.result.refreshToken);
+      for (const token of [rotated.refreshToken, parts.result.refreshToken, rotated.refreshToken]) {
+        const response = await request(app)
+          .post("/logout")
+          .set("Cookie", cookie(token))
+          .send(intent);
+        expect(response.status).toBe(200);
+        expect(response.body.data).toEqual({ ...intent, outcome: "revoked" });
+        expect(response.headers["set-cookie"]).toBeUndefined();
+      }
+      expect(
+        await parts.tokenService.isAccessTokenSessionLive(
+          await parts.tokenService.verifyAccessToken(rotated.accessToken),
+        ),
+      ).toBe(false);
+      expect(
+        (await request(app).post("/refresh").set("Cookie", cookie(rotated.refreshToken))).status,
+      ).toBe(401);
+    });
+
+    it("a retained expired cookie can prove its family but database loss cannot prove revocation", async () => {
+      const { parts, intent, app, cookie } = await fixture();
+      await SessionModel.updateOne(
+        { refreshTokenHash: sha256(parts.result.refreshToken) },
+        { $set: { expiresAt: new Date(0) } },
+      );
+      const proved = await request(app)
+        .post("/logout")
+        .set("Cookie", cookie(parts.result.refreshToken))
+        .send(intent);
+      expect(proved.status).toBe(200);
+      await SessionModel.deleteMany({ tokenFamilyId: intent.familyId });
+      const unknown = await request(app)
+        .post("/logout")
+        .set("Cookie", cookie(parts.result.refreshToken))
+        .send(intent);
+      expect(unknown.status).toBe(409);
+    });
+
+    it("a transaction failure returns no acknowledgement and emits no cookie mutation", async () => {
+      const { parts, intent, app, cookie } = await fixture();
+      const spy = vi
+        .spyOn(parts.sessionRepository, "revokeFamily")
+        .mockRejectedValueOnce(new Error("database unavailable"));
+      try {
+        const response = await request(app)
+          .post("/logout")
+          .set("Cookie", cookie(parts.result.refreshToken))
+          .send(intent);
+        expect(response.status).toBe(500);
+        expect(response.headers["set-cookie"]).toBeUndefined();
+        expect(
+          await parts.sessionRepository.hasLiveFamily(
+            intent.familyId,
+            String(parts.result.user.id),
+          ),
+        ).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   it("revokes only the current session on logout, leaving other sessions/users untouched, and is idempotent", async () => {
     const parts = await completeCustomer("logout-current-db@example.com");
     const currentToken = parts.result.refreshToken;
@@ -1182,6 +1324,304 @@ describe("database-backed authentication integration", () => {
     await expect(parts.authService.logout(currentToken)).resolves.toBeUndefined();
     await expect(parts.authService.logout(undefined)).resolves.toBeUndefined();
     await expect(parts.authService.logout("not-a-real-refresh-token")).resolves.toBeUndefined();
+  });
+
+  it("logout with R0 revokes rotated R1 and R2, while another device remains valid", async () => {
+    const parts = await completeCustomer("logout-successors@example.com");
+    const r0 = parts.result.refreshToken;
+    const r1 = await parts.authService.refresh(r0);
+    const r2 = await parts.authService.refresh(r1.refreshToken);
+    const device = await parts.tokenService.createRefreshSession({
+      userId: new mongoose.Types.ObjectId(parts.result.user.id),
+    });
+    await parts.authService.logout(r0);
+    await parts.authService.logout(r0);
+    await expect(parts.authService.refresh(r2.refreshToken)).rejects.toMatchObject({
+      statusCode: 401,
+    });
+    await expect(parts.authService.refresh(r1.refreshToken)).rejects.toMatchObject({
+      statusCode: 401,
+    });
+    await expect(parts.authService.refresh(device.refreshToken)).resolves.toMatchObject({
+      user: parts.result.user,
+    });
+  });
+
+  it("Phase 1A: an unexpired access JWT from a delayed refresh fails authentication after logout", async () => {
+    const parts = await completeCustomer("logout-access-contract@example.com");
+    const controller = new AuthController(parts.authService);
+    const app = express();
+    app.get(
+      "/api/v1/auth/me",
+      createAuthenticateAccessTokenMiddleware(parts.tokenService, parts.userRepository),
+      controller.me,
+    );
+    app.use(createErrorHandler({ isProduction: true }));
+    const delayed = await parts.authService.refresh(parts.result.refreshToken);
+    await parts.authService.logout(parts.result.refreshToken);
+    await expect(parts.authService.refresh(delayed.refreshToken)).rejects.toMatchObject({
+      statusCode: 401,
+    });
+    // The delayed token is bound to the revoked family, so it no longer authenticates.
+    const me = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${delayed.accessToken}`);
+    expect(me.status).toBe(401);
+    expect(me.body.errors?.[0]?.code).toBe("SESSION_EXPIRED");
+    const original = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${parts.result.accessToken}`);
+    expect(original.status).toBe(401);
+  });
+
+  it.runIf(hasLocalBrowser)(
+    "real Chrome tabs apply delayed R1 cookie after logout and both get refresh 401",
+    async () => {
+      const parts = await completeCustomer("logout-browser@example.com");
+      const controller = new AuthController(parts.authService);
+      const app = express();
+      app.use(express.json());
+      app.get("/browser-fixture", (_req, res) =>
+        res.send("<!doctype html><title>Bookly cookie race fixture</title>"),
+      );
+      app.post(
+        "/api/v1/auth/customer/login",
+        (req, _res, next) => {
+          req.validated = { body: req.body };
+          next();
+        },
+        controller.customerLogin,
+      );
+      app.post("/api/v1/auth/refresh", controller.refresh);
+      app.post("/api/v1/auth/logout", controller.logout);
+      app.use(createErrorHandler({ isProduction: true }));
+      const server = app.listen(0, "127.0.0.1");
+      await new Promise<void>((resolve) => server.once("listening", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing HTTP fixture address");
+      const browser = await startTestBrowser();
+      let release!: () => void;
+      let rotated!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<void>((resolve) => {
+        rotated = resolve;
+      });
+      const original = parts.authService.refresh.bind(parts.authService);
+      let delayedToken = "";
+      const spy = vi.spyOn(parts.authService, "refresh").mockImplementationOnce(async (token) => {
+        const result = await original(token);
+        delayedToken = result.refreshToken;
+        rotated();
+        await gate;
+        return result;
+      });
+      try {
+        const url = `http://127.0.0.1:${address.port}/browser-fixture`;
+        const tabA = await browser.page(url);
+        const tabB = await browser.page(url);
+        expect(
+          await tabA.evaluate(
+            `fetch('/api/v1/auth/customer/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'logout-browser@example.com', password: 'correct-password' }) }).then(async r => { const data = await r.json(); window.logoutFamily = JSON.parse(atob(data.data.accessToken.split('.')[1])).sid; return r.status; })`,
+          ),
+        ).toBe(200);
+        expect(await tabA.evaluate("document.cookie.includes('bookly_refresh_token')")).toBe(false);
+        const delayed = tabA.evaluate(
+          "fetch('/api/v1/auth/refresh', { method: 'POST' }).then(r => r.status)",
+        );
+        await ready;
+        expect(
+          await tabB.evaluate(
+            `fetch('/api/v1/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({intentId: 'chrome-logout', familyId: ${JSON.stringify((await parts.sessionRepository.findByRefreshTokenHash(sha256(delayedToken)))?.tokenFamilyId)}}) }).then(r => r.status)`,
+          ),
+        ).toBe(200);
+        release();
+        // Chrome itself applies the delayed Set-Cookie; neither JS nor the test manually writes it.
+        expect(await delayed).toBe(200);
+        expect(
+          await tabA.evaluate(
+            "fetch('/api/v1/auth/refresh', { method: 'POST' }).then(r => r.status)",
+          ),
+        ).toBe(401);
+        expect(
+          await tabB.evaluate(
+            "fetch('/api/v1/auth/refresh', { method: 'POST' }).then(r => r.status)",
+          ),
+        ).toBe(401);
+        expect(spy.mock.calls.slice(1).map(([token]) => token)).toEqual([
+          delayedToken,
+          delayedToken,
+        ]);
+      } finally {
+        release();
+        spy.mockRestore();
+        await browser.close();
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    },
+    30_000,
+  );
+
+  it("logout before rotation cannot create a usable successor", async () => {
+    const parts = await completeCustomer("logout-first@example.com");
+    await parts.authService.logout(parts.result.refreshToken);
+    await expect(parts.authService.refresh(parts.result.refreshToken)).rejects.toMatchObject({
+      statusCode: 401,
+    });
+    expect(await SessionModel.countDocuments({ revokedAt: { $exists: false } })).toBe(0);
+  });
+
+  it("logout during the consume/insert gap cannot miss the successor", async () => {
+    let release!: () => void;
+    let inserting!: () => void;
+    let revoking!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      inserting = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      revoking = resolve;
+    });
+    class GatedRepository extends SessionRepository {
+      public override async create(...args: Parameters<SessionRepository["create"]>) {
+        if (args[1]) {
+          inserting();
+          await gate;
+        }
+        return super.create(...args);
+      }
+      public override async revokeFamily(family: string) {
+        revoking();
+        return super.revokeFamily(family);
+      }
+    }
+    const repository = new GatedRepository();
+    const tokens = new TokenService(repository);
+    const initial = await tokens.createRefreshSession({ userId: new mongoose.Types.ObjectId() });
+    const pending = tokens.rotateRefreshToken(initial.refreshToken);
+    await ready;
+    const logout = tokens.revokeRefreshToken(initial.refreshToken);
+    await started;
+    release();
+    const rotated = await pending;
+    await logout;
+    await expect(tokens.rotateRefreshToken(rotated.refreshToken)).rejects.toThrow(
+      "REFRESH_TOKEN_REUSED",
+    );
+    expect(await SessionModel.countDocuments({ revokedAt: { $exists: false } })).toBe(0);
+  });
+
+  it("a failed successor insert rolls back consumption and leaves the original refresh usable", async () => {
+    class FailingSuccessorRepository extends SessionRepository {
+      public override async create(...args: Parameters<SessionRepository["create"]>) {
+        if (args[1]) throw new Error("forced successor insert failure");
+        return super.create(...args);
+      }
+    }
+    const tokens = new TokenService(new FailingSuccessorRepository());
+    const initial = await tokens.createRefreshSession({ userId: new mongoose.Types.ObjectId() });
+    await expect(tokens.rotateRefreshToken(initial.refreshToken)).rejects.toThrow(
+      "forced successor insert failure",
+    );
+    expect(await SessionModel.countDocuments()).toBe(1);
+    const healthy = new TokenService(new SessionRepository());
+    await expect(healthy.rotateRefreshToken(initial.refreshToken)).resolves.toHaveProperty(
+      "refreshToken",
+    );
+  });
+
+  it("concurrent logout and refresh leave no live successor in either ordering", async () => {
+    const parts = await completeCustomer("logout-concurrent@example.com");
+    for (let iteration = 0; iteration < 12; iteration++) {
+      const initial = await parts.tokenService.createRefreshSession({
+        userId: new mongoose.Types.ObjectId(parts.result.user.id),
+      });
+      const actions =
+        iteration % 2 === 0
+          ? [
+              parts.authService.refresh(initial.refreshToken),
+              parts.authService.logout(initial.refreshToken),
+            ]
+          : [
+              parts.authService.logout(initial.refreshToken),
+              parts.authService.refresh(initial.refreshToken),
+            ];
+      const outcomes = await Promise.allSettled(actions);
+      const logout = outcomes[iteration % 2 === 0 ? 1 : 0];
+      expect(logout?.status).toBe("fulfilled");
+      const root = await parts.sessionRepository.findByRefreshTokenHash(
+        sha256(initial.refreshToken),
+      );
+      if (!root) throw new Error("Missing session fixture");
+      expect(
+        await SessionModel.countDocuments({
+          tokenFamilyId: root.tokenFamilyId,
+          revokedAt: { $exists: false },
+        }),
+      ).toBe(0);
+      const refresh = outcomes[iteration % 2 === 0 ? 0 : 1];
+      if (refresh?.status === "fulfilled" && refresh.value) {
+        await expect(parts.authService.refresh(refresh.value.refreshToken)).rejects.toMatchObject({
+          statusCode: 401,
+        });
+      }
+    }
+  });
+
+  it("actual HTTP delayed Set-Cookie cannot supply a server-valid successor after acknowledged logout", async () => {
+    const parts = await completeCustomer("logout-http-delay@example.com");
+    let release!: () => void;
+    let rotated!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      rotated = resolve;
+    });
+    const original = parts.authService.refresh.bind(parts.authService);
+    const spy = vi.spyOn(parts.authService, "refresh").mockImplementationOnce(async (token) => {
+      const result = await original(token);
+      rotated();
+      await gate;
+      return result;
+    });
+    const controller = new AuthController(parts.authService);
+    const app = express();
+    app.use(express.json());
+    app.post("/api/v1/auth/refresh", controller.refresh);
+    app.post("/api/v1/auth/logout", controller.logout);
+    app.use(createErrorHandler({ isProduction: true }));
+    const cookie = `bookly_refresh_token=${parts.result.refreshToken}`;
+    const pending = request(app)
+      .post("/api/v1/auth/refresh")
+      .set("Cookie", cookie)
+      .then((result) => result);
+    try {
+      await ready;
+      const logout = await request(app)
+        .post("/api/v1/auth/logout")
+        .set("Cookie", cookie)
+        .send({ intentId: "delayed-logout", familyId: decodeJwt(parts.result.accessToken)["sid"] });
+      expect(logout.status).toBe(200);
+      release();
+      const delayed = await pending;
+      expect(delayed.status).toBe(200);
+      const setCookies = delayed.headers["set-cookie"] as unknown as string[];
+      expect(setCookies[0]).toContain("HttpOnly");
+      // Explicitly apply the delayed cookie to the next HTTP request. This is HTTP
+      // integration evidence, not a claim of real-browser cookie-jar verification.
+      const successor = setCookies[0]?.split(";")[0] ?? "";
+      const retry = await request(app).post("/api/v1/auth/refresh").set("Cookie", successor);
+      expect(retry.status).toBe(401);
+    } finally {
+      release();
+      spy.mockRestore();
+    }
   });
 
   it("database-tests Super Admin seed core behavior without CLI execution or fake phone", async () => {
@@ -1243,6 +1683,387 @@ describe("database-backed authentication integration", () => {
     ).rejects.toThrow("Missing required Super Admin seed environment values");
     expect(await UserModel.countDocuments()).toBe(0);
     expect(JSON.stringify(logs)).not.toContain(config.password);
+  });
+
+  describe("Phase 1A — session-family-bound access tokens", () => {
+    const bearer = (token: string) => `Bearer ${token}`;
+    const cookieFor = (refreshToken: string) =>
+      `${env.AUTH_COOKIE_NAME}=${encodeURIComponent(refreshToken)}`;
+
+    const buildApp = (parts: AuthServiceParts, tokenService: TokenService = parts.tokenService) => {
+      const controller = new AuthController(parts.authService);
+      const authenticate = createAuthenticateAccessTokenMiddleware(
+        tokenService,
+        parts.userRepository,
+      );
+      const optionalAuthenticate = createOptionalAuthenticateAccessTokenMiddleware(
+        tokenService,
+        parts.userRepository,
+      );
+      const app = express();
+      app.use(express.json());
+      app.post("/api/v1/auth/refresh", controller.refresh);
+      app.post("/api/v1/auth/logout", controller.logout);
+      app.get("/api/v1/auth/me", authenticate, requireActiveUser(), controller.me);
+      app.get(
+        "/roles/:role",
+        authenticate,
+        requireActiveUser(),
+        (req, res, next) => requireRoles([req.params["role"] as UserRole])(req, res, next),
+        (req, res) => {
+          res.json({ role: req.auth?.role });
+        },
+      );
+      app.get("/optional", optionalAuthenticate, requireActiveUser(), (req, res) => {
+        res.json({ userId: req.auth?.userId ?? null });
+      });
+      app.use(createErrorHandler({ isProduction: true }));
+      return app;
+    };
+
+    const me = (app: express.Express, token: string) =>
+      request(app).get("/api/v1/auth/me").set("Authorization", bearer(token));
+
+    const seedUser = async (parts: AuthServiceParts, role: UserRole, email: string) =>
+      parts.userRepository.create({
+        normalizedEmail: email,
+        passwordHash: await new Argon2PasswordHasher().hash(testPassword),
+        role,
+        status: "ACTIVE",
+        emailVerifiedAt: new Date(),
+        phoneVerifiedAt: new Date(),
+      });
+
+    const portalFor = (role: UserRole) =>
+      role === "CUSTOMER" ? "CUSTOMER" : role === "SUPER_ADMIN" ? "SUPER_ADMIN" : "PROFESSIONAL";
+
+    it.each([
+      ["CUSTOMER"],
+      ["BUSINESS_OWNER"],
+      ["SUPERVISOR"],
+      ["STAFF"],
+      ["SUPER_ADMIN"],
+    ] as const)(
+      "%s: login → role-gated API → logout → login- and refresh-issued JWTs both rejected",
+      async (role) => {
+        const parts = createAuthService();
+        const app = buildApp(parts);
+        await seedUser(parts, role, `phase1a-${role.toLowerCase()}@example.com`);
+        const login = await parts.authService.login(
+          portalFor(role),
+          { email: `phase1a-${role.toLowerCase()}@example.com`, password: testPassword },
+          context,
+        );
+        const session = await parts.sessionRepository.findByRefreshTokenHash(
+          sha256(login.refreshToken),
+        );
+        expect(decodeJwt(login.accessToken)).toMatchObject({ role, sid: session?.tokenFamilyId });
+
+        expect(
+          (await request(app).get(`/roles/${role}`).set("Authorization", bearer(login.accessToken)))
+            .status,
+        ).toBe(200);
+        const refreshed = await request(app)
+          .post("/api/v1/auth/refresh")
+          .set("Cookie", cookieFor(login.refreshToken));
+        expect(refreshed.status).toBe(200);
+        const refreshedToken = refreshed.body.data.accessToken as string;
+        expect(decodeJwt(refreshedToken)).toMatchObject({ sid: session?.tokenFamilyId });
+        expect(
+          (await request(app).get(`/roles/${role}`).set("Authorization", bearer(refreshedToken)))
+            .status,
+        ).toBe(200);
+
+        const logout = await request(app)
+          .post("/api/v1/auth/logout")
+          .set("Cookie", String(refreshed.headers["set-cookie"]).split(";")[0] ?? "")
+          .send({ intentId: "role-logout", familyId: session?.tokenFamilyId });
+        expect(logout.status).toBe(200);
+
+        for (const token of [login.accessToken, refreshedToken]) {
+          const after = await request(app)
+            .get(`/roles/${role}`)
+            .set("Authorization", bearer(token));
+          expect(after.status).toBe(401);
+          expect(after.body.errors?.[0]?.code).toBe("SESSION_EXPIRED");
+        }
+      },
+    );
+
+    it("registration completion (Customer and Business Owner) issues tokens bound to the created family", async () => {
+      const customer = await completeCustomer("phase1a-reg-customer@example.com");
+      const owner = await completeBusinessOwner("phase1a-reg-owner@example.com");
+      for (const parts of [customer, owner]) {
+        const app = buildApp(parts);
+        const session = await parts.sessionRepository.findByRefreshTokenHash(
+          sha256(parts.result.refreshToken),
+        );
+        expect(decodeJwt(parts.result.accessToken)).toMatchObject({ sid: session?.tokenFamilyId });
+        expect((await me(app, parts.result.accessToken)).status).toBe(200);
+        await parts.authService.logout(parts.result.refreshToken);
+        expect((await me(app, parts.result.accessToken)).status).toBe(401);
+      }
+    });
+
+    it("two independent device sessions: logging out device A leaves device B authenticated and refreshable", async () => {
+      const parts = await completeCustomer("phase1a-devices@example.com");
+      const app = buildApp(parts);
+      const deviceA = parts.result;
+      const deviceB = await parts.authService.login(
+        "CUSTOMER",
+        { email: "phase1a-devices@example.com", password: testPassword },
+        context,
+      );
+
+      await parts.authService.logout(deviceA.refreshToken);
+
+      expect((await me(app, deviceA.accessToken)).status).toBe(401);
+      expect((await me(app, deviceB.accessToken)).status).toBe(200);
+      const refreshedB = await parts.authService.refresh(deviceB.refreshToken);
+      expect((await me(app, refreshedB.accessToken)).status).toBe(200);
+      expect((await me(app, deviceB.accessToken)).status).toBe(200);
+    });
+
+    it("password change: other devices' JWTs fail immediately, the current device keeps working", async () => {
+      const parts = await completeCustomer("phase1a-password@example.com");
+      const app = buildApp(parts);
+      const current = parts.result;
+      const other = await parts.authService.login(
+        "CUSTOMER",
+        { email: "phase1a-password@example.com", password: testPassword },
+        context,
+      );
+
+      await parts.authService.changeMyPassword(
+        current.user.id,
+        { currentPassword: testPassword, newPassword: "a-brand-new-password-1" },
+        current.refreshToken,
+      );
+
+      expect((await me(app, current.accessToken)).status).toBe(200);
+      expect((await me(app, other.accessToken)).status).toBe(401);
+    });
+
+    it("email change: every device's JWT fails immediately (forced re-login everywhere)", async () => {
+      const parts = await completeCustomer("phase1a-email@example.com");
+      const app = buildApp(parts);
+      const other = await parts.authService.login(
+        "CUSTOMER",
+        { email: "phase1a-email@example.com", password: testPassword },
+        context,
+      );
+      await parts.authService.requestEmailChange(parts.result.user.id, {
+        currentPassword: testPassword,
+        newEmail: "phase1a-email-new@example.com",
+      });
+      await parts.authService.verifyEmailChange(parts.result.user.id, {
+        code: parts.emailProvider.lastCode,
+      });
+
+      expect((await me(app, parts.result.accessToken)).status).toBe(401);
+      expect((await me(app, other.accessToken)).status).toBe(401);
+    });
+
+    it("suspension and role changes apply immediately from the database; suspension at refresh also kills the family", async () => {
+      const parts = await completeCustomer("phase1a-status@example.com");
+      const app = buildApp(parts);
+      const token = parts.result.accessToken;
+      const userId = parts.result.user.id;
+
+      await UserModel.updateOne({ _id: userId }, { $set: { status: "SUSPENDED" } });
+      const suspended = await me(app, token);
+      expect(suspended.status).toBe(403);
+      expect(suspended.body.errors?.[0]?.code).toBe("USER_SUSPENDED");
+      await UserModel.updateOne({ _id: userId }, { $set: { status: "ACTIVE" } });
+      expect((await me(app, token)).status).toBe(200);
+
+      // The token's role claim says CUSTOMER; authorization follows the stored role.
+      await UserModel.updateOne({ _id: userId }, { $set: { role: "STAFF" } });
+      expect(
+        (await request(app).get("/roles/CUSTOMER").set("Authorization", bearer(token))).status,
+      ).toBe(403);
+      expect(
+        (await request(app).get("/roles/STAFF").set("Authorization", bearer(token))).status,
+      ).toBe(200);
+      await UserModel.updateOne({ _id: userId }, { $set: { role: "CUSTOMER" } });
+
+      await UserModel.updateOne({ _id: userId }, { $set: { status: "SUSPENDED" } });
+      await expect(parts.authService.refresh(parts.result.refreshToken)).rejects.toMatchObject({
+        statusCode: 403,
+      });
+      await UserModel.updateOne({ _id: userId }, { $set: { status: "ACTIVE" } });
+      expect((await me(app, token)).status).toBe(401);
+    });
+
+    it("account closure: the closed account's JWT fails authentication", async () => {
+      const parts = await completeCustomer("phase1a-closure@example.com");
+      const app = buildApp(parts);
+      await parts.authService.deleteMyAccount(parts.result.user.id, {
+        confirmationText: "DELETE",
+        currentPassword: testPassword,
+      });
+      expect((await me(app, parts.result.accessToken)).status).toBe(401);
+    });
+
+    it("refresh-token reuse detection also kills the family's access tokens", async () => {
+      const parts = await completeCustomer("phase1a-reuse@example.com");
+      const app = buildApp(parts);
+      const rotated = await parts.authService.refresh(parts.result.refreshToken);
+      expect((await me(app, rotated.accessToken)).status).toBe(200);
+
+      await expect(parts.authService.refresh(parts.result.refreshToken)).rejects.toMatchObject({
+        details: [{ code: "REFRESH_TOKEN_REUSED" }],
+      });
+      expect((await me(app, rotated.accessToken)).status).toBe(401);
+    });
+
+    it("optional auth: live family personalizes; revoked family and no token both fall back to anonymous", async () => {
+      const parts = await completeCustomer("phase1a-optional@example.com");
+      const app = buildApp(parts);
+      const optional = (token?: string) => {
+        const call = request(app).get("/optional");
+        return token ? call.set("Authorization", bearer(token)) : call;
+      };
+
+      expect((await optional(parts.result.accessToken)).body).toEqual({
+        userId: parts.result.user.id,
+      });
+      await parts.authService.logout(parts.result.refreshToken);
+      const revoked = await optional(parts.result.accessToken);
+      expect(revoked.status).toBe(200);
+      expect(revoked.body).toEqual({ userId: null });
+      expect((await optional()).body).toEqual({ userId: null });
+    });
+
+    it("forged, mismatched and unknown session identifiers are rejected", async () => {
+      const victim = await completeCustomer("phase1a-victim@example.com");
+      const attacker = await completeCustomer("phase1a-attacker@example.com", createAuthService());
+      const app = buildApp(attacker);
+      const victimFamily = (
+        await victim.sessionRepository.findByRefreshTokenHash(sha256(victim.result.refreshToken))
+      )?.tokenFamilyId;
+      const sign = (
+        payload: Record<string, unknown>,
+        sub: string,
+        secret = env.JWT_ACCESS_TOKEN_SECRET,
+      ) =>
+        new SignJWT(payload)
+          .setProtectedHeader({ alg: "HS256" })
+          .setSubject(sub)
+          .setIssuedAt()
+          .setExpirationTime("15m")
+          .sign(new TextEncoder().encode(secret));
+
+      // Correctly signed, but the attacker's subject with the victim's live family.
+      expect(
+        (
+          await me(
+            app,
+            await sign({ role: "CUSTOMER", sid: victimFamily }, attacker.result.user.id),
+          )
+        ).status,
+      ).toBe(401);
+      // Unknown family.
+      expect(
+        (
+          await me(
+            app,
+            await sign({ role: "CUSTOMER", sid: "no-such-family" }, attacker.result.user.id),
+          )
+        ).status,
+      ).toBe(401);
+      // Victim subject + victim family, but not signed with the server secret.
+      expect(
+        (
+          await me(
+            app,
+            await sign(
+              { role: "CUSTOMER", sid: victimFamily },
+              victim.result.user.id,
+              "x".repeat(40),
+            ),
+          )
+        ).status,
+      ).toBe(401);
+      // The victim's genuine token still works (control).
+      expect((await me(app, victim.result.accessToken)).status).toBe(200);
+    });
+
+    it("legacy JWTs without sid: rejected by default; accepted under grace only if issued before the cutoff", async () => {
+      const parts = await completeCustomer("phase1a-legacy@example.com");
+      const legacy = await new SignJWT({ role: "CUSTOMER" })
+        .setProtectedHeader({ alg: "HS256" })
+        .setSubject(parts.result.user.id)
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .sign(new TextEncoder().encode(env.JWT_ACCESS_TOKEN_SECRET));
+      const withGrace = (cutoffOffsetMs: number) =>
+        new TokenService(parts.sessionRepository, {
+          legacyAccessTokenGrace: true,
+          legacyCutoff: new Date(Date.now() + cutoffOffsetMs),
+        });
+
+      expect((await me(buildApp(parts), legacy)).status).toBe(401);
+      expect((await me(buildApp(parts, withGrace(60_000)), legacy)).status).toBe(200);
+      expect((await me(buildApp(parts, withGrace(-60_000)), legacy)).status).toBe(401);
+      // Grace never weakens bound tokens: a revoked family is still rejected under grace.
+      await parts.authService.logout(parts.result.refreshToken);
+      expect((await me(buildApp(parts, withGrace(60_000)), parts.result.accessToken)).status).toBe(
+        401,
+      );
+    });
+
+    it("concurrent refresh and logout: after the logout is acknowledged, no access token of that family authenticates", async () => {
+      const parts = await completeCustomer("phase1a-race@example.com");
+      const app = buildApp(parts);
+      const userId = new mongoose.Types.ObjectId(parts.result.user.id);
+      for (let iteration = 0; iteration < 12; iteration++) {
+        const initial = await parts.tokenService.createRefreshSession({ userId });
+        const initialAccess = await parts.tokenService.createAccessToken({
+          userId,
+          role: "CUSTOMER",
+          sessionFamilyId: initial.tokenFamilyId,
+        });
+        // Alternate which operation is dispatched first.
+        let refresh: ReturnType<AuthService["refresh"]>;
+        let logout: ReturnType<AuthService["logout"]>;
+        if (iteration % 2 === 0) {
+          refresh = parts.authService.refresh(initial.refreshToken);
+          logout = parts.authService.logout(initial.refreshToken);
+        } else {
+          logout = parts.authService.logout(initial.refreshToken);
+          refresh = parts.authService.refresh(initial.refreshToken);
+        }
+        const [refreshOutcome, logoutOutcome] = await Promise.allSettled([refresh, logout]);
+        expect(logoutOutcome.status).toBe("fulfilled");
+
+        const tokens = [initialAccess];
+        if (refreshOutcome.status === "fulfilled") {
+          tokens.push(refreshOutcome.value.accessToken);
+        }
+        for (const token of tokens) {
+          expect((await me(app, token)).status).toBe(401);
+        }
+      }
+      // Control: the registration session (a different family) was never affected.
+      expect((await me(app, parts.result.accessToken)).status).toBe(200);
+    });
+
+    it("API requests racing logout may complete only if authenticated before the commit; every request after the acknowledgement is rejected", async () => {
+      const parts = await completeCustomer("phase1a-inflight@example.com");
+      const app = buildApp(parts);
+      const token = parts.result.accessToken;
+
+      const inFlight = Array.from({ length: 20 }, () => me(app, token));
+      await parts.authService.logout(parts.result.refreshToken);
+      const racing = await Promise.all(inFlight);
+      for (const response of racing) {
+        expect([200, 401]).toContain(response.status);
+      }
+
+      const afterAck = await Promise.all(Array.from({ length: 20 }, () => me(app, token)));
+      expect(afterAck.every((response) => response.status === 401)).toBe(true);
+    });
   });
 
   describe("seed-demo-customer (local development helper)", () => {

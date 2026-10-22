@@ -24,6 +24,7 @@ import { ServiceCategoryRepository } from "../../../src/modules/services/service
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -159,7 +160,7 @@ describe("database-backed Add-on integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const flatAddonBody = (overrides: Record<string, unknown> = {}): CreateAddonBody =>
     ({

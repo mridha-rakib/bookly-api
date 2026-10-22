@@ -24,6 +24,7 @@ import { createBusinessTravelSettingsRoute } from "../business-travel-settings/b
 import { createDashboardAnalyticsRoute } from "../dashboard-analytics/dashboard-analytics.route.js";
 import { createFinanceRoute } from "../finance/finance.route.js";
 import { createIntegrationRoute } from "../integration/integration.route.js";
+import { createPackagesRoute } from "../packages/package.route.js";
 import { createPayoutDestinationRoute } from "../payout-destination/payout-destination.route.js";
 import { createServicesRoute } from "../services/service.route.js";
 import { SessionRepository } from "../session/session.repository.js";
@@ -167,6 +168,7 @@ export const createBusinessRoute = (): Router => {
   router.use(createBusinessHoursRoute());
   router.use(createBusinessCancellationPolicyRoute());
   router.use(createServicesRoute());
+  router.use(createPackagesRoute());
   router.use(createAddonsRoute());
   router.use(createStaffRoute());
   router.use(createStaffAvatarRoute());

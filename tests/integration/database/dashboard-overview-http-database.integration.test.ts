@@ -10,6 +10,7 @@ import { createDashboardOverviewRoute } from "../../../src/modules/dashboard-ove
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -101,7 +102,7 @@ describe("HTTP-level Dashboard Overview authorization", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   it("an Owner can read their own Business's Overview via the real HTTP route", async () => {
     const { owner, business } = await createBusiness();

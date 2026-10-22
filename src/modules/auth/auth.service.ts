@@ -679,6 +679,7 @@ export class AuthService {
       const accessToken = await this.tokenService.createAccessToken({
         userId: user._id,
         role: user.role,
+        sessionFamilyId: rotated.tokenFamilyId,
       });
 
       return {
@@ -709,6 +710,14 @@ export class AuthService {
     if (refreshToken) {
       await this.tokenService.revokeRefreshToken(refreshToken);
     }
+  }
+
+  public async logoutIntended(
+    refreshToken: string | undefined,
+    intent: { intentId: string; familyId: string },
+  ): Promise<{ intentId: string; familyId: string; outcome: "revoked" }> {
+    await this.tokenService.revokeIntendedFamily(refreshToken, intent.familyId);
+    return { ...intent, outcome: "revoked" };
   }
 
   public async getMe(userId: string) {

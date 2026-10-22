@@ -13,6 +13,7 @@ import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { expectSessionRevokedByLogout } from "../../helpers/session-binding.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -262,6 +263,7 @@ describe("HTTP-level Business Owner Google auth (start + callback + completion)"
     expect(String(cb.headers["set-cookie"])).toMatch(/bookly_refresh_token=/);
     expect(await UserModel.countDocuments({})).toBe(1);
     expect(await RegistrationSessionModel.countDocuments({ authProvider: "GOOGLE" })).toBe(0);
+    await expectSessionRevokedByLogout(buildApp(), cb, "BUSINESS_OWNER");
   });
 
   it("CASE 3 — email already registered (no Google link): status=account_exists, no writes", async () => {

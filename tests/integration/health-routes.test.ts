@@ -85,4 +85,14 @@ describe("health and infrastructure routes", () => {
     expect(response.body.requestId).toBeTruthy();
     expect(response.body.errors).toBeUndefined();
   });
+
+  it("exposes Retry-After to the cross-origin frontend (Phase 1B logout retry)", async () => {
+    const response = await request(createApp())
+      .get("/api/v1/health")
+      .set("Origin", "http://localhost:3000")
+      .expect(200);
+
+    expect(response.headers["access-control-allow-credentials"]).toBe("true");
+    expect(response.headers["access-control-expose-headers"]).toBe("Retry-After");
+  });
 });

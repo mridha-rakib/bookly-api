@@ -13,6 +13,7 @@ import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { expectSessionRevokedByLogout } from "../../helpers/session-binding.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -261,6 +262,7 @@ describe("HTTP-level Business Owner Facebook auth (start + callback + completion
       expect(cb.headers["location"]).toBe(`${FRONTEND_CB}?flow=professional&status=success`);
       expect(String(cb.headers["set-cookie"])).toMatch(/bookly_refresh_token=/);
       expect(await RegistrationSessionModel.countDocuments({ authProvider: "FACEBOOK" })).toBe(0);
+      await expectSessionRevokedByLogout(buildApp(), cb, role);
     },
   );
 

@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 
 import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
+import { attributeRateLimitRejections } from "../../common/middleware/rate-limit-attribution.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
@@ -39,13 +40,17 @@ export const createPublicContentRoute = (): Router => {
     new StaticPageService(new StaticPageRepository()),
   );
 
-  const contentLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    limit: env.RATE_LIMIT_MAX,
-    standardHeaders: "draft-8",
-    legacyHeaders: false,
-    message: buildErrorResponse("Too many requests"),
-  });
+  const contentLimiterWindowMs = 60 * 1000;
+  const contentLimiter = attributeRateLimitRejections(
+    rateLimit({
+      windowMs: contentLimiterWindowMs,
+      limit: env.RATE_LIMIT_MAX,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      message: buildErrorResponse("Too many requests"),
+    }),
+    { name: "content", limit: env.RATE_LIMIT_MAX, windowMs: contentLimiterWindowMs },
+  );
 
   router.get(
     "/faqs",

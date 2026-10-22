@@ -26,6 +26,7 @@ import type {
   VerifyPhoneOtpBody,
   VisitTypeBody,
 } from "./auth.schema.js";
+import { logoutBodySchema } from "./auth.schema.js";
 import type { AuthService } from "./auth.service.js";
 
 export class AuthController {
@@ -179,9 +180,16 @@ export class AuthController {
   };
 
   public logout = async (request: Request, response: Response): Promise<void> => {
-    await this.authService.logout(getRefreshTokenFromRequest(request));
-    clearRefreshCookie(response);
-    sendSuccess(response, 200, "Logged out");
+    const intent = logoutBodySchema.safeParse(request.validated?.body ?? request.body);
+    if (!intent.success) throw new AuthError("LOGOUT_INTENT_REQUIRED", 400);
+    const result = await this.authService.logoutIntended(
+      getRefreshTokenFromRequest(request),
+      intent.data,
+    );
+    // Never clear the shared cookie here: this response can arrive AFTER another login's
+    // Set-Cookie. Revocation is authoritative; the harmless revoked cookie expires naturally
+    // or is replaced by a later login. No logout response can erase a newer session cookie.
+    sendSuccess(response, 200, "Intended session revoked", result);
   };
 
   public me = async (request: Request, response: Response): Promise<void> => {

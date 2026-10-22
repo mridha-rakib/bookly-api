@@ -12,6 +12,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { UserRole } from "../../../src/modules/user/user.types.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -57,7 +58,7 @@ describe("HTTP-level Super Admin Settings — Admin Account (Phase 1)", () => {
   };
 
   const bearerFor = async (userId: Types.ObjectId | string, role: UserRole) =>
-    `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+    `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const loginPathFor = (role: UserRole): string =>
     role === "SUPER_ADMIN"

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Types } from "mongoose";
 
 import { BookingError } from "./booking.errors.js";
@@ -6,8 +7,13 @@ import {
   BookingCreationClaimModel,
 } from "./booking-creation-claim.model.js";
 import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
+import {
+  type PackageRequestBinding,
+  packageRequestBindingSchema,
+} from "./package-request-binding.js";
 
 export type ClaimBookingCreationInput = {
+  packageRequestBinding?: PackageRequestBinding | undefined;
   idempotencyKey: string;
   businessId: Types.ObjectId;
   actorUserId: Types.ObjectId;
@@ -39,6 +45,17 @@ export class BookingCreationClaimRepository {
       ) {
         throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       }
+      const storedBinding = existing.toObject().packageRequestBinding;
+      if (
+        !isDeepStrictEqual(
+          storedBinding ? packageRequestBindingSchema.parse(storedBinding) : undefined,
+          input.packageRequestBinding
+            ? packageRequestBindingSchema.parse(input.packageRequestBinding)
+            : undefined,
+        )
+      ) {
+        throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+      }
       return { isNew: false, bookingId: existing.bookingId };
     }
   }
@@ -46,13 +63,33 @@ export class BookingCreationClaimRepository {
   /** Called only for failures that have no durable provider money operation. Charge-bearing
    * failures retain their claim as part of PaymentAttempt resume/compensation correlation. */
   public async release(idempotencyKey: string): Promise<void> {
-    await BookingCreationClaimModel.deleteOne({ idempotencyKey }).exec();
+    await BookingCreationClaimModel.deleteOne({
+      idempotencyKey,
+      packageRequestBinding: { $exists: false },
+    }).exec();
   }
 
   public async findByIdempotencyKey(
     idempotencyKey: string,
   ): Promise<BookingCreationClaimDocument | null> {
-    return BookingCreationClaimModel.findOne({ idempotencyKey }).exec();
+    return BookingCreationClaimModel.findOne({
+      idempotencyKey,
+      packageRequestBinding: { $exists: false },
+    }).exec();
+  }
+
+  /** P3-only orchestration will use this explicit bound-claim read; legacy shortcuts cannot. */
+  public async findPackageBoundClaim(
+    idempotencyKey: string,
+    businessId: Types.ObjectId,
+    actorUserId: Types.ObjectId,
+  ) {
+    return BookingCreationClaimModel.findOne({
+      idempotencyKey,
+      businessId,
+      actorUserId,
+      packageRequestBinding: { $exists: true },
+    }).exec();
   }
 
   /**

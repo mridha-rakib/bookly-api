@@ -37,6 +37,7 @@ import { StaffRepository } from "../../../src/modules/staff/staff.repository.js"
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import {
   clearIsolatedDatabase,
@@ -410,7 +411,7 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   it("allows an authenticated Customer to read a Business's bookable catalog", async () => {
     const { business, service, membership } = await setupBookableBusiness(8000);

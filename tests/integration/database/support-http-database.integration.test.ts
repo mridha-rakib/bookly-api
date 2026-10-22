@@ -11,6 +11,7 @@ import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-ad
 import { createContactRoute } from "../../../src/modules/support/contact.route.js";
 import { createSupportRoute } from "../../../src/modules/support/support.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -129,7 +130,7 @@ describe("HTTP-level Support endpoints (Batch 15B)", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Requester create/list/detail --------------------------------------------------------------
 

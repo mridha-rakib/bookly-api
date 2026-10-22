@@ -41,6 +41,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import {
   clearIsolatedDatabase,
@@ -345,7 +346,7 @@ describe("HTTP-level Review endpoints (Batch 14)", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const createSuperAdmin = async () =>
     userRepository.create({

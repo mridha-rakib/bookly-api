@@ -454,7 +454,10 @@ export class BookingRepository {
   /** The Calendar range-read (item 15): a narrow, display-only projection — never the full
    * document (no eventHistory/rescheduleHistory/full financials breakdown, no history). Batch
    * 6 adds `source` and the two `financials` totals (a Calendar card shows Manual-vs-Bookly and
-   * a price chip — see toBookingCalendarEntryDto) without pulling the rest of `financials`. */
+   * a price chip — see toBookingCalendarEntryDto) without pulling the rest of `financials`.
+   * The package-session and no-show-window sub-fields are exactly what that mapper reads
+   * (toBookingPackageSessionIdentityDtos destructures `pricingInput`), so every one must stay
+   * projected or the mapper throws for every returned Booking. */
   public async findManyForCalendar(
     businessId: Types.ObjectId | string,
     startAt: Date,
@@ -468,12 +471,18 @@ export class BookingRepository {
         status: 1,
         schedule: 1,
         "serviceLines.serviceSnapshot.name": 1,
+        "serviceLines.serviceSnapshot.pricingMode": 1,
+        "serviceLines.pricingInput.packageProgressId": 1,
+        "serviceLines.pricingInput.sessionIndex": 1,
+        "serviceLines.pricingInput.sessionsInPackage": 1,
         "serviceLines.staffSnapshot": 1,
         "serviceLines.responsibleStaffMembershipId": 1,
         "customer.contact.firstName": 1,
         "customer.contact.lastName": 1,
         "financials.totalCents": 1,
         "financials.currency": 1,
+        "noShowEligibilitySnapshot.opensAfterMinutes": 1,
+        "noShowEligibilitySnapshot.closesAfterMinutes": 1,
       },
     )
       .sort({ "schedule.startAt": 1 })

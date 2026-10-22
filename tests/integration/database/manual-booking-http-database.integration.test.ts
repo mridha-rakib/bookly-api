@@ -19,6 +19,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -256,7 +257,7 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Tests -----------------------------------------------------------------------------------
 

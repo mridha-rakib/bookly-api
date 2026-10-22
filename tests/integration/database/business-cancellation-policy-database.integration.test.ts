@@ -18,6 +18,7 @@ import { createBusinessCancellationPolicyRoute } from "../../../src/modules/busi
 import { BusinessCancellationPolicyService } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.service.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -103,7 +104,7 @@ describe("database-backed BusinessCancellationPolicy integration", () => {
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   it("enforces one BusinessCancellationPolicy document per Business at the database level", async () => {
     const indexes = (await BusinessCancellationPolicyModel.collection.indexes()) as DbIndex[];

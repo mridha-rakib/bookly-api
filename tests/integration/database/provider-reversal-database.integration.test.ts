@@ -94,6 +94,7 @@ import { StripeWebhookEventModel } from "../../../src/modules/stripe-webhook/str
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { seedLegacyReturningDeposit } from "../../helpers/legacy-returning-deposit.js";
 import {
@@ -1909,7 +1910,7 @@ describe("P6 provider-originated reversals", () => {
       return app;
     };
     const bearer = async (userId: Types.ObjectId, role: "SUPER_ADMIN" | "BUSINESS_OWNER") =>
-      `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+      `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
     it("Super Admin sees disputes (with accounting + payout effect), external refunds and FAILED webhooks; a Business Owner cannot", async () => {
       const source = await SOURCES.DEPOSIT();

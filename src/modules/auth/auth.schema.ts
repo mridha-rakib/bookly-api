@@ -15,6 +15,12 @@ import {
 import { genders, userLanguages } from "../user/user.types.js";
 
 const emailSchema = z.email();
+export const logoutBodySchema = z
+  .object({
+    intentId: z.string().min(1).max(128),
+    familyId: z.uuid(),
+  })
+  .strict();
 const sessionIdSchema = z.string().min(1);
 // Bookly-generated OTP (email verification / email change) — fixed 4 digits (OTP_LENGTH).
 const otpCodeSchema = z.string().regex(/^\d{4}$/, "OTP must be 4 digits");

@@ -7,6 +7,7 @@ export type SessionDocument = {
   tokenFamilyId: string;
   expiresAt: Date;
   revokedAt?: Date | undefined;
+  revocationVersion?: number;
   replacedBySessionId?: Types.ObjectId | undefined;
   createdAt: Date;
   lastUsedAt?: Date | undefined;
@@ -21,6 +22,8 @@ const sessionSchema = new Schema<SessionDocument>(
     tokenFamilyId: { type: String, required: true },
     expiresAt: { type: Date, required: true },
     revokedAt: { type: Date },
+    // Ensures repeated family revocations write even within the same millisecond.
+    revocationVersion: { type: Number, default: 0 },
     replacedBySessionId: { type: Schema.Types.ObjectId, ref: "Session" },
     lastUsedAt: { type: Date },
     userAgent: { type: String },
@@ -35,10 +38,8 @@ sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 // currently has zero known callers. Left in place; a future maintenance pass should confirm
 // and drop it rather than removing it opportunistically here.
 sessionSchema.index({ userId: 1, revokedAt: 1 });
-// The actual token-reuse-detection breach-response query shape (revokeFamily below) filters
-// purely on {tokenFamilyId, revokedAt} — previously unindexed, meaning that call was a full
-// collection scan on a security-critical path (an attacker replaying a stolen refresh token
-// triggers this exact query). Matches the query's own filter shape exactly.
+// Family revocation uses the tokenFamilyId prefix, including consumed ancestors, so it
+// conflicts with concurrent rotation. The existing compound index supports that prefix.
 sessionSchema.index({ tokenFamilyId: 1, revokedAt: 1 });
 
 export const SessionModel = model<SessionDocument>("Session", sessionSchema);

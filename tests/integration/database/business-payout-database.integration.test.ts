@@ -48,6 +48,7 @@ import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { seedLegacyReturningDeposit } from "../../helpers/legacy-returning-deposit.js";
 import {
@@ -465,7 +466,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
   const bearerFor = async (
     userId: Types.ObjectId | string,
     role: "SUPER_ADMIN" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
-  ) => `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+  ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- 1/2: first booking PLATFORM_FEE is Bookly's; its Stripe fee is NOT Business-borne -----
 

@@ -266,6 +266,10 @@ export const env = createEnv({
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     JWT_ACCESS_TOKEN_SECRET: jwtSecretSchema,
     JWT_ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
+    // Phase 1A migration aid: when true, access tokens without a session-family claim (`sid`)
+    // that were issued before this process started are still accepted. They expire on their own
+    // within JWT_ACCESS_TOKEN_TTL_MINUTES. Default false: every access token must be bound.
+    AUTH_ACCESS_TOKEN_LEGACY_GRACE: booleanString,
     REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
     AUTH_COOKIE_NAME: z.string().min(1).default("bookly_refresh_token"),
     // A cookie `Domain` attribute is a BARE host — no scheme, port, path or spaces. e.g.

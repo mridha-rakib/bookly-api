@@ -12,6 +12,7 @@ import { signAppleLinkState } from "../../../src/modules/linked-account/linked-a
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -99,7 +100,7 @@ describe("HTTP-level Customer → Apple account linking (linking only, POST form
     });
 
   const bearerFor = (userId: Types.ObjectId | string, role: TestRole) =>
-    tokenService.createAccessToken({ userId, role }).then((token) => `Bearer ${token}`);
+    issueTestAccessToken(tokenService, { userId, role }).then((token) => `Bearer ${token}`);
 
   const FRONTEND_CB = "http://localhost:3000/customer/settings";
   const validIdentity = (over: Record<string, unknown> = {}) => ({

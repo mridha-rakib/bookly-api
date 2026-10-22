@@ -10,6 +10,7 @@ import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { expectSessionRevokedByLogout } from "../../helpers/session-binding.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -179,6 +180,7 @@ describe("HTTP-level Customer Google auth (start + callback)", () => {
     expect(String(res.headers["set-cookie"])).toMatch(/bookly_refresh_token=/);
     expect(await UserModel.countDocuments({})).toBe(1);
     expect(await LinkedAccountModel.countDocuments({})).toBe(1);
+    await expectSessionRevokedByLogout(buildApp(), res, "CUSTOMER");
   });
 
   it("email already registered without a Google link: status=account_exists, no writes, no session", async () => {

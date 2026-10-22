@@ -25,6 +25,7 @@ import "../modules/email-outbox/email-outbox.model.js";
 import "../modules/linked-account/linked-account.model.js";
 import "../modules/marketing/marketing-campaign.model.js";
 import "../modules/marketing/marketing-campaign-recipient.model.js";
+import "../modules/packages/package.model.js";
 import "../modules/payment/customer-payment-profile.model.js";
 import "../modules/payment/payment-attempt.model.js";
 import "../modules/payment/refund-operation.model.js";

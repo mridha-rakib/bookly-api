@@ -13,6 +13,7 @@ import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { expectSessionRevokedByLogout } from "../../helpers/session-binding.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -281,6 +282,7 @@ describe("HTTP-level Business Owner Apple auth (GET start + POST callback + comp
 
     const { cb } = await runFlow({ code: "auth-code" });
     expect(cb.headers["location"]).toBe(`${FRONTEND_CB}?flow=professional&status=success`);
+    await expectSessionRevokedByLogout(buildApp(), cb, "BUSINESS_OWNER");
   });
 
   it("CASE 3 — verified email already registered (no Apple link): status=account_exists, no writes", async () => {

@@ -1,6 +1,10 @@
 import { AppError, type ErrorDetail } from "../../common/errors/app-error.js";
 
 const defaultMessages: Record<string, string> = {
+  LOGOUT_INTENT_REQUIRED: "A session-family logout intent is required",
+  LOGOUT_UNVERIFIABLE: "The intended session's revocation cannot be verified from this cookie",
+  LOGOUT_FAMILY_MISMATCH:
+    "The current cookie belongs to a different session; the intended sign-out remains unconfirmed",
   EMAIL_ALREADY_REGISTERED: "Email is already registered",
   PORTAL_MISMATCH: "This account belongs to a different portal",
   INVALID_CREDENTIALS: "Invalid email or password",
@@ -18,6 +22,7 @@ const defaultMessages: Record<string, string> = {
   BUSINESS_PENDING_APPROVAL: "Business is pending approval",
   BUSINESS_SUSPENDED: "Business is suspended",
   SESSION_EXPIRED: "Session has expired",
+  AUTHENTICATION_UNAVAILABLE: "Authentication is temporarily unavailable. Please try again",
   REFRESH_TOKEN_REUSED: "Refresh token reuse detected",
   PROVIDER_NOT_CONFIGURED: "Verification provider is not configured",
   REGISTRATION_COMPLETION_FAILED: "Registration completion failed",

@@ -12,6 +12,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { UserRole } from "../../../src/modules/user/user.types.js";
 import { createApiRouter } from "../../../src/routes/api-router.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -97,7 +98,7 @@ describe("HTTP-level Business Payout Destination", () => {
   };
 
   const bearerFor = async (userId: Types.ObjectId | string, role: UserRole) =>
-    `Bearer ${await tokenService.createAccessToken({ userId, role })}`;
+    `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   const validBody = (iban = IBAN_CY) => ({
     accountHolderName: "Maria Georgiou",

@@ -23,6 +23,7 @@ import { BusinessLinkVerificationRepository } from "../../../src/modules/busines
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type { EmailOtpProvider } from "../../../src/modules/verification/email-otp.provider.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -127,7 +128,7 @@ describe("business-link OTP rate limiting (dedicated limiter, not just the globa
   };
 
   const bearerFor = async (userId: import("mongoose").Types.ObjectId) =>
-    `Bearer ${await tokenService.createAccessToken({ userId, role: "BUSINESS_OWNER" })}`;
+    `Bearer ${await issueTestAccessToken(tokenService, { userId, role: "BUSINESS_OWNER" })}`;
 
   it("returns 429 once the per-IP send limit is exceeded, with a generic message", async () => {
     const { user: actor } = await createBusinessOwner("actor@example.com", "Actor Business");
