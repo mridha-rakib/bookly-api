@@ -2,6 +2,7 @@ import { Types } from "mongoose";
 import { z } from "zod";
 import { businessCities, businessVisitTypes } from "../business/business.types.js";
 import { calculatePackagePricing } from "../packages/package-pricing.js";
+import { packageGroupSeatSchema } from "../packages/package-service-entitlement.js";
 import type { PackageProgressV2Document } from "./package-progress-v2.types.js";
 import {
   purchasedItemContractSchema,
@@ -18,13 +19,23 @@ export const purchasedPackageItemSchema = z
     packageItemId: id,
     definitionItemId: id,
     serviceId: id,
-    serviceSnapshot: z
-      .object({
-        name: z.string().trim().min(1),
-        pricingMode: z.literal("FIXED"),
-        durationMin: count.min(1),
-      })
-      .strict(),
+    serviceSnapshot: z.discriminatedUnion("pricingMode", [
+      z
+        .object({
+          name: z.string().trim().min(1),
+          pricingMode: z.literal("FIXED"),
+          durationMin: count.min(1),
+        })
+        .strict(),
+      z
+        .object({
+          name: z.string().trim().min(1),
+          pricingMode: z.literal("PER_PERSON"),
+          durationMin: count.min(1),
+          group: packageGroupSeatSchema,
+        })
+        .strict(),
+    ]),
     totalSessions: count.min(1),
     remainingSessions: count,
     completedSessions: count,

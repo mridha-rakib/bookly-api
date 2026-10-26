@@ -45,6 +45,13 @@ import {
   NO_SHOW_RESOLUTION_WINDOW_MINUTES,
 } from "./booking.types.js";
 import { buildCancellationOutcome } from "./booking-cancellation-classification.js";
+import { packageReservationPartySize } from "./booking-package-foundation.js";
+import {
+  acquireSchedulingAdmission,
+  validateSchedulingLine,
+  verifiedOccupiedMilliseconds,
+} from "./booking-scheduling-admission.js";
+import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import {
   cancellationObligationKey,
   computeNoShowPenalty,
@@ -156,8 +163,8 @@ export class BookingLifecycleService {
     private readonly businessRepository: BusinessRepository,
     private readonly reservationService: BookingSlotReservationService,
     private readonly availabilityService: AvailabilityService,
-    private readonly serviceRepository: ServiceRepository,
-    private readonly staffRepository: StaffRepository,
+    _serviceRepository: ServiceRepository,
+    _staffRepository: StaffRepository,
     private readonly paymentService: PaymentService,
     private readonly financialTransactionService: BookingFinancialTransactionService,
     // Optional — see BookingCreationService's identical trailing-optional-dep pattern/comment.
@@ -1997,7 +2004,8 @@ export class BookingLifecycleService {
           timezone: booking.schedule.timezone,
           startAt: booking.schedule.startAt,
           reservationId: line.reservationId,
-          partySize: line.pricingInput.personCount ?? 1,
+          idempotencyKey: line.reservationOperationKey,
+          partySize: packageReservationPartySize(line),
         },
         session,
       );
@@ -2091,42 +2099,50 @@ export class BookingLifecycleService {
 
     try {
       await dbSession.withTransaction(async () => {
+        const currentBusiness = await acquireSchedulingAdmission(params.business, dbSession);
+        if (currentBusiness.timezone !== params.booking.schedule.timezone)
+          throw new BookingError("BOOKING_SCHEDULING_CHANGED", 409);
         const newReservationIdByLineIndex = new Map<number, Types.ObjectId>();
         let overallNewEndAt = params.newStartAt;
 
-        for (const [index, line] of params.booking.serviceLines.entries()) {
-          const [service, staffMembership] = await Promise.all([
-            this.serviceRepository.findById(params.booking.businessId, line.serviceId),
-            this.staffRepository.findActiveById(
-              params.booking.businessId,
-              line.responsibleStaffMembershipId,
-            ),
-          ]);
-
-          if (!service || !staffMembership) {
-            throw new BookingError("BOOKING_STAFF_NOT_ELIGIBLE", 409);
-          }
-
-          const occupiedMin = line.serviceSnapshot.durationMin;
-          const newEndAt = new Date(params.newStartAt.getTime() + occupiedMin * 60_000);
-          if (newEndAt > overallNewEndAt) {
-            overallNewEndAt = newEndAt;
-          }
-
-          const partySize = line.pricingInput.personCount ?? 1;
-          const capacityMax =
-            line.serviceSnapshot.pricingMode === "PER_PERSON"
-              ? (service.perPersonPricing?.maxPersons ?? partySize)
-              : 1;
-
-          await this.availabilityService.assertSlotIsBookable({
-            business: params.business,
-            service,
-            staffMembership,
-            startAt: params.newStartAt,
-            endAt: newEndAt,
-            partySize,
-          });
+        for (const [index, line] of [...params.booking.serviceLines.entries()].sort(
+          (a, b) =>
+            String(a[1].responsibleStaffMembershipId).localeCompare(
+              String(b[1].responsibleStaffMembershipId),
+            ) || a[0] - b[0],
+        )) {
+          const occupied = await verifiedOccupiedMilliseconds(params.booking, line, dbSession);
+          const newEndAt = new Date(params.newStartAt.getTime() + occupied.duration);
+          if (newEndAt > overallNewEndAt) overallNewEndAt = newEndAt;
+          const partySize = packageReservationPartySize(line);
+          const capacityMax = occupied.capacityMax;
+          await validateSchedulingLine(
+            {
+              business: currentBusiness,
+              serviceId: line.serviceId,
+              staffMembershipId: line.responsibleStaffMembershipId,
+              startAt: params.newStartAt,
+              endAt: newEndAt,
+              partySize,
+              capacityMax,
+              packageGroup: line.schedulingSnapshot?.group,
+              allowInactive:
+                line.pricingInput.sessionIndex !== undefined && line.pricingInput.sessionIndex > 1,
+              existingAppointment: true,
+              fulfilment: params.booking.fulfilment,
+              ...(line.pricingInput.packageProgressId && !line.pricingInput.packageItemId
+                ? {
+                    legacyPurchase: {
+                      progressId: line.pricingInput.packageProgressId,
+                      businessClientId: params.booking.customer.businessClientId,
+                      customerUserId: params.booking.customer.customerUserId,
+                    },
+                  }
+                : {}),
+            },
+            this.availabilityService,
+            dbSession,
+          );
 
           const reservation = await this.reservationService.reserveOrJoin(
             {
@@ -2176,6 +2192,7 @@ export class BookingLifecycleService {
           (line, index) => ({
             ...(line as unknown as { toObject: () => BookingServiceLine }).toObject(),
             reservationId: newReservationIdByLineIndex.get(index) as Types.ObjectId,
+            reservationOperationKey: `${String(params.booking._id)}:reschedule:${rescheduleAttemptNonce}:${index}`,
           }),
         );
 
@@ -2274,6 +2291,8 @@ export class BookingLifecycleService {
     if (!booking) {
       throw new BookingError("BOOKING_NOT_FOUND", 404);
     }
+    if (booking.serviceLines.some((line) => line.pricingInput.packageItemId))
+      await verifyPackageBatchActivation();
     if (!allowedStatuses.includes(booking.status)) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
@@ -2292,6 +2311,8 @@ export class BookingLifecycleService {
     if (!booking) {
       throw new BookingError("BOOKING_NOT_FOUND", 404);
     }
+    if (booking.serviceLines.some((line) => line.pricingInput.packageItemId))
+      await verifyPackageBatchActivation();
     if (!allowedStatuses.includes(booking.status)) {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }

@@ -183,6 +183,20 @@ export class BookingCreationClaimRepository {
     }).exec();
   }
 
+  /** Only a caller that proved no commit was attempted may release its exact operation. */
+  public async releaseUncommitted(input: ClaimBookingCreationInput): Promise<void> {
+    await BookingCreationClaimModel.deleteOne({
+      idempotencyKey: input.idempotencyKey,
+      businessId: input.businessId,
+      actorUserId: input.actorUserId,
+      bookingId: input.bookingId,
+      packageRequestBinding: { $exists: false },
+      packageCheckoutRetention: { $exists: false },
+      packageCheckoutPresentation: { $exists: false },
+      packageCheckoutAcceptance: { $exists: false },
+    }).exec();
+  }
+
   public async findByIdempotencyKey(
     idempotencyKey: string,
   ): Promise<BookingCreationClaimDocument | null> {
@@ -191,6 +205,28 @@ export class BookingCreationClaimRepository {
       packageRequestBinding: { $exists: false },
       packageCheckoutRetention: { $exists: false },
     }).exec();
+  }
+
+  /** Read the canonical key before any Customer replay, wait or financial resume.
+   * A key collision is never an ownership credential, including other claim protocols. */
+  public async findForCustomerReplay(
+    idempotencyKey: string,
+    businessId: Types.ObjectId,
+    customerUserId: string,
+  ): Promise<BookingCreationClaimDocument | null> {
+    const claim = await BookingCreationClaimModel.findOne({ idempotencyKey }).exec();
+    if (!claim) return null;
+    if (
+      String(claim.businessId) !== String(businessId) ||
+      String(claim.actorUserId) !== customerUserId ||
+      !claim.bookingId ||
+      claim.packageRequestBinding ||
+      claim.packageCheckoutRetention ||
+      claim.packageCheckoutPresentation ||
+      claim.packageCheckoutAcceptance
+    )
+      throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    return claim;
   }
 
   /** P3-only orchestration will use this explicit bound-claim read; legacy shortcuts cannot. */

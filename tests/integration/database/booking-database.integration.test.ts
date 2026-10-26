@@ -89,6 +89,11 @@ describe("database-backed Booking integration", () => {
       category: "Barber",
       subcategories: ["Haircut"],
     });
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     return { owner, business };
   };
 

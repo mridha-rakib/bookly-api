@@ -1,4 +1,5 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
+import { withPackageEligibility } from "../package-progress/package-eligibility.js";
 
 import {
   type BusinessCancellationPolicyDocument,
@@ -18,11 +19,16 @@ export class BusinessCancellationPolicyRepository {
     businessId: Types.ObjectId,
     tiers: CancellationTierRule[],
     noShowPercentage: number,
+    session?: ClientSession,
   ): Promise<BusinessCancellationPolicyDocument> {
-    return BusinessCancellationPolicyModel.findOneAndUpdate(
-      { businessId },
-      { $set: { tiers, noShowPercentage } },
-      { upsert: true, returnDocument: "after", runValidators: true },
-    ).exec() as Promise<BusinessCancellationPolicyDocument>;
+    return withPackageEligibility(businessId, session, async (transaction) =>
+      BusinessCancellationPolicyModel.findOneAndUpdate(
+        { businessId },
+        { $set: { tiers, noShowPercentage } },
+        { upsert: true, returnDocument: "after", runValidators: true, session: transaction },
+      )
+        .orFail()
+        .exec(),
+    );
   }
 }

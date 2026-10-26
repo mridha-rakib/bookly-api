@@ -25,6 +25,7 @@ import { BusinessTravelSettingsRepository } from "../../../src/modules/business-
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
 import { PlatformSettingsService } from "../../../src/modules/platform-settings/platform-settings.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
@@ -37,6 +38,7 @@ import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedu
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -140,6 +142,10 @@ describe("database-backed no-show eligibility window + max services (Batch 21)",
       ),
       undefined,
       platformSettingsService,
+      undefined,
+      undefined,
+      undefined,
+      new CyprusTaxService(new FakeTaxGateway()),
     );
 
     lifecycleService = new BookingLifecycleService(
@@ -182,6 +188,11 @@ describe("database-backed no-show eligibility window + max services (Batch 21)",
       subcategories: ["Thing"],
     });
 
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: owner._id,
+      changedAt: new Date(),
+    });
     const staffUser = await userRepository.create({
       normalizedEmail: `staff-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: "hash",

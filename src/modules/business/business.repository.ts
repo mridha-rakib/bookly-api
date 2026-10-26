@@ -1,6 +1,9 @@
 import type { ClientSession, Types } from "mongoose";
-
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
+import { BookingError } from "../booking/booking.errors.js";
+import { BookingModel } from "../booking/booking.model.js";
+import { BookingSlotReservationModel } from "../booking-slot-reservation/booking-slot-reservation.model.js";
+import { BookingSlotReservationClaimModel } from "../booking-slot-reservation/booking-slot-reservation-claim.model.js";
 import {
   assertBusinessPackageMode,
   withPackageEligibility,
@@ -63,8 +66,13 @@ export class BusinessRepository {
     return BusinessModel.findOne({ ownerUserId }).exec();
   }
 
-  public async findById(businessId: Types.ObjectId | string): Promise<BusinessDocument | null> {
-    return BusinessModel.findById(businessId).exec();
+  public async findById(
+    businessId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<BusinessDocument | null> {
+    return BusinessModel.findById(businessId)
+      .session(session ?? null)
+      .exec();
   }
 
   public async findManyByIds(
@@ -111,6 +119,23 @@ export class BusinessRepository {
     );
     if (!owned) return null;
     return withPackageEligibility(businessId, session, async (transaction) => {
+      const current = await BusinessModel.findOne({ _id: businessId, ownerUserId }).session(
+        transaction,
+      );
+      if (!current) return null;
+      if (update["timezone"] !== undefined && update["timezone"] !== current.timezone) {
+        // Any durable history freezes the partition. Empty/released history is not unused.
+        const claims = await BookingSlotReservationClaimModel.exists({ businessId })
+          .session(transaction)
+          .maxTimeMS(2000);
+        const days = await BookingSlotReservationModel.exists({ businessId })
+          .session(transaction)
+          .maxTimeMS(2000);
+        const bookings = await BookingModel.exists({ businessId })
+          .session(transaction)
+          .maxTimeMS(2000);
+        if (claims || days || bookings) throw new BookingError("BOOKING_SCHEDULING_CHANGED", 409);
+      }
       await assertBusinessPackageMode(businessId, update["visitType"], transaction);
       return BusinessModel.findOneAndUpdate(
         { _id: businessId, ownerUserId },

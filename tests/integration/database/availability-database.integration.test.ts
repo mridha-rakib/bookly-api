@@ -352,6 +352,76 @@ describe("database-backed Availability integration", () => {
 
   // --- HTTP boundary ---------------------------------------------------------------------------
 
+  it("F1B: Owner/Supervisor hourly reads use selected duration; omission and fractional inputs remain compatible", async () => {
+    const { owner, business } = await createBusiness("hourly-owner@example.com", "Hourly salon");
+    const { membership } = await createStaff(business._id);
+    const { user: supervisor } = await createStaff(business._id, "SUPERVISOR");
+    const service = await createFixedService(business._id, membership._id, {
+      pricingMode: "HOURLY",
+      fixedPricing: undefined,
+      hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 4, bufferAfterMin: 15 },
+    });
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(membership._id, business._id);
+    const app = buildApp();
+    const url = `/businesses/${business._id}/services/${service._id}/availability`;
+    for (const [userId, role] of [
+      [owner._id, "BUSINESS_OWNER"],
+      [supervisor._id, "SUPERVISOR"],
+    ] as const) {
+      const token = await bearerFor(userId, role);
+      const read = (hours?: number | string) =>
+        request(app)
+          .get(url)
+          .query({ fromDate: DATE, toDate: DATE, ...(hours === undefined ? {} : { hours }) })
+          .set("Authorization", token);
+      const legacy = await read();
+      const minimum = await read(2);
+      expect(legacy.status).toBe(200);
+      expect(minimum.body.data).toEqual(legacy.body.data);
+      for (const hours of [2.5, 4]) {
+        const response = await read(hours);
+        expect(response.status).toBe(200);
+        const slots = response.body.data.days[0].slots as Array<{ startAt: string; endAt: string }>;
+        expect(slots.length).toBeGreaterThan(0);
+        expect(
+          slots.every(
+            (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === (hours * 60 + 15) * 60_000,
+          ),
+        ).toBe(true);
+      }
+      for (const hours of [1, 5, "NaN", "Infinity", "abc", 0, 25])
+        expect((await read(hours)).status).toBe(400);
+    }
+    for (const pricingMode of ["FIXED", "PER_PERSON"] as const) {
+      const other = await createFixedService(business._id, membership._id, {
+        pricingMode,
+        perPersonPricing: {
+          ratePerPersonCents: 1000,
+          minPersons: 1,
+          maxPersons: 4,
+          durationMin: 60,
+        },
+      });
+      const endpoint = `/businesses/${business._id}/services/${other._id}/availability`;
+      const token = await bearerFor(owner._id, "BUSINESS_OWNER");
+      expect(
+        (
+          await request(app)
+            .get(endpoint)
+            .query({ fromDate: DATE, toDate: DATE })
+            .set("Authorization", token)
+        ).status,
+      ).toBe(200);
+      const invalid = await request(app)
+        .get(endpoint)
+        .query({ fromDate: DATE, toDate: DATE, hours: 2 })
+        .set("Authorization", token);
+      expect(invalid.status).toBe(400);
+      expect(JSON.stringify(invalid.body)).toContain("AVAILABILITY_HOURS_INVALID");
+    }
+  });
+
   it("a Business Owner and an active Supervisor can both read availability through the real HTTP route", async () => {
     const { owner, business } = await createBusiness("owner@example.com", "Salon A");
     const { membership } = await createStaff(business._id);
@@ -470,5 +540,26 @@ describe("database-backed Availability integration", () => {
     });
 
     expect(result.days[0]!.slots).toEqual([]);
+  });
+  it("C1 explicit inactive provider and ANY both exclude employment-inactive Staff", async () => {
+    const { owner, business } = await createBusiness("inactive-c1@example.com", "Salon C1");
+    const { membership } = await createStaff(business._id);
+    const service = await createFixedService(business._id, membership._id);
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(membership._id, business._id);
+    await staffRepository.updateActiveById(business._id, membership._id, {
+      employmentActive: false,
+    });
+    const input = {
+      businessId: String(business._id),
+      serviceId: String(service._id),
+      fromDate: DATE,
+      toDate: DATE,
+    };
+    const any = await availabilityService.getAvailability(input);
+    expect(any.days[0]?.slots).toHaveLength(0);
+    await expect(
+      availabilityService.getAvailability({ ...input, staffMembershipId: String(membership._id) }),
+    ).rejects.toMatchObject({ statusCode: 409 });
   });
 });

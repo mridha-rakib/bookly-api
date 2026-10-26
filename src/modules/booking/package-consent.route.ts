@@ -58,7 +58,9 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
   let services: PackageConsentServices | undefined;
   router.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
-    if (!(options.enabled ?? env.PACKAGE_CONSENT_ENABLED))
+    // Shipped composition passes no options. A runtime flag cannot grant B1c authority.
+    // Explicit options remain an isolated engineering-test composition seam only.
+    if (options.enabled !== true)
       return next(
         consentError("Package terms review is unavailable", 404, "PACKAGE_CONSENT_DISABLED"),
       );

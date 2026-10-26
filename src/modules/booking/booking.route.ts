@@ -82,6 +82,7 @@ import {
   packagePurchaseBodySchema,
   packageRedemptionPreviewBodySchema,
   redeemPackageSessionBodySchema,
+  rescheduleAvailabilityQuerySchema,
   rescheduleBookingBodySchema,
   voidPackageBodySchema,
   waiveFeeBodySchema,
@@ -90,6 +91,8 @@ import { BookingService } from "./booking.service.js";
 import { BookingCreationService } from "./booking-creation.service.js";
 import { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "./booking-lifecycle.service.js";
+import { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
+import { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
 import { createPenaltyCollectionService } from "./penalty-collection.factory.js";
 
 const buildController = (): BookingController => {
@@ -232,7 +235,13 @@ const buildController = (): BookingController => {
     }),
   );
 
-  return new BookingController(bookingService, creationService, lifecycleService);
+  return new BookingController(
+    bookingService,
+    creationService,
+    lifecycleService,
+    new BookingRescheduleAvailabilityService(bookingService, availabilityService),
+    new CustomerFinancialOutcomeRead(),
+  );
 };
 
 const buildPackageProgressController = (): PackageProgressController =>
@@ -256,6 +265,15 @@ export const createBusinessBookingRoute = (): Router => {
   const authenticate = buildAuthenticate();
   const controller = buildController();
   const businessRepository = new BusinessRepository();
+
+  router.get(
+    "/:businessId/bookings/:bookingId/reschedule-availability",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({ params: bookingIdParamsSchema, query: rescheduleAvailabilityQuerySchema }),
+    asyncHandler(controller.getRescheduleAvailabilityForBusiness),
+  );
 
   // Batch 11 — a PENDING or SUSPENDED Business cannot have a NEW manual booking created for it
   // (confirmed policy). Existing-booking lifecycle routes below (calendar/list/detail/complete/
@@ -514,6 +532,17 @@ export const createCustomerBookingRoute = (): Router => {
   const router = Router();
   const authenticate = buildAuthenticate();
   const controller = buildController();
+  router.get(
+    "/bookings/:bookingId/reschedule-availability",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({
+      params: bookingIdOnlyParamsSchema,
+      query: rescheduleAvailabilityQuerySchema,
+    }),
+    asyncHandler(controller.getRescheduleAvailabilityForCustomer),
+  );
   const packageProgressController = buildPackageProgressController();
   const bookAgainController = new BookAgainController(
     new BookAgainService(

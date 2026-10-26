@@ -32,6 +32,8 @@ export class EmailOutboxRepository {
     input: EnqueueEmailInput,
     session?: ClientSession,
   ): Promise<EnqueueEmailResult> {
+    if (session && !session.inTransaction())
+      throw new Error("Email scheduling requires an active caller transaction");
     const recipient = normalizeEmailRecipient(input.recipient);
     const dedupeKey = buildEmailDedupeKey(input.eventKey, input.templateKey, recipient);
 
@@ -51,6 +53,9 @@ export class EmailOutboxRepository {
       }).save(session ? { session } : undefined);
       return { created: true, record };
     } catch (error) {
+      // A failed transactional insert can invalidate the entire session. Only its owner may
+      // retry; an out-of-session lookup could otherwise turn an aborted write into success.
+      if (session) throw error;
       if (!isDuplicateKeyError(error)) {
         throw error;
       }

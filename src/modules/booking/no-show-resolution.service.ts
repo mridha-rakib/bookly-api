@@ -1,5 +1,4 @@
 import type { ClientSession, Types } from "mongoose";
-
 import { logger } from "../../config/logger.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -11,6 +10,7 @@ import {
 import type { PaymentService } from "../payment/payment.service.js";
 import type { BookingDocument, BookingEventHistoryEntry } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
+import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import {
   computeNoShowPenalty,
   isPenaltyCollectible,
@@ -131,6 +131,8 @@ export class NoShowResolutionService {
    */
   public async autoResolve(bookingId: Types.ObjectId): Promise<NoShowResolutionOutcome> {
     const booking = await this.bookingRepository.findByIdOnly(bookingId);
+    if (booking?.serviceLines.some((line) => line.pricingInput.packageItemId))
+      await verifyPackageBatchActivation();
     if (
       !booking ||
       booking.status !== "PENDING" ||

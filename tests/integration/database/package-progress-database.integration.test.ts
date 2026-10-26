@@ -11,6 +11,7 @@ import { BookingService } from "../../../src/modules/booking/booking.service.js"
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import { BookingRescheduleAvailabilityService } from "../../../src/modules/booking/booking-reschedule-availability.service.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -234,6 +235,11 @@ describe("database-backed Package Deal integration", () => {
       subcategories: ["Massage"],
       ...overrides,
     } as Parameters<typeof businessRepository.create>[0]);
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     return { owner, business };
   };
 
@@ -1695,6 +1701,11 @@ describe("database-backed Package Deal integration", () => {
         },
       );
       expect(booking.fulfilment.mode).toBe("TRAVEL_TO_CUSTOMER");
+      const rescheduleRead = await new BookingRescheduleAvailabilityService(
+        bookingService,
+        availabilityService,
+      ).forCustomer(String(customer._id), String(booking._id), DATE_2, DATE_2);
+      expect(rescheduleRead.days[0]!.slots.length).toBeGreaterThan(0);
     });
 
     it("at-business purchase does not silently convert after the Business changes to travel", async () => {
@@ -2253,5 +2264,74 @@ describe("database-backed Package Deal integration", () => {
 
       expect(await BookingModel.countDocuments({ businessId: business._id }).exec()).toBe(0);
     });
+  });
+  it("C1 legacy redemption reschedule preserves original buffer and processing occupancy on INACTIVE Service", async () => {
+    const f = await setUpSettledPackage();
+    const provider = f.staff[0]?.membership;
+    if (!provider) throw new Error("Provider fixture missing");
+    const current = await ServiceModel.findById(f.service._id).orFail();
+    const fields = current.toObject();
+    if (!fields.packagePricing) throw new Error("Package pricing required");
+    fields.packagePricing.bufferAfterMin = 10;
+    fields.packagePricing.processingTimeMin = 5;
+    await serviceRepository.replaceById(f.business._id, f.service._id, fields);
+    const booking = await redeemConfirmed(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      redeemInput(provider._id),
+    );
+    expect(booking.serviceLines[0]?.serviceSnapshot.durationMin).toBe(60);
+    expect(booking.schedule.endAt.getTime() - booking.schedule.startAt.getTime()).toBe(75 * 60_000);
+    fields.packagePricing.bufferAfterMin = 40;
+    fields.packagePricing.processingTimeMin = 20;
+    await serviceRepository.replaceById(f.business._id, f.service._id, fields);
+    await serviceRepository.updateStatusById(f.business._id, f.service._id, "INACTIVE");
+    const ownedReader = new BookingRescheduleAvailabilityService(
+      bookingService,
+      availabilityService,
+    );
+    const customerAvailability = await ownedReader.forCustomer(
+      String(f.customer._id),
+      String(booking._id),
+      DATE_2,
+      DATE_2,
+    );
+    const managementAvailability = await ownedReader.forBusiness(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(booking._id),
+      DATE_2,
+      DATE_2,
+    );
+    expect(customerAvailability.days).toEqual(managementAvailability.days);
+    expect(
+      customerAvailability.days[0]!.slots.some(
+        (slot) => slot.startAt === startAtFor(DATE_2, "14:00"),
+      ),
+    ).toBe(true);
+    expect(
+      customerAvailability.days[0]!.slots.every(
+        (slot) => Date.parse(slot.endAt) - Date.parse(slot.startAt) === 75 * 60_000,
+      ),
+    ).toBe(true);
+    const moved = await lifecycleService.rescheduleByOwner(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(booking._id),
+      startAtFor(DATE_2, "14:00"),
+    );
+    expect(moved.schedule.endAt.getTime() - moved.schedule.startAt.getTime()).toBe(75 * 60_000);
+    expect(moved.serviceLines[0]?.serviceSnapshot.durationMin).toBe(60);
+    const day = await BookingSlotReservationModel.findOne({
+      businessId: f.business._id,
+      occupancyDate: DATE_2,
+    }).orFail();
+    const actual = day.intervals.find((entry) =>
+      entry.reservationId.equals(moved.serviceLines[0]?.reservationId),
+    );
+    expect(actual?.endAt.getTime()).toBe(moved.schedule.endAt.getTime());
   });
 });

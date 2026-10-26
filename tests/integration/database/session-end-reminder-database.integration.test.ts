@@ -177,6 +177,11 @@ describe("database-backed Session End Reminder snapshot integration", () => {
       category: "Wellness & Beauty",
       subcategories: ["Massage"],
     } as Parameters<typeof businessRepository.create>[0]);
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: owner._id,
+      changedAt: new Date(),
+    });
     return { owner, business };
   };
 

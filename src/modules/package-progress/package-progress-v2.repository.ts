@@ -5,6 +5,7 @@ import { BusinessModel } from "../business/business.model.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
 import { BusinessClientModel } from "../client/client.model.js";
 import { PackageModel } from "../packages/package.model.js";
+import { resolvePackageServiceEntitlement } from "../packages/package-service-entitlement.js";
 import { copyPackageDefinitionContractTerms } from "../packages/package-session-penalty-policy.js";
 import { ServiceModel } from "../services/service.model.js";
 import { StaffMembershipModel } from "../staff/staff.model.js";
@@ -88,17 +89,22 @@ export class PackageProgressV2Repository {
         businessId: valid.businessId,
         status: "ACTIVE",
         isPackageDeal: false,
-        pricingMode: "FIXED",
+        pricingMode: item.serviceSnapshot.pricingMode,
       }).session(session);
       const row = definition.items.find(
         (row) => row.itemId.equals(item.definitionItemId) && row.serviceId.equals(item.serviceId),
       );
+      const entitlement = service && resolvePackageServiceEntitlement(service);
       if (
         !service ||
         !row ||
-        !service.fixedPricing ||
-        !Number.isSafeInteger(service.fixedPricing.durationMin) ||
-        service.fixedPricing.durationMin < 1
+        !entitlement ||
+        !isDeepStrictEqual(
+          entitlement.group,
+          item.serviceSnapshot.pricingMode === "PER_PERSON"
+            ? item.serviceSnapshot.group
+            : undefined,
+        )
       )
         throw packageEligibilityError("PACKAGE_PURCHASE_LINK_INVALID", 404);
       if (
@@ -463,13 +469,20 @@ export class PackageProgressV2Repository {
       businessId: scope.businessId,
       linkedUserId: scope.customerUserId,
     }).session(session);
+    const purchasedItem = progress.items.find((item) =>
+      item.packageItemId.equals(scope.packageItemId),
+    );
+    if (!purchasedItem) throw packageEligibilityError("PACKAGE_NOT_SELLABLE");
     const service = await ServiceModel.findOne({
       _id: scope.serviceId,
       businessId: scope.businessId,
       isPackageDeal: false,
-      pricingMode: "FIXED",
+      pricingMode: purchasedItem.serviceSnapshot.pricingMode,
       status: { $in: ["ACTIVE", "INACTIVE"] },
     }).session(session);
+    const entitlement = service && resolvePackageServiceEntitlement(service);
+    if (!entitlement || !isDeepStrictEqual(entitlement.group, purchasedItem?.serviceSnapshot.group))
+      throw packageEligibilityError("PACKAGE_NOT_SELLABLE");
     const provider =
       service &&
       (await StaffMembershipModel.exists({
@@ -490,7 +503,7 @@ export class PackageProgressV2Repository {
     const origin = await BookingModel.findOne({
       _id: progress.originBookingId,
       businessId: scope.businessId,
-      customerUserId: scope.customerUserId,
+      "customer.customerUserId": scope.customerUserId,
     }).session(session);
     if (!origin || !computePackageBalanceSettlement(origin).balanceSettled)
       throw packageEligibilityError("PACKAGE_BALANCE_UNSETTLED");

@@ -1,5 +1,4 @@
 import type { ClientSession, Types } from "mongoose";
-
 import { logger } from "../../config/logger.js";
 import { BookingError } from "../booking/booking.errors.js";
 import type { BookingDocument } from "../booking/booking.model.js";
@@ -9,11 +8,16 @@ import type {
   FinancialContract,
   RelationshipClassification,
 } from "../booking/financial-contract.js";
+import {
+  isCanonicalRetainedBatch,
+  reconcileBatchCompensation,
+} from "../booking/package-batch-payment-recovery.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { PaymentAttemptDocument } from "../payment/payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
+import { hasLifecyclePaymentEvidence } from "../payment/payment-lifecycle-binding.js";
 import type { RefundOperationDocument } from "../payment/refund-operation.model.js";
 import type { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import type { BusinessClientDocument } from "./client.model.js";
@@ -408,7 +412,7 @@ export class FinancialRelationshipService {
     paymentAttemptId: Types.ObjectId | string,
   ): Promise<void> {
     const attempt = await this.paymentAttemptRepository.findById(paymentAttemptId);
-    if (!attempt?.businessId) return;
+    if (!attempt?.businessId || hasLifecyclePaymentEvidence(attempt)) return;
     const client = await this.clientRepository.findByBusinessIdAndLinkedUserId(
       attempt.businessId,
       attempt.customerUserId,
@@ -488,6 +492,10 @@ export class FinancialRelationshipService {
     let pending = relationship?.pending;
     if (!row || !relationship || !pending) return;
 
+    if (await isCanonicalRetainedBatch(pending.idempotencyKey)) {
+      await reconcileBatchCompensation(pending.idempotencyKey);
+      return;
+    }
     const booking = await this.bookingRepository.findByIdOnly(pending.bookingId);
     if (booking) {
       if (relationship.state === "RESTORATION_PENDING" && pending.restorationRefundOperationId) {

@@ -2,6 +2,8 @@ import type { Types } from "mongoose";
 import type Stripe from "stripe";
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
+import { inspectBatchPaymentAuthority } from "../booking/package-batch-payment-recovery.js";
 import {
   type PenaltyCollectionService,
   PenaltyCorrelationError,
@@ -13,10 +15,19 @@ import type { PackageProgressRepository } from "../package-progress/package-prog
 import type { PaymentGateway } from "../payment/payment.types.js";
 import type { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import {
+  assertPaymentBatchBinding,
+  assertPaymentBatchMetadata,
+} from "../payment/payment-batch-binding.js";
+import {
   type ParsedPaymentIntentMetadata,
   type PaymentIntentPurpose,
   parsePaymentIntentMetadata,
 } from "../payment/payment-intent-metadata.js";
+import {
+  assertLifecyclePaymentBinding,
+  assertLifecyclePaymentMetadata,
+  hasLifecyclePaymentEvidence,
+} from "../payment/payment-lifecycle-binding.js";
 import type { PaymentTaxAssociationReconciler } from "../payment/payment-tax-association-reconciler.js";
 import { isPenaltyPurpose } from "../payment/penalty-attempt.js";
 import {
@@ -359,7 +370,31 @@ export class StripeWebhookService {
     if (!attempt && metadataAttemptId) {
       attempt = await this.paymentAttemptRepository?.findById(metadataAttemptId);
     }
+    if (
+      Object.keys(paymentIntent.metadata ?? {}).some((key) => key.startsWith("booklyBatch")) &&
+      !attempt?.packageBatchBinding
+    )
+      throw new InvestigationWebhookError("Batch metadata has no canonical bound attempt");
+    if (
+      (paymentIntent.metadata?.["purpose"] === "PACKAGE_LIFECYCLE_MONEY" ||
+        Object.keys(paymentIntent.metadata ?? {}).some((key) =>
+          key.startsWith("booklyLifecycle"),
+        )) &&
+      !attempt?.packageLifecycleBinding
+    )
+      throw new InvestigationWebhookError("Lifecycle metadata has no canonical attempt");
     if (!attempt) return undefined;
+    if (hasLifecyclePaymentEvidence(attempt)) {
+      assertLifecyclePaymentMetadata(
+        assertLifecyclePaymentBinding(attempt),
+        paymentIntent.metadata,
+      );
+      await verifyPackageBatchActivation();
+      const { inspectLifecyclePaymentAuthority } = await import(
+        "../booking/package-lifecycle-payment-recovery.js"
+      );
+      await inspectLifecyclePaymentAuthority(attempt);
+    }
     const customerId =
       typeof paymentIntent.customer === "string"
         ? paymentIntent.customer
@@ -381,6 +416,15 @@ export class StripeWebhookService {
         "Penalty PaymentIntent purpose does not match its attempt",
       );
     }
+    if (attempt.packageBatchBinding) {
+      if (attempt.providerPaymentIntentId && attempt.providerPaymentIntentId !== paymentIntent.id)
+        throw new InvestigationWebhookError("Batch provider identity mismatch");
+      assertPaymentBatchMetadata(assertPaymentBatchBinding(attempt), paymentIntent.metadata);
+      if (
+        paymentIntent.metadata["relationshipClassification"] !== attempt.relationshipClassification
+      )
+        throw new InvestigationWebhookError("Batch financial classification metadata mismatch");
+    }
     return attempt;
   }
 
@@ -400,6 +444,21 @@ export class StripeWebhookService {
       if (isPenaltyPurpose(attempt.purpose)) {
         await this.convergePenalty(attempt._id, "SUCCEEDED");
       }
+    }
+    if (attempt) {
+      if (hasLifecyclePaymentEvidence(attempt)) {
+        await verifyPackageBatchActivation();
+        const { inspectLifecyclePaymentAuthority } = await import(
+          "../booking/package-lifecycle-payment-recovery.js"
+        );
+        await inspectLifecyclePaymentAuthority(attempt);
+        return;
+      }
+      const batch = await inspectBatchPaymentAuthority(attempt);
+      if (batch && batch.kind !== "BATCH_PAYMENT_COMPLETE")
+        throw new InvestigationWebhookError(
+          "Canonical complete batch monetary proof is unresolved",
+        );
     }
     let metadata: ParsedPaymentIntentMetadata | undefined;
     try {
@@ -555,6 +614,7 @@ export class StripeWebhookService {
       if (storedAttempt && storedAttempt.providerStatus !== "CANCELED") {
         throw new InvestigationWebhookError("PaymentAttempt terminal provider state conflict");
       }
+      if (hasLifecyclePaymentEvidence(attempt)) return;
       if (isPenaltyPurpose(attempt.purpose)) {
         await this.convergePenalty(attempt._id, "FAILED");
         return;
@@ -629,6 +689,8 @@ export class StripeWebhookService {
       return;
     }
 
+    const lifecycleSource =
+      await this.paymentAttemptRepository?.findByProviderPaymentIntentId?.(paymentIntentId);
     for (const refund of charge.refunds?.data ?? []) {
       let operation = await this.refundOperationRepository?.findByProviderRefundId(refund.id);
       const operationId = refund.metadata?.["booklyRefundOperationId"];
@@ -648,6 +710,32 @@ export class StripeWebhookService {
         operation.currency !== refund.currency.toUpperCase()
       ) {
         throw new InvestigationWebhookError("RefundOperation provider correlation mismatch");
+      }
+      if (lifecycleSource && hasLifecyclePaymentEvidence(lifecycleSource)) {
+        await verifyPackageBatchActivation();
+        const { inspectLifecyclePaymentAuthority } = await import(
+          "../booking/package-lifecycle-payment-recovery.js"
+        );
+        const a = await inspectLifecyclePaymentAuthority(lifecycleSource);
+        if (
+          a?.kind !== "UNRESOLVED" ||
+          a.row.phase !== "FAILED_FINAL" ||
+          lifecycleSource.providerStatus !== "SUCCEEDED" ||
+          lifecycleSource.persistenceStatus !== "FAILED" ||
+          !["REQUIRED", "REFUND_PENDING", "REFUNDED", "RECONCILIATION_REQUIRED"].includes(
+            lifecycleSource.compensationStatus,
+          ) ||
+          String(operation.sourcePaymentAttemptId) !== String(lifecycleSource._id) ||
+          operation.reason !== "BOOKING_PERSISTENCE_COMPENSATION" ||
+          operation.logicalIdempotencyKey !== `refund:${paymentIntentId}:compensation` ||
+          operation.expectedRefundAmountCents !== lifecycleSource.expectedAmountCents ||
+          String(operation.businessId) !== a.binding.businessId ||
+          String(operation.customerUserId) !== a.binding.customerUserId ||
+          String(operation.businessClientId) !== a.binding.businessClientId ||
+          String(operation.bookingId) !== a.binding.bookingId ||
+          String(operation.packageProgressId) !== a.binding.packageProgressId
+        )
+          throw new InvestigationWebhookError("Lifecycle refund lacks exact known-abort authority");
       }
       const storedOperation = await this.refundOperationRepository?.recordProviderResult(
         operation._id,

@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 
 import {
   type AppointmentReminderDocument,
@@ -78,7 +78,12 @@ export class AppointmentReminderRepository {
    * PENDING row that would fire an immediate "24-hour" reminder. A duplicate scheduling call
    * (same `dedupeKey`) is a no-op that returns the existing row.
    */
-  public async schedule(input: ScheduleReminderInput): Promise<ScheduleReminderResult> {
+  public async schedule(
+    input: ScheduleReminderInput,
+    session?: ClientSession,
+  ): Promise<ScheduleReminderResult> {
+    if (session && !session.inTransaction())
+      throw new Error("Reminder scheduling requires an active caller transaction");
     const offsetMinutes = input.offsetMinutes ?? APPOINTMENT_REMINDER_OFFSET_MINUTES[input.kind];
     if (offsetMinutes === undefined) {
       throw new Error(
@@ -95,8 +100,13 @@ export class AppointmentReminderRepository {
     const emailDecision = isLate ? "SKIPPED_INELIGIBLE" : "PENDING";
     const smsDecision = EMAIL_ONLY_KINDS.has(input.kind) ? "NOT_APPLICABLE" : emailDecision;
 
+    if (session) {
+      const existing = await AppointmentReminderModel.findOne({ dedupeKey }).session(session);
+      if (existing) return { created: false, record: existing };
+    }
+
     try {
-      const record = await AppointmentReminderModel.create({
+      const record = await new AppointmentReminderModel({
         dedupeKey,
         kind: input.kind,
         bookingId: input.bookingId,
@@ -110,9 +120,10 @@ export class AppointmentReminderRepository {
         emailDecision,
         smsDecision,
         ...(isLate ? { processedAt: input.now, lastErrorCategory: "CREATED_INSIDE_WINDOW" } : {}),
-      });
+      }).save(session ? { session } : undefined);
       return { created: true, record };
     } catch (error) {
+      if (session) throw error;
       if (!isDuplicateKeyError(error)) {
         throw error;
       }
@@ -153,7 +164,10 @@ export class AppointmentReminderRepository {
        * when both are given. */
       exceptDedupeKeys?: string[] | undefined;
     } = { now: new Date() },
+    session?: ClientSession,
   ): Promise<number> {
+    if (session && !session.inTransaction())
+      throw new Error("Reminder retirement requires an active transaction");
     const filter: Record<string, unknown> = {
       bookingId,
       status: { $in: ["PENDING", "PROCESSING"] },
@@ -166,14 +180,18 @@ export class AppointmentReminderRepository {
       filter["dedupeKey"] = { $nin: excepted };
     }
 
-    const result = await AppointmentReminderModel.updateMany(filter, {
-      $set: {
-        status: "CANCELLED",
-        processedAt: options.now,
-        lastErrorCategory: reasonCategory,
+    const result = await AppointmentReminderModel.updateMany(
+      filter,
+      {
+        $set: {
+          status: "CANCELLED",
+          processedAt: options.now,
+          lastErrorCategory: reasonCategory,
+        },
+        $unset: { claimedAt: "", claimedBy: "" },
       },
-      $unset: { claimedAt: "", claimedBy: "" },
-    }).exec();
+      session ? { session } : {},
+    ).exec();
 
     return result.modifiedCount ?? 0;
   }

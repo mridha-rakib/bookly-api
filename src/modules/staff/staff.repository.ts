@@ -19,8 +19,8 @@ export class StaffRepository {
     input: CreateStaffMembershipInput,
     session?: ClientSession,
   ): Promise<StaffMembershipDocument> {
-    return new StaffMembershipModel({ ...input, employmentActive: true }).save(
-      session ? { session } : undefined,
+    return withPackageEligibility(input.businessId, session, (transaction) =>
+      new StaffMembershipModel({ ...input, employmentActive: true }).save({ session: transaction }),
     );
   }
 
@@ -36,12 +36,15 @@ export class StaffRepository {
   public async findActiveById(
     businessId: Types.ObjectId | string,
     staffId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<StaffMembershipDocument | null> {
     return StaffMembershipModel.findOne({
       _id: staffId,
       businessId,
       removedAt: { $exists: false },
-    }).exec();
+    })
+      .session(session ?? null)
+      .exec();
   }
 
   /**
@@ -70,12 +73,15 @@ export class StaffRepository {
   public async findManyByIdsForBusiness(
     businessId: Types.ObjectId | string,
     staffIds: Array<Types.ObjectId | string>,
+    session?: ClientSession,
   ): Promise<StaffMembershipDocument[]> {
     if (staffIds.length === 0) {
       return [];
     }
 
-    return StaffMembershipModel.find({ _id: { $in: staffIds }, businessId }).exec();
+    return StaffMembershipModel.find({ _id: { $in: staffIds }, businessId })
+      .session(session ?? null)
+      .exec();
   }
 
   public async updateActiveById(

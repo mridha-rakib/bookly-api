@@ -1,6 +1,7 @@
 import { AppError, type ErrorDetail } from "../../common/errors/app-error.js";
 
 const defaultMessages: Record<string, string> = {
+  BOOKING_SCHEDULING_CHANGED: "Scheduling facts changed; please review the appointment again",
   BOOKING_BUSINESS_NOT_FOUND: "Business not found",
   BOOKING_NOT_FOUND: "Booking not found",
   BOOKING_SERVICE_NOT_FOUND: "Service not found for this business",

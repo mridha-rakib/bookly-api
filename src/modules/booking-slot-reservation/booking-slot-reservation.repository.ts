@@ -1,10 +1,22 @@
+import { isDeepStrictEqual } from "node:util";
 import type { ClientSession, Types } from "mongoose";
+import { BookingSlotReservationError } from "./booking-slot-reservation.errors.js";
 import {
   type BookingSlotReservationDocument,
   type BookingSlotReservationInterval,
   BookingSlotReservationModel,
 } from "./booking-slot-reservation.model.js";
-import { BookingSlotReservationClaimModel } from "./booking-slot-reservation-claim.model.js";
+import {
+  BookingSlotReservationClaimModel,
+  type ReservationMembershipEffect,
+  transitionReservationEffect,
+} from "./booking-slot-reservation-claim.model.js";
+import {
+  isPackageInitialReservationKey,
+  type OriginalReservationIntent,
+  originalReservationIntentSchema,
+  packageInitialReservationKey,
+} from "./reservation-operation.js";
 
 export type ClaimIdempotencyKeyInput = {
   idempotencyKey: string;
@@ -14,6 +26,7 @@ export type ClaimIdempotencyKeyInput = {
   serviceId: Types.ObjectId;
   reservationId: Types.ObjectId;
   partySize: number;
+  originalIntent?: OriginalReservationIntent | undefined;
 };
 
 export type ClaimIdempotencyKeyResult = {
@@ -49,6 +62,32 @@ export type JoinCapacityInput = {
 };
 
 export class BookingSlotReservationRepository {
+  public async findOperation(idempotencyKey: string, session?: ClientSession) {
+    return BookingSlotReservationClaimModel.findOne({ idempotencyKey })
+      .session(session ?? null)
+      .exec();
+  }
+
+  public async recordEffect(
+    idempotencyKey: string,
+    effect: ReservationMembershipEffect,
+    session: ClientSession,
+  ) {
+    const claim = await this.findOperation(idempotencyKey, session);
+    if (!claim) throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+    await transitionReservationEffect(claim.toObject(), effect, session);
+  }
+
+  public async hasEffectForInterval(
+    businessId: Types.ObjectId,
+    reservationId: Types.ObjectId,
+    session: ClientSession,
+  ) {
+    return BookingSlotReservationClaimModel.exists({
+      businessId,
+      "effect.actualReservationId": reservationId,
+    }).session(session);
+  }
   /**
    * The idempotency entry point (see booking-slot-reservation-claim.model.ts). Atomically
    * assigns `reservationId` to `idempotencyKey` the first time this key is ever seen; every
@@ -60,6 +99,21 @@ export class BookingSlotReservationRepository {
     input: ClaimIdempotencyKeyInput,
     session?: ClientSession,
   ): Promise<ClaimIdempotencyKeyResult> {
+    const originalIntent = input.originalIntent
+      ? originalReservationIntentSchema.parse(input.originalIntent)
+      : undefined;
+    input = { ...input, originalIntent };
+    if (
+      originalIntent?.packageOperation &&
+      (originalIntent.packageOperation.businessId !== String(input.businessId) ||
+        packageInitialReservationKey(originalIntent.packageOperation) !== input.idempotencyKey)
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+    const prior = await this.findMatchingClaim(input, session);
+    if (prior) return prior;
+    if (isPackageInitialReservationKey(input.idempotencyKey) && !originalIntent?.packageOperation)
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+    const inTransaction = session?.inTransaction() === true;
     try {
       await new BookingSlotReservationClaimModel({
         idempotencyKey: input.idempotencyKey,
@@ -69,30 +123,55 @@ export class BookingSlotReservationRepository {
         serviceId: input.serviceId,
         reservationId: input.reservationId,
         partySize: input.partySize,
+        ...(originalIntent ? { originalIntent } : {}),
       }).save(session ? { session } : undefined);
       return { isNew: true, reservationId: input.reservationId };
     } catch (error) {
-      if (!this.isDuplicateKeyError(error)) {
+      // An insert error may abort the transaction. Never read/reuse that session
+      // here: its owner must abort/retry or report the unresolved conflict.
+      if (!this.isDuplicateKeyError(error) || inTransaction) {
         throw error;
       }
-
-      const query = BookingSlotReservationClaimModel.findOne({
-        idempotencyKey: input.idempotencyKey,
-      });
-      if (session) {
-        query.session(session);
-      }
-      const existing = await query.orFail();
-      return { isNew: false, reservationId: existing.reservationId };
+      const winner = await this.findMatchingClaim(input, session);
+      if (!winner) throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+      return winner;
     }
+  }
+
+  private async findMatchingClaim(input: ClaimIdempotencyKeyInput, session?: ClientSession) {
+    const existing = await BookingSlotReservationClaimModel.findOne({
+      idempotencyKey: input.idempotencyKey,
+    })
+      .session(session ?? null)
+      .exec();
+    if (!existing) return null;
+    const retainedIntent = existing.toObject().originalIntent;
+    if (
+      String(existing.businessId) !== String(input.businessId) ||
+      String(existing.staffMembershipId) !== String(input.staffMembershipId) ||
+      existing.occupancyDate !== input.occupancyDate ||
+      String(existing.serviceId) !== String(input.serviceId) ||
+      existing.partySize !== input.partySize ||
+      !existing.reservationId ||
+      (retainedIntent &&
+        (!input.originalIntent ||
+          !isDeepStrictEqual(
+            originalReservationIntentSchema.parse(retainedIntent),
+            input.originalIntent,
+          ))) ||
+      (!retainedIntent && input.originalIntent?.packageOperation)
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+    return { isNew: false, reservationId: existing.reservationId };
   }
 
   /**
    * Unconditional upsert-if-missing for the day-document — never touches `intervals`. Its own
    * create-race (two concurrent first-reservations-of-the-day for the same staff) is resolved
    * by the unique `{businessId,staffMembershipId,occupancyDate}` index: the losing caller gets
-   * E11000, which this method catches and resolves by re-reading the now-existing document —
-   * always converges in at most one retry, since this filter has no interval condition to keep
+   * E11000 outside a transaction is resolved by re-reading the now-existing document.
+   * Active transaction errors propagate to its owner, without a fallback read.
+   * The nontransactional fallback is bounded, since this filter has no interval condition to keep
    * conflicting on (unlike createInterval below).
    */
   public async ensureDayDocument(
@@ -102,6 +181,7 @@ export class BookingSlotReservationRepository {
     timezone: string,
     session?: ClientSession,
   ): Promise<BookingSlotReservationDocument> {
+    const inTransaction = session?.inTransaction() === true;
     try {
       return await BookingSlotReservationModel.findOneAndUpdate(
         { businessId, staffMembershipId, occupancyDate },
@@ -114,7 +194,7 @@ export class BookingSlotReservationRepository {
         },
       ).orFail();
     } catch (error) {
-      if (this.isDuplicateKeyError(error)) {
+      if (this.isDuplicateKeyError(error) && !inTransaction) {
         const query = BookingSlotReservationModel.findOne({
           businessId,
           staffMembershipId,

@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 import type { AddonRepository } from "../addons/addon.repository.js";
 import type { AddonServiceAssignmentRepository } from "../addons/addon-service-assignment.repository.js";
 import type { BusinessDocument } from "../business/business.model.js";
@@ -260,12 +260,13 @@ export class BookingService {
     business: BusinessDocument,
     serviceId: string,
     staffMembershipId: string,
+    session?: ClientSession,
   ): Promise<{ service: ServiceDocument; staffMembership: StaffMembershipDocument }> {
     if (!Types.ObjectId.isValid(serviceId)) {
       throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
     }
 
-    const service = await this.serviceRepository.findById(business._id, serviceId);
+    const service = await this.serviceRepository.findById(business._id, serviceId, session);
 
     if (!service) {
       throw new BookingError("BOOKING_SERVICE_NOT_FOUND", 404);
@@ -282,6 +283,7 @@ export class BookingService {
     const staffMembership = await this.staffRepository.findActiveById(
       business._id,
       staffMembershipId,
+      session,
     );
 
     if (!staffMembership) {

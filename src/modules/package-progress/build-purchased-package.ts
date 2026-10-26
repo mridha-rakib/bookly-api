@@ -4,6 +4,7 @@ import { normalizeBusinessVisitType } from "../business/business.types.js";
 import type { BusinessTravelSettingsDocument } from "../business-travel-settings/business-travel-settings.model.js";
 import type { PackageDocument } from "../packages/package.model.js";
 import { calculatePackagePricing } from "../packages/package-pricing.js";
+import { resolvePackageServiceEntitlement } from "../packages/package-service-entitlement.js";
 import type { ServiceDocument } from "../services/service.model.js";
 import { packageProgressV2InputSchema } from "./package-progress-v2.rules.js";
 import type { CreatePackageProgressV2Input } from "./package-progress-v2.types.js";
@@ -34,11 +35,11 @@ export const buildPurchasedPackage = (input: {
     const service = input.services.find(
       (service) => service._id.equals(row.serviceId) && service.businessId.equals(business._id),
     );
+    const entitlement = service && resolvePackageServiceEntitlement(service);
     if (
       service?.status !== "ACTIVE" ||
       service.isPackageDeal ||
-      service.pricingMode !== "FIXED" ||
-      !service.fixedPricing ||
+      !entitlement ||
       row.referenceUnitPriceCents === undefined
     )
       throw new Error("Invalid Package Service");
@@ -48,8 +49,9 @@ export const buildPurchasedPackage = (input: {
       serviceId: row.serviceId,
       serviceSnapshot: {
         name: service.name,
-        pricingMode: "FIXED" as const,
-        durationMin: service.fixedPricing.durationMin,
+        pricingMode: entitlement.pricingMode,
+        durationMin: entitlement.durationMin,
+        ...(entitlement.group ? { group: entitlement.group } : {}),
       },
       totalSessions: row.includedSessions,
       remainingSessions: row.includedSessions,

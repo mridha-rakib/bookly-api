@@ -1,9 +1,9 @@
-import { Types } from "mongoose";
-
+import { type ClientSession, Types } from "mongoose";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessCity } from "../business/business.types.js";
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
+import { withPackageEligibility } from "../package-progress/package-eligibility.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { StaffMembershipDocument } from "../staff/staff.model.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
@@ -218,15 +218,14 @@ export class ServiceService {
     body: CreateServiceBody,
   ): Promise<ServiceDto> {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
-    const fields = await this.buildServiceFields(business, body);
-
-    const input: CreateServiceInput = {
-      businessId: business._id,
-      status: body.status,
-      ...fields,
-    };
-
-    const created = await this.serviceRepository.create(input);
+    const created = await withPackageEligibility(business._id, undefined, async (session) => {
+      const current = await this.requireOwnedBusiness(actorUserId, businessId, session);
+      const fields = await this.buildServiceFields(current, body, session);
+      return this.serviceRepository.create(
+        { businessId: current._id, status: body.status, ...fields },
+        session,
+      );
+    });
     const [dto] = await this.toServiceDtos(business, [created]);
     return dto as ServiceDto;
   }
@@ -238,31 +237,40 @@ export class ServiceService {
     body: UpdateServiceBody,
   ): Promise<ServiceDto> {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
-    const existing = await this.serviceRepository.findById(business._id, serviceId);
+    const replaced = await withPackageEligibility(business._id, undefined, async (session) => {
+      const current = await this.requireOwnedBusiness(actorUserId, businessId, session);
+      const existing = await this.serviceRepository.findById(business._id, serviceId, session);
 
-    if (!existing) {
-      throw new ServiceError("SERVICE_NOT_FOUND", 404);
-    }
+      if (!existing) {
+        throw new ServiceError("SERVICE_NOT_FOUND", 404);
+      }
 
-    const fields = await this.buildServiceFields(business, body);
-    // Bug fix: editing an ARCHIVED Service is a repair flow, never an implicit restore — only
-    // the explicit Restore action (ServiceService.restoreService, which re-runs the full
-    // ACTIVE/INACTIVE publish validation) may unarchive. `body.status` still selects which
-    // completeness rules buildServiceFields/updateServiceBodySchema's own superRefine already
-    // applied above (DRAFT tolerates partial data, letting the Owner save an intermediate
-    // repair; ACTIVE/INACTIVE do not) — it just never becomes the PERSISTED value while the
-    // Service is ARCHIVED. `archivedAt` is untouched either way: it isn't part of
-    // ReplaceServiceFields, so replaceById's $set can never write it.
-    const persistedStatus = existing.status === "ARCHIVED" ? "ARCHIVED" : body.status;
-    const replaced = await this.serviceRepository.replaceById(business._id, serviceId, {
-      ...fields,
-      status: persistedStatus,
-    } as ReplaceServiceFields);
+      const fields = await this.buildServiceFields(current, body, session);
+      // Bug fix: editing an ARCHIVED Service is a repair flow, never an implicit restore — only
+      // the explicit Restore action (ServiceService.restoreService, which re-runs the full
+      // ACTIVE/INACTIVE publish validation) may unarchive. `body.status` still selects which
+      // completeness rules buildServiceFields/updateServiceBodySchema's own superRefine already
+      // applied above (DRAFT tolerates partial data, letting the Owner save an intermediate
+      // repair; ACTIVE/INACTIVE do not) — it just never becomes the PERSISTED value while the
+      // Service is ARCHIVED. `archivedAt` is untouched either way: it isn't part of
+      // ReplaceServiceFields, so replaceById's $set can never write it.
+      const persistedStatus = existing.status === "ARCHIVED" ? "ARCHIVED" : body.status;
+      const replaced = await this.serviceRepository.replaceById(
+        business._id,
+        serviceId,
+        {
+          ...fields,
+          status: persistedStatus,
+        } as ReplaceServiceFields,
+        session,
+      );
 
-    if (!replaced) {
-      throw new ServiceError("SERVICE_NOT_FOUND", 404);
-    }
+      if (!replaced) {
+        throw new ServiceError("SERVICE_NOT_FOUND", 404);
+      }
 
+      return replaced;
+    });
     const [dto] = await this.toServiceDtos(business, [replaced]);
     return dto as ServiceDto;
   }
@@ -296,33 +304,37 @@ export class ServiceService {
     serviceId: string,
   ): Promise<void> {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
-    const existing = await this.serviceRepository.findById(business._id, serviceId);
+    await withPackageEligibility(business._id, undefined, async (session) => {
+      await this.requireOwnedBusiness(actorUserId, businessId, session);
+      const existing = await this.serviceRepository.findById(business._id, serviceId, session);
 
-    if (!existing) {
-      throw new ServiceError("SERVICE_NOT_FOUND", 404);
-    }
-
-    if (existing.status === "ARCHIVED") {
-      throw new ServiceError("SERVICE_ALREADY_ARCHIVED", 409);
-    }
-
-    // Approved rule: ARCHIVED is blocked while outstanding Package entitlements (unused,
-    // unvoided purchased sessions) exist for this Service — archiving must never strand a
-    // customer who already paid for sessions they haven't used yet. INACTIVE already blocks new
-    // purchases (see resolveServiceLines's own ACTIVE-only gate) without this restriction —
-    // existing customers keep redeeming an INACTIVE Package Deal, so only ARCHIVED needs it.
-    if (existing.isPackageDeal && this.packageProgressRepository) {
-      const hasOutstanding =
-        await this.packageProgressRepository.hasOutstandingEntitlementsForService(
-          business._id,
-          serviceId,
-        );
-      if (hasOutstanding) {
-        throw new ServiceError("SERVICE_ARCHIVE_BLOCKED_BY_PACKAGE_ENTITLEMENTS", 409);
+      if (!existing) {
+        throw new ServiceError("SERVICE_NOT_FOUND", 404);
       }
-    }
 
-    await this.serviceRepository.archiveById(business._id, serviceId);
+      if (existing.status === "ARCHIVED") {
+        throw new ServiceError("SERVICE_ALREADY_ARCHIVED", 409);
+      }
+
+      // Approved rule: ARCHIVED is blocked while outstanding Package entitlements (unused,
+      // unvoided purchased sessions) exist for this Service — archiving must never strand a
+      // customer who already paid for sessions they haven't used yet. INACTIVE already blocks new
+      // purchases (see resolveServiceLines's own ACTIVE-only gate) without this restriction —
+      // existing customers keep redeeming an INACTIVE Package Deal, so only ARCHIVED needs it.
+      if (existing.isPackageDeal && this.packageProgressRepository) {
+        const hasOutstanding =
+          await this.packageProgressRepository.hasOutstandingEntitlementsForService(
+            business._id,
+            serviceId,
+            session,
+          );
+        if (hasOutstanding) {
+          throw new ServiceError("SERVICE_ARCHIVE_BLOCKED_BY_PACKAGE_ENTITLEMENTS", 409);
+        }
+      }
+
+      await this.serviceRepository.archiveById(business._id, serviceId, session);
+    });
   }
 
   public async restoreService(
@@ -332,31 +344,40 @@ export class ServiceService {
     status: Extract<ServiceStatus, "ACTIVE" | "INACTIVE">,
   ): Promise<ServiceDto> {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
-    const existing = await this.serviceRepository.findById(business._id, serviceId);
+    const restored = await withPackageEligibility(business._id, undefined, async (session) => {
+      const current = await this.requireOwnedBusiness(actorUserId, businessId, session);
+      const existing = await this.serviceRepository.findById(business._id, serviceId, session);
 
-    if (!existing) {
-      throw new ServiceError("SERVICE_NOT_FOUND", 404);
-    }
+      if (!existing) {
+        throw new ServiceError("SERVICE_NOT_FOUND", 404);
+      }
 
-    if (existing.status !== "ARCHIVED") {
-      throw new ServiceError("SERVICE_NOT_ARCHIVED", 409);
-    }
+      if (existing.status !== "ARCHIVED") {
+        throw new ServiceError("SERVICE_NOT_ARCHIVED", 409);
+      }
 
-    // Bug fix: restore used to bypass the exact same completeness/publish validation
-    // create/update already enforce for ACTIVE/INACTIVE — an incomplete Service (e.g. archived
-    // while still an incomplete DRAFT, or one whose category/staff/served-city later became
-    // invalid while it sat archived) could be restored straight to ACTIVE. This re-runs that
-    // SAME validation (never a second, independently-invented rule set) against the Service's
-    // current persisted fields before allowing the status change; on failure nothing is written
-    // — the Service stays ARCHIVED exactly as it was.
-    await this.assertRestorableToStatus(business, existing, status);
+      // Bug fix: restore used to bypass the exact same completeness/publish validation
+      // create/update already enforce for ACTIVE/INACTIVE — an incomplete Service (e.g. archived
+      // while still an incomplete DRAFT, or one whose category/staff/served-city later became
+      // invalid while it sat archived) could be restored straight to ACTIVE. This re-runs that
+      // SAME validation (never a second, independently-invented rule set) against the Service's
+      // current persisted fields before allowing the status change; on failure nothing is written
+      // — the Service stays ARCHIVED exactly as it was.
+      await this.assertRestorableToStatus(current, existing, status, session);
 
-    const restored = await this.serviceRepository.restoreById(business._id, serviceId, status);
+      const restored = await this.serviceRepository.restoreById(
+        business._id,
+        serviceId,
+        status,
+        session,
+      );
 
-    if (!restored) {
-      throw new ServiceError("SERVICE_NOT_FOUND", 404);
-    }
+      if (!restored) {
+        throw new ServiceError("SERVICE_NOT_FOUND", 404);
+      }
 
+      return restored;
+    });
     const [dto] = await this.toServiceDtos(business, [restored]);
     return dto as ServiceDto;
   }
@@ -382,6 +403,7 @@ export class ServiceService {
     business: BusinessDocument,
     existing: ServiceDocument,
     status: Extract<ServiceStatus, "ACTIVE" | "INACTIVE">,
+    session?: ClientSession,
   ): Promise<void> {
     // `existing` is a live Mongoose document — its embedded objects (sessionExpiryAlert,
     // fixedPricing, manualSchedule entries, ...) are Mongoose subdocument instances, not plain
@@ -416,7 +438,7 @@ export class ServiceService {
       throw new ServiceError("SERVICE_RESTORE_INCOMPLETE", 409);
     }
 
-    await this.buildServiceFields(business, parsed.data);
+    await this.buildServiceFields(business, parsed.data, session);
   }
 
   // --- Validation / field building ----------------------------------------------------------
@@ -430,16 +452,17 @@ export class ServiceService {
   private async buildServiceFields(
     business: BusinessDocument,
     body: CreateServiceBody | UpdateServiceBody,
+    session?: ClientSession,
   ): Promise<Omit<CreateServiceInput, "businessId" | "status">> {
     const category =
       body.serviceCategoryId !== undefined
-        ? await this.requireActiveCategory(business, body.serviceCategoryId)
+        ? await this.requireActiveCategory(business, body.serviceCategoryId, session)
         : undefined;
     if (body.subcategory !== undefined) {
       this.requireValidSubcategory(business, body.subcategory);
     }
-    await this.requireValidStaffMemberships(business, body.assignedStaffMembershipIds);
-    const servedCities = await this.requireValidServedCities(business, body.servedCities);
+    await this.requireValidStaffMemberships(business, body.assignedStaffMembershipIds, session);
+    const servedCities = await this.requireValidServedCities(business, body.servedCities, session);
 
     return {
       isFeatured: body.isFeatured,
@@ -491,12 +514,17 @@ export class ServiceService {
   private async requireActiveCategory(
     business: BusinessDocument,
     categoryId: string,
+    session?: ClientSession,
   ): Promise<ServiceCategoryDocument> {
     if (!Types.ObjectId.isValid(categoryId)) {
       throw new ServiceError("SERVICE_CATEGORY_NOT_FOUND", 404);
     }
 
-    const category = await this.serviceCategoryRepository.findActiveById(business._id, categoryId);
+    const category = await this.serviceCategoryRepository.findActiveById(
+      business._id,
+      categoryId,
+      session,
+    );
 
     if (!category) {
       throw new ServiceError("SERVICE_CATEGORY_NOT_FOUND", 404);
@@ -514,6 +542,7 @@ export class ServiceService {
   private async requireValidStaffMemberships(
     business: BusinessDocument,
     staffMembershipIds: string[],
+    session?: ClientSession,
   ): Promise<void> {
     if (staffMembershipIds.length === 0) {
       return;
@@ -526,6 +555,7 @@ export class ServiceService {
     const memberships = await this.staffRepository.findManyByIdsForBusiness(
       business._id,
       staffMembershipIds,
+      session,
     );
 
     if (memberships.length !== new Set(staffMembershipIds).size) {
@@ -553,6 +583,7 @@ export class ServiceService {
   private async requireValidServedCities(
     business: BusinessDocument,
     servedCities: BusinessCity[],
+    session?: ClientSession,
   ): Promise<BusinessCity[]> {
     if (business.visitType === "AT_BUSINESS_LOCATION") {
       if (servedCities.length > 0) {
@@ -567,6 +598,7 @@ export class ServiceService {
 
     const travelSettings = await this.businessTravelSettingsRepository.findByBusinessId(
       business._id,
+      session,
     );
     const activeCities = new Set(
       (travelSettings?.cities ?? []).filter((city) => city.active).map((city) => city.city),
@@ -590,12 +622,13 @@ export class ServiceService {
   private async requireOwnedBusiness(
     actorUserId: string,
     businessId: string,
+    session?: ClientSession,
   ): Promise<BusinessDocument> {
     if (!Types.ObjectId.isValid(businessId)) {
       throw new ServiceError("SERVICE_BUSINESS_NOT_FOUND", 404);
     }
 
-    const business = await this.businessRepository.findById(businessId);
+    const business = await this.businessRepository.findById(businessId, session);
 
     if (!business) {
       throw new ServiceError("SERVICE_BUSINESS_NOT_FOUND", 404);

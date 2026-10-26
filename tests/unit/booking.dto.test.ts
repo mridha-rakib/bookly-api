@@ -435,3 +435,42 @@ describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
     ).toEqual([]);
   });
 });
+
+describe("F1C-A optional original quantities", () => {
+  it("copies fractional hourly and ordinary group quantities without reinterpreting durationMin", () => {
+    const booking = buildBooking();
+    const original = requireFirstLine(booking);
+    booking.serviceLines = [
+      {
+        ...original,
+        serviceSnapshot: { ...original.serviceSnapshot, pricingMode: "HOURLY", durationMin: 165 },
+        pricingInput: { hours: 2.5 },
+      },
+      {
+        ...original,
+        serviceSnapshot: { ...original.serviceSnapshot, pricingMode: "PER_PERSON" },
+        pricingInput: { personCount: 4 },
+      },
+    ];
+    const dto = toBookingDetailDto(booking);
+    expect(dto.serviceLines[0]).toMatchObject({ hours: 2.5, durationMin: 165 });
+    expect(dto.serviceLines[0]).not.toHaveProperty("personCount");
+    expect(dto.serviceLines[1]).toMatchObject({ personCount: 4 });
+    expect(dto.serviceLines[1]).not.toHaveProperty("hours");
+    expect(dto.financials).toEqual(booking.financials);
+  });
+  it.each(["FIXED", "HOURLY", "PER_PERSON", "PACKAGE"] as const)(
+    "preserves absence for historical %s and exposes no internal pricingInput",
+    (mode) => {
+      const booking = buildBooking();
+      const line = requireFirstLine(booking);
+      line.serviceSnapshot.pricingMode = mode;
+      line.pricingInput = {};
+      const dto = toBookingDetailDto(booking).serviceLines[0]!;
+      expect(dto).not.toHaveProperty("hours");
+      expect(dto).not.toHaveProperty("personCount");
+      expect(dto).not.toHaveProperty("pricingInput");
+      expect(dto).not.toHaveProperty("reservationId");
+    },
+  );
+});

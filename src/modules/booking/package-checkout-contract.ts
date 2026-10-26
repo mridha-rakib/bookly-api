@@ -8,6 +8,7 @@ import {
   purchasedItemContractSchema,
   purchasedPenaltyContractSchema,
 } from "../package-progress/purchased-package-contract.js";
+import { packageGroupSeatSchema } from "../packages/package-service-entitlement.js";
 import { businessCategoryKeys } from "../platform-settings/business-category.js";
 import { NO_SHOW_RESOLUTION_WINDOW_MINUTES } from "./booking.types.js";
 import { calculateFirstUpfrontCents } from "./financial-contract.js";
@@ -182,6 +183,7 @@ const addon = z
   .readonly();
 export const packageCheckoutAppointmentSchema = z
   .object({
+    group: packageGroupSeatSchema.optional(),
     selectionId: id,
     bookingId: id,
     packageItemId: id,
@@ -201,9 +203,24 @@ export const packageCheckoutAppointmentSchema = z
   .strict()
   .readonly();
 
+export const packageTravelEntitlementSchema = z
+  .object({
+    version: z.literal(1),
+    mode: z.literal("TRAVEL_TO_CUSTOMER"),
+    source: z.literal("ACTIVE_SERVICE_CITY_INTERSECTION"),
+    cities: z.array(z.object({ city: z.enum(businessCities), feeCents: cents }).strict()).min(1),
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    if (new Set(v.cities.map((c) => c.city)).size !== v.cities.length)
+      ctx.addIssue({ code: "custom", message: "Duplicate purchased travel city" });
+  });
+
 export const packageCheckoutItemSchema = z
   .object({
+    group: packageGroupSeatSchema.optional(),
     ...purchasedItemContractSchema.unwrap().shape,
+    travelEntitlement: packageTravelEntitlementSchema.optional(),
     serviceName: z.string().min(1),
     baseDurationMin: positive,
     referenceUnitPriceCents: positive,
@@ -428,9 +445,23 @@ export const packageCheckoutQuoteSchema = z
       if (
         !item?.definitionItemId.equals(row.definitionItemId) ||
         !item.serviceId.equals(row.serviceId) ||
-        item.baseDurationMin !== row.timing.baseDurationMin
+        item.baseDurationMin !== row.timing.baseDurationMin ||
+        JSON.stringify(item.group) !== JSON.stringify(row.group) ||
+        (row.group !== undefined && row.timing.processingTimeMin !== 0)
       )
         fail("Foreign/mismatched appointment item");
+      if (item?.travelEntitlement) {
+        if (row.location.mode !== "TRAVEL_TO_CUSTOMER")
+          fail("Travel rights on a venue appointment");
+        else {
+          const city = row.location.travelAddress.city;
+          if (
+            item.travelEntitlement.cities.find((c) => c.city === city)?.feeCents !==
+            row.travelFeeCents
+          )
+            fail("Selected travel fee differs from accepted purchased rights");
+        }
+      }
       const timing = row.timing;
       const occupied =
         BigInt(timing.baseDurationMin) +

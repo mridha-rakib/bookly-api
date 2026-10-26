@@ -1,3 +1,4 @@
+import { DateTime, Settings } from "luxon";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -12,6 +13,44 @@ import {
 const NICOSIA = "Europe/Nicosia";
 
 describe("businessLocalToUtc", () => {
+  it.each(["2026-01-15T12:00:00Z", "2026-07-15T12:00:00Z"])(
+    "S6F-16 repeated-hour choice is earlier under clock %s and both candidates round-trip",
+    (now) => {
+      const original = Settings.now;
+      try {
+        Settings.now = () => Date.parse(now);
+        Settings.resetCaches();
+        const candidates = DateTime.fromObject(
+          { year: 2026, month: 10, day: 25, hour: 3, minute: 30 },
+          { zone: NICOSIA },
+        )
+          .getPossibleOffsets()
+          .map((date) => date.toUTC().toISO())
+          .sort();
+        expect(candidates).toEqual(["2026-10-25T00:30:00.000Z", "2026-10-25T01:30:00.000Z"]);
+        for (const candidate of candidates) {
+          if (!candidate) throw Error("Expected a valid UTC candidate");
+          expect(utcToBusinessLocalTime(NICOSIA, new Date(candidate))).toBe("03:30");
+        }
+        expect(businessLocalToUtc(NICOSIA, "2026-10-25", "03:30")).toEqual(
+          new Date("2026-10-25T00:30:00.000Z"),
+        );
+        expect(businessLocalToUtc(NICOSIA, "2026-03-29", "03:30")).toEqual(
+          new Date("2026-03-29T01:30:00Z"),
+        );
+      } finally {
+        Settings.now = original;
+        Settings.resetCaches();
+      }
+    },
+  );
+  it("S6F-17 midnight-spanning intervals retain absolute elapsed time and UTC dates", () => {
+    const start = businessLocalToUtc(NICOSIA, "2026-10-24", "23:30");
+    const end = businessLocalToUtc(NICOSIA, "2026-10-25", "04:30");
+    expect(start.toISOString()).toBe("2026-10-24T20:30:00.000Z");
+    expect(end.toISOString()).toBe("2026-10-25T02:30:00.000Z");
+    expect(end.getTime() - start.getTime()).toBe(6 * 60 * 60_000);
+  });
   it("converts a normal (non-DST-boundary) local time correctly", () => {
     // August: Europe/Nicosia is EEST, UTC+3.
     expect(businessLocalToUtc(NICOSIA, "2026-08-25", "09:00")).toEqual(

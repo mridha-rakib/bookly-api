@@ -78,6 +78,8 @@ const schema = new Schema<RefundOperationDocument>(
   { timestamps: true },
 );
 
+// Customer-owned detail: bounded, deterministic read; no financial transition.
+schema.index({ bookingId: 1, createdAt: -1, _id: -1 });
 schema.index({ logicalIdempotencyKey: 1 }, { unique: true });
 schema.index(
   { providerRefundId: 1 },

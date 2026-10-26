@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 
 import {
   addCalendarDays,
@@ -81,6 +81,8 @@ export type GetAvailabilityInput = {
   toDate: string;
   /** Only meaningful for a PER_PERSON service; defaults to 1. */
   partySize?: number | undefined;
+  /** Requested HOURLY duration; omission preserves the configured minimum. */
+  hours?: number | undefined;
   /** Required when Business.visitType is TRAVEL_TO_CUSTOMER. */
   customerCity?: BusinessCity | undefined;
   /** Package-owned availability is authorized separately by CatalogService; fulfilment/city is
@@ -90,13 +92,8 @@ export type GetAvailabilityInput = {
 };
 
 type ServiceSchedulingConfig = {
-  /** The customer-visible duration used to decide whether a candidate slot FITS inside an
-   * opening/staff-schedule boundary. For HOURLY services (which have no fixed durationMin —
-   * the customer chooses an hour count at booking time, see service.model.ts) this is
-   * `minHours * 60`: the minimum commitment is the only duration this engine can safely assume
-   * without inventing one: a candidate start is only offered if it can accommodate at least
-   * the shortest booking the Service allows. The actual chosen duration is Batch 3's concern
-   * (booking creation), not this engine's. */
+  /** Duration tested against opening hours, staff schedules and reservations. HOURLY uses
+   * the requested hours, falling back to minHours for callers that omit duration. */
   durationMin: number;
   bufferAfterMin: number;
   /** Deliberately treated as additional blocking time, never a staff-reuse opportunity — see
@@ -106,7 +103,7 @@ type ServiceSchedulingConfig = {
    * non-overlapping candidates) when the Service has no explicit bookingIntervalMin
    * configured — the only defensible default absent a configured value: never invents a
    * *smaller* step than the service actually occupies. For HOURLY (no bookingIntervalMin
-   * field exists at all), this is `minHours * 60`, the same derivation as `durationMin`. */
+   * field exists at all), this stays `minHours * 60` regardless of requested duration. */
   bookingIntervalMin: number;
   /** 1 for every pricing mode except PER_PERSON. */
   capacityMax: number;
@@ -116,6 +113,16 @@ type StaffContext = {
   membership: StaffMembershipDocument;
   schedule: StaffScheduleDocument | undefined;
   timeOffDateSet: Set<string>;
+};
+
+/** Internal only: resolved from an owned Booking and verified persisted reservation proof.
+ * Never bind this shape to public query/body parameters. */
+export type BookedAvailabilityLine = {
+  service: ServiceDocument;
+  staffMembership: StaffMembershipDocument;
+  occupiedMilliseconds: number;
+  partySize: number;
+  capacityMax: number;
 };
 
 /**
@@ -156,7 +163,8 @@ export class AvailabilityService {
 
     const business = await this.requireBusiness(input.businessId);
     const service = await this.requireBookableService(business, input.serviceId);
-    const config = this.resolveServiceConfig(service);
+    this.requireValidHours(service, input.hours);
+    const config = this.resolveServiceConfig(service, input.hours);
     const partySize = input.partySize ?? 1;
     this.requireValidPartySize(partySize, config);
 
@@ -242,14 +250,17 @@ export class AvailabilityService {
    * `reserveOrJoin`'s job, and duplicating it here would just be a second, non-atomic (hence
    * unsafe to rely on) conflict check.
    */
-  public async assertSlotIsBookable(input: {
-    business: BusinessDocument;
-    service: ServiceDocument;
-    staffMembership: StaffMembershipDocument;
-    startAt: Date;
-    endAt: Date;
-    partySize: number;
-  }): Promise<{ capacityMax: number }> {
+  public async assertSlotIsBookable(
+    input: {
+      business: BusinessDocument;
+      service: ServiceDocument;
+      staffMembership: StaffMembershipDocument;
+      startAt: Date;
+      endAt: Date;
+      partySize: number;
+    },
+    session?: ClientSession,
+  ): Promise<{ capacityMax: number }> {
     const config = this.resolveServiceConfig(input.service);
     this.requireValidPartySize(input.partySize, config);
 
@@ -266,14 +277,16 @@ export class AvailabilityService {
       throw new AvailabilityError("AVAILABILITY_SLOT_NOT_BOOKABLE", 409);
     }
 
-    const [schedules, timeOffs] = await Promise.all([
-      this.staffScheduleRepository.findManyByMembershipIds([input.staffMembership._id]),
-      this.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange(
-        [input.staffMembership._id],
-        date,
-        date,
-      ),
-    ]);
+    const schedules = await this.staffScheduleRepository.findManyByMembershipIds(
+      [input.staffMembership._id],
+      session,
+    );
+    const timeOffs = await this.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange(
+      [input.staffMembership._id],
+      date,
+      date,
+      session,
+    );
     const [staffContext] = this.buildStaffContexts([input.staffMembership], schedules, timeOffs);
 
     if (
@@ -297,7 +310,10 @@ export class AvailabilityService {
         throw new AvailabilityError("AVAILABILITY_SLOT_NOT_BOOKABLE", 409);
       }
     } else {
-      const openingHours = await this.businessHoursRepository.findByBusinessId(input.business._id);
+      const openingHours = await this.businessHoursRepository.findByBusinessId(
+        input.business._id,
+        session,
+      );
       const day = (openingHours?.days ?? []).find((entry) => entry.dayOfWeek === dayOfWeek);
       const withinOpeningHours =
         day?.isOpen === true &&
@@ -313,6 +329,189 @@ export class AvailabilityService {
     }
 
     return { capacityMax: config.capacityMax };
+  }
+
+  /** Booking-owned read adapter. Candidate generation, shift/overlap/capacity decisions and
+   * ordering reuse this engine. The caller additionally runs the unchanged final scheduling
+   * validator inside the same read snapshot. No original reservation is excluded. */
+  public async getBookingAvailability(input: {
+    business: BusinessDocument;
+    lines: BookedAvailabilityLine[];
+    fromDate: string;
+    toDate: string;
+    session: ClientSession;
+    validateCandidate: (lineIndex: number, startAt: Date, endAt: Date) => Promise<boolean>;
+  }): Promise<AvailabilityResult> {
+    this.requireBoundedRange(input.fromDate, input.toDate);
+    const { business, lines, session } = input;
+    if (!session.inTransaction() || lines.length === 0) {
+      throw new AvailabilityError("AVAILABILITY_SLOT_NOT_BOOKABLE", 409);
+    }
+    const primary = lines[0]!;
+    const configs = lines.map((line) => ({
+      ...this.resolveServiceConfig(line.service),
+      // The proof already includes historical buffer/processing. Never add live buffers.
+      durationMin: line.occupiedMilliseconds / 60_000,
+      bufferAfterMin: 0,
+      processingTimeMin: 0,
+      capacityMax: line.capacityMax,
+    }));
+    const dates = enumerateCalendarDates(input.fromDate, input.toDate);
+    const staffIds = lines.map((line) => line.staffMembership._id);
+    // MongoDB transactions do not support parallel operations on a shared session.
+    const openingHours = await this.businessHoursRepository.findByBusinessId(business._id, session);
+    const settings = await this.businessBookingSettingsRepository.findByBusinessId(
+      business._id,
+      session,
+    );
+    const schedules = await this.staffScheduleRepository.findManyByMembershipIds(staffIds, session);
+    const timeOffs = await this.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange(
+      staffIds,
+      input.fromDate,
+      input.toDate,
+      session,
+    );
+    const reservations = await this.reservationRepository.findManyForStaffInDateRange(
+      business._id,
+      staffIds,
+      dates,
+      session,
+    );
+    const staffContexts = this.buildStaffContexts(
+      lines.map((line) => line.staffMembership),
+      schedules,
+      timeOffs,
+    );
+    const order = lines
+      .map((_, index) => index)
+      .sort(
+        (a, b) =>
+          String(lines[a]!.staffMembership._id).localeCompare(
+            String(lines[b]!.staffMembership._id),
+          ) || a - b,
+      );
+    const days: AvailabilityDay[] = [];
+    for (const date of dates) {
+      const dayOfWeek = dayOfWeekForDate(date);
+      const candidates =
+        primary.service.scheduleMode === "MANUAL"
+          ? this.manualCandidateStarts(primary.service, dayOfWeek)
+          : this.autoCandidateStarts(openingHours?.days ?? [], dayOfWeek, configs[0]!);
+      const slots: AvailabilitySlot[] = [];
+      for (const time of candidates) {
+        const startAt = businessLocalToUtc(business.timezone, date, time);
+        if (startAt.getTime() <= Date.now()) continue;
+        // A read-only projection models the same sequential group joins as final admission.
+        // Each candidate starts with ALL actual occupancy, including this Booking's old seat.
+        const projected: BookingSlotReservationDocument[] = reservations.map((doc) => ({
+          _id: doc._id,
+          businessId: doc.businessId,
+          staffMembershipId: doc.staffMembershipId,
+          occupancyDate: doc.occupancyDate,
+          timezone: doc.timezone,
+          createdAt: doc.createdAt,
+          updatedAt: doc.updatedAt,
+          intervals: doc.intervals.map((entry) => ({
+            reservationId: entry.reservationId,
+            serviceId: entry.serviceId,
+            startAt: entry.startAt,
+            endAt: entry.endAt,
+            capacityMax: entry.capacityMax,
+            capacityUsed: entry.capacityUsed,
+            status: entry.status,
+            createdAt: entry.createdAt,
+          })),
+        }));
+        let valid = true;
+        let primaryRemaining = primary.capacityMax;
+        for (const index of order) {
+          const line = lines[index]!;
+          const endAt = new Date(startAt.getTime() + line.occupiedMilliseconds);
+          const outcome = this.evaluateStaffForSlot({
+            staffContext: staffContexts[index]!,
+            date,
+            dayOfWeek,
+            timezone: business.timezone,
+            startAt,
+            endAt,
+            serviceId: line.service._id,
+            config: configs[index]!,
+            partySize: line.partySize,
+            reservations: projected,
+          });
+          if (
+            outcome.status !== "AVAILABLE" ||
+            !(await input.validateCandidate(index, startAt, endAt))
+          ) {
+            valid = false;
+            break;
+          }
+          if (index === 0) primaryRemaining = outcome.remainingCapacity;
+          let day = projected.find(
+            (doc) =>
+              doc.staffMembershipId.equals(line.staffMembership._id) && doc.occupancyDate === date,
+          );
+          if (!day) {
+            day = {
+              _id: new Types.ObjectId(),
+              businessId: business._id,
+              staffMembershipId: line.staffMembership._id,
+              occupancyDate: date,
+              timezone: business.timezone,
+              intervals: [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            projected.push(day);
+          }
+          const matching = day.intervals.find(
+            (entry) =>
+              entry.serviceId.equals(line.service._id) &&
+              entry.startAt.getTime() === startAt.getTime() &&
+              entry.endAt.getTime() === endAt.getTime(),
+          );
+          if (matching) {
+            // reserveOrJoin also refuses joining an interval with a different capacity contract.
+            if (matching.capacityMax !== line.capacityMax) {
+              valid = false;
+              break;
+            }
+            matching.capacityUsed += line.partySize;
+          } else {
+            day.intervals.push({
+              reservationId: new Types.ObjectId(),
+              serviceId: line.service._id,
+              startAt,
+              endAt,
+              capacityMax: line.capacityMax,
+              capacityUsed: line.partySize,
+              status: "CONFIRMED",
+              createdAt: new Date(),
+            });
+          }
+        }
+        if (valid)
+          slots.push({
+            startAt: startAt.toISOString(),
+            endAt: new Date(
+              startAt.getTime() + Math.max(...lines.map((line) => line.occupiedMilliseconds)),
+            ).toISOString(),
+            eligibleStaffMembershipIds: [String(primary.staffMembership._id)],
+            ...(primary.capacityMax > 1 ? { remainingCapacity: primaryRemaining } : {}),
+            source: primary.service.scheduleMode === "MANUAL" ? "MANUAL" : "AUTO",
+          });
+      }
+      if (settings?.gapEliminationEnabled)
+        this.applyGapEliminationOrdering(slots, reservations, date);
+      days.push({ date, isOpen: candidates.length > 0, slots });
+    }
+    return {
+      businessId: String(business._id),
+      serviceId: String(primary.service._id),
+      timezone: business.timezone,
+      capacityMax: primary.capacityMax,
+      days,
+    };
   }
 
   // --- Day building ---------------------------------------------------------------------------
@@ -604,7 +803,24 @@ export class AvailabilityService {
 
   // --- Config / eligibility resolution -----------------------------------------------------------
 
-  private resolveServiceConfig(service: ServiceDocument): ServiceSchedulingConfig {
+  private requireValidHours(service: ServiceDocument, hours: number | undefined): void {
+    if (hours === undefined) return;
+    const pricing = service.hourlyPricing;
+    if (
+      service.isPackageDeal ||
+      service.pricingMode !== "HOURLY" ||
+      !pricing ||
+      !Number.isFinite(hours) ||
+      hours <= 0 ||
+      hours > 24 ||
+      hours < pricing.minHours ||
+      hours > pricing.maxHours
+    ) {
+      throw new AvailabilityError("AVAILABILITY_HOURS_INVALID", 400);
+    }
+  }
+
+  private resolveServiceConfig(service: ServiceDocument, hours?: number): ServiceSchedulingConfig {
     if (service.isPackageDeal) {
       const pricing = service.packagePricing;
       if (!pricing) {
@@ -636,7 +852,7 @@ export class AvailabilityService {
         if (!pricing) throw new AvailabilityError("AVAILABILITY_SERVICE_NOT_FOUND", 409);
         const minDurationMin = pricing.minHours * 60;
         return {
-          durationMin: minDurationMin,
+          durationMin: (hours ?? pricing.minHours) * 60,
           bufferAfterMin: pricing.bufferAfterMin ?? 0,
           processingTimeMin: 0,
           bookingIntervalMin: minDurationMin,
@@ -678,7 +894,11 @@ export class AvailabilityService {
         throw new AvailabilityError("AVAILABILITY_STAFF_NOT_FOUND", 404);
       }
 
-      if (!service.assignedStaffMembershipIds.some((id) => id.equals(membership._id))) {
+      if (
+        !["STAFF", "SUPERVISOR"].includes(membership.role) ||
+        !membership.employmentActive ||
+        !service.assignedStaffMembershipIds.some((id) => id.equals(membership._id))
+      ) {
         throw new AvailabilityError("AVAILABILITY_STAFF_NOT_ELIGIBLE", 409);
       }
 
@@ -694,7 +914,12 @@ export class AvailabilityService {
       service.assignedStaffMembershipIds,
     );
 
-    return memberships.filter((membership) => membership.employmentActive && !membership.removedAt);
+    return memberships.filter(
+      (membership) =>
+        ["STAFF", "SUPERVISOR"].includes(membership.role) &&
+        membership.employmentActive &&
+        !membership.removedAt,
+    );
   }
 
   private buildStaffContexts(

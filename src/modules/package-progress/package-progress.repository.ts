@@ -224,12 +224,15 @@ export class PackageProgressRepository {
   public async hasOutstandingEntitlementsForService(
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<boolean> {
     return PackageProgressModel.exists({
       businessId,
       serviceId,
       remainingSessions: { $gt: 0 },
       voidedAt: { $exists: false },
-    }).then((doc) => doc !== null);
+    })
+      .session(session ?? null)
+      .then((doc) => doc !== null);
   }
 }

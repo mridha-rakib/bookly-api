@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
@@ -196,6 +196,11 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       briefDescription: "A great business",
       category: "Barber",
       subcategories: ["Haircut"],
+    });
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
     });
     return { owner, business };
   };
@@ -745,12 +750,8 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
 
-    // Create at the standard fixed, known-within-business-hours slot (creation itself requires
-    // a real availability match, which real "now + 90min" cannot reliably guarantee regardless
-    // of what time of day this suite happens to run). Then move the persisted schedule.startAt
-    // to 90 minutes from the real clock — the classifier only reads `schedule.startAt` and
-    // `now`, so this cleanly produces a genuinely UNDER_2_HOURS cancellation without needing a
-    // real reservation at that instant (cancellation itself does not re-validate availability).
+    // Keep the actual reserved interval and immutable intent aligned. Only the
+    // classification clock is controlled after creation, never persisted history.
     const finalizeResult = await creationService.finalizeCustomerBooking(
       String(customer._id),
       String(business._id),
@@ -759,16 +760,18 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     expect(finalizeResult.status).toBe("confirmed");
     if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
 
-    await BookingModel.updateOne(
-      { _id: finalizeResult.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 90 * 60_000) } },
-    ).exec();
-
-    const cancelled = await lifecycleService.cancelByCustomer(
-      String(customer._id),
-      String(finalizeResult.booking._id),
-      undefined,
-    );
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(finalizeResult.booking.schedule.startAt.getTime() - 90 * 60_000));
+    let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(finalizeResult.booking._id),
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(cancelled.status).toBe("LATE_CANCELLATION");
     expect(cancelled.cancellationOutcome?.cancellationFeeCents).toBeGreaterThan(0);

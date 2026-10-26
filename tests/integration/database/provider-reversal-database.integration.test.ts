@@ -158,7 +158,13 @@ describe("P6 provider-originated reversals", () => {
     await connectIsolatedDatabase();
   }, 120_000);
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2030-08-19T08:00:00Z"));
     await clearIsolatedDatabase();
     userRepository = new UserRepository();
     businessRepository = new BusinessRepository();
@@ -367,6 +373,11 @@ describe("P6 provider-originated reversals", () => {
       category: "Barber",
       subcategories: ["Haircut"],
     });
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     const staffUser = await userRepository.create({
       normalizedEmail: `staff-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: "hash",
@@ -559,11 +570,11 @@ describe("P6 provider-originated reversals", () => {
     return { booking };
   };
 
-  const makeLate = (bookingId: Types.ObjectId) =>
-    BookingModel.updateOne(
-      { _id: bookingId },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
+  const makeLate = async (bookingId: Types.ObjectId) => {
+    const booking = await BookingModel.findById(bookingId).orFail();
+    // Advance the action clock; never contradict the admitted interval or B2 intent.
+    vi.setSystemTime(new Date(booking.schedule.startAt.getTime() - 60 * 60 * 1000));
+  };
 
   const markOverdue = async (ctx: Ctx, bookingId: Types.ObjectId) => {
     await lifecycleService.markNoShow(

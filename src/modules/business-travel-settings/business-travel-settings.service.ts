@@ -1,5 +1,4 @@
 import { Types } from "mongoose";
-
 import { BusinessError } from "../business/business.errors.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -10,6 +9,7 @@ import {
   normalizeBusinessVisitType,
 } from "../business/business.types.js";
 import type { BusinessAccessRepository } from "../business/business-access.repository.js";
+import { withPackageEligibility } from "../package-progress/package-eligibility.js";
 import { BusinessTravelSettingsError } from "./business-travel-settings.errors.js";
 import type {
   BusinessTravelCitySetting,
@@ -84,11 +84,17 @@ export class BusinessTravelSettingsService {
     cities: BusinessTravelCitySetting[],
   ): Promise<BusinessTravelSettingsDto> {
     const business = await this.requireOwnedBusiness(userId, businessId);
-    this.requireTravelToCustomer(business);
-    const settings = await this.businessTravelSettingsRepository.upsertByBusinessId(
-      businessId,
-      this.normalizeCitySettings(cities),
-    );
+    const normalized = this.normalizeCitySettings(cities);
+    const settings = await withPackageEligibility(business._id, undefined, async (session) => {
+      const current = await this.businessRepository.findById(businessId, session);
+      if (!current?.ownerUserId.equals(userId)) throw new BusinessError("BUSINESS_NOT_FOUND", 404);
+      this.requireTravelToCustomer(current);
+      return this.businessTravelSettingsRepository.upsertByBusinessId(
+        businessId,
+        normalized,
+        session,
+      );
+    });
 
     return this.toDto(businessId, settings);
   }

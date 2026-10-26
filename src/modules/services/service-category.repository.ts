@@ -1,4 +1,4 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import { type ServiceCategoryDocument, ServiceCategoryModel } from "./service-category.model.js";
 
@@ -50,8 +50,11 @@ export class ServiceCategoryRepository {
   public async findActiveById(
     businessId: Types.ObjectId | string,
     categoryId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<ServiceCategoryDocument | null> {
-    return ServiceCategoryModel.findOne({ _id: categoryId, businessId, active: true }).exec();
+    return ServiceCategoryModel.findOne({ _id: categoryId, businessId, active: true })
+      .session(session ?? null)
+      .exec();
   }
 
   public async findByNameKey(

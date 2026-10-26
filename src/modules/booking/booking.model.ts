@@ -1,5 +1,4 @@
 import { model, Schema, type Types } from "mongoose";
-
 import {
   type BusinessCity,
   type BusinessVisitType,
@@ -42,6 +41,7 @@ import {
 } from "./booking-package-foundation.js";
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
+import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 
 // --- Actor / customer -------------------------------------------------------------------
 //
@@ -185,6 +185,8 @@ export type BookingServiceLine = {
    * onward: every real creation path reserves before it persists.
    */
   reservationId: Types.ObjectId;
+  /** Canonical party operation; optional only for historical Bookings. */
+  reservationOperationKey?: string | undefined;
 };
 
 // --- Financial snapshot ------------------------------------------------------------------
@@ -715,6 +717,7 @@ const bookingServiceLineSchema = new Schema<BookingServiceLine>(
     staffSnapshot: { type: bookingServiceLineStaffSnapshotSchema },
     addons: { type: [bookingServiceLineAddonSchema], required: true, default: [] },
     amountCents: { type: Number, required: true, min: 0, validate: Number.isInteger },
+    reservationOperationKey: { type: String, required: false },
     reservationId: {
       type: Schema.Types.ObjectId,
       ref: "BookingSlotReservation",
@@ -1095,4 +1098,87 @@ bookingSchema.index(
 // collection; no existing index leads with createdAt.
 bookingSchema.index({ createdAt: -1 });
 
+// Preparation-only first-class rows must not become a back door through existing generic
+// Booking writers/routes. This denial is independent of flags and also covers validation-off
+// saves. Raw privileged collection writes remain outside application enforcement.
+bookingSchema.pre("save", async function () {
+  if (
+    this.serviceLines.some((line) => line.pricingInput.packageItemId) ||
+    (!this.isNew &&
+      (await BookingModel.exists({
+        _id: this._id,
+        "serviceLines.pricingInput.packageItemId": { $exists: true },
+      }).session(this.$session())))
+  )
+    await verifyPackageBatchActivation();
+});
+bookingSchema.pre("deleteOne", { document: true, query: false }, async function () {
+  if (
+    this.serviceLines.some((line) => line.pricingInput.packageItemId) ||
+    (await BookingModel.exists({
+      _id: this._id,
+      "serviceLines.pricingInput.packageItemId": { $exists: true },
+    }).session(this.$session()))
+  )
+    await verifyPackageBatchActivation();
+});
+for (const hook of [
+  "updateOne",
+  "updateMany",
+  "findOneAndUpdate",
+  "replaceOne",
+  "findOneAndReplace",
+  "deleteOne",
+  "deleteMany",
+  "findOneAndDelete",
+] as const) {
+  bookingSchema.pre(hook, async function () {
+    const update = JSON.stringify(this.getUpdate() ?? {});
+    if (
+      update.includes("packageItemId") ||
+      (await this.model
+        .exists({
+          $and: [
+            this.getFilter(),
+            { "serviceLines.pricingInput.packageItemId": { $exists: true } },
+          ],
+        })
+        .session(this.getOptions().session ?? null))
+    )
+      await verifyPackageBatchActivation();
+  });
+}
+bookingSchema.pre("insertMany", async (docs) => {
+  if (
+    docs?.some((doc: Pick<BookingDocument, "serviceLines">) =>
+      doc.serviceLines?.some((line: BookingServiceLine) => line.pricingInput.packageItemId),
+    )
+  )
+    await verifyPackageBatchActivation();
+});
+// Generic bulk composition is not an approved first-class lifecycle seam. Inspect each actual
+// target and proposed document, rather than trusting a caller-supplied bypass option.
+bookingSchema.pre("bulkWrite", async function (operations) {
+  for (const operation of operations) {
+    if (JSON.stringify(operation).includes("packageItemId")) await verifyPackageBatchActivation();
+    for (const key of [
+      "updateOne",
+      "updateMany",
+      "replaceOne",
+      "deleteOne",
+      "deleteMany",
+    ] as const) {
+      if (key in operation) {
+        const filter = Reflect.get(operation, key)?.filter;
+        if (
+          filter &&
+          (await this.exists({
+            $and: [filter, { "serviceLines.pricingInput.packageItemId": { $exists: true } }],
+          }))
+        )
+          await verifyPackageBatchActivation();
+      }
+    }
+  }
+});
 export const BookingModel = model<BookingDocument>("Booking", bookingSchema);

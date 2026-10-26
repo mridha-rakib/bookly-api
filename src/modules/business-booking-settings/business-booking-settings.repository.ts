@@ -1,4 +1,4 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
 
 import {
   type BusinessBookingSettingsDocument,
@@ -8,8 +8,11 @@ import {
 export class BusinessBookingSettingsRepository {
   public async findByBusinessId(
     businessId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<BusinessBookingSettingsDocument | null> {
-    return BusinessBookingSettingsModel.findOne({ businessId }).exec();
+    const query = BusinessBookingSettingsModel.findOne({ businessId });
+    if (session) query.session(session);
+    return query.exec();
   }
 
   public async upsertByBusinessId(

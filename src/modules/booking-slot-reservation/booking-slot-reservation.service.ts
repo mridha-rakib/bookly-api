@@ -1,5 +1,5 @@
 import type { ClientSession } from "mongoose";
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 
 import { utcToBusinessLocalDate } from "../../common/time/business-clock.js";
 import { BookingSlotReservationError } from "./booking-slot-reservation.errors.js";
@@ -8,6 +8,10 @@ import type {
   BookingSlotReservationInterval,
 } from "./booking-slot-reservation.model.js";
 import type { BookingSlotReservationRepository } from "./booking-slot-reservation.repository.js";
+import {
+  type PackageInitialReservationOperation,
+  packageInitialReservationOperationSchema,
+} from "./reservation-operation.js";
 
 /** Bounded so heavy contention on one popular group-session slot fails clearly rather than
  * retrying forever — each attempt is a real atomic DB round trip, never a busy-spin. */
@@ -29,6 +33,8 @@ export type ReserveSlotInput = {
    * generated here, since the caller (not this service) is the one that knows whether a given
    * attempt is a fresh request or a retry of an earlier one. */
   idempotencyKey: string;
+  /** Future server-correlated initial Package writer only; never a public actor/consent proof. */
+  packageOperation?: PackageInitialReservationOperation | undefined;
 };
 
 export type ReservationResult = {
@@ -43,43 +49,34 @@ export type ReservationResult = {
   capacityUsed: number;
 };
 
-/**
- * The conflict-safe reservation foundation (see booking-slot-reservation.model.ts for the full
- * concurrency-correctness argument). Deliberately does NOT create a Booking — see this
- * service's own module doc comment in the model file. Deliberately does NOT implement
- * cancel/release — nothing in this batch needs to release a reservation (no cancellation
- * charging, no full booking lifecycle yet); that is explicit Batch 3 scope.
- */
+/** Canonical party effects and occupancy share the caller's transaction. Calls without
+ * a session own a transaction here. No external effects run inside either callback. */
 export class BookingSlotReservationService {
   public constructor(private readonly reservationRepository: BookingSlotReservationRepository) {}
 
-  /**
-   * The one entry point real callers (the Availability Engine) should use — handles both an
-   * exclusive 1:1 booking and a group/capacity session uniformly, and is fully idempotent.
-   *
-   * Concurrency-safety story in three layers:
-   *  1. IDEMPOTENCY: `claimIdempotencyKey` atomically pins one `reservationId` to this
-   *     `idempotencyKey`, collection-wide, via a flat single-level unique index (see
-   *     booking-slot-reservation-claim.model.ts). Every call — first attempt, a client's own
-   *     retry, or a concurrent duplicate of the identical request — converges on the SAME
-   *     reservationId.
-   *  2. Every loop iteration checks FIRST whether an interval for that exact reservationId
-   *     already exists and returns it immediately if so — this is what makes a retry (or a
-   *     race between two copies of the same logical request) idempotent even while the
-   *     original attempt is still in flight, not just after it completes.
-   *  3. If not yet created, this attempts createInterval (a brand-new session) or, if a
-   *     *different* reservationId already occupies the exact same session identity (a
-   *     genuinely different customer joining a group session), joinCapacity instead. Both are
-   *     single-document atomic operations (see the repository) — a bounded retry loop absorbs
-   *     the case where capacity/occupancy changes between the two.
-   * For an exclusive (capacityMax=1) service, the join branch can never find room, so this
-   * collapses to plain create-or-conflict semantics automatically.
-   */
+  /** Replays verify immutable intent then read the actual APPLIED target. Historical
+   * no-effect claims retain B1 creator-only evidence; they never authorize another write. */
   public async reserveOrJoin(
     input: ReserveSlotInput,
     session?: ClientSession,
   ): Promise<ReservationResult> {
+    input = {
+      ...input,
+      startAt: new Date(input.startAt.getTime()),
+      endAt: new Date(input.endAt.getTime()),
+      ...(input.packageOperation
+        ? {
+            packageOperation: packageInitialReservationOperationSchema.parse(
+              input.packageOperation,
+            ),
+          }
+        : {}),
+    };
     this.requireValidInterval(input.startAt, input.endAt, input.partySize, input.capacityMax);
+    // One initial Package appointment always contributes one seat. The structured
+    // operation is correlation, not permission for a larger ordinary party.
+    if (input.packageOperation && input.partySize !== 1)
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
 
     const occupancyDate = utcToBusinessLocalDate(input.timezone, input.startAt).dateStr;
     const endOccupancyDate = utcToBusinessLocalDate(input.timezone, input.endAt).dateStr;
@@ -88,13 +85,9 @@ export class BookingSlotReservationService {
       throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CROSSES_MIDNIGHT", 422);
     }
 
-    await this.reservationRepository.ensureDayDocument(
-      input.businessId,
-      input.staffMembershipId,
-      occupancyDate,
-      input.timezone,
-      session,
-    );
+    if (!session) return this.inOwnedTransaction((owned) => this.reserveOrJoin(input, owned));
+    if (!session.inTransaction())
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
 
     const claim = await this.reservationRepository.claimIdempotencyKey(
       {
@@ -105,10 +98,81 @@ export class BookingSlotReservationService {
         serviceId: input.serviceId,
         reservationId: new Types.ObjectId(),
         partySize: input.partySize,
+        originalIntent: {
+          version: 1,
+          startAt: input.startAt,
+          endAt: input.endAt,
+          timezone: input.timezone,
+          capacityMax: input.capacityMax,
+          ...(input.packageOperation ? { packageOperation: input.packageOperation } : {}),
+        },
       },
       session,
     );
     const reservationId = claim.reservationId;
+
+    // Existing claims never authorize new create/join work. In particular a group
+    // joiner's unused pinned ID is NOT evidence that its capacity was never applied.
+    if (!claim.isNew) {
+      const operation = await this.reservationRepository.findOperation(
+        input.idempotencyKey,
+        session,
+      );
+      if (!operation)
+        throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+      if (operation.effect) {
+        if (
+          operation.effect.state !== "APPLIED" ||
+          (operation.effect.role === "CREATOR" &&
+            !operation.reservationId.equals(operation.effect.actualReservationId))
+        )
+          throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+        const actual = await this.reservationRepository.findIntervalByReservationId(
+          input.businessId,
+          input.staffMembershipId,
+          occupancyDate,
+          operation.effect.actualReservationId,
+          session,
+        );
+        if (!actual || actual.capacityUsed < input.partySize)
+          throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+        this.assertExistingIntent(input, actual);
+        return this.toResultFromParts(
+          input.businessId,
+          input.staffMembershipId,
+          occupancyDate,
+          actual,
+        );
+      }
+      // A concurrent creator may still be finishing. Bounded reads can observe its
+      // result; absence never authorizes another write or a repeated group join.
+      for (let attempt = 0; attempt < MAX_RESERVE_OR_JOIN_ATTEMPTS; attempt += 1) {
+        const own = await this.reservationRepository.findIntervalByReservationId(
+          input.businessId,
+          input.staffMembershipId,
+          occupancyDate,
+          reservationId,
+          session,
+        );
+        if (!own) continue;
+        this.assertExistingIntent(input, own);
+        return this.toResultFromParts(
+          input.businessId,
+          input.staffMembershipId,
+          occupancyDate,
+          own,
+        );
+      }
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
+    }
+
+    await this.reservationRepository.ensureDayDocument(
+      input.businessId,
+      input.staffMembershipId,
+      occupancyDate,
+      input.timezone,
+      session,
+    );
 
     for (let attempt = 0; attempt < MAX_RESERVE_OR_JOIN_ATTEMPTS; attempt += 1) {
       const own = await this.reservationRepository.findIntervalByReservationId(
@@ -118,14 +182,7 @@ export class BookingSlotReservationService {
         reservationId,
         session,
       );
-      if (own) {
-        return this.toResultFromParts(
-          input.businessId,
-          input.staffMembershipId,
-          occupancyDate,
-          own,
-        );
-      }
+      if (own) throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
 
       const created = await this.reservationRepository.createInterval(
         {
@@ -147,6 +204,16 @@ export class BookingSlotReservationService {
           entry.reservationId.equals(reservationId),
         );
         if (interval) {
+          await this.reservationRepository.recordEffect(
+            input.idempotencyKey,
+            {
+              version: 1,
+              actualReservationId: interval.reservationId,
+              role: "CREATOR",
+              state: "APPLIED",
+            },
+            session,
+          );
           return this.toResult(created, interval);
         }
       }
@@ -154,6 +221,8 @@ export class BookingSlotReservationService {
       const matching = await this.findExactMatchingInterval(input, occupancyDate, session);
 
       if (matching && !matching.reservationId.equals(reservationId)) {
+        if (matching.capacityMax !== input.capacityMax)
+          throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
         if (matching.capacityUsed + input.partySize > matching.capacityMax) {
           throw new BookingSlotReservationError(
             "BOOKING_SLOT_RESERVATION_CAPACITY_UNAVAILABLE",
@@ -178,6 +247,16 @@ export class BookingSlotReservationService {
             entry.reservationId.equals(matching.reservationId),
           );
           if (interval) {
+            await this.reservationRepository.recordEffect(
+              input.idempotencyKey,
+              {
+                version: 1,
+                actualReservationId: interval.reservationId,
+                role: "JOINER",
+                state: "APPLIED",
+              },
+              session,
+            );
             return this.toResult(joined, interval);
           }
         }
@@ -205,15 +284,8 @@ export class BookingSlotReservationService {
     throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
   }
 
-  /**
-   * The release/cancel counterpart to reserveOrJoin (Batch 3). Idempotent: releasing a
-   * reservationId+partySize that has already been fully released (interval no longer present,
-   * or already reduced below partySize by an earlier successful release of this exact claim) is
-   * treated as a successful no-op, never an error — a Booking-cancellation retry must never fail
-   * merely because an earlier attempt already released the slot. Only a genuine misuse (the
-   * interval still exists, is still large enough that it could never legitimately have had this
-   * partySize subtracted twice, yet the ceiling check still fails) throws.
-   */
+  /** Internal owned-Booking call only. Keys select canonical operations, not actors.
+   * Historical unkeyed exclusive release is retained; ambiguous Group release fails closed. */
   public async release(
     input: {
       businessId: Types.ObjectId;
@@ -222,37 +294,141 @@ export class BookingSlotReservationService {
       startAt: Date;
       reservationId: Types.ObjectId;
       partySize: number;
+      idempotencyKey?: string | undefined;
     },
     session?: ClientSession,
   ): Promise<{ released: boolean; alreadyReleased: boolean }> {
+    input = { ...input, startAt: new Date(input.startAt.getTime()) };
+    if (!session) return this.inOwnedTransaction((owned) => this.release(input, owned));
+    if (!session.inTransaction())
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
     const occupancyDate = utcToBusinessLocalDate(input.timezone, input.startAt).dateStr;
-
+    const operation = input.idempotencyKey
+      ? await this.reservationRepository.findOperation(input.idempotencyKey, session)
+      : null;
+    if (input.idempotencyKey && !operation)
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+    if (
+      operation &&
+      (!operation.businessId.equals(input.businessId) ||
+        !operation.staffMembershipId.equals(input.staffMembershipId) ||
+        operation.occupancyDate !== occupancyDate ||
+        operation.partySize !== input.partySize ||
+        (operation.originalIntent &&
+          (operation.originalIntent.timezone !== input.timezone ||
+            operation.originalIntent.startAt.getTime() !== input.startAt.getTime())))
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+    if (operation?.effect) {
+      if (!operation.effect.actualReservationId.equals(input.reservationId))
+        throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+      if (operation.effect.state === "RELEASED") return { released: false, alreadyReleased: true };
+      const interval = await this.reservationRepository.findIntervalByReservationId(
+        input.businessId,
+        input.staffMembershipId,
+        occupancyDate,
+        input.reservationId,
+        session,
+      );
+      if (!interval || !operation.originalIntent)
+        throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+      this.assertExistingIntent(
+        {
+          serviceId: operation.serviceId,
+          startAt: operation.originalIntent.startAt,
+          endAt: operation.originalIntent.endAt,
+          capacityMax: operation.originalIntent.capacityMax,
+        },
+        interval,
+      );
+      const released = await this.reservationRepository.releaseInterval(
+        input.businessId,
+        input.staffMembershipId,
+        occupancyDate,
+        input.reservationId,
+        operation.partySize,
+        session,
+      );
+      if (!released)
+        throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+      await this.reservationRepository.recordEffect(
+        operation.idempotencyKey,
+        {
+          version: 1,
+          actualReservationId: input.reservationId,
+          role: operation.effect.role,
+          state: "RELEASED",
+        },
+        session,
+      );
+      return { released: true, alreadyReleased: false };
+    }
+    // An unkeyed caller cannot decrement new membership. Historical Group parties
+    // cannot be identified from pooled usage; no backfill or guessed decrement.
+    if (
+      await this.reservationRepository.hasEffectForInterval(
+        input.businessId,
+        input.reservationId,
+        session,
+      )
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+    const interval = await this.reservationRepository.findIntervalByReservationId(
+      input.businessId,
+      input.staffMembershipId,
+      occupancyDate,
+      input.reservationId,
+      session,
+    );
+    // Absence proves neither which historical party released nor whether it was
+    // ever applied. Only a retained RELEASED effect authorizes that response.
+    if (!interval)
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+    if (
+      interval.capacityMax !== 1 ||
+      input.partySize !== 1 ||
+      (operation && !operation.reservationId.equals(input.reservationId))
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
     const released = await this.reservationRepository.releaseInterval(
       input.businessId,
       input.staffMembershipId,
       occupancyDate,
       input.reservationId,
-      input.partySize,
+      1,
       session,
     );
+    if (!released)
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
+    return { released: true, alreadyReleased: false };
+  }
 
-    if (released) {
-      return { released: true, alreadyReleased: false };
+  private async inOwnedTransaction<T>(work: (session: ClientSession) => Promise<T>): Promise<T> {
+    const session = await mongoose.startSession();
+    let callbackCompleted = false;
+    try {
+      return await session.withTransaction(async () => {
+        callbackCompleted = false;
+        const result = await work(session);
+        callbackCompleted = true;
+        return result;
+      });
+    } catch (error) {
+      // Preserve evidence after any completed callback or structured unknown result.
+      // A later matching call reads the committed effect; absence never triggers cleanup.
+      if (
+        callbackCompleted ||
+        (error &&
+          typeof error === "object" &&
+          "hasErrorLabel" in error &&
+          typeof error.hasErrorLabel === "function" &&
+          error.hasErrorLabel("UnknownTransactionCommitResult"))
+      )
+        throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 503);
+      throw error;
+    } finally {
+      await session.endSession().catch(() => undefined);
     }
-
-    const stillPresent = await this.reservationRepository.findIntervalByReservationId(
-      input.businessId,
-      input.staffMembershipId,
-      occupancyDate,
-      input.reservationId,
-      session,
-    );
-
-    if (!stillPresent) {
-      return { released: false, alreadyReleased: true };
-    }
-
-    throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_RELEASE_INVALID", 409);
   }
 
   private async findExactMatchingInterval(
@@ -277,6 +453,19 @@ export class BookingSlotReservationService {
       );
 
     return match ?? null;
+  }
+
+  private assertExistingIntent(
+    input: Pick<ReserveSlotInput, "serviceId" | "startAt" | "endAt" | "capacityMax">,
+    interval: BookingSlotReservationInterval,
+  ) {
+    if (
+      String(interval.serviceId) !== String(input.serviceId) ||
+      interval.startAt.getTime() !== input.startAt.getTime() ||
+      interval.endAt.getTime() !== input.endAt.getTime() ||
+      interval.capacityMax !== input.capacityMax
+    )
+      throw new BookingSlotReservationError("BOOKING_SLOT_RESERVATION_CONFLICT", 409);
   }
 
   private async hasOverlapOtherThanOwn(

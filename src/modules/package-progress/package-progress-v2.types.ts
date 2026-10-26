@@ -1,5 +1,6 @@
 import type { Types } from "mongoose";
 import type { BusinessCity, BusinessVisitType } from "../business/business.types.js";
+import type { PackageGroupSeat } from "../packages/package-service-entitlement.js";
 import type {
   PackageProgressDocument,
   PackageProgressSessionStatus,
@@ -10,7 +11,10 @@ export type PurchasedPackageItem = {
   packageItemId: Types.ObjectId;
   definitionItemId: Types.ObjectId;
   serviceId: Types.ObjectId;
-  serviceSnapshot: { name: string; pricingMode: "FIXED"; durationMin: number };
+  serviceSnapshot: { name: string; durationMin: number } & (
+    | { pricingMode: "FIXED"; group?: never }
+    | { pricingMode: "PER_PERSON"; group: PackageGroupSeat }
+  );
   totalSessions: number;
   remainingSessions: number;
   completedSessions: number;

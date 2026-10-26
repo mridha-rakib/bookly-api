@@ -12,16 +12,54 @@ const requireOffset = (offset: number) => {
   if (!Number.isFinite(offset) || Math.abs(offset) > OFFSET_ENVELOPE_MINUTES)
     throw new Error("Unsupported timezone offset envelope");
 };
+type GregorianWall = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  millisecond: number;
+};
+
+// utc/fromObject consult Settings.now even with complete fields. Start from an explicit
+// instant instead; set() normalizes invalid fields, so require an exact Gregorian round trip.
+// Luxon's explicit year handling also preserves years 0-99 without Date.UTC's 1900 offset.
+const utcWall = (wall: GregorianWall): DateTime => {
+  if (
+    !Object.values(wall).every(Number.isInteger) ||
+    wall.month < 1 ||
+    wall.month > 12 ||
+    wall.day < 1 ||
+    wall.day > 31 ||
+    wall.hour < 0 ||
+    wall.hour > 23 ||
+    wall.minute < 0 ||
+    wall.minute > 59 ||
+    wall.second < 0 ||
+    wall.second > 59 ||
+    wall.millisecond < 0 ||
+    wall.millisecond > 999
+  )
+    throw new Error("Unsupported target calendar date");
+  const result = DateTime.fromMillis(0, { zone: "UTC" }).set(wall);
+  if (
+    !result.isValid ||
+    (Object.keys(wall) as (keyof GregorianWall)[]).some((key) => result[key] !== wall[key])
+  )
+    throw new Error("Unsupported target calendar date");
+  return result;
+};
 const wallMillis = (time: DateTime) =>
-  DateTime.utc(
-    time.year,
-    time.month,
-    time.day,
-    time.hour,
-    time.minute,
-    time.second,
-    time.millisecond,
-  ).toMillis();
+  utcWall({
+    year: time.year,
+    month: time.month,
+    day: time.day,
+    hour: time.hour,
+    minute: time.minute,
+    second: time.second,
+    millisecond: time.millisecond,
+  }).toMillis();
 
 /** Approved purchase-expiry v1. Explicit input only; never an activation constructor.
  * Clamp Gregorian day; preserve wall clock; select later fold; shift gaps forward.
@@ -40,7 +78,15 @@ export const calculatePackageExpiryV1 = (
   const monthIndex = local.year * 12 + local.month - 1 + months;
   const year = Math.floor(monthIndex / 12);
   const month = (monthIndex % 12) + 1;
-  const monthStart = DateTime.utc(year, month, 1);
+  const monthStart = utcWall({
+    year,
+    month,
+    day: 1,
+    hour: 0,
+    minute: 0,
+    second: 0,
+    millisecond: 0,
+  });
   if (!monthStart.isValid || !monthStart.daysInMonth)
     throw new Error("Unsupported target calendar date");
   const wall = {
@@ -52,11 +98,11 @@ export const calculatePackageExpiryV1 = (
     second: local.second,
     millisecond: local.millisecond,
   };
-  const naive = DateTime.fromObject(wall, { zone: "UTC" }).toMillis();
+  const naive = utcWall(wall).toMillis();
   if (!Number.isFinite(naive)) throw new Error("Invalid target wall clock");
   // Keep exact requested wall times and explicitly choose the later fold candidate,
   // independent of the initial offset guess used by the library.
-  const guess = DateTime.fromObject(wall, { zone: timezone });
+  const guess = DateTime.fromMillis(naive, { zone: timezone }).set(wall);
   const candidates = guess
     .getPossibleOffsets()
     .filter((time) => time.isValid && wallMillis(time) === naive);
@@ -85,14 +131,10 @@ export const calculatePackageExpiryV1 = (
   return new Date(result.instant);
 };
 
-const calendarMinimumCache = new Map<6 | 12, number>();
 /** Complete Gregorian 400-year cycle, including EVERY source date and target clamp.
  * A finite calendar proof, not quote-window sampling: it derives minimum wall-calendar
  * distances (181/365 days) instead of inventing commercial validity durations. */
-export const minimumGregorianValidityDays = (months: 6 | 12): number => {
-  if (![6, 12].includes(months)) throw new Error("Unsupported validity months");
-  const cached = calendarMinimumCache.get(months);
-  if (cached !== undefined) return cached;
+const deriveMinimumGregorianValidityDays = (months: 6 | 12): number => {
   let minimum = Infinity;
   for (let year = 2000; year < 2400; year++)
     for (let month = 0; month < 12; month++) {
@@ -105,8 +147,18 @@ export const minimumGregorianValidityDays = (months: 6 | 12): number => {
         minimum = Math.min(minimum, distance);
       }
     }
-  calendarMinimumCache.set(months, minimum);
   return minimum;
+};
+
+// Derive once, synchronously from explicit Gregorian dates; no lazy business-state mutation.
+// This deliberately pays the bounded 400-year calculation at import, even for FOREVER-only callers.
+const gregorianMinima = Object.freeze({
+  6: deriveMinimumGregorianValidityDays(6),
+  12: deriveMinimumGregorianValidityDays(12),
+});
+export const minimumGregorianValidityDays = (months: 6 | 12): number => {
+  if (![6, 12].includes(months)) throw new Error("Unsupported validity months");
+  return gregorianMinima[months];
 };
 
 /** Proven conservative LOWER BOUND, not the tight zone/window-specific minimum.

@@ -90,7 +90,14 @@ export const buildPackageCheckoutDisclosure = (
     "Included Services and quantities:",
     ...q.items.map(
       (item) =>
-        `${item.serviceName}: ${item.totalSessions} sessions; independent monetary penalty basis per included session ${euros(item.penaltyBasisCents)}. Reference price ${euros(item.referenceUnitPriceCents)} is for comparison, not the penalty basis.`,
+        `${item.serviceName}: ${item.totalSessions} sessions;${item.group ? " each Group session credit entitles one person to one seat (party size 1);" : ""} independent monetary penalty basis per included session ${euros(item.penaltyBasisCents)}. Reference price ${euros(item.referenceUnitPriceCents)} is for comparison, not the penalty basis.`,
+    ),
+    ...q.items.flatMap((item) =>
+      item.travelEntitlement
+        ? [
+            `${item.serviceName} purchased future travel entitlement v1: ${item.travelEntitlement.cities.map((c) => `${c.city} ${euros(c.feeCents)}`).join(", ")}. These purchased city/fee rights are frozen; future scheduling still requires current Service/provider availability. Each appointment's travel fee is a separate manual due, not additional Package base.`,
+          ]
+        : [],
     ),
     "Initially selected appointments (each is a separate appointment):",
     ...q.appointments.map((row) => {
@@ -103,7 +110,7 @@ export const buildPackageCheckoutDisclosure = (
         row.location.mode === "AT_BUSINESS_LOCATION"
           ? row.location.businessLocation
           : row.location.travelAddress;
-      return `${item.serviceName} with ${provider.displayName}: ${local} (${q.businessTimezone}); ${row.location.mode === "AT_BUSINESS_LOCATION" ? "at Business location" : "travel to Customer"}: ${[address.city, address.area, address.streetName, address.streetNumber, address.floorUnit, address.aptRoom].filter(Boolean).join(", ")}; occupied ${row.timing.occupiedDurationMin} minutes. Add-ons: ${row.addons.map((a) => `${a.name} ${euros(a.priceCents)}`).join(", ") || "none"}. Travel: ${euros(row.travelFeeCents)}.`;
+      return `${item.serviceName} with ${provider.displayName}: ${local} (${q.businessTimezone}); ${row.location.mode === "AT_BUSINESS_LOCATION" ? "at Business location" : "travel to Customer"}: ${[address.city, address.area, address.streetName, address.streetNumber, address.floorUnit, address.aptRoom].filter(Boolean).join(", ")}; occupied ${row.timing.occupiedDurationMin} minutes.${row.group ? ` Group entitlement v1: one credit, one seat; original capacity ${row.group.capacityMax}.` : ""} Add-ons: ${row.addons.map((a) => `${a.name} ${euros(a.priceCents)}`).join(", ") || "none"}. Travel: ${euros(row.travelFeeCents)}.`;
     }),
   ];
   if (q.validity.mode === "FOREVER")

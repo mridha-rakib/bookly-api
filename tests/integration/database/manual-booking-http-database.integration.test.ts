@@ -98,6 +98,11 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
       category: "Barber",
       subcategories: ["Haircut"],
     });
+    await businessRepository.casUpdateStatus(pending._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: pending.ownerUserId,
+      changedAt: new Date(),
+    });
     // Batch 11 — manual booking creation is now gated on Business approval status; every
     // fixture business in this file needs to be in good standing unless a test specifically
     // means to exercise the PENDING-block itself (see the dedicated test for that below).

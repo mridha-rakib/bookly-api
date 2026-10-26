@@ -20,6 +20,12 @@ import { StripeWebhookService } from "../modules/stripe-webhook/stripe-webhook.s
 import { StripeWebhookEventRepository } from "../modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserRepository } from "../modules/user/user.repository.js";
 
+import {
+  assertMoneyRecoveryLaunch,
+  MoneyRecoveryLaunchError,
+  withMoneyRecoveryLifecycle,
+} from "./money-recovery-runtime.js";
+
 const POLL_INTERVAL_MS = 30_000;
 
 const buildService = (): MoneyRecoveryService => {
@@ -85,7 +91,11 @@ const buildService = (): MoneyRecoveryService => {
 
 const runOnce = async (service: MoneyRecoveryService): Promise<void> => {
   const counts = await service.runOnce();
-  logger.info({ counts }, "Money recovery worker pass complete");
+  if (counts.errors > 0 || counts.webhooksFailed > 0) {
+    logger.warn({ counts }, "Money recovery worker pass completed with unresolved errors");
+  } else {
+    logger.info({ counts }, "Money recovery worker pass complete");
+  }
 };
 
 const runContinuous = async (
@@ -96,54 +106,53 @@ const runContinuous = async (
   while (!shouldStop()) {
     try {
       await runOnce(service);
-    } catch (error) {
-      logger.error({ err: error }, "Money recovery worker pass failed");
+    } catch {
+      logger.error({ event: "MONEY_RECOVERY_PASS_FAILED" }, "Money recovery worker pass failed");
     }
     if (!shouldStop()) await wait(POLL_INTERVAL_MS);
   }
 };
 
 const runCli = async (): Promise<void> => {
+  // env.ts still validates the shared application configuration; these checks add launch intent.
+  assertMoneyRecoveryLaunch(process.env, process.argv.slice(2));
   const databaseManager = new DatabaseManager();
-  const service = buildService();
   const runForever = !process.argv.includes("--once");
-  try {
-    await databaseManager.connect();
-    if (!runForever) {
-      await runOnce(service);
-      return;
-    }
-    let stopping = false;
-    let releaseWait: (() => void) | undefined;
-    const shutdown = (): void => {
-      stopping = true;
-      releaseWait?.();
-    };
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
-    await runContinuous(
-      service,
-      () => stopping,
-      (milliseconds) =>
-        new Promise<void>((resolve) => {
-          const timeout = setTimeout(() => {
-            releaseWait = undefined;
-            resolve();
-          }, milliseconds);
-          releaseWait = () => {
-            clearTimeout(timeout);
-            releaseWait = undefined;
-            resolve();
-          };
-        }),
-    );
-  } finally {
-    await databaseManager.disconnect();
-  }
+  await withMoneyRecoveryLifecycle({
+    signals: process,
+    connect: () => databaseManager.connect(),
+    disconnect: () => databaseManager.disconnect(),
+    onStopping: () => logger.info("Money recovery worker stopping after the active pass"),
+    execute: async (shouldStop, wait) => {
+      const service = buildService();
+      logger.info({ mode: runForever ? "continuous" : "once" }, "Money recovery worker started");
+      if (runForever) {
+        await runContinuous(service, shouldStop, wait);
+      } else if (!shouldStop()) {
+        await runOnce(service);
+      }
+    },
+  });
+  logger.info("Money recovery worker stopped");
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await runCli();
+  try {
+    await runCli();
+  } catch (error) {
+    // Never serialize raw provider/connection exceptions or environment values here.
+    logger.error(
+      {
+        event: "MONEY_RECOVERY_WORKER_EXIT",
+        reason:
+          error instanceof MoneyRecoveryLaunchError
+            ? error.message
+            : "STARTUP_OR_EXECUTION_FAILURE",
+      },
+      "Money recovery worker could not continue",
+    );
+    process.exitCode = 1;
+  }
 }
 
 export { buildService, runContinuous, runOnce };

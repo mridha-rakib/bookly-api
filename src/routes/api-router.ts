@@ -21,6 +21,7 @@ import { createReadinessHealthRoute } from "../modules/health/health.route.js";
 import { HealthService } from "../modules/health/health.service.js";
 import { createGoogleCalendarCallbackRoute } from "../modules/integration/integration.route.js";
 import { createMarketingRoute } from "../modules/marketing/marketing.route.js";
+import { createPackageViewRoute } from "../modules/package-progress/package-view.route.js";
 import { createPaymentRoute } from "../modules/payment/payment.route.js";
 import { createPlatformConfigRoute } from "../modules/platform-settings/platform-settings.route.js";
 import {
@@ -89,6 +90,7 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).
   router.use("/me", createCustomerBookingRoute());
   router.use("/package-consent", createPackageConsentRoute());
+  router.use("/package-views", createPackageViewRoute());
   // Batch 14 — Customer self-service Review surface, same "/me" prefix/rationale as "My
   // Bookings" above (own booking-scoped review, cross-business).
   router.use("/me", createCustomerReviewRoute());

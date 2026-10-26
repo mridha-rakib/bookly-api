@@ -9,6 +9,7 @@ import {
   toBookingDetailDto,
   toBookingListItemDto,
 } from "./booking.dto.js";
+import { BookingError } from "./booking.errors.js";
 import type {
   BookingBusinessParams,
   BookingIdOnlyParams,
@@ -25,6 +26,7 @@ import type {
   PackagePurchaseBody,
   PackageRedemptionPreviewBody,
   RedeemPackageSessionBody,
+  RescheduleAvailabilityQuery,
   RescheduleBookingBody,
   VoidPackageBody,
   WaiveFeeBody,
@@ -32,15 +34,57 @@ import type {
 import type { BookingService } from "./booking.service.js";
 import type { BookingCreationService } from "./booking-creation.service.js";
 import type { BookingLifecycleService } from "./booking-lifecycle.service.js";
+import type { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
+import type { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
 
 export class BookingController {
   public constructor(
     private readonly bookingService: BookingService,
     private readonly creationService: BookingCreationService,
     private readonly lifecycleService: BookingLifecycleService,
+    private readonly rescheduleAvailability?: BookingRescheduleAvailabilityService,
+    private readonly financialOutcomeRead?: CustomerFinancialOutcomeRead,
   ) {}
 
   // --- Business-side ------------------------------------------------------------------------
+
+  public getRescheduleAvailabilityForBusiness = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const { userId, role } = this.requireBusinessActor(request);
+    const params = request.validated?.params as BookingIdParams;
+    const query = request.validated?.query as RescheduleAvailabilityQuery;
+    if (!this.rescheduleAvailability)
+      throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+    const result = await this.rescheduleAvailability.forBusiness(
+      userId,
+      role as "BUSINESS_OWNER" | "SUPERVISOR",
+      params.businessId,
+      params.bookingId,
+      query.fromDate,
+      query.toDate,
+    );
+    sendSuccess(response, 200, "Reschedule availability", result);
+  };
+
+  public getRescheduleAvailabilityForCustomer = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const params = request.validated?.params as BookingIdOnlyParams;
+    const query = request.validated?.query as RescheduleAvailabilityQuery;
+    if (!this.rescheduleAvailability)
+      throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+    const result = await this.rescheduleAvailability.forCustomer(
+      userId,
+      params.bookingId,
+      query.fromDate,
+      query.toDate,
+    );
+    sendSuccess(response, 200, "Reschedule availability", result);
+  };
 
   public createManual = async (request: Request, response: Response): Promise<void> => {
     const { userId, role } = this.requireBusinessActor(request);
@@ -461,7 +505,15 @@ export class BookingController {
 
     const booking = await this.bookingService.getBookingDetailForCustomer(userId, params.bookingId);
 
-    sendSuccess(response, 200, "Booking", toBookingDetailDto(booking));
+    const detail = this.financialOutcomeRead
+      ? await this.financialOutcomeRead.forOwnedBooking(userId, booking)
+      : { booking };
+    sendSuccess(response, 200, "Booking", {
+      ...toBookingDetailDto(detail.booking),
+      ...("financialOutcome" in detail && detail.financialOutcome
+        ? { financialOutcome: detail.financialOutcome }
+        : {}),
+    });
   };
 
   public listForCustomer = async (request: Request, response: Response): Promise<void> => {

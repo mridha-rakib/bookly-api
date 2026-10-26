@@ -1,14 +1,25 @@
 import { randomUUID } from "node:crypto";
-
 import { type ClientSession, Types } from "mongoose";
-
+import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
+import { isCanonicalRetainedBatch } from "../booking/package-batch-payment-recovery.js";
 import { PaymentError } from "./payment.errors.js";
 import {
+  completeBoundPaymentAttempt,
   type PaymentAttemptDocument,
   PaymentAttemptModel,
   type PaymentAttemptProviderStatus,
   PROVIDER_NOT_CREATED,
 } from "./payment-attempt.model.js";
+import {
+  assertPaymentBatchBinding,
+  equalPaymentBatchBindings,
+  type PaymentBatchBinding,
+} from "./payment-batch-binding.js";
+import {
+  assertLifecyclePaymentBinding,
+  hasLifecyclePaymentEvidence,
+  type LifecyclePaymentBinding,
+} from "./payment-lifecycle-binding.js";
 import {
   isPenaltyPurpose,
   PENALTY_ATTEMPT_KEY_PREFIX,
@@ -17,6 +28,8 @@ import {
 } from "./penalty-attempt.js";
 
 export type CreatePaymentAttemptInput = {
+  packageLifecycleBinding?: LifecyclePaymentBinding | undefined;
+  packageBatchBinding?: PaymentBatchBinding | undefined;
   logicalIdempotencyKey: string;
   customerUserId: Types.ObjectId | string;
   businessId?: Types.ObjectId | string | undefined;
@@ -41,6 +54,19 @@ export class PaymentAttemptRepository {
     input: CreatePaymentAttemptInput,
     session?: ClientSession,
   ): Promise<{ attempt: PaymentAttemptDocument; isNew: boolean }> {
+    if (hasLifecyclePaymentEvidence(input)) {
+      await verifyPackageBatchActivation();
+      assertLifecyclePaymentBinding(input);
+      const { validateLifecyclePaymentCreation } = await import(
+        "../booking/package-lifecycle-payment-recovery.js"
+      );
+      await validateLifecyclePaymentCreation(input, session);
+    }
+    if (
+      input.packageBatchBinding ||
+      (await isCanonicalRetainedBatch(input.logicalIdempotencyKey, session))
+    )
+      await verifyPackageBatchActivation();
     // P5 — the penalty namespace is server-only: a client-supplied checkout key can never occupy
     // it, and a penalty attempt can never use a client-shaped key.
     if (
@@ -65,7 +91,7 @@ export class PaymentAttemptRepository {
       }).save(session ? { session } : undefined);
       return { attempt, isNew: true };
     } catch (error) {
-      if (!this.isDuplicateKeyError(error)) throw error;
+      if (session || !this.isDuplicateKeyError(error)) throw error;
       const existing = await PaymentAttemptModel.findOne({
         logicalIdempotencyKey: input.logicalIdempotencyKey,
       }).orFail();
@@ -204,7 +230,12 @@ export class PaymentAttemptRepository {
         compensationStatus: "NOT_REQUIRED",
         $or: [
           { persistenceStatus: { $in: ["NOT_STARTED", "FAILED"] } },
-          { persistenceStatus: "PERSISTING", persistenceLeaseExpiresAt: { $lte: now } },
+          {
+            packageBatchBinding: { $exists: false },
+            packageLifecycleBinding: { $exists: false },
+            persistenceStatus: "PERSISTING",
+            persistenceLeaseExpiresAt: { $lte: now },
+          },
         ],
       },
       {
@@ -229,6 +260,26 @@ export class PaymentAttemptRepository {
     persistenceLeaseToken: string,
     session?: ClientSession,
   ): Promise<boolean> {
+    const current = await PaymentAttemptModel.findById(id).session(session ?? null);
+    if (current && hasLifecyclePaymentEvidence(current))
+      throw Error("Use lifecycle parent completion");
+    if (current?.packageBatchBinding) {
+      await verifyPackageBatchActivation();
+      const binding = assertPaymentBatchBinding(current);
+      if (
+        !session?.inTransaction() ||
+        String(input.bookingId) !== binding.originBookingId ||
+        String(input.packageProgressId) !== binding.packageProgressId ||
+        !input.succeededTransactionId
+      )
+        throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
+      return completeBoundPaymentAttempt(
+        id,
+        persistenceLeaseToken,
+        input.succeededTransactionId,
+        session,
+      );
+    }
     const result = await PaymentAttemptModel.updateOne(
       {
         _id: id,
@@ -298,10 +349,17 @@ export class PaymentAttemptRepository {
         providerStatus: "SUCCEEDED",
         $or: [
           {
+            packageBatchBinding: { $exists: false },
+            packageLifecycleBinding: { $exists: false },
             compensationStatus: "NOT_REQUIRED",
             $or: [
               { persistenceStatus: { $in: ["NOT_STARTED", "FAILED"] } },
-              { persistenceStatus: "PERSISTING", persistenceLeaseExpiresAt: { $lte: now } },
+              {
+                packageBatchBinding: { $exists: false },
+                packageLifecycleBinding: { $exists: false },
+                persistenceStatus: "PERSISTING",
+                persistenceLeaseExpiresAt: { $lte: now },
+              },
             ],
           },
           {
@@ -593,6 +651,8 @@ export class PaymentAttemptRepository {
     input: CreatePaymentAttemptInput,
   ): void {
     const mismatch =
+      !equalPaymentBatchBindings(existing.packageLifecycleBinding, input.packageLifecycleBinding) ||
+      !equalPaymentBatchBindings(existing.packageBatchBinding, input.packageBatchBinding) ||
       String(existing.customerUserId) !== String(input.customerUserId) ||
       String(existing.businessId ?? "") !== String(input.businessId ?? "") ||
       existing.purpose !== input.purpose ||

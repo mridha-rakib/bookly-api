@@ -1,5 +1,4 @@
-import mongoose from "mongoose";
-
+import mongoose, { type ClientSession } from "mongoose";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { normalizeEmail } from "../auth/auth.utils.js";
@@ -7,6 +6,10 @@ import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
 import { StaffInvitationNotifier } from "../notification/staff-invitation.notifier.js";
+import {
+  acquirePackageEligibilityFence,
+  withPackageEligibility,
+} from "../package-progress/package-eligibility.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { ServiceRepository } from "../services/service.repository.js";
 import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
@@ -172,8 +175,9 @@ export class StaffService {
    * feature in this class) or the membership is assigned to no Package Deal service.
    */
   private async assertPackageStaffRemovalSafe(
-    business: BusinessDocument,
+    business: Pick<BusinessDocument, "_id">,
     membershipId: string,
+    session?: ClientSession,
   ): Promise<void> {
     if (!this.serviceRepository || !this.packageProgressRepository) {
       return;
@@ -182,6 +186,7 @@ export class StaffService {
     const assignedServices = await this.serviceRepository.listActiveByAssignedStaffMembershipId(
       business._id,
       membershipId,
+      session,
     );
 
     for (const service of assignedServices) {
@@ -193,6 +198,7 @@ export class StaffService {
         await this.packageProgressRepository.hasOutstandingEntitlementsForService(
           business._id,
           service._id,
+          session,
         );
       if (!hasOutstanding) {
         continue;
@@ -203,7 +209,11 @@ export class StaffService {
       );
       const otherMemberships =
         otherAssignedIds.length > 0
-          ? await this.staffRepository.findManyByIdsForBusiness(business._id, otherAssignedIds)
+          ? await this.staffRepository.findManyByIdsForBusiness(
+              business._id,
+              otherAssignedIds,
+              session,
+            )
           : [];
       const otherEligible = otherMemberships.filter(
         (membership) => membership.employmentActive && !membership.removedAt,
@@ -446,10 +456,6 @@ export class StaffService {
       }
     }
 
-    if (input.employmentActive === false && membership.employmentActive) {
-      await this.assertPackageStaffRemovalSafe(business, staffId);
-    }
-
     if (input.employmentActive !== undefined) {
       const employmentEvent = await this.updateEmploymentActiveTransactionally(
         business._id,
@@ -655,6 +661,9 @@ export class StaffService {
     try {
       await dbSession.withTransaction(async () => {
         accessEvent = null;
+        await acquirePackageEligibilityFence(businessId, dbSession);
+        if (!nextActive)
+          await this.assertPackageStaffRemovalSafe({ _id: businessId }, staffId, dbSession);
 
         const updatedMembership = await this.staffRepository.updateActiveById(
           businessId,
@@ -701,8 +710,10 @@ export class StaffService {
     staffId: string,
   ): Promise<void> {
     const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
-    await this.assertPackageStaffRemovalSafe(business, staffId);
-    const removed = await this.staffRepository.softRemoveById(business._id, staffId);
+    const removed = await withPackageEligibility(business._id, undefined, async (session) => {
+      await this.assertPackageStaffRemovalSafe(business, staffId, session);
+      return this.staffRepository.softRemoveById(business._id, staffId, session);
+    });
 
     if (!removed) {
       throw new StaffError("STAFF_NOT_FOUND", 404);
@@ -891,15 +902,8 @@ export class StaffService {
     const startDate = input.startDate;
     const endDate = input.endDate ?? input.startDate;
 
-    const existing = await this.staffTimeOffRepository.listByMembershipId(membership._id);
-    const overlaps = existing.some(
-      (entry) => startDate <= entry.endDate && endDate >= entry.startDate,
-    );
-
-    if (overlaps) {
-      throw new StaffError("STAFF_TIME_OFF_OVERLAP", 409);
-    }
-
+    // The repository checks inclusive overlap under the shared Business write,
+    // in the same transaction as insertion; no stale pre-transaction overlap decision.
     const created = await this.staffTimeOffRepository.create({
       membershipId: membership._id,
       businessId: business._id,

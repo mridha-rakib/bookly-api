@@ -1,9 +1,11 @@
 /** biome-ignore-all lint/style/noNonNullAssertion: Fixture dimensions and successful reads are asserted by these tests; optional chaining would silently skip mutations. */
 import mongoose, { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
+import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
@@ -453,13 +455,89 @@ describe("internal accounting2 atomic expiry and restoration (synthetic accepted
     let now = BEFORE;
     const repository = new PackageProgressV2Repository(() => now);
     await transaction((session) => repository.create(input, session));
-    // Partial origin read fixture in a disposable DB, NOT a real purchase or Booking creation.
-    // Its financial fields exercise the existing source-of-truth settlement read only.
-    await mongoose.connection.db!.collection("bookings").insertOne({
+    // Model-valid synthetic origin in the disposable DB, not purchase orchestration,
+    // genuine consent, a real reservation or provider payment evidence.
+    const amountCents = input.purchaseSnapshot.bundlePriceCents;
+    const origin = await BookingModel.create({
       _id: input.originBookingId,
       businessId: input.businessId,
-      customerUserId: input.customerUserId,
-      financials: { balanceDueCents: 0 },
+      reference: `S1-${input.originBookingId.toHexString()}`,
+      source: "BOOKLY_MANAGED",
+      status: "COMPLETED",
+      customer: {
+        businessClientId: f.client._id,
+        customerUserId: input.customerUserId,
+        contact: {
+          firstName: f.client.firstName,
+          normalizedEmail: f.client.normalizedEmail,
+          phone: f.client.phone,
+        },
+      },
+      createdBy: { actorUserId: f.ownerId, actorRole: "BUSINESS_OWNER" },
+      fulfilment: {
+        mode: "AT_BUSINESS_LOCATION",
+        businessLocation: {
+          city: "Larnaca",
+          area: f.business.address.area,
+          streetName: f.business.address.streetName,
+          streetNumber: f.business.address.streetNumber,
+        },
+      },
+      serviceLines: [
+        {
+          serviceId: f.services[0]!._id,
+          serviceSnapshot: {
+            name: f.services[0]!.name,
+            pricingMode: "PACKAGE",
+            durationMin: 60,
+          },
+          pricingInput: {
+            packageProgressId: input._id,
+            packageItemId: input.items[0]!.packageItemId,
+          },
+          packageContext: {
+            packageId: input.packageId,
+            packageName: f.definition.name,
+            definitionItemId: input.items[0]!.definitionItemId,
+            role: "PURCHASE",
+          },
+          schedulingSnapshot: {
+            version: 1,
+            baseDurationMin: 60,
+            bufferAfterMin: 0,
+            processingTimeMin: 0,
+            occupiedDurationMin: 60,
+          },
+          responsibleStaffMembershipId: f.provider._id,
+          reservationId: new Types.ObjectId(),
+          addons: [],
+          amountCents,
+        },
+      ],
+      financials: {
+        currency: "EUR",
+        servicesSubtotalCents: amountCents,
+        addonsSubtotalCents: 0,
+        serviceDiscountCents: 0,
+        travelFeeCents: 0,
+        eligiblePlatformFeeBasisCents: amountCents,
+        platformFeeCents: 0,
+        depositCents: 0,
+        balanceDueCents: amountCents,
+        totalCents: amountCents,
+      },
+      schedule: {
+        timezone: f.business.timezone,
+        startAt: new Date("2026-01-02T10:00:00Z"),
+        endAt: new Date("2026-01-02T11:00:00Z"),
+      },
+      eventHistory: [],
+      completionPayment: {
+        paid: true,
+        amountCents,
+        recordedAt: new Date("2026-01-02T11:00:00Z"),
+        recordedBy: f.ownerId,
+      },
     });
     const read = async () => {
       const data = await f.read();
@@ -475,12 +553,98 @@ describe("internal accounting2 atomic expiry and restoration (synthetic accepted
       input,
       read,
       repository,
+      origin,
       setTime: (time: Date) => {
         now = time;
       },
       expire,
     };
   };
+  it("recognizes a model-valid owned settled origin through the nested Customer", async () => {
+    const f = await fixture();
+    const persisted = await BookingModel.findById(f.input.originBookingId);
+    expect(persisted).not.toBeNull();
+    await persisted!.validate();
+    expect(persisted!.toObject()).not.toHaveProperty("customerUserId");
+    expect(persisted!.customer.customerUserId).toEqual(f.customerId);
+    expect(persisted!.serviceLines[0]!.serviceId).toEqual(f.input.items[0]!.serviceId);
+    expect(persisted!.financials.balanceDueCents).toBe(100);
+    const bookingId = new Types.ObjectId();
+    await expect(
+      transaction((session) => f.repository.claim(f.scope(1), bookingId, session)),
+    ).resolves.toMatchObject({ isNew: true });
+    const after = await f.read();
+    expect(after.items[1]!.remainingSessions).toBe(1);
+    expect(after.sessions.filter((attempt) => attempt.bookingId.equals(bookingId))).toHaveLength(1);
+    expect(after.originBookingId).toEqual(f.input.originBookingId);
+  });
+  it.each([
+    "foreign Customer",
+    "foreign Business",
+    "different origin ID",
+    "missing origin",
+    "unpaid origin",
+    "partially settled origin",
+  ] as const)(
+    "rejects %s without committing credits, attempts or the eligibility fence",
+    async (kind) => {
+      const f = await fixture();
+      if (kind === "foreign Customer") {
+        const foreignCustomer = new Types.ObjectId();
+        const client = await BusinessClientModel.create({
+          businessId: f.business._id,
+          createdByUserId: f.ownerId,
+          firstName: "Other buyer",
+          normalizedEmail: "other-buyer@example.com",
+          phone: { countryCode: "+357", nationalNumber: "99112234", e164: "+35799112234" },
+          linkState: "LINKED",
+          linkedUserId: foreignCustomer,
+        });
+        f.origin.customer.businessClientId = client._id;
+        f.origin.customer.customerUserId = foreignCustomer;
+        await f.origin.save();
+      } else if (kind === "foreign Business") {
+        const foreign = await fixture();
+        foreign.client.linkedUserId = f.customerId;
+        await foreign.client.save();
+        foreign.origin.customer.customerUserId = f.customerId;
+        await foreign.origin.save();
+        await f.origin.deleteOne();
+        // A complete validated foreign Booking, including its own package/client/staff,
+        // is placed at the target ID only for the tenant-isolation adversarial case.
+        const { _id: _foreignId, ...data } = foreign.origin.toObject();
+        await BookingModel.create({
+          ...data,
+          _id: f.input.originBookingId,
+          reference: "S1-FOREIGN",
+        });
+      } else if (kind === "different origin ID") {
+        const { _id: _originId, ...data } = f.origin.toObject();
+        await f.origin.deleteOne();
+        await BookingModel.create({ ...data, _id: new Types.ObjectId(), reference: "S1-OTHER-ID" });
+      } else if (kind === "missing origin") {
+        await f.origin.deleteOne();
+      } else {
+        f.origin.completionPayment = {
+          paid: kind !== "unpaid origin",
+          amountCents: kind === "unpaid origin" ? 0 : 99,
+          recordedAt: BEFORE,
+          recordedBy: f.ownerId,
+        };
+        await f.origin.save();
+      }
+      const before = await f.read();
+      const fence = (await BusinessModel.findById(f.business._id))!.packageEligibilityVersion;
+      await expect(
+        transaction((session) => f.repository.claim(f.scope(1), new Types.ObjectId(), session)),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        details: [{ code: "PACKAGE_BALANCE_UNSETTLED" }],
+      });
+      expect(await f.read()).toEqual(before);
+      expect((await BusinessModel.findById(f.business._id))!.packageEligibilityVersion).toBe(fence);
+    },
+  );
   it("stores the complete strict contract with one canonical P, and no public activation evidence", async () => {
     const f = await fixture();
     const data = await f.read();
@@ -734,27 +898,16 @@ describe("internal accounting2 atomic expiry and restoration (synthetic accepted
   });
   it("enforces normal origin settlement independently of any penalty receipt", async () => {
     const f = await fixture();
-    await mongoose.connection.db!.collection("bookings").updateOne(
-      { _id: f.input.originBookingId },
-      {
-        $set: {
-          "financials.balanceDueCents": 100,
-          completionPayment: { paid: true, amountCents: 99 },
-        },
-      },
-    );
+    f.origin.completionPayment!.amountCents = 99;
+    await f.origin.save();
     await mongoose.connection
       .db!.collection("p2_penalty_receipt_fixture")
       .insertOne({ amountCents: 10000, status: "SUCCEEDED" });
     await expect(
       transaction((session) => f.repository.claim(f.scope(1), new Types.ObjectId(), session)),
     ).rejects.toMatchObject({ statusCode: 409 });
-    await mongoose.connection
-      .db!.collection("bookings")
-      .updateOne(
-        { _id: f.input.originBookingId },
-        { $set: { "completionPayment.amountCents": 100 } },
-      );
+    f.origin.completionPayment!.amountCents = 100;
+    await f.origin.save();
     await expect(
       transaction((session) => f.repository.claim(f.scope(1), new Types.ObjectId(), session)),
     ).resolves.toMatchObject({ isNew: true });
@@ -842,3 +995,8 @@ describe("internal accounting2 atomic expiry and restoration (synthetic accepted
     expect((await f.read()).items.map((item) => item.expiredSessions)).toEqual([3, 2, 1]);
   });
 });
+
+// Vitest-only authority mock for existing model-valid synthetic first-class fixtures.
+vi.mock("../../../src/modules/booking/package-batch-authority.js", () => ({
+  verifyPackageBatchActivation: vi.fn(async () => undefined),
+}));

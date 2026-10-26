@@ -1,5 +1,6 @@
 import type { ClientSession, Types } from "mongoose";
-
+import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
+import { isCanonicalRetainedBatch } from "../booking/package-batch-payment-recovery.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { CustomerPaymentProfileRepository } from "./customer-payment-profile.repository.js";
 import { PaymentError } from "./payment.errors.js";
@@ -13,6 +14,20 @@ import type {
 } from "./payment.types.js";
 import { isProviderCreationClosed, type PaymentAttemptDocument } from "./payment-attempt.model.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import {
+  assertPaymentBatchBinding,
+  assertPaymentBatchMetadata,
+  type PaymentBatchBinding,
+} from "./payment-batch-binding.js";
+import {
+  assertLifecyclePaymentBinding,
+  assertLifecyclePaymentMetadata,
+  hasLifecyclePaymentEvidence,
+  type LifecyclePaymentBinding,
+  lifecyclePaymentBindingSchema,
+  lifecyclePaymentKey,
+  lifecyclePaymentMetadata,
+} from "./payment-lifecycle-binding.js";
 import { isPenaltyPurpose, type PenaltyPurpose } from "./penalty-attempt.js";
 import type { CreateRefundOperationInput } from "./refund-operation.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
@@ -177,17 +192,39 @@ export class PaymentService {
    * Business-owned prepayment is decided entirely by the caller (see
    * booking-creation.service.ts's persistCustomerBooking), never here — this method only moves
    * money, it has no opinion on who keeps it. */
+  public async chargePackageLifecycle(
+    bindingInput: LifecyclePaymentBinding,
+  ): Promise<PaymentIntentResult> {
+    await verifyPackageBatchActivation();
+    const binding = lifecyclePaymentBindingSchema.parse(bindingInput);
+    const profile = await this.profileRepository.findByUserId(binding.customerUserId);
+    if (!profile?.defaultPaymentMethodId) throw new PaymentError("PAYMENT_METHOD_REQUIRED", 402);
+    return this.executeDurablePayment({
+      userId: binding.customerUserId,
+      stripeCustomerId: profile.stripeCustomerId,
+      paymentMethodId: profile.defaultPaymentMethodId,
+      amountCents: binding.amountCents,
+      currency: "EUR",
+      idempotencyKey: lifecyclePaymentKey(binding),
+      offSession: binding.kind !== "SESSION_DUES",
+      saveForFutureUse: false,
+      metadata: lifecyclePaymentMetadata(binding),
+      packageLifecycleBinding: binding,
+    });
+  }
   public async chargeBookingDeposit(input: {
     userId: Types.ObjectId | string;
     amountCents: number;
     idempotencyKey: string;
     metadata: Record<string, string>;
     /** P1 — immutable Financial Contract (V2/V3) correlation persisted on the PaymentAttempt. */
+    packageBatchBinding?: PaymentBatchBinding | undefined;
     financialContract?: PaymentAttemptContractCorrelation | undefined;
     /** P1 — runs after the durable PaymentAttempt exists and BEFORE any provider interaction
      * (e.g. binding a FIRST relationship claim to this attempt). Throwing aborts with no PI. */
     beforeProviderDispatch?: ((attempt: PaymentAttemptDocument) => Promise<void>) | undefined;
   }): Promise<PaymentIntentResult> {
+    if (input.packageBatchBinding) await verifyPackageBatchActivation();
     const profile = await this.profileRepository.findByUserId(input.userId);
     const paymentMethodId = profile?.defaultPaymentMethodId;
     if (!profile || !paymentMethodId) {
@@ -204,6 +241,7 @@ export class PaymentService {
       offSession: false,
       saveForFutureUse: true,
       metadata: input.metadata,
+      packageBatchBinding: input.packageBatchBinding,
       financialContract: input.financialContract,
       beforeProviderDispatch: input.beforeProviderDispatch,
     });
@@ -333,6 +371,39 @@ export class PaymentService {
     businessClientId?: Types.ObjectId | string | undefined;
     domainReason?: string | undefined;
   }): Promise<RefundResult> {
+    const sourceAttempt = input.sourcePaymentAttemptId
+      ? await this.paymentAttemptRepository.findById(input.sourcePaymentAttemptId)
+      : await this.paymentAttemptRepository.findByProviderPaymentIntentId(input.paymentIntentId);
+    if (sourceAttempt?.packageLifecycleBinding) {
+      await verifyPackageBatchActivation();
+      const { inspectLifecyclePaymentAuthority } = await import(
+        "../booking/package-lifecycle-payment-recovery.js"
+      );
+      const authority = await inspectLifecyclePaymentAuthority(sourceAttempt);
+      const b = sourceAttempt.packageLifecycleBinding;
+      if (
+        !authority ||
+        authority.kind === "COMPLETE" ||
+        authority.row.phase !== "FAILED_FINAL" ||
+        sourceAttempt.providerStatus !== "SUCCEEDED" ||
+        sourceAttempt.persistenceStatus !== "FAILED" ||
+        !["REQUIRED", "REFUND_PENDING", "RECONCILIATION_REQUIRED", "REFUNDED"].includes(
+          sourceAttempt.compensationStatus,
+        ) ||
+        String(input.sourcePaymentAttemptId) !== String(sourceAttempt._id) ||
+        input.paymentIntentId !== sourceAttempt.providerPaymentIntentId ||
+        input.amountCents !== sourceAttempt.expectedAmountCents ||
+        input.currency !== "EUR" ||
+        input.idempotencyKey !== `refund:${input.paymentIntentId}:compensation` ||
+        input.domainReason !== "BOOKING_PERSISTENCE_COMPENSATION" ||
+        String(input.bookingId) !== b.bookingId ||
+        String(input.packageProgressId) !== b.packageProgressId ||
+        String(input.businessId) !== b.businessId ||
+        String(input.businessClientId) !== b.businessClientId ||
+        String(input.customerUserId) !== b.customerUserId
+      )
+        throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
+    }
     let amountCents = input.amountCents;
     let currency = input.currency?.toUpperCase();
     if (amountCents === undefined || !currency) {
@@ -480,6 +551,10 @@ export class PaymentService {
   public async reconcilePaymentAttempt(paymentAttemptId: Types.ObjectId | string) {
     const attempt = await this.paymentAttemptRepository.findById(paymentAttemptId);
     if (!attempt) throw new PaymentError("PAYMENT_FAILED", 404);
+    if (hasLifecyclePaymentEvidence(attempt)) {
+      await verifyPackageBatchActivation();
+      assertLifecyclePaymentBinding(attempt);
+    }
     let snapshot: PaymentIntentSnapshot;
     if (attempt.providerPaymentIntentId) {
       snapshot = await this.requireRetrievePaymentIntent()(attempt.providerPaymentIntentId);
@@ -626,10 +701,14 @@ export class PaymentService {
     offSession: boolean;
     saveForFutureUse: boolean;
     metadata: Record<string, string>;
+    packageLifecycleBinding?: LifecyclePaymentBinding | undefined;
+    packageBatchBinding?: PaymentBatchBinding | undefined;
     financialContract?: PaymentAttemptContractCorrelation | undefined;
     beforeProviderDispatch?: ((attempt: PaymentAttemptDocument) => Promise<void>) | undefined;
   }): Promise<PaymentIntentResult> {
     const purpose = input.metadata["purpose"] ?? "UNKNOWN";
+    if (!input.packageBatchBinding && (await isCanonicalRetainedBatch(input.idempotencyKey)))
+      await verifyPackageBatchActivation();
     const productKind =
       purpose === "BOOKING_DEPOSIT"
         ? ("NORMAL_BOOKING" as const)
@@ -640,6 +719,19 @@ export class PaymentService {
       throw new PaymentError("PAYMENT_IDEMPOTENCY_CONFLICT", 409);
     }
     const { attempt, isNew } = await this.paymentAttemptRepository.createOrResumeWithDisposition({
+      ...(input.packageBatchBinding
+        ? {
+            packageBatchBinding: input.packageBatchBinding,
+            packageProgressId: input.packageBatchBinding.packageProgressId,
+          }
+        : {}),
+      ...(input.packageLifecycleBinding
+        ? {
+            packageLifecycleBinding: input.packageLifecycleBinding,
+            businessClientId: input.packageLifecycleBinding.businessClientId,
+            packageProgressId: input.packageLifecycleBinding.packageProgressId,
+          }
+        : {}),
       logicalIdempotencyKey: input.idempotencyKey,
       customerUserId: input.userId,
       ...(input.metadata["businessId"] ? { businessId: input.metadata["businessId"] } : {}),
@@ -746,6 +838,18 @@ export class PaymentService {
     attempt: import("./payment-attempt.model.js").PaymentAttemptDocument,
     customerId: string,
   ): void {
+    if (attempt.packageLifecycleBinding)
+      assertLifecyclePaymentMetadata(attempt.packageLifecycleBinding, result.metadata);
+    if (attempt.packageBatchBinding) {
+      assertPaymentBatchMetadata(assertPaymentBatchBinding(attempt), result.metadata);
+      if (result.metadata["relationshipClassification"] !== attempt.relationshipClassification)
+        throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
+      if (
+        attempt.providerPaymentIntentId &&
+        attempt.providerPaymentIntentId !== result.paymentIntentId
+      )
+        throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
+    }
     if (
       result.amountCents !== attempt.expectedAmountCents ||
       result.currency.toUpperCase() !== attempt.currency ||

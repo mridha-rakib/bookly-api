@@ -245,6 +245,7 @@ export class CatalogService {
       toDate: string;
       staffMembershipId?: string | undefined;
       partySize?: number | undefined;
+      hours?: number | undefined;
       customerCity?: BusinessCity | undefined;
       packageProgressId?: string | undefined;
       customerUserId?: string | undefined;
@@ -274,6 +275,7 @@ export class CatalogService {
       fromDate: input.fromDate,
       toDate: input.toDate,
       partySize: input.partySize,
+      hours: input.hours,
       customerCity: input.customerCity,
       skipTravelEligibility: packageOwned,
     });

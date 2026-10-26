@@ -1,4 +1,7 @@
-import type { Types } from "mongoose";
+import type { ClientSession, Types } from "mongoose";
+import { withPackageEligibility } from "../package-progress/package-eligibility.js";
+import { StaffError } from "./staff.errors.js";
+import { StaffMembershipModel } from "./staff.model.js";
 
 import { type StaffTimeOffDocument, StaffTimeOffModel } from "./staff-time-off.model.js";
 import type { StaffTimeOffType } from "./staff-time-off.types.js";
@@ -13,14 +16,35 @@ export type CreateStaffTimeOffInput = {
 };
 
 export class StaffTimeOffRepository {
-  public async create(input: CreateStaffTimeOffInput): Promise<StaffTimeOffDocument> {
-    return new StaffTimeOffModel(input).save();
+  public async create(
+    input: CreateStaffTimeOffInput,
+    session?: ClientSession,
+  ): Promise<StaffTimeOffDocument> {
+    return withPackageEligibility(input.businessId, session, async (transaction) => {
+      const member = await StaffMembershipModel.findOne({
+        _id: input.membershipId,
+        businessId: input.businessId,
+        removedAt: { $exists: false },
+      }).session(transaction);
+      if (!member) throw new StaffError("STAFF_NOT_FOUND", 404);
+      const overlapping = await StaffTimeOffModel.exists({
+        membershipId: input.membershipId,
+        startDate: { $lte: input.endDate },
+        endDate: { $gte: input.startDate },
+      }).session(transaction);
+      if (overlapping) throw new StaffError("STAFF_TIME_OFF_OVERLAP", 409);
+      return new StaffTimeOffModel(input).save({ session: transaction });
+    });
   }
 
   public async listByMembershipId(
     membershipId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<StaffTimeOffDocument[]> {
-    return StaffTimeOffModel.find({ membershipId }).sort({ startDate: 1 }).exec();
+    return StaffTimeOffModel.find({ membershipId })
+      .sort({ startDate: 1 })
+      .session(session ?? null)
+      .exec();
   }
 
   /** Batched lookup for the Staff list / Availability table — one query, never per-row. */
@@ -48,6 +72,7 @@ export class StaffTimeOffRepository {
     membershipIds: Array<Types.ObjectId | string>,
     fromDateStr: string,
     toDateStr: string,
+    session?: ClientSession,
   ): Promise<StaffTimeOffDocument[]> {
     if (membershipIds.length === 0) {
       return [];
@@ -57,7 +82,9 @@ export class StaffTimeOffRepository {
       membershipId: { $in: membershipIds },
       startDate: { $lte: toDateStr },
       endDate: { $gte: fromDateStr },
-    }).exec();
+    })
+      .session(session ?? null)
+      .exec();
   }
 
   public async findByIdForMembership(
@@ -70,12 +97,30 @@ export class StaffTimeOffRepository {
   public async deleteByIdForMembership(
     membershipId: Types.ObjectId | string,
     timeOffId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<boolean> {
-    const result = await StaffTimeOffModel.deleteOne({ _id: timeOffId, membershipId }).exec();
-    return result.deletedCount > 0;
+    const member = await StaffMembershipModel.findById(membershipId).session(session ?? null);
+    if (!member) throw new StaffError("STAFF_NOT_FOUND", 404);
+    return withPackageEligibility(member.businessId, session, async (transaction) => {
+      const result = await StaffTimeOffModel.deleteOne({
+        _id: timeOffId,
+        membershipId,
+        businessId: member.businessId,
+      }).session(transaction);
+      return result.deletedCount > 0;
+    });
   }
 
-  public async deleteByMembershipId(membershipId: Types.ObjectId | string): Promise<void> {
-    await StaffTimeOffModel.deleteMany({ membershipId }).exec();
+  public async deleteByMembershipId(
+    membershipId: Types.ObjectId | string,
+    session?: ClientSession,
+  ): Promise<void> {
+    const member = await StaffMembershipModel.findById(membershipId).session(session ?? null);
+    if (!member) throw new StaffError("STAFF_NOT_FOUND", 404);
+    await withPackageEligibility(member.businessId, session, async (transaction) => {
+      await StaffTimeOffModel.deleteMany({ membershipId, businessId: member.businessId }).session(
+        transaction,
+      );
+    });
   }
 }

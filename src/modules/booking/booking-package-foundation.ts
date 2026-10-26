@@ -1,4 +1,9 @@
 import { Schema, type Types } from "mongoose";
+import {
+  type PackageGroupSeat,
+  packageGroupSeatMongooseSchema,
+  readPackageGroupSeat,
+} from "../packages/package-service-entitlement.js";
 
 export type BookingPackageContext = {
   packageId: Types.ObjectId;
@@ -7,6 +12,7 @@ export type BookingPackageContext = {
   role: "PURCHASE" | "REDEMPTION";
 };
 export type BookingSchedulingSnapshot = {
+  group?: PackageGroupSeat | undefined;
   version: 1;
   baseDurationMin: number;
   bufferAfterMin: number;
@@ -32,6 +38,7 @@ export const bookingPackageContextSchema = new Schema<BookingPackageContext>(
 export const bookingSchedulingSnapshotSchema = new Schema<BookingSchedulingSnapshot>(
   {
     version: { type: Number, enum: [1], required: true },
+    group: { type: packageGroupSeatMongooseSchema, required: false },
     baseDurationMin: { ...minute, min: 1 },
     bufferAfterMin: minute,
     processingTimeMin: minute,
@@ -42,6 +49,8 @@ export const bookingSchedulingSnapshotSchema = new Schema<BookingSchedulingSnaps
 
 export const validPackageSchedulingSnapshot = (snapshot: BookingSchedulingSnapshot): boolean =>
   snapshot.version === 1 &&
+  (snapshot.group === undefined ||
+    (validGroup(snapshot.group) && snapshot.processingTimeMin === 0)) &&
   [
     snapshot.baseDurationMin,
     snapshot.bufferAfterMin,
@@ -55,3 +64,36 @@ export const validPackageSchedulingSnapshot = (snapshot: BookingSchedulingSnapsh
     BigInt(snapshot.baseDurationMin) +
       BigInt(snapshot.bufferAfterMin) +
       BigInt(snapshot.processingTimeMin);
+
+/** One-seat Package occupancy is independent of ordinary personCount pricing. */
+export function packageReservationPartySize(line: {
+  serviceSnapshot: { pricingMode: string };
+  pricingInput: {
+    personCount?: number | undefined;
+    packageItemId?: Types.ObjectId | undefined;
+    packageProgressId?: Types.ObjectId | undefined;
+  };
+  schedulingSnapshot?: BookingSchedulingSnapshot | undefined;
+  packageContext?: BookingPackageContext | undefined;
+}): number {
+  if (!line.schedulingSnapshot?.group) return line.pricingInput.personCount ?? 1;
+  if (
+    line.serviceSnapshot.pricingMode !== "PACKAGE" ||
+    !line.packageContext ||
+    !line.pricingInput.packageItemId ||
+    !line.pricingInput.packageProgressId ||
+    line.pricingInput.personCount !== undefined ||
+    !validPackageSchedulingSnapshot(line.schedulingSnapshot)
+  )
+    throw new Error("Invalid one-seat Package reservation contract");
+  return readPackageGroupSeat(line.schedulingSnapshot.group).partySize;
+}
+
+function validGroup(group: PackageGroupSeat): boolean {
+  try {
+    readPackageGroupSeat(group);
+    return true;
+  } catch {
+    return false;
+  }
+}

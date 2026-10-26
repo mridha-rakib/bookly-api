@@ -1,5 +1,7 @@
 import { logger } from "../../config/logger.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
+import { inspectBatchPaymentAuthority } from "../booking/package-batch-payment-recovery.js";
 import type { PenaltyCollectionService } from "../booking/penalty-collection.service.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
@@ -12,6 +14,7 @@ import type {
   PaymentAttemptProviderStatus,
 } from "./payment-attempt.model.js";
 import type { PaymentAttemptRepository } from "./payment-attempt.repository.js";
+import { hasLifecyclePaymentEvidence } from "./payment-lifecycle-binding.js";
 import { isPenaltyPurpose } from "./penalty-attempt.js";
 import { ensureRefundAccounting } from "./refund-accounting.js";
 import type { RefundOperationDocument } from "./refund-operation.model.js";
@@ -95,6 +98,86 @@ export class MoneyRecoveryService {
     const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
     for (const candidate of attempts) {
       try {
+        if (hasLifecyclePaymentEvidence(candidate)) {
+          await verifyPackageBatchActivation();
+          const { inspectLifecyclePaymentAuthority } = await import(
+            "../booking/package-lifecycle-payment-recovery.js"
+          );
+          const authority = await inspectLifecyclePaymentAuthority(candidate);
+          paymentAttempts++;
+          if (authority?.kind === "COMPLETE" || authority?.kind === "NON_COLLECTION") continue;
+          if (
+            authority &&
+            candidate.providerStatus === "SUCCEEDED" &&
+            candidate.persistenceStatus === "FAILED" &&
+            ["REQUIRED", "REFUND_PENDING", "RECONCILIATION_REQUIRED"].includes(
+              candidate.compensationStatus,
+            ) &&
+            candidate.providerPaymentIntentId &&
+            authority.row.phase === "FAILED_FINAL" &&
+            (await this.paymentService.claimPaymentCompensation(candidate._id))
+          ) {
+            await this.paymentService.refund({
+              paymentIntentId: candidate.providerPaymentIntentId,
+              amountCents: candidate.expectedAmountCents,
+              currency: "EUR",
+              idempotencyKey: `refund:${candidate.providerPaymentIntentId}:compensation`,
+              reason: "requested_by_customer",
+              domainReason: "BOOKING_PERSISTENCE_COMPENSATION",
+              sourcePaymentAttemptId: candidate._id,
+              bookingId: authority.binding.bookingId,
+              packageProgressId: authority.binding.packageProgressId,
+              businessId: authority.binding.businessId,
+              customerUserId: authority.binding.customerUserId,
+              businessClientId: authority.binding.businessClientId,
+            });
+          } else {
+            await this.paymentService.reconcilePaymentAttempt(candidate._id);
+            await this.paymentAttemptRepository.scheduleRecoveryRetry(
+              candidate._id,
+              "Complete lifecycle result unresolved; original operation remains pinned",
+            );
+          }
+          continue;
+        }
+        // Never reconcile/complete/refund a retained batch through origin-only authority.
+        const batch = await inspectBatchPaymentAuthority(candidate);
+        if (batch) {
+          paymentAttempts += 1;
+          if (batch.kind === "BATCH_PAYMENT_COMPLETE") continue;
+          // FAILED + REQUIRED is a definitive token-owner transition, never inferred from
+          // missing members or elapsed time. Resume a crash before RefundOperation creation.
+          if (
+            candidate.providerStatus === "SUCCEEDED" &&
+            candidate.persistenceStatus === "FAILED" &&
+            ["REQUIRED", "REFUND_PENDING", "RECONCILIATION_REQUIRED"].includes(
+              candidate.compensationStatus,
+            ) &&
+            candidate.providerPaymentIntentId &&
+            (await this.paymentService.claimPaymentCompensation(candidate._id))
+          ) {
+            await this.paymentService.refund({
+              paymentIntentId: candidate.providerPaymentIntentId,
+              amountCents: candidate.expectedAmountCents,
+              currency: candidate.currency,
+              idempotencyKey: `refund:${candidate.providerPaymentIntentId}:compensation`,
+              reason: "requested_by_customer",
+              domainReason: "BOOKING_PERSISTENCE_COMPENSATION",
+              sourcePaymentAttemptId: candidate._id,
+              bookingId: batch.binding.originBookingId,
+              packageProgressId: batch.binding.packageProgressId,
+              businessId: batch.binding.businessId,
+              customerUserId: batch.binding.customerUserId,
+              businessClientId: batch.binding.businessClientId,
+            });
+            await this.relationshipService?.reconcileForPaymentAttempt(candidate._id);
+          } else
+            await this.paymentAttemptRepository.scheduleRecoveryRetry(
+              candidate._id,
+              "Canonical complete batch monetary proof is unresolved",
+            );
+          continue;
+        }
         const { attempt, snapshot } = await this.paymentService.reconcilePaymentAttempt(
           candidate._id,
         );
@@ -202,6 +285,56 @@ export class MoneyRecoveryService {
     const refunds = await this.refundOperationRepository.listRecoverable(limit);
     for (const operation of refunds) {
       try {
+        if (operation.sourcePaymentAttemptId) {
+          const source = await this.paymentAttemptRepository.findById(
+            operation.sourcePaymentAttemptId,
+          );
+          if (source && hasLifecyclePaymentEvidence(source)) {
+            await verifyPackageBatchActivation();
+            const { inspectLifecyclePaymentAuthority } = await import(
+              "../booking/package-lifecycle-payment-recovery.js"
+            );
+            const authority = await inspectLifecyclePaymentAuthority(source);
+            if (
+              !authority ||
+              authority.kind === "COMPLETE" ||
+              authority.row.phase !== "FAILED_FINAL" ||
+              source.persistenceStatus !== "FAILED" ||
+              source.compensationStatus === "NOT_REQUIRED" ||
+              operation.reason !== "BOOKING_PERSISTENCE_COMPENSATION" ||
+              operation.sourcePaymentIntentId !== source.providerPaymentIntentId ||
+              operation.expectedRefundAmountCents !== source.expectedAmountCents ||
+              operation.currency !== "EUR" ||
+              String(operation.businessId) !== authority.binding.businessId ||
+              String(operation.customerUserId) !== authority.binding.customerUserId ||
+              String(operation.businessClientId) !== authority.binding.businessClientId ||
+              String(operation.bookingId) !== authority.binding.bookingId ||
+              String(operation.packageProgressId) !== authority.binding.packageProgressId
+            )
+              throw Error("Lifecycle refund lacks exact abort authority");
+          }
+          const batch =
+            source &&
+            !hasLifecyclePaymentEvidence(source) &&
+            (await inspectBatchPaymentAuthority(source));
+          if (
+            batch &&
+            (!source ||
+              batch.kind === "BATCH_PAYMENT_COMPLETE" ||
+              source.persistenceStatus !== "FAILED" ||
+              source.compensationStatus === "NOT_REQUIRED" ||
+              operation.reason !== "BOOKING_PERSISTENCE_COMPENSATION" ||
+              operation.sourcePaymentIntentId !== source.providerPaymentIntentId ||
+              operation.expectedRefundAmountCents !== source.expectedAmountCents ||
+              operation.currency !== source.currency ||
+              String(operation.businessId) !== batch.binding.businessId ||
+              String(operation.customerUserId) !== batch.binding.customerUserId ||
+              String(operation.businessClientId) !== batch.binding.businessClientId ||
+              String(operation.bookingId) !== batch.binding.originBookingId ||
+              String(operation.packageProgressId) !== batch.binding.packageProgressId)
+          )
+            throw new Error("Batch refund lacks definitive canonical compensation authority");
+        }
         const result = await this.paymentService.refund({
           paymentIntentId: operation.sourcePaymentIntentId,
           amountCents: operation.expectedRefundAmountCents,
@@ -520,6 +653,13 @@ export class MoneyRecoveryService {
     let errors = 0;
     for (const candidate of candidates) {
       try {
+        if (await inspectBatchPaymentAuthority(candidate)) {
+          await this.paymentAttemptRepository.scheduleRecoveryRetry(
+            candidate._id,
+            "Batch provider recovery remains pinned to complete canonical proof",
+          );
+          continue;
+        }
         if (!(await relationships.ownsPendingFirstClaim(candidate))) {
           logger.warn(
             { recordType: "PaymentAttempt", recordId: String(candidate._id) },

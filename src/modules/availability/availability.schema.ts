@@ -16,6 +16,7 @@ export const getAvailabilityQuerySchema = z
     toDate: isoDateSchema,
     staffMembershipId: z.union([objectIdSchema, z.literal(ANY_STAFF)]).optional(),
     partySize: z.coerce.number().int().min(1).max(1000).optional(),
+    hours: z.coerce.number().finite().positive().max(24).optional(),
     customerCity: z.enum(businessCities).optional(),
   })
   .strict();

@@ -1,19 +1,25 @@
 import express from "express";
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { toBookingDetailDto } from "../../../src/modules/booking/booking.dto.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import { createCustomerBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
+import { CustomerFinancialOutcomeRead } from "../../../src/modules/booking/customer-financial-outcome.read.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
@@ -27,10 +33,17 @@ import { BusinessClientModel } from "../../../src/modules/client/client.model.js
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
+import { ensureRefundAccounting } from "../../../src/modules/payment/refund-accounting.js";
+import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
+import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
+import { StripePaymentGateway } from "../../../src/modules/payment/stripe-payment-gateway.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
+import { ExternalRefundModel } from "../../../src/modules/provider-reversal/external-refund.model.js";
+import { PaymentDisputeModel } from "../../../src/modules/provider-reversal/payment-dispute.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -576,6 +589,293 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     expect(response.body.data.days).toHaveLength(1);
     expect(response.body.data.days[0].isOpen).toBe(true);
     expect(response.body.data.days[0].slots.length).toBeGreaterThan(0);
+  });
+
+  it("F1B: Customer hourly HTTP contract, full-duration preview parity and authoritative concurrent finalize", async () => {
+    const { owner, business } = await createBusiness("Hourly venue");
+    const { membership } = await createStaff(business._id);
+    const service = await serviceRepository.create({
+      businessId: business._id,
+      status: "ACTIVE",
+      isFeatured: false,
+      isPackageDeal: false,
+      category: "Barber",
+      name: "Hourly",
+      pricingMode: "HOURLY",
+      hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 4, bufferAfterMin: 15 },
+      sessionExpiryAlert: { enabled: false },
+      scheduleMode: "AUTO",
+      manualSchedule: [],
+      servedCities: [],
+      assignedStaffMembershipIds: [membership._id],
+    });
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(membership._id, business._id);
+    const customer = await createCustomer("hourly-contract");
+    await saveCard(customer._id);
+    const token = await bearerFor(customer._id, "CUSTOMER");
+    const app = buildCatalogApp();
+    const read = (hours?: number | string) =>
+      request(app)
+        .get(`/catalog/businesses/${business._id}/services/${service._id}/availability`)
+        .query({ fromDate: DATE, toDate: DATE, ...(hours === undefined ? {} : { hours }) })
+        .set("Authorization", token);
+    const legacy = await read();
+    expect(legacy.status).toBe(200);
+    expect((await read(2)).body.data).toEqual(legacy.body.data);
+    const fixed = await createFixedService(business._id, membership._id);
+    const fixedUrl = `/catalog/businesses/${business._id}/services/${fixed._id}/availability`;
+    expect(
+      (
+        await request(app)
+          .get(fixedUrl)
+          .query({ fromDate: DATE, toDate: DATE })
+          .set("Authorization", token)
+      ).status,
+    ).toBe(200);
+    const invalidFixed = await request(app)
+      .get(fixedUrl)
+      .query({ fromDate: DATE, toDate: DATE, hours: 2 })
+      .set("Authorization", token);
+    expect(invalidFixed.status).toBe(400);
+    expect(JSON.stringify(invalidFixed.body)).toContain("AVAILABILITY_HOURS_INVALID");
+    for (const hours of [1, 5, "NaN", "Infinity", "abc", 0, 25])
+      expect((await read(hours)).status).toBe(400);
+    const input = (hours: number, startAt: string) => ({
+      ...finalizeInput(service._id, membership._id),
+      startAt,
+      serviceLines: [
+        {
+          serviceId: String(service._id),
+          staffMembershipId: String(membership._id),
+          addonIds: [],
+          pricingInput: { hours },
+        },
+      ],
+    });
+    for (const hours of [2.5, 4]) {
+      const response = await read(hours);
+      expect(response.status).toBe(200);
+      const slots = response.body.data.days[0].slots as Array<{ startAt: string; endAt: string }>;
+      expect(slots.length).toBeGreaterThan(0);
+      for (const slot of slots) {
+        expect(Date.parse(slot.endAt) - Date.parse(slot.startAt)).toBe((hours * 60 + 15) * 60_000);
+        await expect(
+          creationService.previewCustomerBooking(
+            String(customer._id),
+            String(business._id),
+            input(hours, slot.startAt),
+          ),
+        ).resolves.toBeDefined();
+      }
+    }
+    // The short 15:00 slot must never be offered or admitted for four hours.
+    expect(
+      legacy.body.data.days[0].slots.some(
+        (s: { startAt: string }) => s.startAt === startAtFor("15:00"),
+      ),
+    ).toBe(true);
+    expect(
+      (await read(4)).body.data.days[0].slots.some(
+        (s: { startAt: string }) => s.startAt === startAtFor("15:00"),
+      ),
+    ).toBe(false);
+    await expect(
+      creationService.previewCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input(4, startAtFor("15:00")),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    // Establish returning-client financial identity on a different day, so the
+    // scheduling admission gate, rather than first-relationship admission, decides the loser.
+    const established = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      input(2, businessLocalToUtc(TIMEZONE, "2030-08-19", "09:00").toISOString()),
+    );
+    expect(established.status).toBe("confirmed");
+    const chargeCountBefore = paymentGateway.paymentIntentInputs.length;
+    const result = await Promise.allSettled([
+      creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input(4, startAtFor("13:00")),
+      ),
+      creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input(4, startAtFor("11:00")),
+      ),
+    ]);
+    // Both starts were offered before this race; they overlap at four hours. Final writes
+    // remain authoritative after the read, regardless of the previous availability response.
+    expect(
+      result.filter((r) => r.status === "fulfilled" && r.value.status === "confirmed"),
+    ).toHaveLength(1);
+    expect(result.filter((r) => r.status === "rejected")).toHaveLength(1);
+    expect(await BookingModel.countDocuments({ businessId: business._id })).toBe(2);
+    const occupancy = await BookingSlotReservationModel.findOne({
+      businessId: business._id,
+      staffMembershipId: membership._id,
+      occupancyDate: DATE,
+    }).lean();
+    expect(occupancy?.intervals.filter((interval) => interval.status === "CONFIRMED")).toHaveLength(
+      1,
+    );
+    // Returning bookings collect zero online under the existing financial policy.
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(chargeCountBefore);
+    expect((await read(4)).body.data.days[0].slots).toEqual([]);
+  });
+
+  it("F2D: real Customer detail is owned, bounded, private and performs no financial writes or provider calls", async () => {
+    const { business, owner, membership, service } = await setupBookableBusiness(8000);
+    const customer = await createCustomer("f2d-owned");
+    const foreign = await createCustomer("f2d-foreign");
+    await saveCard(customer._id);
+    const created = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (created.status !== "confirmed") throw new Error("Expected real persisted Booking");
+    await Promise.all([
+      PaymentAttemptModel.init(),
+      RefundOperationModel.init(),
+      ExternalRefundModel.init(),
+      PaymentDisputeModel.init(),
+    ]);
+    const token = await bearerFor(customer._id, "CUSTOMER");
+    const foreignToken = await bearerFor(foreign._id, "CUSTOMER");
+    const ownerToken = await bearerFor(owner._id, "BUSINESS_OWNER");
+    const app = express();
+    app.use(express.json());
+    app.use("/me", createCustomerBookingRoute());
+    app.use(createErrorHandler());
+    const url = `/me/bookings/${created.booking._id}`;
+    const providerMethods = [
+      "retrievePaymentIntent",
+      "createAndConfirmPaymentIntent",
+      "createRefund",
+      "retrieveRefund",
+      "listRefundsForPaymentIntent",
+      "retrieveDispute",
+    ] as const;
+    const providerSpies = providerMethods.map((method) =>
+      vi
+        .spyOn(StripePaymentGateway.prototype, method)
+        .mockRejectedValue(new Error("GET must not call provider")),
+    );
+    const snapshot = async () => {
+      const db = mongoose.connection.db!;
+      const names = [
+        BookingModel.collection.name,
+        PaymentAttemptModel.collection.name,
+        RefundOperationModel.collection.name,
+        ExternalRefundModel.collection.name,
+        PaymentDisputeModel.collection.name,
+        BookingFinancialTransactionModel.collection.name,
+        BookingSlotReservationModel.collection.name,
+      ];
+      return Promise.all(
+        names.map(async (name) => ({
+          name,
+          rows: await db.collection(name).find({}).sort({ _id: 1 }).toArray(),
+        })),
+      );
+    };
+    try {
+      const before = JSON.stringify(await snapshot());
+      const response = await request(app).get(url).set("Authorization", token);
+      expect(response.status).toBe(200);
+      expect(response.body.data.financialOutcome.payments.items[0]).toMatchObject({
+        providerStatus: "SUCCEEDED",
+        providerConfirmed: true,
+        accountingConfirmed: true,
+      });
+      expect(response.body.data.financialOutcome.refunds).toEqual({ items: [], hasMore: false });
+      expect(JSON.stringify(response.body.data.financialOutcome)).not.toMatch(
+        /clientSecret|providerPaymentIntentId|providerRefundId|lastError|idempotency|payout/,
+      );
+      expect((await request(app).get(url).set("Authorization", foreignToken)).status).toBe(404);
+      expect(
+        (
+          await request(app)
+            .get(`/me/bookings/${new Types.ObjectId()}`)
+            .set("Authorization", foreignToken)
+        ).status,
+      ).toBe(404);
+      expect((await request(app).get(url)).status).toBe(401);
+      expect((await request(app).get(url).set("Authorization", ownerToken)).status).toBe(403);
+      const list = await request(app).get("/me/bookings").set("Authorization", token);
+      expect(list.status).toBe(200);
+      expect(list.body.data.bookings[0]).not.toHaveProperty("financialOutcome");
+      expect(toBookingDetailDto(created.booking)).not.toHaveProperty("financialOutcome");
+      expect(JSON.stringify(await snapshot())).toBe(before);
+      providerSpies.forEach((spy) => {
+        expect(spy).not.toHaveBeenCalled();
+      });
+    } finally {
+      providerSpies.forEach((spy) => {
+        spy.mockRestore();
+      });
+    }
+  });
+
+  it("F2D: a real Bookly refund operation has distinct provider/accounting evidence and no owed-amount reconstruction", async () => {
+    const { business, membership, service } = await setupBookableBusiness(8000);
+    const customer = await createCustomer("f2d-refund");
+    await saveCard(customer._id);
+    const created = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (created.status !== "confirmed") throw new Error("Expected real Booking");
+    await Promise.all([
+      PaymentAttemptModel.init(),
+      RefundOperationModel.init(),
+      ExternalRefundModel.init(),
+      PaymentDisputeModel.init(),
+    ]);
+    const source = await BookingFinancialTransactionModel.findOne({
+      bookingId: created.booking._id,
+      status: "SUCCEEDED",
+      type: { $in: ["PLATFORM_FEE", "DEPOSIT"] },
+    }).orFail();
+    const refund = await paymentService.refund({
+      paymentIntentId: source.providerReference!,
+      amountCents: source.amountCents,
+      currency: "EUR",
+      idempotencyKey: `business-cancel-refund:${created.booking._id}`,
+      domainReason: "BUSINESS_CANCELLATION",
+      sourceFinancialTransactionId: source._id,
+      bookingId: created.booking._id,
+      businessId: business._id,
+      customerUserId: customer._id,
+      businessClientId: created.booking.customer.businessClientId,
+    });
+    const operation = await RefundOperationModel.findById(refund.refundOperationId).orFail();
+    const read = new CustomerFinancialOutcomeRead();
+    const observed = await read.forOwnedBooking(String(customer._id), created.booking);
+    expect(observed.financialOutcome?.refunds.items[0]).toMatchObject({
+      origin: "BOOKLY",
+      status: "SUCCEEDED",
+      providerConfirmed: true,
+      accountingConfirmed: false,
+    });
+    await ensureRefundAccounting(
+      operation,
+      financialTransactionService,
+      new RefundOperationRepository(),
+    );
+    const accounted = await read.forOwnedBooking(String(customer._id), created.booking);
+    expect(accounted.financialOutcome?.refunds.items[0]).toMatchObject({
+      providerConfirmed: true,
+      accountingConfirmed: true,
+      amountCents: source.amountCents,
+    });
+    expect(created.booking.cancellationOutcome).toBeUndefined(); // refund read did not manufacture cancellation/intent
   });
 
   it("returns 404 for a nonexistent Business (never leaks existence details)", async () => {

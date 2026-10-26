@@ -1,4 +1,14 @@
-import { model, Schema, type Types } from "mongoose";
+import { type ClientSession, model, Schema, Types } from "mongoose";
+import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
+import {
+  assertPaymentBatchBinding,
+  type PaymentBatchBinding,
+  paymentBatchBindingSchema,
+} from "./payment-batch-binding.js";
+import {
+  assertLifecyclePaymentBinding,
+  type LifecyclePaymentBinding,
+} from "./payment-lifecycle-binding.js";
 
 /**
  * Provider (Stripe PaymentIntent) lifecycle as last observed. Only SUCCEEDED and CANCELED are
@@ -55,6 +65,8 @@ export const paymentAttemptCompensationStatuses = [
 export type PaymentAttemptCompensationStatus = (typeof paymentAttemptCompensationStatuses)[number];
 
 export type PaymentAttemptDocument = {
+  packageLifecycleBinding?: LifecyclePaymentBinding | undefined;
+  packageBatchBinding?: PaymentBatchBinding | undefined;
   _id: Types.ObjectId;
   logicalIdempotencyKey: string;
   customerUserId: Types.ObjectId;
@@ -96,6 +108,8 @@ export type PaymentAttemptDocument = {
 
 const schema = new Schema<PaymentAttemptDocument>(
   {
+    packageLifecycleBinding: { type: Schema.Types.Mixed },
+    packageBatchBinding: { type: Schema.Types.Mixed },
     logicalIdempotencyKey: { type: String, required: true, trim: true, maxlength: 250 },
     customerUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     businessId: { type: Schema.Types.ObjectId, ref: "Business" },
@@ -144,6 +158,8 @@ const schema = new Schema<PaymentAttemptDocument>(
   { timestamps: true },
 );
 
+// Customer-owned detail: bounded, deterministic read; no financial transition.
+schema.index({ bookingId: 1, createdAt: -1, _id: -1 });
 schema.index({ logicalIdempotencyKey: 1 }, { unique: true });
 schema.index(
   { providerPaymentIntentId: 1 },
@@ -162,4 +178,233 @@ schema.index({ providerStatus: 1, createdAt: 1 });
 schema.index({ compensationStatus: 1, persistenceLeaseExpiresAt: 1, updatedAt: 1 });
 schema.index({ nextRecoveryAt: 1, updatedAt: 1 });
 
+const batchPaymentTransitions = new WeakSet<object>();
+const batchIdentityRoots = [
+  "logicalIdempotencyKey",
+  "customerUserId",
+  "businessId",
+  "businessClientId",
+  "bookingId",
+  "packageProgressId",
+  "purpose",
+  "productKind",
+  "financialContractVersion",
+  "relationshipClassification",
+  "currency",
+  "expectedAmountCents",
+  "providerCustomerId",
+];
+// Batch association is set only at validated creation; ordinary status writes cannot repoint it.
+schema.pre("validate", function () {
+  if (this.packageLifecycleBinding) assertLifecyclePaymentBinding(this);
+  if (this.packageBatchBinding) {
+    paymentBatchBindingSchema.parse(this.packageBatchBinding);
+    assertPaymentBatchBinding(this);
+  }
+});
+schema.pre("save", async function () {
+  if (!this.isNew && this.isModified("packageLifecycleBinding"))
+    throw Error("Lifecycle payment binding is immutable");
+  if (!this.isNew && !this.packageLifecycleBinding)
+    this.$where = { ...this.$where, packageLifecycleBinding: { $exists: false } };
+  if (this.packageLifecycleBinding) {
+    await verifyPackageBatchActivation();
+    assertLifecyclePaymentBinding(this);
+    if (
+      !this.isNew &&
+      (this.isModified("packageLifecycleBinding") ||
+        batchIdentityRoots.some((key) => this.isModified(key)))
+    )
+      throw Error("Lifecycle payment identity is immutable");
+  }
+  if (this.isNew && this.packageBatchBinding) await verifyPackageBatchActivation();
+  if (
+    !this.isNew &&
+    (this.isModified("packageBatchBinding") ||
+      (this.packageBatchBinding && batchIdentityRoots.some((key) => this.isModified(key))))
+  )
+    throw new Error("PaymentAttempt batch binding is immutable");
+  if (this.packageBatchBinding) assertPaymentBatchBinding(this);
+});
+schema.pre(["updateOne", "updateMany", "findOneAndUpdate"], function () {
+  if (batchPaymentTransitions.has(this)) {
+    batchPaymentTransitions.delete(this);
+    return;
+  }
+  const update = this.getUpdate();
+  const completesLifecycle = (value: object): boolean =>
+    Object.entries(value).some(
+      ([key, item]) =>
+        key === "succeededTransactionId" ||
+        (key === "persistenceStatus" && item === "COMPLETED") ||
+        (key.startsWith("$") && !!item && typeof item === "object" && completesLifecycle(item)),
+    );
+  if (update && !Array.isArray(update) && completesLifecycle(update))
+    this.and([{ packageLifecycleBinding: { $exists: false } }]);
+  const touches = (value: object): boolean =>
+    Object.entries(value).some(
+      ([key, item]) =>
+        key === "packageLifecycleBinding" ||
+        key.startsWith("packageLifecycleBinding.") ||
+        item === "packageLifecycleBinding" ||
+        (typeof item === "string" && item.startsWith("packageLifecycleBinding.")) ||
+        key === "packageBatchBinding" ||
+        key.startsWith("packageBatchBinding.") ||
+        (key.startsWith("$") && item && typeof item === "object" && touches(item)) ||
+        (typeof item === "string" &&
+          (item === "packageBatchBinding" || item.startsWith("packageBatchBinding."))),
+    );
+  if (Array.isArray(update) || (update && touches(update)))
+    throw new Error("PaymentAttempt batch binding is immutable");
+  const changesIdentity = (value: object): boolean =>
+    Object.entries(value).some(
+      ([key, item]) =>
+        batchIdentityRoots.some(
+          (root) =>
+            key === root ||
+            key.startsWith(`${root}.`) ||
+            item === root ||
+            (typeof item === "string" && item.startsWith(`${root}.`)),
+        ) ||
+        (key.startsWith("$") && item && typeof item === "object" && changesIdentity(item)),
+    );
+  if (update && changesIdentity(update))
+    this.and([
+      { packageBatchBinding: { $exists: false }, packageLifecycleBinding: { $exists: false } },
+    ]);
+});
+schema.pre(["replaceOne", "findOneAndReplace"], function () {
+  this.and([
+    { packageBatchBinding: { $exists: false }, packageLifecycleBinding: { $exists: false } },
+  ]);
+  const value = this.getUpdate();
+  if (value && ("packageBatchBinding" in value || "packageLifecycleBinding" in value))
+    throw new Error("Use validated batch attempt creation");
+});
+schema.pre("bulkWrite", () => {
+  throw new Error("Use single PaymentAttempt operations");
+});
+schema.pre("insertMany", () => {
+  throw new Error("Use validated PaymentAttempt creation");
+});
+schema.pre(["deleteOne", "deleteMany", "findOneAndDelete"], function () {
+  this.and([
+    { packageBatchBinding: { $exists: false }, packageLifecycleBinding: { $exists: false } },
+  ]);
+});
+schema.pre("deleteOne", { document: true, query: false }, async function () {
+  if (
+    this.packageBatchBinding ||
+    this.packageLifecycleBinding ||
+    (await PaymentAttemptModel.exists({
+      _id: this._id,
+      packageLifecycleBinding: { $exists: true },
+    }))
+  )
+    throw new Error("Bound payment evidence is immutable");
+});
+
 export const PaymentAttemptModel = model<PaymentAttemptDocument>("PaymentAttempt", schema);
+
+/** Fixed-shape batch-only completion. It cannot repoint immutable roots or complete outside
+ * the same transaction as the real origin ledger. Shipped activation still rejects first. */
+export async function completeBoundPaymentAttempt(
+  id: Types.ObjectId | string,
+  token: string,
+  ledgerId: Types.ObjectId | string,
+  session: ClientSession,
+) {
+  await verifyPackageBatchActivation();
+  if (!session.inTransaction()) throw new Error("Batch payment requires active parent transaction");
+  const row = await PaymentAttemptModel.findById(id).session(session).orFail();
+  const originalBinding = row.packageBatchBinding;
+  if (!originalBinding) throw new Error("Batch binding missing");
+  const binding = assertPaymentBatchBinding(row);
+  const { assertFreshPackageBatchMaterialization } = await import(
+    "../booking/booking-creation-claim.model.js"
+  );
+  assertFreshPackageBatchMaterialization(session, binding.claimId);
+  const { inspectBatchPaymentAuthority } = await import(
+    "../booking/package-batch-payment-recovery.js"
+  );
+  if (!(await inspectBatchPaymentAuthority(row, session)))
+    throw new Error("Canonical batch payment authority missing");
+  if (!row.providerPaymentIntentId || row.currency !== "EUR")
+    throw new Error("Batch provider result missing");
+  const { BookingFinancialTransactionModel } = await import(
+    "../booking-financial-transaction/booking-financial-transaction.model.js"
+  );
+  const ledger = await BookingFinancialTransactionModel.findOne({
+    _id: new Types.ObjectId(ledgerId),
+    bookingId: new Types.ObjectId(binding.originBookingId),
+    businessId: new Types.ObjectId(binding.businessId),
+    businessClientId: new Types.ObjectId(binding.businessClientId),
+    customerUserId: new Types.ObjectId(binding.customerUserId),
+    status: "SUCCEEDED",
+    direction: "DEBIT",
+    amountCents: row.expectedAmountCents,
+    currency: "EUR",
+    providerReference: row.providerPaymentIntentId,
+    idempotencyKey: `${row.logicalIdempotencyKey}:deposit`,
+  }).session(session);
+  if (!ledger || !["PLATFORM_FEE", "DEPOSIT"].includes(ledger.type))
+    throw new Error("Batch origin ledger mismatch");
+  const query = PaymentAttemptModel.updateOne(
+    {
+      _id: row._id,
+      packageBatchBinding: originalBinding,
+      providerStatus: "SUCCEEDED",
+      persistenceStatus: "PERSISTING",
+      persistenceLeaseToken: token,
+      compensationStatus: "NOT_REQUIRED",
+    },
+    {
+      $set: { persistenceStatus: "COMPLETED", succeededTransactionId: ledger._id },
+      $unset: {
+        persistenceLeaseToken: 1,
+        persistenceLeaseExpiresAt: 1,
+        reconciliationNeededAt: 1,
+        lastErrorCode: 1,
+        lastErrorMessage: 1,
+      },
+    },
+    { session },
+  );
+  batchPaymentTransitions.add(query);
+  return (await query).modifiedCount === 1;
+}
+
+/** Same-parent lifecycle completion; never accepts origin-only proof. */
+export async function completeLifecyclePaymentAttempt(
+  id: Types.ObjectId | string,
+  token: string,
+  session: ClientSession,
+) {
+  await verifyPackageBatchActivation();
+  if (!session.inTransaction()) throw Error("Lifecycle payment requires active parent");
+  const attempt = await PaymentAttemptModel.findById(id).session(session).orFail();
+  const { inspectLifecyclePaymentAuthority } = await import(
+    "../booking/package-lifecycle-payment-recovery.js"
+  );
+  const authority = await inspectLifecyclePaymentAuthority(attempt, session);
+  if (authority?.kind !== "COMPLETE") throw Error("Complete lifecycle proof required");
+  const money = authority.result.money;
+  if (!money || !attempt.packageLifecycleBinding) throw Error("Lifecycle money evidence required");
+  const query = PaymentAttemptModel.updateOne(
+    {
+      _id: attempt._id,
+      packageLifecycleBinding: attempt.packageLifecycleBinding,
+      providerStatus: "SUCCEEDED",
+      persistenceStatus: "PERSISTING",
+      persistenceLeaseToken: token,
+      compensationStatus: "NOT_REQUIRED",
+    },
+    {
+      $set: { persistenceStatus: "COMPLETED", succeededTransactionId: money.ledgerId },
+      $unset: { persistenceLeaseToken: 1, persistenceLeaseExpiresAt: 1, reconciliationNeededAt: 1 },
+    },
+    { session },
+  );
+  batchPaymentTransitions.add(query);
+  return (await query).modifiedCount === 1;
+}

@@ -26,8 +26,8 @@ import {
  *    for a skipped local time is a business/opening-hours-configuration edge case, not
  *    something the engine should hard-fail on.
  *  - Fall-back duplicate local time (a local wall-clock time that occurs twice, e.g. 01:30
- *    during a 02:00->01:00 repeat): luxon's default resolves to the FIRST occurrence (the
- *    pre-transition offset). Explicit and tested — never left to chance.
+ *    during a 02:00->01:00 repeat): explicitly select the FIRST occurrence (the
+ *    pre-transition offset). Luxon's initial offset guess is not this policy.
  */
 
 export type BusinessLocalDate = {
@@ -69,7 +69,13 @@ export const businessLocalToUtc = (timezone: string, dateStr: string, hhmm: stri
     throw new Error(`Cannot resolve ${dateStr} ${hhmm} in zone ${timezone}: ${dt.invalidReason}`);
   }
 
-  return dt.toUTC().toJSDate();
+  // fromObject starts with the zone's offset at Settings.now(), so its ambiguous
+  // choice can change with the season. Enumerate valid instants for this local
+  // time and apply our existing earlier-occurrence contract independently of now.
+  const earlier = dt
+    .getPossibleOffsets()
+    .reduce((first, candidate) => (candidate.toMillis() < first.toMillis() ? candidate : first));
+  return earlier.toUTC().toJSDate();
 };
 
 /** The inverse: an absolute UTC instant -> the business-local calendar date + weekday it falls

@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { type ClientSession, model, Schema, type SchemaDefinition } from "mongoose";
+import { packageGroupSeatMongooseSchema } from "../packages/package-service-entitlement.js";
 import { PackageProgressModel } from "./package-progress.model.js";
 import { packageProgressV2InputSchema } from "./package-progress-v2.rules.js";
 import type {
@@ -147,7 +148,8 @@ const item = new Schema(
       type: new Schema(
         {
           name: { type: String, required: true },
-          pricingMode: { type: String, enum: ["FIXED"], required: true },
+          pricingMode: { type: String, enum: ["FIXED", "PER_PERSON"], required: true },
+          group: { type: packageGroupSeatMongooseSchema, required: false },
           durationMin: { ...number, min: 1 },
         },
         { _id: false, strict: "throw" },

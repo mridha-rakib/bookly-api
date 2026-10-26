@@ -1,5 +1,34 @@
 # Package consent integration (P3-B1c)
 
+## Current shipped status — strict authority remains blocked
+
+The shipped `createPackageConsentRoute()` composition denies regardless of
+`PACKAGE_CONSENT_ENABLED`. The current Customer destination is read-only and
+does not render consent finalization. `verifyPackageBatchActivation()` always
+throws; no runtime flag, environment mode or application route grants activation.
+
+The retained `ACCEPTED_IMMUTABLE` engineering record proves an exact authenticated
+action/disclosure binding, **not** authoritative persistence before the original
+quote's strict deadline. Its `acceptedAt` is an application-clock sample before
+the later database update. Neither this sample nor a database-generated update
+timestamp is automatically the durable commit time. `$$NOW` may also precede a
+contended write's eventual completion. No grace, renewal, timezone conversion or
+request-time substitution is permitted.
+
+The approved activation deadline is strictly before original `issuedAt + 1,800,000ms`.
+The historical configurable quote TTL below does not authorize changing that contract.
+
+The local characterization tests in `package-consent-mongo-clock.integration.test.ts`,
+`package-consent-boundaries.integration.test.ts` and
+`package-b1c-authority-proof.integration.test.ts` distinguish these counterexamples
+from a proven consent mechanism. Production Purchase/Consent stays unavailable.
+
+## Historical engineering-only integration notes
+
+The following describes the earlier isolated explicit-factory test seam and UI,
+not current shipped behavior. Its flag table and editable UI instructions cannot
+enable the current application. Retained action evidence alone is not B1c authority.
+
 This surface records terms acceptance only. It cannot buy a Package, reserve a slot,
 create Bookings/PackageProgress, charge a card or enable monetary penalties.
 

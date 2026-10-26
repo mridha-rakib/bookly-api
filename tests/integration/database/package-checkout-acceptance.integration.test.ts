@@ -49,8 +49,36 @@ const actionFor = (p: PackageCheckoutPresentation): PackageCheckoutAffirmativeAc
 /** Real JWT/user/session and Mongo CAS; quotes, names and affirmative UI actions are synthetic.
  * This is not a test of real disclosure delivery, checkbox interaction or production consent.
  */
-const setup = async (mode: "FINITE" | "FOREVER" = "FOREVER", months: 6 | 12 = 6) => {
+const setup = async (
+  mode: "FINITE" | "FOREVER" = "FOREVER",
+  months: 6 | 12 = 6,
+  oneSeatGroup = false,
+) => {
   const f = checkoutFixture(mode);
+  if (oneSeatGroup) {
+    const service = f.services[0];
+    if (!service) throw new Error("Missing synthetic Service");
+    service.set({
+      pricingMode: "PER_PERSON",
+      fixedPricing: undefined,
+      perPersonPricing: {
+        ratePerPersonCents: 9000,
+        minPersons: 1,
+        maxPersons: 5,
+        durationMin: 60,
+        bufferAfterMin: 25,
+      },
+    });
+    const original = vi.mocked(f.dependencies.availability.getAvailability).getMockImplementation();
+    if (!original) throw new Error("Missing synthetic read port");
+    vi.mocked(f.dependencies.availability.getAvailability).mockImplementation(async (input) => {
+      const result = await original(input);
+      return {
+        ...result,
+        capacityMax: input.serviceId === String(service._id) ? 5 : result.capacityMax,
+      };
+    });
+  }
   if (mode === "FINITE") f.definition.set("contractTerms.validity.months", months);
   let now = CHECK_TIME;
   f.setTime(now);
@@ -126,6 +154,58 @@ const setup = async (mode: "FINITE" | "FOREVER" = "FOREVER", months: 6 | 12 = 6)
 };
 
 describe("inactive authenticated acceptance foundation with synthetic affirmative events", () => {
+  it("D1-G denies a different authenticated Customer or Business access to retained Group evidence", async () => {
+    const s = await setup("FOREVER", 6, true);
+    const other = await UserModel.create({
+      normalizedEmail: "group-foreign@example.com",
+      passwordHash: "synthetic",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const token = await issueTestAccessToken(s.tokens, { userId: other._id, role: "CUSTOMER" });
+    await expect(
+      s.service.present(`Bearer ${token}`, s.f.context.businessId, s.f.seed.idempotencyKey),
+    ).rejects.toThrow("Owned retained");
+    await expect(
+      s.service.present(s.authorization, new Types.ObjectId(), s.f.seed.idempotencyKey),
+    ).rejects.toThrow("Owned retained");
+    expect(
+      (await BookingCreationClaimModel.findOne().orFail()).packageCheckoutAcceptance,
+    ).toBeUndefined();
+  });
+  it("D1-G authenticates and retains one-seat Group acceptance without purchase authority", async () => {
+    const s = await setup("FOREVER", 6, true);
+    const p = await s.present();
+    expect(p.disclosure.content.renderedTermsSnapshot).toContain("one person to one seat");
+    const event = actionFor(p),
+      accepted = await s.accept(event);
+    expect((await s.accept(event)).evidence.acceptanceId).toEqual(accepted.evidence.acceptanceId);
+    const row = await BookingCreationClaimModel.findOne().orFail();
+    expect(row.packageCheckoutRetention?.quote.payload.appointments[0]?.group).toMatchObject({
+      partySize: 1,
+      credits: 1,
+      capacityMax: 5,
+    });
+    await expect(
+      BookingCreationClaimModel.updateOne(
+        { _id: row._id },
+        { $set: { "packageCheckoutRetention.quote.payload.appointments.0.group.partySize": 2 } },
+      ),
+    ).rejects.toThrow();
+    expect(row.financialContract).toBeUndefined();
+    for (const name of ["bookings", "packageprogresses", "paymentattempts"])
+      expect(await mongoose.connection.db?.collection(name).countDocuments()).toBe(0);
+  });
+  it("D1-G rejects changed original Group capacity before acceptance", async () => {
+    const s = await setup("FOREVER", 6, true);
+    const p = await s.present();
+    s.f.services[0]?.set("perPersonPricing.maxPersons", 6);
+    await expect(s.accept(actionFor(p))).rejects.toThrow();
+    expect(
+      (await BookingCreationClaimModel.findOne().orFail()).packageCheckoutAcceptance,
+    ).toBeUndefined();
+  });
   beforeAll(async () => {
     const database = await connectIsolatedDatabase();
     expect(database).toMatch(/^bookly_consent_v1_\d+_[a-f0-9]+$/);

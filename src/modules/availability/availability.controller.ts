@@ -34,6 +34,7 @@ export class AvailabilityController {
       fromDate: query.fromDate,
       toDate: query.toDate,
       partySize: query.partySize,
+      hours: query.hours,
       customerCity: query.customerCity,
     });
 

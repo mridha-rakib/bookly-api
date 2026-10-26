@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_AVAILABILITY_RANGE_DAYS } from "../availability/availability.types.js";
 
 import { businessCities } from "../business/business.types.js";
 import { clientPropertyTypes } from "../client/client.types.js";
@@ -122,6 +123,21 @@ export const voidPackageBodySchema = z
   .strict();
 
 export const rescheduleBookingBodySchema = z.object({ startAt: isoDateTimeSchema }).strict();
+
+export const rescheduleAvailabilityQuerySchema = z
+  .object({
+    fromDate: z.string().date(),
+    toDate: z.string().date(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.fromDate <= value.toDate &&
+      (Date.parse(value.toDate) - Date.parse(value.fromDate)) / 86_400_000 + 1 <=
+        MAX_AVAILABILITY_RANGE_DAYS,
+    { message: "Invalid availability date range" },
+  );
+export type RescheduleAvailabilityQuery = z.infer<typeof rescheduleAvailabilityQuerySchema>;
 
 export const cancelBookingBodySchema = z
   .object({ reason: z.string().trim().max(500).optional() })

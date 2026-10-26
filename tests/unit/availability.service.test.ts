@@ -1,10 +1,12 @@
 import { Types } from "mongoose";
 import { describe, expect, it, vi } from "vitest";
-
+import { businessLocalToUtc } from "../../src/common/time/business-clock.js";
+import { getAvailabilityQuerySchema } from "../../src/modules/availability/availability.schema.js";
 import { AvailabilityService } from "../../src/modules/availability/availability.service.js";
 import type { BookingSlotReservationDocument } from "../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import type { BusinessDocument } from "../../src/modules/business/business.model.js";
 import type { BusinessOpeningHoursDocument } from "../../src/modules/business-hours/business-hours.model.js";
+import { catalogAvailabilityQuerySchema } from "../../src/modules/catalog/catalog.schema.js";
 import type { ServiceDocument } from "../../src/modules/services/service.model.js";
 import type { StaffMembershipDocument } from "../../src/modules/staff/staff.model.js";
 import type { StaffScheduleDocument } from "../../src/modules/staff/staff-schedule.model.js";
@@ -1326,3 +1328,672 @@ describe("AvailabilityService — business/service/staff resolution", () => {
     expect(result.days[0]!.slots[0]!.eligibleStaffMembershipIds).toEqual([String(activeStaff._id)]);
   });
 });
+
+// BOOKING-F1B: exercise the existing public engine, not an alternate duration calculator.
+describe("AvailabilityService — requested hourly duration (F1B)", () => {
+  const DATE = "2030-08-20"; // Tuesday, Nicosia UTC+3
+  function fixture() {
+    const h = buildHarness();
+    const business = buildBusiness();
+    const staff = buildStaff(business._id);
+    const other = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id, other._id], {
+      pricingMode: "HOURLY",
+      fixedPricing: undefined,
+      hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 4, bufferAfterMin: 15 },
+    });
+    h.businessRepository.findById.mockResolvedValue(business);
+    h.serviceRepository.findById.mockResolvedValue(service);
+    h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff, other]);
+    h.staffRepository.findActiveById.mockResolvedValue(staff);
+    wireStandardOpenSchedule(h, business, staff);
+    const shifts = (end = "17:00", split = false) => [
+      buildSchedule(staff._id, business._id, [
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: end }] },
+      ]),
+      buildSchedule(other._id, business._id, [
+        {
+          dayOfWeek: "TUESDAY",
+          intervals: split
+            ? [
+                { startTime: "09:00", endTime: "12:00" },
+                { startTime: "13:00", endTime: "17:00" },
+              ]
+            : [{ startTime: "09:00", endTime: "17:00" }],
+        },
+      ]),
+    ];
+    h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue(shifts());
+    h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+      buildOpeningHours(business._id, [
+        { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]),
+    );
+    const input = {
+      businessId: String(business._id),
+      serviceId: String(service._id),
+      fromDate: DATE,
+      toDate: DATE,
+    };
+    const get = (hours?: number) => h.service.getAvailability({ ...input, hours });
+    return { h, business, staff, other, service, input, shifts, get };
+  }
+  it("omitted hours equals explicit minimum; four hours keeps the two-hour grid and includes buffer", async () => {
+    const f = fixture();
+    expect(await f.get()).toEqual(await f.get(2));
+    const result = await f.get(4);
+    expect(result.days[0]!.slots.map((s) => s.startAt)).toEqual([
+      `${DATE}T06:00:00.000Z`,
+      `${DATE}T08:00:00.000Z`,
+    ]);
+    expect(
+      result.days[0]!.slots.every(
+        (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === 255 * 60_000,
+      ),
+    ).toBe(true);
+    // 13:00 + 4h fits opening hours, but the required 15-minute buffer does not.
+    expect(result.days[0]!.slots.some((s) => s.startAt === `${DATE}T10:00:00.000Z`)).toBe(false);
+    f.service.hourlyPricing!.bufferAfterMin = 0;
+    expect((await f.get(4)).days[0]!.slots.some((s) => s.startAt === `${DATE}T10:00:00.000Z`)).toBe(
+      true,
+    );
+  });
+  it("accepts fractional hours with the same occupied interval as booking", async () => {
+    const result = await fixture().get(2.5);
+    expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+    expect(
+      result.days[0]!.slots.every(
+        (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === 165 * 60_000,
+      ),
+    ).toBe(true);
+  });
+  it.each([0, -1, 1.5, 4.5, 25, NaN, Infinity, -Infinity])(
+    "rejects invalid/out-of-range engine hours %s",
+    async (hours) => {
+      await expect(fixture().get(hours)).rejects.toMatchObject({
+        statusCode: 400,
+        message: "Duration is invalid for this service",
+      });
+    },
+  );
+  it.each(["FIXED", "PER_PERSON", "PACKAGE"])(
+    "rejects explicit hours for %s; omission preserves that mode",
+    async (mode) => {
+      const f = fixture();
+      f.service.isPackageDeal = mode === "PACKAGE";
+      f.service.pricingMode = mode === "PACKAGE" ? undefined : (mode as "FIXED" | "PER_PERSON");
+      f.service.fixedPricing = { priceCents: 1000, durationMin: 60 };
+      f.service.perPersonPricing = {
+        ratePerPersonCents: 1000,
+        minPersons: 1,
+        maxPersons: 4,
+        durationMin: 60,
+      };
+      f.service.packagePricing = { bundlePriceCents: 5000, sessionsInPackage: 5, durationMin: 60 };
+      await expect(f.get(2)).rejects.toMatchObject({ statusCode: 400 });
+      expect((await f.get()).days[0]!.slots.length).toBeGreaterThan(0);
+      if (mode === "PER_PERSON") {
+        expect((await f.h.service.getAvailability({ ...f.input, partySize: 4 })).capacityMax).toBe(
+          4,
+        );
+        await expect(
+          f.h.service.getAvailability({ ...f.input, partySize: 5 }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+      }
+    },
+  );
+  it("excludes staff whose break or shift boundary interrupts the full duration", async () => {
+    const f = fixture();
+    f.h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue(f.shifts("14:00", true));
+    const short = (await f.get(2)).days[0]!.slots;
+    expect(short[0]!.eligibleStaffMembershipIds).toEqual([
+      String(f.staff._id),
+      String(f.other._id),
+    ]);
+    const long = (await f.get(4)).days[0]!.slots;
+    expect(long).toHaveLength(1);
+    expect(long[0]!.eligibleStaffMembershipIds).toEqual([String(f.staff._id)]);
+    // The same start is not offered for explicitly selected split-shift staff either.
+    f.h.staffRepository.findActiveById.mockResolvedValue(f.other);
+    expect(
+      (
+        await f.h.service.getAvailability({
+          ...f.input,
+          hours: 4,
+          staffMembershipId: String(f.other._id),
+        })
+      ).days[0]!.slots,
+    ).toEqual([]);
+  });
+  it("two hours fits before an existing reservation, four hours overlaps and excludes that staff", async () => {
+    const f = fixture();
+    f.h.reservationRepository.findManyForStaffInDateRange.mockResolvedValue([
+      {
+        _id: new Types.ObjectId(),
+        businessId: f.business._id,
+        staffMembershipId: f.staff._id,
+        occupancyDate: DATE,
+        timezone: TIMEZONE,
+        intervals: [
+          {
+            reservationId: new Types.ObjectId(),
+            serviceId: new Types.ObjectId(),
+            startAt: new Date(`${DATE}T09:00:00Z`),
+            endAt: new Date(`${DATE}T10:00:00Z`),
+            capacityMax: 1,
+            capacityUsed: 1,
+            status: "CONFIRMED",
+            createdAt: new Date(),
+          },
+        ],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } satisfies BookingSlotReservationDocument,
+    ]);
+    expect((await f.get(2)).days[0]!.slots[0]!.eligibleStaffMembershipIds).toContain(
+      String(f.staff._id),
+    );
+    expect((await f.get(4)).days[0]!.slots[0]!.eligibleStaffMembershipIds).toEqual([
+      String(f.other._id),
+    ]);
+    f.h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([f.staff]);
+    expect((await f.get(4)).days[0]!.slots).toEqual([]);
+  });
+  it("time off removes staff for the requested duration", async () => {
+    const f = fixture();
+    f.h.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange.mockResolvedValue([
+      { membershipId: f.staff._id, startDate: DATE, endDate: DATE },
+    ]);
+    expect((await f.get(4)).days[0]!.slots[0]!.eligibleStaffMembershipIds).toEqual([
+      String(f.other._id),
+    ]);
+  });
+  it.each([2, 2.5, 4])(
+    "every returned %s-hour slot passes the unchanged final schedule guard",
+    async (hours) => {
+      const f = fixture();
+      for (const slot of (await f.get(hours)).days[0]!.slots) {
+        await expect(
+          f.h.service.assertSlotIsBookable({
+            business: f.business,
+            service: f.service,
+            staffMembership: f.staff,
+            startAt: new Date(slot.startAt),
+            endAt: new Date(slot.endAt),
+            partySize: 1,
+          }),
+        ).resolves.toEqual({ capacityMax: 1 });
+      }
+      await expect(
+        f.h.service.assertSlotIsBookable({
+          business: f.business,
+          service: f.service,
+          staffMembership: f.staff,
+          startAt: businessLocalToUtc(TIMEZONE, DATE, "15:00"),
+          endAt: businessLocalToUtc(TIMEZONE, DATE, "19:15"),
+          partySize: 1,
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    },
+  );
+  it.each(["2030-03-31", "2030-10-27"])(
+    "daytime DST %s preserves duration, grid and final scheduling parity",
+    async (date) => {
+      const f = fixture();
+      f.h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(f.business._id, [
+          { dayOfWeek: "SUNDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      );
+      f.h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(f.staff._id, f.business._id, [
+          { dayOfWeek: "SUNDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]),
+      ]);
+      for (const hours of [2, 4]) {
+        const result = await f.h.service.getAvailability({
+          ...f.input,
+          fromDate: date,
+          toDate: date,
+          hours,
+        });
+        expect(result.days[0]!.slots[0]!.startAt).toBe(
+          businessLocalToUtc(TIMEZONE, date, "09:00").toISOString(),
+        );
+        for (const slot of result.days[0]!.slots) {
+          expect(Date.parse(slot.endAt) - Date.parse(slot.startAt)).toBe(
+            (hours * 60 + 15) * 60_000,
+          );
+          await expect(
+            f.h.service.assertSlotIsBookable({
+              business: f.business,
+              service: f.service,
+              staffMembership: f.staff,
+              startAt: new Date(slot.startAt),
+              endAt: new Date(slot.endAt),
+              partySize: 1,
+            }),
+          ).resolves.toEqual({ capacityMax: 1 });
+        }
+      }
+    },
+  );
+  it.each(["2030-03-31", "2030-10-27"])(
+    "characterizes the existing local-minute grid across DST night %s",
+    async (date) => {
+      const f = fixture();
+      f.h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+        buildOpeningHours(f.business._id, [
+          { dayOfWeek: "SUNDAY", isOpen: true, slots: [{ startTime: "00:00", endTime: "06:00" }] },
+        ]),
+      );
+      f.h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+        buildSchedule(f.staff._id, f.business._id, [
+          { dayOfWeek: "SUNDAY", intervals: [{ startTime: "00:00", endTime: "10:00" }] },
+        ]),
+      ]);
+      const input = { ...f.input, fromDate: date, toDate: date };
+      expect(await f.h.service.getAvailability(input)).toEqual(
+        await f.h.service.getAvailability({ ...input, hours: 2 }),
+      );
+      for (const hours of [2, 4]) {
+        const result = await f.h.service.getAvailability({ ...input, hours });
+        expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+        for (const slot of result.days[0]!.slots) {
+          const endAt = new Date(slot.endAt);
+          const insideOpening = endAt <= businessLocalToUtc(TIMEZONE, date, "06:00");
+          const check = f.h.service.assertSlotIsBookable({
+            business: f.business,
+            service: f.service,
+            staffMembership: f.staff,
+            startAt: new Date(slot.startAt),
+            endAt,
+            partySize: 1,
+          });
+          if (insideOpening) await expect(check).resolves.toEqual({ capacityMax: 1 });
+          else await expect(check).rejects.toMatchObject({ statusCode: 409 });
+        }
+      }
+      // Existing AUTO candidate fit uses wall-clock minutes. On fall-back night, 02:00 +
+      // 4h15m ends at 05:15 in absolute time and passes final validation, but local-minute
+      // generation omits it (02:00 + 255 > 06:00). Record this conservative omission;
+      // changing the DST/grid policy is outside F1B.
+      if (date === "2030-10-27") {
+        const startAt = businessLocalToUtc(TIMEZONE, date, "02:00");
+        const endAt = new Date(startAt.getTime() + 255 * 60_000);
+        expect(
+          (await f.h.service.getAvailability({ ...input, hours: 4 })).days[0]!.slots.some(
+            (slot) => slot.startAt === startAt.toISOString(),
+          ),
+        ).toBe(false);
+        await expect(
+          f.h.service.assertSlotIsBookable({
+            business: f.business,
+            service: f.service,
+            staffMembership: f.staff,
+            startAt,
+            endAt,
+            partySize: 1,
+          }),
+        ).resolves.toEqual({ capacityMax: 1 });
+      }
+    },
+  );
+});
+
+describe.each([getAvailabilityQuerySchema, catalogAvailabilityQuerySchema])(
+  "F1B availability query contract",
+  (schema) => {
+    const dates = { fromDate: "2030-08-20", toDate: "2030-08-20" };
+    it("accepts omission and fractional hours, keeps strict fields", () => {
+      expect(schema.parse(dates).hours).toBeUndefined();
+      expect(schema.parse({ ...dates, hours: "2.5" }).hours).toBe(2.5);
+      expect(schema.safeParse({ ...dates, unknown: 1 }).success).toBe(false);
+    });
+    it.each(["abc", "NaN", "Infinity", "-Infinity", "", "0", "-1", "25"])(
+      "rejects malformed/domain hours %s",
+      (hours) => {
+        expect(schema.safeParse({ ...dates, hours }).success).toBe(false);
+      },
+    );
+  },
+);
+
+describe("F1C-A booking-owned engine adapter", () => {
+  const DATE = "2030-08-20";
+  function fixture(occupiedMinutes = 255) {
+    const h = buildHarness();
+    const business = buildBusiness();
+    const staff = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id], {
+      pricingMode: "HOURLY",
+      hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 3, bufferAfterMin: 0 },
+    });
+    h.businessRepository.findById.mockResolvedValue(business);
+    h.serviceRepository.findById.mockResolvedValue(service);
+    h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+    wireStandardOpenSchedule(h, business, staff);
+    h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+      buildOpeningHours(business._id, [
+        { dayOfWeek: "TUESDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]),
+    );
+    const line = {
+      service,
+      staffMembership: staff,
+      occupiedMilliseconds: occupiedMinutes * 60_000,
+      partySize: 1,
+      capacityMax: 1,
+    };
+    const validateCandidate = vi.fn().mockResolvedValue(true);
+    const input = {
+      business,
+      lines: [line],
+      fromDate: DATE,
+      toDate: DATE,
+      session: { inTransaction: () => true } as never,
+      validateCandidate,
+    };
+    const read = () => h.service.getBookingAvailability(input);
+    const reserve = (startTime: string, endTime: string, capacityMax = 1, capacityUsed = 1) => {
+      h.reservationRepository.findManyForStaffInDateRange.mockResolvedValue([
+        {
+          _id: new Types.ObjectId(),
+          businessId: business._id,
+          staffMembershipId: staff._id,
+          occupancyDate: DATE,
+          timezone: TIMEZONE,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          intervals: [
+            {
+              reservationId: new Types.ObjectId(),
+              serviceId: service._id,
+              startAt: businessLocalToUtc(TIMEZONE, DATE, startTime),
+              endAt: businessLocalToUtc(TIMEZONE, DATE, endTime),
+              capacityMax,
+              capacityUsed,
+              status: "CONFIRMED",
+              createdAt: new Date(),
+            },
+          ],
+        },
+      ]);
+    };
+    return { h, business, staff, service, line, input, read, reserve, validateCandidate };
+  }
+  it("preserves original four hours + 15 minutes after live buffer/bounds edits; generic F1B stays strict", async () => {
+    const f = fixture();
+    const result = await f.read();
+    expect(result.days[0]!.slots.map((s) => s.startAt)).toEqual([
+      `${DATE}T06:00:00.000Z`,
+      `${DATE}T08:00:00.000Z`,
+    ]);
+    expect(
+      result.days[0]!.slots.every(
+        (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === 255 * 60_000,
+      ),
+    ).toBe(true);
+    await expect(
+      f.h.service.getAvailability({
+        businessId: String(f.business._id),
+        serviceId: String(f.service._id),
+        fromDate: DATE,
+        toDate: DATE,
+        hours: 4,
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+  it.each([150, 165, 60])(
+    "preserves an original %s-minute interval without adding live timing again",
+    async (minutes) => {
+      const f = fixture(minutes);
+      f.service.hourlyPricing!.bufferAfterMin = 60;
+      const result = await f.read();
+      expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+      expect(
+        result.days[0]!.slots.every(
+          (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === minutes * 60_000,
+        ),
+      ).toBe(true);
+    },
+  );
+  it("keeps partial and exclusive exact self-overlap blocked, including original buffer", async () => {
+    const f = fixture(135);
+    f.reserve("09:00", "11:15");
+    const slots = (await f.read()).days[0]!.slots;
+    expect(slots.map((s) => s.startAt)).toEqual([`${DATE}T10:00:00.000Z`]); // 13:00 only
+    expect(slots[0]!.eligibleStaffMembershipIds).toEqual([String(f.staff._id)]);
+  });
+  it("uses full original group size and characterizes exact same-slot spare-capacity semantics", async () => {
+    const f = fixture(60);
+    f.service.pricingMode = "PER_PERSON";
+    f.service.perPersonPricing = {
+      ratePerPersonCents: 1000,
+      minPersons: 1,
+      maxPersons: 6,
+      durationMin: 60,
+    };
+    f.line.partySize = 4;
+    f.line.capacityMax = 6;
+    f.reserve("09:00", "10:00", 6, 3);
+    expect((await f.read()).days[0]!.slots.some((s) => s.startAt === `${DATE}T06:00:00.000Z`)).toBe(
+      false,
+    );
+    f.line.partySize = 2;
+    expect((await f.read()).days[0]!.slots.some((s) => s.startAt === `${DATE}T06:00:00.000Z`)).toBe(
+      true,
+    );
+    f.reserve("09:00", "10:00", 6, 6);
+    expect((await f.read()).days[0]!.slots.some((s) => s.startAt === `${DATE}T06:00:00.000Z`)).toBe(
+      false,
+    );
+  });
+  it("projects cumulative same-staff group joins across lines without mutating actual occupancy", async () => {
+    const f = fixture(60);
+    f.service.pricingMode = "PER_PERSON";
+    f.service.perPersonPricing = {
+      ratePerPersonCents: 1000,
+      minPersons: 1,
+      maxPersons: 5,
+      durationMin: 60,
+    };
+    f.line.partySize = 2;
+    f.line.capacityMax = 5;
+    f.input.lines = [f.line, { ...f.line }];
+    f.reserve("09:00", "10:00", 5, 2); // each party fits alone; both together do not.
+    expect((await f.read()).days[0]!.slots.some((s) => s.startAt === `${DATE}T06:00:00.000Z`)).toBe(
+      false,
+    );
+    const actual = await f.h.reservationRepository.findManyForStaffInDateRange();
+    expect(actual[0].intervals[0].capacityUsed).toBe(2);
+  });
+  it("all secondary lines must pass their own final validator, end and staff constraints", async () => {
+    const f = fixture(60);
+    const other = buildStaff(f.business._id);
+    const otherService = buildFixedService(f.business._id, [other._id]);
+    f.input.lines = [
+      f.line,
+      {
+        ...f.line,
+        service: otherService,
+        staffMembership: other,
+        occupiedMilliseconds: 180 * 60_000,
+      },
+    ];
+    wireStandardOpenSchedule(f.h, f.business, other);
+    const schedules = await f.h.staffScheduleRepository.findManyByMembershipIds();
+    f.h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+      buildSchedule(f.staff._id, f.business._id, [
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]),
+      ...schedules,
+    ]);
+    f.validateCandidate.mockImplementation(
+      async (index: number, startAt: Date) => index === 0 || startAt.getUTCHours() === 6,
+    );
+    const slots = (await f.read()).days[0]!.slots;
+    expect(slots).toHaveLength(1);
+    expect(Date.parse(slots[0]!.endAt) - Date.parse(slots[0]!.startAt)).toBe(180 * 60_000);
+  });
+  it("full interval cannot cross split-shift break or a staff day off", async () => {
+    const f = fixture();
+    f.h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+      buildSchedule(f.staff._id, f.business._id, [
+        {
+          dayOfWeek: "TUESDAY",
+          intervals: [
+            { startTime: "09:00", endTime: "12:00" },
+            { startTime: "13:00", endTime: "17:00" },
+          ],
+        },
+      ]),
+    ]);
+    expect((await f.read()).days[0]!.slots).toEqual([]);
+    wireStandardOpenSchedule(f.h, f.business, f.staff);
+    f.h.staffTimeOffRepository.findManyByMembershipIdsOverlappingRange.mockResolvedValue([
+      { membershipId: f.staff._id, startDate: DATE, endDate: DATE },
+    ]);
+    expect((await f.read()).days[0]!.slots).toEqual([]);
+  });
+  it("MANUAL candidate rules and validation remain in the existing paths", async () => {
+    const f = fixture(150);
+    f.service.scheduleMode = "MANUAL";
+    f.service.manualSchedule = [{ dayOfWeek: "TUESDAY", isOpen: true, times: ["10:30"] }];
+    const slots = (await f.read()).days[0]!.slots;
+    expect(slots.map((s) => s.startAt)).toEqual([`${DATE}T07:30:00.000Z`]);
+    expect(slots[0]!.source).toBe("MANUAL");
+    f.validateCandidate.mockResolvedValue(false);
+    expect((await f.read()).days[0]!.slots).toEqual([]);
+  });
+  it("rejects invalid ranges and missing transaction context", async () => {
+    const f = fixture();
+    await expect(
+      f.h.service.getBookingAvailability({ ...f.input, fromDate: "2030-08-21" }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    await expect(
+      f.h.service.getBookingAvailability({
+        ...f.input,
+        session: { inTransaction: () => false } as never,
+      }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+  });
+});
+
+it.each(["2030-03-31", "2030-10-27"])(
+  "F1C-A booked daytime DST %s keeps original milliseconds and unchanged final schedule checks",
+  async (date) => {
+    const h = buildHarness();
+    const business = buildBusiness();
+    const staff = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id]);
+    h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+      buildOpeningHours(business._id, [
+        { dayOfWeek: "SUNDAY", isOpen: true, slots: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]),
+    );
+    h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+      buildSchedule(staff._id, business._id, [
+        { dayOfWeek: "SUNDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+      ]),
+    ]);
+    const result = await h.service.getBookingAvailability({
+      business,
+      lines: [
+        {
+          service,
+          staffMembership: staff,
+          occupiedMilliseconds: 255 * 60_000,
+          partySize: 1,
+          capacityMax: 1,
+        },
+      ],
+      fromDate: date,
+      toDate: date,
+      session: { inTransaction: () => true } as never,
+      validateCandidate: async (_, startAt, endAt) => {
+        await h.service.assertSlotIsBookable({
+          business,
+          service,
+          staffMembership: staff,
+          startAt,
+          endAt,
+          partySize: 1,
+        });
+        return true;
+      },
+    });
+    expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+    expect(result.days[0]!.slots[0]!.startAt).toBe(
+      businessLocalToUtc(TIMEZONE, date, "09:00").toISOString(),
+    );
+    expect(
+      result.days[0]!.slots.every(
+        (slot) => Date.parse(slot.endAt) - Date.parse(slot.startAt) === 255 * 60_000,
+      ),
+    ).toBe(true);
+  },
+);
+
+it.each(["2030-03-31", "2030-10-27"])(
+  "F1C-A transition-night %s uses existing DST candidates and final UTC containment",
+  async (date) => {
+    const h = buildHarness();
+    const business = buildBusiness();
+    const staff = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id], {
+      pricingMode: "HOURLY",
+      hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 4 },
+    });
+    h.businessHoursRepository.findByBusinessId.mockResolvedValue(
+      buildOpeningHours(business._id, [
+        { dayOfWeek: "SUNDAY", isOpen: true, slots: [{ startTime: "00:00", endTime: "06:00" }] },
+      ]),
+    );
+    h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([
+      buildSchedule(staff._id, business._id, [
+        { dayOfWeek: "SUNDAY", intervals: [{ startTime: "00:00", endTime: "10:00" }] },
+      ]),
+    ]);
+    for (const minutes of [135, 255]) {
+      const result = await h.service.getBookingAvailability({
+        business,
+        lines: [
+          {
+            service,
+            staffMembership: staff,
+            occupiedMilliseconds: minutes * 60_000,
+            partySize: 1,
+            capacityMax: 1,
+          },
+        ],
+        fromDate: date,
+        toDate: date,
+        session: { inTransaction: () => true } as never,
+        validateCandidate: async (_, startAt, endAt) => {
+          try {
+            await h.service.assertSlotIsBookable({
+              business,
+              service,
+              staffMembership: staff,
+              startAt,
+              endAt,
+              partySize: 1,
+            });
+            return true;
+          } catch (error) {
+            expect(error).toMatchObject({ statusCode: 409 });
+            return false;
+          }
+        },
+      });
+      expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+      for (const slot of result.days[0]!.slots) {
+        expect(Date.parse(slot.endAt) - Date.parse(slot.startAt)).toBe(minutes * 60_000);
+        expect(Date.parse(slot.endAt)).toBeLessThanOrEqual(
+          businessLocalToUtc(TIMEZONE, date, "06:00").getTime(),
+        );
+      }
+    }
+  },
+);

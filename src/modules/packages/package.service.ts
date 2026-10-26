@@ -1,6 +1,4 @@
 import { Types } from "mongoose";
-import { z } from "zod";
-
 import { RequestValidationError } from "../../common/errors/validation-error.js";
 import { AuthError } from "../auth/auth.errors.js";
 import type { BusinessDocument } from "../business/business.model.js";
@@ -21,6 +19,7 @@ import {
   type UpdatePackageBody,
 } from "./package.schema.js";
 import type { EditablePackageStatus, PackageDependencyIssue } from "./package.types.js";
+import { resolvePackageServiceEntitlement } from "./package-service-entitlement.js";
 import {
   copyPackageDefinitionContractTerms,
   PACKAGE_DEFINITION_CONTRACT_VERSION,
@@ -28,15 +27,6 @@ import {
   PACKAGE_SESSION_PENALTY_POLICY,
 } from "./package-session-penalty-policy.js";
 
-const safePositive = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
-const fixedConfiguration = z.object({
-  priceCents: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-  durationMin: safePositive,
-  bookingIntervalMin: safePositive.optional(),
-  bufferAfterMin: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-  processingTimeMin: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-  discountPercent: z.number().min(0).max(100).optional(),
-});
 const invalidEvenInDraft = new Set([
   "PACKAGE_SERVICE_INVALID",
   "PACKAGE_SERVICE_NOT_FIXED",
@@ -54,6 +44,56 @@ export class PackageService {
     private readonly staff: StaffRepository,
     private readonly travel: BusinessTravelSettingsRepository,
   ) {}
+
+  /** Read-only customer catalogue. Reuse publication dependencies; never grant checkout. */
+  public async customerCatalog(businessId: string, packageId?: string) {
+    const business = await this.businesses.findById(businessId);
+    if (!business || !["APPROVED", "WARNING"].includes(business.status))
+      throw new PackageError("PACKAGE_NOT_FOUND", 404);
+    const definitions = await this.packages.list(business._id, { status: "ACTIVE" });
+    const issues = await this.dependencies(business, definitions);
+    const services = await this.services.findManyByIdsForBusiness(business._id, [
+      ...new Set(definitions.flatMap((d) => d.items.map((i) => String(i.serviceId)))),
+    ]);
+    const packages = definitions.flatMap((definition, index) => {
+      const dto = toPackageDefinitionDto(definition, issues[index] ?? []);
+      if (
+        !dto.newContractReady ||
+        definition.status !== "ACTIVE" ||
+        (packageId && String(definition._id) !== packageId)
+      )
+        return [];
+      return [
+        {
+          id: dto.id,
+          businessId: dto.businessId,
+          name: dto.name,
+          description: dto.description,
+          currency: "EUR" as const,
+          bundlePriceCents: dto.bundlePriceCents,
+          validity:
+            definition.contractTerms?.version === 2
+              ? definition.contractTerms.validity
+              : { mode: "FINITE" as const, months: definition.contractTerms?.validityMonths },
+          fulfilmentMode: normalizeBusinessVisitType(business.visitType),
+          checkoutAvailable: false as const,
+          items: definition.items.map((item) => {
+            const service = services.find((s) => s._id.equals(item.serviceId));
+            return {
+              itemId: String(item.itemId),
+              serviceId: String(item.serviceId),
+              name: service?.name,
+              quantity: item.includedSessions,
+              pricingMode: service?.pricingMode,
+              group: service ? resolvePackageServiceEntitlement(service)?.group : undefined,
+            };
+          }),
+        },
+      ];
+    });
+    if (packageId && packages.length === 0) throw new PackageError("PACKAGE_NOT_FOUND", 404);
+    return { packages };
+  }
 
   public async list(actor: string, businessId: string, filter: PackageListFilter) {
     const business = await this.requireBusiness(actor, businessId);
@@ -329,11 +369,11 @@ export class PackageService {
           add("PACKAGE_SERVICE_INVALID");
           continue;
         }
-        if (service.isPackageDeal || service.pricingMode !== "FIXED") {
+        if (service.isPackageDeal || !["FIXED", "PER_PERSON"].includes(service.pricingMode ?? "")) {
           add("PACKAGE_SERVICE_NOT_FIXED");
           continue;
         }
-        if (!fixedConfiguration.safeParse(service.fixedPricing).success) {
+        if (!resolvePackageServiceEntitlement(service)) {
           add("PACKAGE_FIXED_CONFIG_INVALID");
           continue;
         }

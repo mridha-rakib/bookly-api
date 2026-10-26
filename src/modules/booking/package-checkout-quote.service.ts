@@ -12,6 +12,7 @@ import type { ClientRepository } from "../client/client.repository.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageRepository } from "../packages/package.repository.js";
 import { calculatePackagePricing } from "../packages/package-pricing.js";
+import { resolvePackageServiceEntitlement } from "../packages/package-service-entitlement.js";
 import {
   calculatePackageLifetimeCaptureCap,
   copyPackageDefinitionContractTerms,
@@ -174,13 +175,13 @@ export class PackageCheckoutQuotePreparer {
             ["STAFF", "SUPERVISOR"].includes(provider.role) &&
             service?.assignedStaffMembershipIds.some((id) => id.equals(provider._id)),
         );
+        const entitlement = service && resolvePackageServiceEntitlement(service);
         if (
           !service ||
           !planned ||
           service.status !== "ACTIVE" ||
           service.isPackageDeal ||
-          service.pricingMode !== "FIXED" ||
-          !service.fixedPricing ||
+          !entitlement ||
           !eligible.length ||
           row.referenceUnitPriceCents === undefined ||
           row.penaltyBasisCents === undefined
@@ -197,7 +198,8 @@ export class PackageCheckoutQuotePreparer {
           penaltyBasisCents: row.penaltyBasisCents,
           provenance: "ACCEPTED_DEFINITION_ITEM" as const,
           serviceName: service.name,
-          baseDurationMin: service.fixedPricing.durationMin,
+          baseDurationMin: entitlement.durationMin,
+          ...(entitlement.group ? { group: entitlement.group } : {}),
           referenceUnitPriceCents: row.referenceUnitPriceCents,
           serviceUpdatedAt: service.updatedAt,
           eligibleProviderIds: eligible
@@ -271,12 +273,14 @@ export class PackageCheckoutQuotePreparer {
         staffCache.set(staffKey, resolved);
       }
       const { service, staffMembership } = resolved;
+      const entitlement = resolvePackageServiceEntitlement(service);
       if (
         !service._id.equals(item.serviceId) ||
         !service.businessId.equals(business._id) ||
         !staffMembership._id.equals(selection.staffMembershipId) ||
         !staffMembership.businessId.equals(business._id) ||
-        !service.fixedPricing
+        !entitlement ||
+        JSON.stringify(entitlement.group) !== JSON.stringify(item.group)
       )
         throw new PackageCheckoutConflictError("Resolved staff/service mismatch");
       const addonKey = `${item.serviceId}:${selection.addonIds.map(String).sort().join(",")}`;
@@ -297,12 +301,12 @@ export class PackageCheckoutQuotePreparer {
       const timing = {
         version: 1 as const,
         baseDurationMin: item.baseDurationMin,
-        processingTimeMin: service.fixedPricing.processingTimeMin ?? 0,
-        bufferAfterMin: service.fixedPricing.bufferAfterMin ?? 0,
+        processingTimeMin: entitlement.processingTimeMin ?? 0,
+        bufferAfterMin: entitlement.bufferAfterMin ?? 0,
         occupiedDurationMin:
           item.baseDurationMin +
-          (service.fixedPricing.processingTimeMin ?? 0) +
-          (service.fixedPricing.bufferAfterMin ?? 0),
+          (entitlement.processingTimeMin ?? 0) +
+          (entitlement.bufferAfterMin ?? 0),
       };
       const endAt = new Date(selection.startAt.getTime() + timing.occupiedDurationMin * 60000);
       const coordinate =
@@ -364,7 +368,7 @@ export class PackageCheckoutQuotePreparer {
         available.businessId !== String(business._id) ||
         available.serviceId !== String(item.serviceId) ||
         available.timezone !== business.timezone ||
-        available.capacityMax !== 1
+        available.capacityMax !== (item.group?.capacityMax ?? 1)
       )
         throw new PackageCheckoutConflictError("Availability context mismatch");
       const slot = available.days
@@ -377,6 +381,7 @@ export class PackageCheckoutQuotePreparer {
         );
       if (!slot) throw new PackageCheckoutConflictError("Selected slot no longer available");
       appointments.push({
+        ...(item.group ? { group: item.group } : {}),
         selectionId: selection.selectionId,
         bookingId: planned.bookingId,
         packageItemId: item.packageItemId,
@@ -426,7 +431,23 @@ export class PackageCheckoutQuotePreparer {
       businessTimezone: business.timezone,
       source: "BOOKLY_MANAGED",
       state: "INTERNAL_UNRETAINED_NOT_ACCEPTED",
-      items,
+      items: items.map((item) => {
+        if (mode !== "TRAVEL_TO_CUSTOMER") return item;
+        const service = services.find((s) => s._id.equals(item.serviceId));
+        if (!service) throw new PackageCheckoutConflictError("Missing travel Service");
+        return {
+          ...item,
+          travelEntitlement: {
+            version: 1,
+            mode,
+            source: "ACTIVE_SERVICE_CITY_INTERSECTION",
+            cities: (travelSettings?.cities ?? [])
+              .filter((c) => c.active && service.servedCities.includes(c.city))
+              .map(({ city, feeCents }) => ({ city, feeCents }))
+              .sort((a, b) => a.city.localeCompare(b.city)),
+          },
+        };
+      }),
       appointments,
       originBookingId,
       validity,

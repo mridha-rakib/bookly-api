@@ -1,6 +1,6 @@
 import mongoose, { Types } from "mongoose";
 import type Stripe from "stripe";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
@@ -18,14 +18,18 @@ import { BookingLifecycleService } from "../../../src/modules/booking/booking-li
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BookingSlotReservationClaimModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation-claim.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { BusinessAccessRepository } from "../../../src/modules/business/business-access.repository.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
+import { BusinessTravelSettingsService } from "../../../src/modules/business-travel-settings/business-travel-settings.service.js";
 import {
   type BusinessClientDocument,
   BusinessClientModel,
@@ -96,6 +100,8 @@ describe("P1 — universal customer↔business financial relationship + Financia
   let serviceRepository: ServiceRepository;
   let staffRepository: StaffRepository;
   let staffScheduleRepository: StaffScheduleRepository;
+  let availabilityService: AvailabilityService;
+  let reservationService: BookingSlotReservationService;
   let businessHoursService: BusinessHoursService;
   let clientRepository: ClientRepository;
   let bookingRepository: BookingRepository;
@@ -118,7 +124,25 @@ describe("P1 — universal customer↔business financial relationship + Financia
   let recoveryService: MoneyRecoveryService;
 
   beforeAll(async () => {
-    await connectIsolatedDatabase();
+    const database = await connectIsolatedDatabase();
+    expect(mongoose.connection.host).toBe("127.0.0.1");
+    expect(database).toMatch(new RegExp(`^bookly_auth_${process.pid}_[a-f0-9]{32}$`));
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await mongoose.connection.db
+          ?.collection("a1_transaction_preflight")
+          .insertOne({ verified: true }, { session });
+      });
+      expect(
+        await mongoose.connection.db
+          ?.collection("a1_transaction_preflight")
+          .findOne({ verified: true }),
+      ).toBeTruthy();
+      process.stdout.write(`A1 owned transaction preflight PASS: ${database}\n`);
+    } finally {
+      await session.endSession();
+    }
   }, 120_000);
 
   beforeEach(async () => {
@@ -138,7 +162,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
     businessTravelSettingsRepository = new BusinessTravelSettingsRepository();
     packageProgressRepository = new PackageProgressRepository();
     const reservationRepository = new BookingSlotReservationRepository();
-    const reservationService = new BookingSlotReservationService(reservationRepository);
+    reservationService = new BookingSlotReservationService(reservationRepository);
     const cancellationPolicyRepository = new BusinessCancellationPolicyRepository();
 
     paymentGateway = new FakePaymentGateway();
@@ -165,7 +189,7 @@ describe("P1 — universal customer↔business financial relationship + Financia
       clientRepository,
     );
 
-    const availabilityService = new AvailabilityService(
+    availabilityService = new AvailabilityService(
       businessRepository,
       serviceRepository,
       staffRepository,
@@ -300,6 +324,11 @@ describe("P1 — universal customer↔business financial relationship + Financia
       category: "Wellness & Beauty",
       subcategories: ["Massage"],
     } as Parameters<typeof businessRepository.create>[0]);
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     const staffUser = await userRepository.create({
       normalizedEmail: `staff-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: "hash",
@@ -4637,5 +4666,792 @@ describe("P1 — universal customer↔business financial relationship + Financia
         (await BookingModel.findById(row.booking._id))?.cancellationOutcome?.settlementStatus,
       ).toBe("SUCCEEDED");
     });
+  });
+  describe("A1 Customer replay ownership", () => {
+    afterEach(() => vi.restoreAllMocks());
+    const denied = { statusCode: 409, details: [{ code: "BOOKING_IDEMPOTENCY_CONFLICT" }] };
+    const databaseState = async () => {
+      const db = mongoose.connection.db;
+      if (!db || mongoose.connection.host !== "127.0.0.1")
+        throw new Error("Owned database required");
+      const state: Record<string, unknown> = {};
+      for (const collection of (await db.collections()).sort((a, b) =>
+        a.collectionName.localeCompare(b.collectionName),
+      ))
+        state[collection.collectionName] = await collection.find({}).sort({ _id: 1 }).toArray();
+      return JSON.stringify({
+        state,
+        provider: paymentGateway.paymentIntentInputs,
+        refunds: paymentGateway.refundInputs,
+        tax: taxGateway.calls,
+      });
+    };
+    const setupReplay = async (kind: "normal" | "purchase" | "redemption") => {
+      const f = await setupFixture({ fixedPriceCents: 0, bundlePriceCents: 0 });
+      const { customer } = await createLinkedCustomer(f, "a1-owner");
+      let progressId: Types.ObjectId | undefined;
+      const input = kind === "normal" ? normalInput(f) : packageInput(f);
+      if (kind === "redemption") {
+        const purchase = confirmed(await finalizePackage(f, customer._id, packageInput(f)));
+        progressId = (
+          await PackageProgressModel.findOne({ originBookingId: purchase._id }).orFail()
+        )._id;
+      }
+      const redemption = {
+        staffMembershipId: String(f.staffId),
+        startAt: startAtFor("10:00", DATE_2),
+        idempotencyKey: input.idempotencyKey,
+      };
+      const call = (
+        actor = customer._id,
+        business = f.business._id,
+        otherKey = input.idempotencyKey,
+        selectedProgress = progressId,
+      ) =>
+        kind === "normal"
+          ? creationService.finalizeCustomerBooking(String(actor), String(business), {
+              ...input,
+              idempotencyKey: otherKey,
+            })
+          : kind === "purchase"
+            ? creationService.finalizePackagePurchase(String(actor), String(business), {
+                ...input,
+                idempotencyKey: otherKey,
+              })
+            : creationService.redeemPackageSession(
+                String(actor),
+                String(business),
+                String(selectedProgress),
+                { ...redemption, idempotencyKey: otherKey },
+              );
+      const booking = confirmed(await call());
+      return { f, customer, booking, input, call, progressId };
+    };
+    const prepareA2 = async (kind: "normal" | "manual" | "purchase" | "redemption" | "paid") => {
+      const f = await setupFixture({
+        fixedPriceCents: kind === "paid" ? 10000 : 0,
+        bundlePriceCents: 0,
+      });
+      const { customer, client } = await createLinkedCustomer(f, "a2-owner");
+      const input = kind === "purchase" ? packageInput(f) : normalInput(f);
+      let progressId: Types.ObjectId | undefined;
+      if (kind === "redemption") {
+        const purchase = confirmed(await finalizePackage(f, customer._id, packageInput(f)));
+        progressId = (
+          await PackageProgressModel.findOne({ originBookingId: purchase._id }).orFail()
+        )._id;
+      }
+      const run = async () =>
+        kind === "manual"
+          ? creationService.createManualBooking(
+              String(f.owner._id),
+              "BUSINESS_OWNER",
+              String(f.business._id),
+              {
+                ...input,
+                businessClientId: String(client._id),
+              },
+            )
+          : confirmed(
+              await (kind === "purchase"
+                ? finalizePackage(f, customer._id, input)
+                : kind === "redemption"
+                  ? creationService.redeemPackageSession(
+                      String(customer._id),
+                      String(f.business._id),
+                      String(progressId),
+                      {
+                        staffMembershipId: String(f.staffId),
+                        startAt: startAtFor("10:00", DATE_2),
+                        idempotencyKey: input.idempotencyKey,
+                      },
+                    )
+                  : finalizeNormal(f, customer._id, input)),
+            );
+      return { f, customer, client, input, run, progressId };
+    };
+
+    const c1Signal = () => {
+      let resolve = () => {};
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    it.each(["normal", "purchase", "redemption", "paid"] as const)(
+      "C1 %s final admission rejects a shift edit after preview and preserves money authorities",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        const bookingsBefore = await BookingModel.countDocuments();
+        const reservationsBefore = await BookingSlotReservationClaimModel.countDocuments();
+        const reached = c1Signal(),
+          proceed = c1Signal();
+        const original = availabilityService.assertSlotIsBookable.bind(availabilityService);
+        vi.spyOn(availabilityService, "assertSlotIsBookable").mockImplementation(
+          async (input, session) => {
+            const result = await original(input, session);
+            if (!session) {
+              reached.resolve();
+              await proceed.promise;
+            }
+            return result;
+          },
+        );
+        const pending = f.run().then(
+          (value) => ({ value, error: undefined }),
+          (error) => ({ value: undefined, error }),
+        );
+        try {
+          await reached.promise;
+          await staffScheduleRepository.replace(f.f.staffId, f.f.business._id, []);
+        } finally {
+          proceed.resolve();
+        }
+        expect((await pending).error).toMatchObject({ statusCode: 409 });
+        expect(await BookingModel.countDocuments()).toBe(bookingsBefore);
+        expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(reservationsBefore);
+        if (kind === "paid") {
+          expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+          expect(paymentGateway.refundInputs).toHaveLength(1);
+        } else expect(paymentGateway.refundInputs).toHaveLength(0);
+      },
+    );
+    it("C1 Customer admission wins before a prospective shift removal and replay remains read-only", async () => {
+      const f = await prepareA2("normal");
+      const reached = c1Signal(),
+        proceed = c1Signal();
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+        async (input, session) => {
+          reached.resolve();
+          await proceed.promise;
+          return original(input, session);
+        },
+      );
+      const pending = f.run();
+      await reached.promise;
+      const mutation = staffScheduleRepository.replace(f.f.staffId, f.f.business._id, []);
+      proceed.resolve();
+      const booking = await pending;
+      await mutation;
+      const before = await databaseState();
+      expect((await f.run())._id).toEqual(booking._id);
+      expect(await databaseState()).toBe(before);
+    });
+    it("C1 ordinary travel admission rechecks active city after preview", async () => {
+      const f = await setupFixture({ fixedPriceCents: 0, travel: { feeCents: 0 } });
+      const { customer } = await createLinkedCustomer(f, "c1-travel");
+      const reached = c1Signal(),
+        proceed = c1Signal();
+      const original = claimRepository.claim.bind(claimRepository);
+      vi.spyOn(claimRepository, "claim").mockImplementationOnce(async (input) => {
+        const result = await original(input);
+        reached.resolve();
+        await proceed.promise;
+        return result;
+      });
+      const pending = finalizeNormal(
+        f,
+        customer._id,
+        normalInput(f, "10:00", { travel: true }),
+      ).then(
+        (value) => ({ value, error: undefined }),
+        (error) => ({ value: undefined, error }),
+      );
+      try {
+        await reached.promise;
+        await new BusinessTravelSettingsService(
+          businessTravelSettingsRepository,
+          businessRepository,
+          new BusinessAccessRepository(),
+        ).updateBusinessTravelSettings(String(f.owner._id), String(f.business._id), [
+          { city: "Larnaca", active: false, feeCents: 0 },
+        ]);
+      } finally {
+        proceed.resolve();
+      }
+      expect((await pending).error).toMatchObject({ statusCode: 409 });
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+    });
+
+    it("C1 ordinary travel admission commits before a prospective city deactivation", async () => {
+      const f = await setupFixture({ fixedPriceCents: 0, travel: { feeCents: 0 } });
+      const { customer } = await createLinkedCustomer(f, "c1-travel-first");
+      const input = normalInput(f, "10:00", { travel: true });
+      const reached = c1Signal(),
+        proceed = c1Signal();
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+        async (request, session) => {
+          reached.resolve();
+          await proceed.promise;
+          return original(request, session);
+        },
+      );
+      const pending = finalizeNormal(f, customer._id, input);
+      await reached.promise;
+      const mutation = new BusinessTravelSettingsService(
+        businessTravelSettingsRepository,
+        businessRepository,
+        new BusinessAccessRepository(),
+      ).updateBusinessTravelSettings(String(f.owner._id), String(f.business._id), [
+        { city: "Larnaca", active: false, feeCents: 0 },
+      ]);
+      proceed.resolve();
+      const booking = confirmed(await pending);
+      await mutation;
+      const before = await databaseState();
+      expect(confirmed(await finalizeNormal(f, customer._id, input))._id).toEqual(booking._id);
+      expect(await databaseState()).toBe(before);
+      expect(
+        await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "APPLIED" }),
+      ).toBe(1);
+    });
+    const injectA2Outcome = (mode: "committed" | "unresolved") => {
+      const originalStart = mongoose.startSession.bind(mongoose);
+      vi.spyOn(mongoose, "startSession").mockImplementation(async (...args) => {
+        const session = await originalStart(...args);
+        const originalTransaction = session.withTransaction.bind(session);
+        vi.spyOn(session, "withTransaction").mockImplementation(async (callback, options) => {
+          await originalTransaction(async (active) => {
+            await callback(active);
+            if (mode === "unresolved") await active.abortTransaction();
+          }, options);
+          // Public transaction-return boundary injection, NOT a wire acknowledgement fault.
+          if (mode === "committed") expect(await BookingModel.countDocuments()).toBeGreaterThan(0);
+          const error = new mongoose.mongo.MongoServerError({
+            message: "A2 injected unknown transaction result",
+          });
+          error.addErrorLabel("UnknownTransactionCommitResult");
+          throw error;
+        });
+        return session;
+      });
+    };
+    it.each(["normal", "manual", "purchase", "redemption", "paid"] as const)(
+      "A2 committed %s survives injected lost transaction return and replays original",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        injectA2Outcome("committed");
+        const booking = await f.run().catch(async (error) => {
+          expect(await BookingModel.countDocuments()).toBeGreaterThan(0);
+          expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).not.toBeNull();
+          throw error;
+        });
+        const claim = await claimRepository.findByIdempotencyKey(f.input.idempotencyKey);
+        expect(String(claim?.bookingId)).toBe(String(booking._id));
+        const before = await databaseState();
+        expect(String((await f.run())._id)).toBe(String(booking._id));
+        expect(await databaseState()).toBe(before);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+      },
+    );
+    it.each(["normal", "manual", "purchase", "redemption", "paid"] as const)(
+      "A2 unresolved %s preserves claim and bounded retries without replacement or refund",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        injectA2Outcome("unresolved");
+        await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+        const claim = await claimRepository.findByIdempotencyKey(f.input.idempotencyKey);
+        expect(claim).not.toBeNull();
+        expect(await BookingModel.findById(claim?.bookingId)).toBeNull();
+        const before = await databaseState();
+        await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+        await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+        expect(await databaseState()).toBe(before);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+      },
+    );
+    it.each(["absent", "read failure"] as const)(
+      "A2 delayed winner resolution after %s retains the original operation",
+      async (fault) => {
+        const f = await prepareA2("normal");
+        injectA2Outcome("committed");
+        const read = vi.spyOn(bookingRepository, "findById");
+        if (fault === "absent") read.mockResolvedValueOnce(null);
+        else read.mockRejectedValueOnce(new Error("A2 temporary result-read failure"));
+        await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+        const claim = await claimRepository.findByIdempotencyKey(f.input.idempotencyKey);
+        expect(claim).not.toBeNull();
+        expect(await BookingModel.findById(claim?.bookingId)).not.toBeNull();
+        const before = await databaseState();
+        expect(String((await f.run())._id)).toBe(String(claim?.bookingId));
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it.each(["normal", "manual", "purchase", "redemption"] as const)(
+      "A2 definite callback abort for %s rolls back and permits an authorized retry",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        const count = await BookingModel.countDocuments();
+        const progress = await PackageProgressModel.find({}).lean();
+        vi.spyOn(bookingRepository, "create").mockRejectedValueOnce(new Error("A2 before commit"));
+        await expect(f.run()).rejects.toThrow("A2 before commit");
+        expect(await BookingModel.countDocuments()).toBe(count);
+        expect(await PackageProgressModel.find({}).lean()).toEqual(progress);
+        expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).toBeNull();
+        const result = await f.run();
+        expect(
+          String((await claimRepository.findByIdempotencyKey(f.input.idempotencyKey))?.bookingId),
+        ).toBe(String(result._id));
+      },
+    );
+    it.each(["normal", "manual", "purchase", "redemption"] as const)(
+      "A2 session-start failure for %s permits retry without poisoning the claim",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        vi.spyOn(mongoose, "startSession").mockRejectedValueOnce(
+          new Error("A2 session unavailable"),
+        );
+        await expect(f.run()).rejects.toThrow("A2 session unavailable");
+        expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).toBeNull();
+        await f.run();
+      },
+    );
+    it.each(["normal", "paid"] as const)(
+      "A2 postcommit notification failure for %s never compensates or releases",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        const port = creationService as unknown as {
+          dispatchBookingCreatedNotifications: () => Promise<void>;
+        };
+        vi.spyOn(port, "dispatchBookingCreatedNotifications").mockRejectedValue(
+          new Error("A2 notification unavailable"),
+        );
+        const booking = await f.run();
+        expect(
+          String((await claimRepository.findByIdempotencyKey(f.input.idempotencyKey))?.bookingId),
+        ).toBe(String(booking._id));
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        expect(String((await f.run())._id)).toBe(String(booking._id));
+      },
+    );
+    it("A2 driver callback retry reuses pinned identity and dispatches outside the callback", async () => {
+      const f = await prepareA2("paid");
+      const error = new mongoose.mongo.MongoServerError({
+        message: "A2 synthetic transient callback error",
+      });
+      error.addErrorLabel("TransientTransactionError");
+      const original = bookingRepository.create.bind(bookingRepository);
+      const create = vi
+        .spyOn(bookingRepository, "create")
+        .mockRejectedValueOnce(error)
+        .mockImplementation(original);
+      const result = await f.run();
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(String(create.mock.calls[0]?.[0]._id)).toBe(String(result._id));
+      expect(String(create.mock.calls[1]?.[0]._id)).toBe(String(result._id));
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(await BookingModel.countDocuments()).toBe(1);
+    });
+    it("A2 conditional abort cleanup cannot delete a replacement claim", async () => {
+      const f = await prepareA2("manual");
+      let replacement: Types.ObjectId | undefined;
+      vi.spyOn(bookingRepository, "create").mockImplementationOnce(async () => {
+        replacement = new Types.ObjectId();
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { bookingId: replacement } },
+        );
+        throw new Error("A2 abort after claim replacement");
+      });
+      await expect(f.run()).rejects.toThrow("A2 abort after claim replacement");
+      expect(
+        String((await claimRepository.findByIdempotencyKey(f.input.idempotencyKey))?.bookingId),
+      ).toBe(String(replacement));
+    });
+    it("A2 incomplete legacy entitlement never certifies a committed result", async () => {
+      const f = await prepareA2("purchase");
+      const originalStart = mongoose.startSession.bind(mongoose);
+      vi.spyOn(mongoose, "startSession").mockImplementation(async (...args) => {
+        const session = await originalStart(...args);
+        const originalTransaction = session.withTransaction.bind(session);
+        vi.spyOn(session, "withTransaction").mockImplementation(async (callback, options) => {
+          await originalTransaction(callback, options);
+          await PackageProgressModel.deleteMany({}); // only the owned synthetic DB
+          throw new Error("A2 unlabelled post-callback uncertainty");
+        });
+        return session;
+      });
+      await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+      expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).not.toBeNull();
+      await expect(f.run()).rejects.toMatchObject({ statusCode: 503 });
+      expect(await BookingModel.countDocuments()).toBe(1);
+    });
+    it.each(["normal", "purchase", "redemption"] as const)(
+      "A1 same Customer %s replay returns original without side effects",
+      async (kind) => {
+        const f = await setupReplay(kind);
+        const before = await databaseState();
+        expect(String(confirmed(await f.call())._id)).toBe(String(f.booking._id));
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it.each(["normal", "purchase", "redemption"] as const)(
+      "A1 denies foreign Customer %s finalized-key replay",
+      async (kind) => {
+        const f = await setupReplay(kind);
+        const { customer: foreign } = await createLinkedCustomer(f.f, "a1-foreign");
+        let foreignProgress: Types.ObjectId | undefined;
+        if (kind === "redemption") {
+          const purchase = confirmed(
+            await finalizePackage(f.f, foreign._id, packageInput(f.f, "12:00")),
+          );
+          foreignProgress = (
+            await PackageProgressModel.findOne({ originBookingId: purchase._id }).orFail()
+          )._id;
+        }
+        const before = await databaseState();
+        const read = vi.spyOn(bookingRepository, "findById");
+        await expect(
+          f.call(foreign._id, f.f.business._id, f.input.idempotencyKey, foreignProgress),
+        ).rejects.toMatchObject(denied);
+        if (kind !== "redemption") expect(read).not.toHaveBeenCalled();
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it.each(["normal", "purchase"] as const)(
+      "A1 %s cross-Business replay denies independently",
+      async (kind) => {
+        const f = await setupReplay(kind);
+        const other = await setupFixture();
+        const before = await databaseState();
+        await expect(f.call(f.customer._id, other.business._id)).rejects.toMatchObject(denied);
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it.each(["normal", "purchase"] as const)(
+      "A1 %s wrong operation kind denies before replay",
+      async (kind) => {
+        const f = await setupReplay(kind);
+        const before = await databaseState();
+        const call =
+          kind === "normal"
+            ? finalizePackage(f.f, f.customer._id, {
+                ...packageInput(f.f),
+                idempotencyKey: f.input.idempotencyKey,
+              })
+            : finalizeNormal(f.f, f.customer._id, {
+                ...normalInput(f.f),
+                idempotencyKey: f.input.idempotencyKey,
+              });
+        await expect(call).rejects.toMatchObject(denied);
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it("A1 redemption key cannot replay as purchase or ordinary", async () => {
+      const f = await setupReplay("redemption");
+      const before = await databaseState();
+      await expect(
+        finalizeNormal(f.f, f.customer._id, {
+          ...normalInput(f.f),
+          idempotencyKey: f.input.idempotencyKey,
+        }),
+      ).rejects.toMatchObject(denied);
+      await expect(
+        finalizePackage(f.f, f.customer._id, {
+          ...packageInput(f.f),
+          idempotencyKey: f.input.idempotencyKey,
+        }),
+      ).rejects.toMatchObject(denied);
+      expect(await databaseState()).toBe(before);
+    });
+    it("A1 rejects purchase key through owned Progress redemption", async () => {
+      const f = await setupReplay("purchase");
+      const progress = await PackageProgressModel.findOne({
+        originBookingId: f.booking._id,
+      }).orFail();
+      const before = await databaseState();
+      await expect(
+        creationService.redeemPackageSession(
+          String(f.customer._id),
+          String(f.f.business._id),
+          String(progress._id),
+          {
+            staffMembershipId: String(f.f.staffId),
+            startAt: startAtFor("10:00", DATE_2),
+            idempotencyKey: f.input.idempotencyKey,
+          },
+        ),
+      ).rejects.toMatchObject(denied);
+      expect(await databaseState()).toBe(before);
+    });
+    it.each([
+      "claim actor",
+      "claim Business",
+      "claim Booking",
+      "missing actor",
+      "Booking Customer",
+      "missing Booking Customer",
+      "missing Booking client",
+      "contract Customer",
+      "contract client",
+    ])("A1 fails closed on %s evidence", async (fault) => {
+      const f = await setupReplay("normal");
+      const other = await createLinkedCustomer(f.f, "a1-corrupt");
+      // Deliberately corrupt only an owned test row to exercise fail-closed reads; no runtime bypass.
+      if (fault === "claim actor")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { actorUserId: other.customer._id } },
+        );
+      if (fault === "claim Business")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { businessId: new Types.ObjectId() } },
+        );
+      if (fault === "claim Booking")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { bookingId: new Types.ObjectId() } },
+        );
+      if (fault === "missing actor")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $unset: { actorUserId: 1 } },
+        );
+      if (fault === "Booking Customer")
+        await BookingModel.collection.updateOne(
+          { _id: f.booking._id },
+          { $set: { "customer.customerUserId": other.customer._id } },
+        );
+      if (fault === "missing Booking Customer")
+        await BookingModel.collection.updateOne(
+          { _id: f.booking._id },
+          { $unset: { "customer.customerUserId": 1 } },
+        );
+      if (fault === "missing Booking client")
+        await BookingModel.collection.updateOne(
+          { _id: f.booking._id },
+          { $unset: { "customer.businessClientId": 1 } },
+        );
+      if (fault === "contract Customer")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { "financialContract.customerUserId": other.customer._id } },
+        );
+      if (fault === "contract client")
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $set: { "financialContract.businessClientId": other.client._id } },
+        );
+      const before = await databaseState();
+      await expect(f.call()).rejects.toMatchObject(denied);
+      expect(await databaseState()).toBe(before);
+    });
+    it("A1 foreign bare pending claim rejects before Booking/payment lookup or wait", async () => {
+      const f = await setupFixture();
+      const { customer: owner } = await createLinkedCustomer(f, "a1-pending-owner");
+      const { customer: foreign } = await createLinkedCustomer(f, "a1-pending-foreign");
+      const input = normalInput(f);
+      await claimRepository.claim({
+        idempotencyKey: input.idempotencyKey,
+        businessId: f.business._id,
+        actorUserId: owner._id,
+        bookingId: new Types.ObjectId(),
+      });
+      const before = await databaseState();
+      const read = vi.spyOn(bookingRepository, "findById");
+      const attempt = vi.spyOn(paymentService, "findPaymentAttempt");
+      await expect(finalizeNormal(f, foreign._id, input)).rejects.toMatchObject(denied);
+      expect(read).not.toHaveBeenCalled();
+      expect(attempt).not.toHaveBeenCalled();
+      expect(await databaseState()).toBe(before);
+    });
+    it.each([false, true])(
+      "A1 awaited result rechecks canonical and Booking ownership; corrupt=%s",
+      async (corrupt) => {
+        const f = await setupReplay("normal");
+        if (corrupt)
+          await BookingModel.collection.updateOne(
+            { _id: f.booking._id },
+            { $set: { "customer.customerUserId": new Types.ObjectId() } },
+          );
+        const original = bookingRepository.findById.bind(bookingRepository);
+        vi.spyOn(bookingRepository, "findById")
+          .mockImplementationOnce(async () => null)
+          .mockImplementation(original);
+        vi.spyOn(paymentService, "findPaymentAttempt").mockResolvedValue(null);
+        const read = vi.spyOn(claimRepository, "findForCustomerReplay");
+        const before = await databaseState();
+        if (corrupt) await expect(f.call()).rejects.toMatchObject(denied);
+        else expect(String(confirmed(await f.call())._id)).toBe(String(f.booking._id));
+        expect(read.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it.each(["actor", "Booking ID", "removed"])(
+      "A1 awaited result rejects a canonical claim changed at the read boundary: %s",
+      async (fault) => {
+        const f = await setupReplay("normal");
+        const original = bookingRepository.findById.bind(bookingRepository);
+        // Force the pending-result boundary using real stored rows, then alter only
+        // this owned disposable claim before the next canonical read.
+        vi.spyOn(bookingRepository, "findById")
+          .mockImplementationOnce(async () => {
+            const filter = { idempotencyKey: f.input.idempotencyKey };
+            if (fault === "removed") await BookingCreationClaimModel.collection.deleteOne(filter);
+            else
+              await BookingCreationClaimModel.collection.updateOne(filter, {
+                $set:
+                  fault === "actor"
+                    ? { actorUserId: new Types.ObjectId() }
+                    : { bookingId: new Types.ObjectId() },
+              });
+            return null;
+          })
+          .mockImplementation(original);
+        vi.spyOn(paymentService, "findPaymentAttempt").mockResolvedValue(null);
+        await expect(f.call()).rejects.toMatchObject(
+          fault === "removed"
+            ? { statusCode: 503, details: [{ code: "BOOKING_TRANSACTION_UNAVAILABLE" }] }
+            : denied,
+        );
+        expect(await BookingModel.countDocuments({ _id: f.booking._id })).toBe(1);
+        expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+      },
+    );
+    it.each(["normal", "purchase"] as const)(
+      "A1 historical %s replay without a FinancialContract uses owned stored Booking evidence",
+      async (kind) => {
+        const f = await setupReplay(kind);
+        // Simulate pre-contract history without manufacturing new runtime authority.
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: f.input.idempotencyKey },
+          { $unset: { financialContract: 1 } },
+        );
+        await BookingModel.collection.updateOne(
+          { _id: f.booking._id },
+          { $unset: { financialContract: 1 } },
+        );
+        const before = await databaseState();
+        expect(String(confirmed(await f.call())._id)).toBe(String(f.booking._id));
+        const wrong =
+          kind === "normal"
+            ? finalizePackage(f.f, f.customer._id, {
+                ...packageInput(f.f),
+                idempotencyKey: f.input.idempotencyKey,
+              })
+            : finalizeNormal(f.f, f.customer._id, {
+                ...normalInput(f.f),
+                idempotencyKey: f.input.idempotencyKey,
+              });
+        await expect(wrong).rejects.toMatchObject(denied);
+        expect(await databaseState()).toBe(before);
+      },
+    );
+    it("A1 late claim collision cannot return mismatched Booking Customer", async () => {
+      const f = await setupReplay("normal");
+      await BookingModel.collection.updateOne(
+        { _id: f.booking._id },
+        { $set: { "customer.customerUserId": new Types.ObjectId() } },
+      );
+      vi.spyOn(claimRepository, "findForCustomerReplay").mockResolvedValueOnce(null);
+      const before = await databaseState();
+      await expect(f.call()).rejects.toMatchObject(denied);
+      expect(await databaseState()).toBe(before);
+    });
+    it("A1 own bare pending claim with no kind waits boundedly without financial side effects", async () => {
+      const f = await setupFixture();
+      const { customer } = await createLinkedCustomer(f, "a1-own-pending");
+      const input = normalInput(f);
+      await claimRepository.claim({
+        idempotencyKey: input.idempotencyKey,
+        businessId: f.business._id,
+        actorUserId: customer._id,
+        bookingId: new Types.ObjectId(),
+      });
+      const before = await databaseState();
+      await expect(finalizeNormal(f, customer._id, input)).rejects.toMatchObject({
+        statusCode: 503,
+        details: [{ code: "BOOKING_TRANSACTION_UNAVAILABLE" }],
+      });
+      expect(await databaseState()).toBe(before);
+    });
+  });
+
+  it("B3 actual Customer Group creators and joiners cancel only their own contribution", async () => {
+    const f = await setupFixture();
+    const group = await serviceRepository.create({
+      businessId: f.business._id,
+      status: "ACTIVE",
+      isFeatured: false,
+      isPackageDeal: false,
+      category: "Fitness",
+      name: "B3 group",
+      pricingMode: "PER_PERSON",
+      perPersonPricing: {
+        ratePerPersonCents: 1000,
+        minPersons: 1,
+        maxPersons: 5,
+        durationMin: 60,
+        bookingIntervalMin: 60,
+      },
+      sessionExpiryAlert: { enabled: false },
+      scheduleMode: "AUTO",
+      manualSchedule: [],
+      servedCities: [],
+      assignedStaffMembershipIds: [f.staffId],
+    });
+    const a = await createLinkedCustomer(f, "b3-creator");
+    const b = await createLinkedCustomer(f, "b3-joiner");
+    const request = (partySize: number) => ({
+      ...normalInput(f),
+      serviceLines: [
+        {
+          serviceId: String(group._id),
+          staffMembershipId: String(f.staffId),
+          addonIds: [],
+          pricingInput: { personCount: partySize },
+        },
+      ],
+    });
+    const first = confirmed(
+      await creationService.finalizeCustomerBooking(
+        String(a.customer._id),
+        String(f.business._id),
+        request(1),
+      ),
+    );
+    const joined = confirmed(
+      await creationService.finalizeCustomerBooking(
+        String(b.customer._id),
+        String(f.business._id),
+        request(2),
+      ),
+    );
+    const firstLine = first.serviceLines[0];
+    const joinLine = joined.serviceLines[0];
+    if (!firstLine?.reservationOperationKey || !joinLine?.reservationOperationKey)
+      throw new Error("Real Booking operations required");
+    expect(String(firstLine.reservationId)).toBe(String(joinLine.reservationId));
+    expect(firstLine.reservationOperationKey).toBeDefined();
+    expect(joinLine.reservationOperationKey).not.toBe(firstLine.reservationOperationKey);
+    expect((await BookingSlotReservationModel.findOne().orFail()).intervals[0]?.capacityUsed).toBe(
+      3,
+    );
+    await lifecycleService.cancelByCustomer(String(a.customer._id), String(first._id), undefined);
+    expect((await BookingSlotReservationModel.findOne().orFail()).intervals[0]?.capacityUsed).toBe(
+      2,
+    );
+    expect(
+      (
+        await BookingSlotReservationClaimModel.findOne({
+          idempotencyKey: firstLine.reservationOperationKey,
+        }).orFail()
+      ).effect?.state,
+    ).toBe("RELEASED");
+    await expect(
+      lifecycleService.cancelByCustomer(String(a.customer._id), String(first._id), undefined),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect((await BookingSlotReservationModel.findOne().orFail()).intervals[0]?.capacityUsed).toBe(
+      2,
+    );
+    await lifecycleService.cancelByCustomer(String(b.customer._id), String(joined._id), undefined);
+    expect((await BookingSlotReservationModel.findOne().orFail()).intervals).toHaveLength(0);
+    expect(
+      await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "RELEASED" }),
+    ).toBe(2);
   });
 });

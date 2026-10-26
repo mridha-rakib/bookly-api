@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BusinessDocument } from "../../src/modules/business/business.model.js";
@@ -435,3 +435,11 @@ describe("BusinessTravelSettingsService", () => {
     });
   });
 });
+
+vi.mock("../../src/modules/package-progress/package-eligibility.js", () => ({
+  withPackageEligibility: async (
+    _business: unknown,
+    _existing: unknown,
+    work: (session: ClientSession) => Promise<unknown>,
+  ) => work({} as ClientSession),
+}));

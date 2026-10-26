@@ -25,6 +25,8 @@ export type BookingServiceLineDto = {
   name: string;
   pricingMode: string;
   durationMin: number;
+  hours?: number | undefined;
+  personCount?: number | undefined;
   discountPercent?: number | undefined;
   staffMembershipId: string;
   staffName?: string | undefined;
@@ -36,9 +38,12 @@ export type BookingServiceLineDto = {
   sessionsInPackage?: number | undefined;
   sessionIndex?: number | undefined;
   packageProgressId?: string | undefined;
+  packageItemId?: string | undefined;
+  packageRole?: "PURCHASE" | "REDEMPTION" | undefined;
 };
 
 export type BookingDetailDto = {
+  financialOutcome?: import("./customer-financial-outcome.dto.js").CustomerFinancialOutcomeDto;
   id: string;
   businessId: string;
   reference: string;
@@ -290,6 +295,7 @@ const toFulfilmentLocationDto = (
 };
 
 export type BookingListItemDto = {
+  firstClassPackage: boolean;
   id: string;
   /** Batch 9 — added so the CUSTOMER-scoped `/me/bookings` list (which spans many Businesses)
    * can identify and link to each row's Business; `listForBusiness` callers already know their
@@ -348,6 +354,16 @@ const toServiceLineDto = (
   name: line.serviceSnapshot.name,
   pricingMode: line.serviceSnapshot.pricingMode,
   durationMin: line.serviceSnapshot.durationMin,
+  ...(line.serviceSnapshot.pricingMode === "HOURLY" &&
+  Number.isFinite(line.pricingInput.hours) &&
+  line.pricingInput.hours! > 0
+    ? { hours: line.pricingInput.hours }
+    : {}),
+  ...(line.serviceSnapshot.pricingMode === "PER_PERSON" &&
+  Number.isInteger(line.pricingInput.personCount) &&
+  line.pricingInput.personCount! > 0
+    ? { personCount: line.pricingInput.personCount }
+    : {}),
   discountPercent: line.serviceSnapshot.discountPercent,
   staffMembershipId: String(line.responsibleStaffMembershipId),
   staffName: line.staffSnapshot
@@ -364,6 +380,10 @@ const toServiceLineDto = (
   packageProgressId: line.pricingInput.packageProgressId
     ? String(line.pricingInput.packageProgressId)
     : undefined,
+  packageItemId: line.pricingInput.packageItemId
+    ? String(line.pricingInput.packageItemId)
+    : undefined,
+  packageRole: line.packageContext?.role,
 });
 
 /** Deduped, presence-ordered display names across a Booking's service lines — a list/calendar
@@ -457,6 +477,7 @@ export const toBookingDetailDto = (
 });
 
 export const toBookingListItemDto = (booking: BookingDocument): BookingListItemDto => ({
+  firstClassPackage: booking.serviceLines.some((line) => Boolean(line.pricingInput.packageItemId)),
   id: String(booking._id),
   businessId: String(booking.businessId),
   reference: booking.reference,

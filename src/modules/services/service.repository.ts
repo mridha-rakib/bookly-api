@@ -36,14 +36,19 @@ export class ServiceRepository {
     input: CreateServiceInput,
     session?: ClientSession,
   ): Promise<ServiceDocument> {
-    return new ServiceModel(input).save(session ? { session } : undefined);
+    return withPackageEligibility(input.businessId, session, (transaction) =>
+      new ServiceModel(input).save({ session: transaction }),
+    );
   }
 
   public async findById(
     businessId: Types.ObjectId | string,
     serviceId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<ServiceDocument | null> {
-    return ServiceModel.findOne({ _id: serviceId, businessId }).exec();
+    return ServiceModel.findOne({ _id: serviceId, businessId })
+      .session(session ?? null)
+      .exec();
   }
 
   /** Batched lookup for Add-on service-assignment validation — never one query per id. */
@@ -79,6 +84,7 @@ export class ServiceRepository {
   public async listActiveByAssignedStaffMembershipId(
     businessId: Types.ObjectId | string,
     membershipId: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<ServiceDocument[]> {
     return ServiceModel.find({
       businessId,
@@ -86,6 +92,7 @@ export class ServiceRepository {
       status: { $ne: "ARCHIVED" },
     })
       .sort({ createdAt: -1 })
+      .session(session ?? null)
       .exec();
   }
 

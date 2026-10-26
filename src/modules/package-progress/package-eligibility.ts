@@ -2,6 +2,7 @@ import mongoose, { type ClientSession, type Types } from "mongoose";
 import { AppError } from "../../common/errors/app-error.js";
 import { BusinessModel } from "../business/business.model.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
+import { resolvePackageServiceEntitlement } from "../packages/package-service-entitlement.js";
 import { type ServiceDocument, ServiceModel } from "../services/service.model.js";
 import { StaffMembershipModel } from "../staff/staff.model.js";
 import { PackageProgressV2Model } from "./package-progress-v2.model.js";
@@ -19,6 +20,8 @@ export const packageEligibilityError = (
 export const requirePackageTransaction = (session: ClientSession): void => {
   if (!session?.inTransaction()) throw packageEligibilityError("PACKAGE_TRANSACTION_REQUIRED", 503);
 };
+/** Shared Business write also orders final scheduling admission and scheduling mutations.
+ * Acquired before authoritative reads; the counter is coordination, never purchase authority. */
 export const acquirePackageEligibilityFence = async (
   businessId: Types.ObjectId | string,
   session: ClientSession,
@@ -110,7 +113,12 @@ export const assertServicePackageDependencies = async (
   serviceId: Types.ObjectId | string,
   candidate: Pick<
     ServiceDocument,
-    "status" | "isPackageDeal" | "pricingMode" | "fixedPricing" | "assignedStaffMembershipIds"
+    | "status"
+    | "isPackageDeal"
+    | "pricingMode"
+    | "fixedPricing"
+    | "perPersonPricing"
+    | "assignedStaffMembershipIds"
   >,
   session: ClientSession,
 ): Promise<void> => {
@@ -118,12 +126,40 @@ export const assertServicePackageDependencies = async (
   if (
     candidate.status === "DRAFT" ||
     candidate.status === "ARCHIVED" ||
-    candidate.isPackageDeal ||
-    candidate.pricingMode !== "FIXED" ||
-    !Number.isSafeInteger(candidate.fixedPricing?.durationMin) ||
-    (candidate.fixedPricing?.durationMin ?? 0) < 1
+    !resolvePackageServiceEntitlement(candidate)
   )
     throw packageEligibilityError();
+  // Outstanding purchased items keep their mode and original Group ceiling. A valid
+  // configuration in another mode cannot silently reinterpret a purchased credit.
+  const purchased = await PackageProgressV2Model.find({
+    businessId,
+    voidedAt: { $exists: false },
+    "items.serviceId": serviceId,
+  })
+    .session(session)
+    .lean();
+  const next = resolvePackageServiceEntitlement(candidate);
+  const now = new Date();
+  for (const progress of purchased) {
+    for (const item of progress.items.filter(
+      (row) => String(row.serviceId) === String(serviceId),
+    )) {
+      const scheduled = progress.sessions.some(
+        (row) => row.serviceId.equals(item.serviceId) && row.status === "SCHEDULED",
+      );
+      const expired =
+        progress.creditAccountingVersion === 2 &&
+        (progress.expiryReconciledAt !== undefined ||
+          (progress.purchasedContract.validity.mode === "FINITE" &&
+            now >= progress.purchasedContract.validity.expiresAt));
+      if (!scheduled && (item.remainingSessions === 0 || expired)) continue;
+      if (
+        item.serviceSnapshot.pricingMode !== next?.pricingMode ||
+        item.serviceSnapshot.group?.capacityMax !== next.group?.capacityMax
+      )
+        throw packageEligibilityError();
+    }
+  }
   const provider = await StaffMembershipModel.exists({
     businessId,
     _id: { $in: candidate.assignedStaffMembershipIds },

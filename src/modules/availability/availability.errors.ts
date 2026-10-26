@@ -11,6 +11,7 @@ const defaultMessages: Record<string, string> = {
   AVAILABILITY_CITY_REQUIRED: "A customer city is required for a travel-to-customer service",
   AVAILABILITY_CITY_NOT_SERVED: "This business does not serve the selected city",
   AVAILABILITY_PARTY_SIZE_INVALID: "Party size is invalid for this service",
+  AVAILABILITY_HOURS_INVALID: "Duration is invalid for this service",
   AVAILABILITY_SLOT_NOT_BOOKABLE:
     "This staff member is not available for the requested time — it is outside their schedule, on a day off, or (for a fixed-schedule service) not one of its configured times",
 };

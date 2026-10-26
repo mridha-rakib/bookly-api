@@ -1,8 +1,9 @@
-import mongoose, { Types } from "mongoose";
+import mongoose, { type ClientSession, Types } from "mongoose";
 import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import { AvailabilityError } from "../availability/availability.errors.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../booking-slot-reservation/booking-slot-reservation.model.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -70,14 +71,33 @@ import { generateBookingReference } from "./booking.utils.js";
 import type { CreateBookingInput, CreateManualBookingInput } from "./booking-creation.types.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import {
+  acquireSchedulingAdmission,
+  validateSchedulingLine,
+} from "./booking-scheduling-admission.js";
+import {
   calculateFirstUpfrontCents,
   FINANCIAL_CONTRACT_V2,
   FINANCIAL_CONTRACT_V3,
   type FinancialContract,
   type FinancialContractProductKind,
   type FinancialContractVersion,
+  findFinancialContractMismatch,
   type RelationshipClassification,
 } from "./financial-contract.js";
+
+type CustomerReplayScope = {
+  businessId: Types.ObjectId;
+  customerUserId: string;
+  idempotencyKey: string;
+  kind: FinancialContractProductKind | "PACKAGE_REDEMPTION";
+  packageProgressId?: Types.ObjectId;
+};
+
+class BookingPersistenceUnresolvedError extends BookingError {
+  constructor() {
+    super("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+  }
+}
 
 /**
  * Stage B mailing observer for Triggers 2/3/4. Optional + trailing so every existing
@@ -450,13 +470,23 @@ export class BookingCreationService {
     input: CreateManualBookingInput,
   ): Promise<BookingDocument> {
     this.requireIdempotencyKey(input.idempotencyKey);
-    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
 
     const business = await this.bookingService.requireBookingManagementAccess(
       actorUserId,
       actorRole,
       businessId,
     );
+    const existingClaim = await this.claimRepository.findForCustomerReplay(
+      input.idempotencyKey,
+      business._id,
+      actorUserId,
+    );
+    if (existingClaim)
+      return this.awaitIdempotentBooking(
+        { business, idempotencyKey: input.idempotencyKey, manualActorUserId: actorUserId },
+        existingClaim.bookingId,
+      );
+    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
     const client = await this.bookingService.validateCustomerReference(
       business,
       input.businessClientId,
@@ -668,23 +698,28 @@ export class BookingCreationService {
     input: CreateBookingInput,
   ): Promise<FinalizeBookingResult> {
     this.requireIdempotencyKey(input.idempotencyKey);
-    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
     const business = await this.requireBusiness(businessId);
 
-    const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
+    const customerReplay: CustomerReplayScope = {
+      businessId: business._id,
+      customerUserId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "NORMAL_BOOKING",
+    };
+    const replay = await this.readCustomerReplay(customerReplay);
+    const existingClaim = replay.claim;
     if (existingClaim) {
-      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
-      if (booking) return { status: "confirmed", booking };
-      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
-      if (!attempt) {
+      if (replay.booking) return { status: "confirmed", booking: replay.booking };
+      if (!replay.attempt || this.persistenceLeaseActive(replay.attempt)) {
         const pendingBooking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
+          { business, idempotencyKey: input.idempotencyKey, customerReplay },
           existingClaim.bookingId,
         );
         return { status: "confirmed", booking: pendingBooking };
       }
     }
 
+    await this.enforceMaxServicesPerBooking(input.serviceLines.length);
     const startAt = this.parseStartAt(input.startAt);
     const lines = await this.resolveServiceLines(business, startAt, input);
     const fulfilment = await this.resolveFulfilment(business, input);
@@ -719,7 +754,7 @@ export class BookingCreationService {
 
     if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
+        { business, idempotencyKey: input.idempotencyKey, customerReplay },
         claimResult.bookingId,
       );
       return { status: "confirmed", booking };
@@ -740,7 +775,13 @@ export class BookingCreationService {
         promoCode: input.promoCode,
       });
     } catch (error) {
-      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim)
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: input.idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(customerUserId),
+          bookingId,
+        });
       throw error;
     }
 
@@ -816,7 +857,13 @@ export class BookingCreationService {
       );
     } catch (error) {
       if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
-      if (!params.existingClaim) await this.claimRepository.release(idempotencyKey);
+      if (!params.existingClaim)
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(params.customerUserId),
+          bookingId: contract.bookingId,
+        });
       throw error;
     }
 
@@ -866,7 +913,16 @@ export class BookingCreationService {
     try {
       if (persistenceLeaseToken === null) {
         const booking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey },
+          {
+            business,
+            idempotencyKey,
+            customerReplay: {
+              businessId: business._id,
+              customerUserId: params.customerUserId,
+              idempotencyKey,
+              kind: contract.productKind,
+            },
+          },
           contract.bookingId,
         );
         return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
@@ -874,6 +930,8 @@ export class BookingCreationService {
       const booking = await params.persist(paymentResult, persistenceLeaseToken);
       return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
     } catch (error) {
+      if (error instanceof BookingPersistenceUnresolvedError || persistenceLeaseToken === null)
+        throw error;
       if (paymentResult) {
         const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
           paymentResult.paymentAttemptId,
@@ -896,7 +954,12 @@ export class BookingCreationService {
         // confirmed). Derived from durable state, so a lease-loss/duplicate caller is harmless.
         if (isFirst) await this.relationships.reconcileQuietly(client._id);
       } else {
-        await this.claimRepository.release(idempotencyKey);
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(params.customerUserId),
+          bookingId: contract.bookingId,
+        });
         if (isFirst) await this.releaseFirstClaimAfterPreMoneyFailure(client, idempotencyKey);
       }
       throw error;
@@ -1034,14 +1097,19 @@ export class BookingCreationService {
     this.requireIdempotencyKey(input.idempotencyKey);
     const business = await this.requireBusiness(businessId);
 
-    const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
+    const customerReplay: CustomerReplayScope = {
+      businessId: business._id,
+      customerUserId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "PACKAGE_PURCHASE",
+    };
+    const replay = await this.readCustomerReplay(customerReplay);
+    const existingClaim = replay.claim;
     if (existingClaim) {
-      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
-      if (booking) return { status: "confirmed", booking };
-      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
-      if (!attempt) {
+      if (replay.booking) return { status: "confirmed", booking: replay.booking };
+      if (!replay.attempt || this.persistenceLeaseActive(replay.attempt)) {
         const pendingBooking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
+          { business, idempotencyKey: input.idempotencyKey, customerReplay },
           existingClaim.bookingId,
         );
         return { status: "confirmed", booking: pendingBooking };
@@ -1099,7 +1167,7 @@ export class BookingCreationService {
 
     if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
+        { business, idempotencyKey: input.idempotencyKey, customerReplay },
         claimResult.bookingId,
       );
       return { status: "confirmed", booking };
@@ -1132,7 +1200,13 @@ export class BookingCreationService {
         packageBundlePriceCents: packagePricing.bundlePriceCents,
       });
     } catch (error) {
-      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim)
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: input.idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(customerUserId),
+          bookingId,
+        });
       throw error;
     }
 
@@ -1264,14 +1338,20 @@ export class BookingCreationService {
     );
     const { business, progress, service, fulfilment, addons, financials } = pricing;
 
-    const existingClaim = await this.claimRepository.findByIdempotencyKey(input.idempotencyKey);
+    const customerReplay: CustomerReplayScope = {
+      businessId: business._id,
+      customerUserId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "PACKAGE_REDEMPTION",
+      packageProgressId: progress._id,
+    };
+    const replay = await this.readCustomerReplay(customerReplay);
+    const existingClaim = replay.claim;
     if (existingClaim) {
-      const booking = await this.bookingRepository.findById(business._id, existingClaim.bookingId);
-      if (booking) return { status: "confirmed", booking };
-      const attempt = await this.paymentService.findPaymentAttempt(input.idempotencyKey);
-      if (!attempt) {
+      if (replay.booking) return { status: "confirmed", booking: replay.booking };
+      if (!replay.attempt || this.persistenceLeaseActive(replay.attempt)) {
         const pendingBooking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
+          { business, idempotencyKey: input.idempotencyKey, customerReplay },
           existingClaim.bookingId,
         );
         return { status: "confirmed", booking: pendingBooking };
@@ -1394,7 +1474,7 @@ export class BookingCreationService {
     });
     if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
-        { business, idempotencyKey: input.idempotencyKey },
+        { business, idempotencyKey: input.idempotencyKey, customerReplay },
         claimResult.bookingId,
       );
       return { status: "confirmed", booking };
@@ -1414,7 +1494,13 @@ export class BookingCreationService {
         `${input.idempotencyKey}:tax`,
       );
     } catch (error) {
-      if (!existingClaim) await this.claimRepository.release(input.idempotencyKey);
+      if (!existingClaim)
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: input.idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(customerUserId),
+          bookingId,
+        });
       throw error;
     }
 
@@ -1457,7 +1543,16 @@ export class BookingCreationService {
       }
     }
 
-    const dbSession = await mongoose.startSession();
+    const dbSession = await mongoose.startSession().catch(async (error) => {
+      if (!paymentResult)
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: input.idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(customerUserId),
+          bookingId,
+        });
+      throw error;
+    });
     let created: BookingDocument | undefined;
     let succeededTransactionId: Types.ObjectId | undefined;
     const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
@@ -1467,127 +1562,154 @@ export class BookingCreationService {
     try {
       if (persistenceLeaseToken === null) {
         const booking = await this.awaitIdempotentBooking(
-          { business, idempotencyKey: input.idempotencyKey },
+          { business, idempotencyKey: input.idempotencyKey, customerReplay },
           bookingId,
         );
         return { status: "confirmed", booking, ...(computedTax ? { computedTax } : {}) };
       }
-      await dbSession.withTransaction(async () => {
-        const afterClaim = await (
-          this.packageProgressRepository as PackageProgressRepository
-        ).claimSession(progress._id, dbSession);
-        if (!afterClaim) {
-          throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
-        }
-        const claimedSessionIndex = afterClaim.totalSessions - afterClaim.remainingSessions;
-
-        const reservation = await this.reservationService.reserveOrJoin(
-          {
-            businessId: business._id,
-            staffMembershipId: staffMembership._id,
-            serviceId: service._id,
-            timezone: business.timezone,
-            startAt,
-            endAt,
-            capacityMax: 1,
-            partySize: 1,
-            idempotencyKey: `${input.idempotencyKey}:0`,
-          },
-          dbSession,
-        );
-
-        const reference = await this.generateUniqueReference();
-
-        const serviceLine: BookingServiceLine = {
-          serviceId: service._id,
-          serviceSnapshot: resolvedLine.serviceSnapshot,
-          pricingInput: {
-            sessionsInPackage: afterClaim.totalSessions,
-            sessionIndex: claimedSessionIndex,
-            packageProgressId: progress._id,
-          },
-          responsibleStaffMembershipId: staffMembership._id,
-          ...(staffSnapshot ? { staffSnapshot } : {}),
-          addons,
-          amountCents: 0,
-          reservationId: reservation.reservationId,
-        };
-
-        created = await this.bookingRepository.create(
-          {
-            _id: bookingId,
-            businessId: business._id,
-            reference,
-            source: "BOOKLY_MANAGED",
-            status: "UPCOMING",
-            customer,
-            createdBy,
-            fulfilment,
-            serviceLines: [serviceLine],
-            financials,
-            schedule: { timezone: business.timezone, startAt, endAt },
-            customerRescheduleCount: 0,
-            rescheduleHistory: [],
-            eventHistory: [
-              {
-                type: "CREATED",
-                nextStatus: "UPCOMING",
-                actorUserId: createdBy.actorUserId,
-                actorRole: createdBy.actorRole,
-                createdAt: new Date(),
+      const recovered = await this.runBookingTransaction(
+        dbSession,
+        async () => {
+          const currentBusiness = await acquireSchedulingAdmission(business, dbSession);
+          await validateSchedulingLine(
+            {
+              business: currentBusiness,
+              serviceId: service._id,
+              staffMembershipId: staffMembership._id,
+              startAt,
+              endAt,
+              partySize: 1,
+              capacityMax: 1,
+              allowInactive: true,
+              expectedService: service,
+              fulfilment,
+              legacyPurchase: {
+                progressId: progress._id,
+                businessClientId: progress.businessClientId,
+                customerUserId: progress.customerUserId,
               },
-            ],
-            ...(cancellationPolicySnapshot ? { cancellationPolicySnapshot } : {}),
-            ...(noShowEligibilitySnapshot ? { noShowEligibilitySnapshot } : {}),
-            sessionEndReminderSnapshot,
-            ...(input.notes ? { notes: input.notes } : {}),
-          },
-          dbSession,
-        );
+            },
+            this.availabilityService,
+            dbSession,
+          );
+          const afterClaim = await (
+            this.packageProgressRepository as PackageProgressRepository
+          ).claimSession(progress._id, dbSession);
+          if (!afterClaim) {
+            throw new PackageProgressError("PACKAGE_PROGRESS_NO_SESSIONS_REMAINING", 409);
+          }
+          const claimedSessionIndex = afterClaim.totalSessions - afterClaim.remainingSessions;
 
-        await (this.packageProgressRepository as PackageProgressRepository).recordScheduledSession(
-          progress._id,
-          claimedSessionIndex,
-          bookingId,
-          dbSession,
-        );
-
-        // Real money was actually charged (Add-ons/travel) — ledger it exactly like any other
-        // BOOKLY_MANAGED deposit (never PLATFORM_FEE here: isFirstBooking is always false for a
-        // redemption, matching the confirmed "already activated" reasoning above).
-        if (customerChargeNowCents > 0) {
-          const transaction = await this.financialTransactionService.record(
+          const reservation = await this.reservationService.reserveOrJoin(
             {
               businessId: business._id,
-              bookingId,
-              businessClientId: client._id,
-              customerUserId: createdBy.actorUserId,
-              type: "DEPOSIT",
-              direction: "DEBIT",
-              amountCents: customerChargeNowCents,
-              currency: financials.currency,
-              status: "SUCCEEDED",
-              ...(paymentResult ? { providerReference: paymentResult.paymentIntentId } : {}),
-              idempotencyKey: `${input.idempotencyKey}:deposit`,
+              staffMembershipId: staffMembership._id,
+              serviceId: service._id,
+              timezone: business.timezone,
+              startAt,
+              endAt,
+              capacityMax: 1,
+              partySize: 1,
+              idempotencyKey: `${input.idempotencyKey}:0`,
             },
             dbSession,
           );
-          succeededTransactionId = transaction._id;
-        }
 
-        const completed = await this.paymentService.markPaymentCompleted(
-          paymentResult?.paymentAttemptId,
-          {
-            bookingId,
-            packageProgressId: progress._id,
-            ...(succeededTransactionId ? { succeededTransactionId } : {}),
-          },
-          persistenceLeaseToken ?? undefined,
-          dbSession,
-        );
-        if (!completed) throw new Error("Payment persistence lease was lost");
-      });
+          const reference = await this.generateUniqueReference();
+
+          const serviceLine: BookingServiceLine = {
+            serviceId: service._id,
+            serviceSnapshot: resolvedLine.serviceSnapshot,
+            pricingInput: {
+              sessionsInPackage: afterClaim.totalSessions,
+              sessionIndex: claimedSessionIndex,
+              packageProgressId: progress._id,
+            },
+            responsibleStaffMembershipId: staffMembership._id,
+            ...(staffSnapshot ? { staffSnapshot } : {}),
+            addons,
+            amountCents: 0,
+            reservationId: reservation.reservationId,
+            reservationOperationKey: `${input.idempotencyKey}:0`,
+          };
+
+          created = await this.bookingRepository.create(
+            {
+              _id: bookingId,
+              businessId: business._id,
+              reference,
+              source: "BOOKLY_MANAGED",
+              status: "UPCOMING",
+              customer,
+              createdBy,
+              fulfilment,
+              serviceLines: [serviceLine],
+              financials,
+              schedule: { timezone: business.timezone, startAt, endAt },
+              customerRescheduleCount: 0,
+              rescheduleHistory: [],
+              eventHistory: [
+                {
+                  type: "CREATED",
+                  nextStatus: "UPCOMING",
+                  actorUserId: createdBy.actorUserId,
+                  actorRole: createdBy.actorRole,
+                  createdAt: new Date(),
+                },
+              ],
+              ...(cancellationPolicySnapshot ? { cancellationPolicySnapshot } : {}),
+              ...(noShowEligibilitySnapshot ? { noShowEligibilitySnapshot } : {}),
+              sessionEndReminderSnapshot,
+              ...(input.notes ? { notes: input.notes } : {}),
+            },
+            dbSession,
+          );
+
+          await (
+            this.packageProgressRepository as PackageProgressRepository
+          ).recordScheduledSession(progress._id, claimedSessionIndex, bookingId, dbSession);
+
+          // Real money was actually charged (Add-ons/travel) — ledger it exactly like any other
+          // BOOKLY_MANAGED deposit (never PLATFORM_FEE here: isFirstBooking is always false for a
+          // redemption, matching the confirmed "already activated" reasoning above).
+          if (customerChargeNowCents > 0) {
+            const transaction = await this.financialTransactionService.record(
+              {
+                businessId: business._id,
+                bookingId,
+                businessClientId: client._id,
+                customerUserId: createdBy.actorUserId,
+                type: "DEPOSIT",
+                direction: "DEBIT",
+                amountCents: customerChargeNowCents,
+                currency: financials.currency,
+                status: "SUCCEEDED",
+                ...(paymentResult ? { providerReference: paymentResult.paymentIntentId } : {}),
+                idempotencyKey: `${input.idempotencyKey}:deposit`,
+              },
+              dbSession,
+            );
+            succeededTransactionId = transaction._id;
+          }
+
+          const completed = await this.paymentService.markPaymentCompleted(
+            paymentResult?.paymentAttemptId,
+            {
+              bookingId,
+              packageProgressId: progress._id,
+              ...(succeededTransactionId ? { succeededTransactionId } : {}),
+            },
+            persistenceLeaseToken ?? undefined,
+            dbSession,
+          );
+          if (!completed) throw new Error("Payment persistence lease was lost");
+        },
+        () => this.resolveCommittedBooking(customerReplay, bookingId),
+      );
+      if (recovered) created = recovered;
     } catch (error) {
+      if (error instanceof BookingPersistenceUnresolvedError || persistenceLeaseToken === null)
+        throw error;
       if (paymentResult) {
         const ownsCompensation = await this.paymentService.markPaymentCompensationRequired(
           paymentResult.paymentAttemptId,
@@ -1603,22 +1725,26 @@ export class BookingCreationService {
             paymentResult,
           );
         }
-      } else await this.claimRepository.release(input.idempotencyKey);
+      } else
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: input.idempotencyKey,
+          businessId: business._id,
+          actorUserId: new Types.ObjectId(customerUserId),
+          bookingId,
+        });
       if (this.isTransactionUnsupported(error)) {
         throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
       }
       throw error;
     } finally {
-      await dbSession.endSession();
+      await dbSession.endSession().catch(() => undefined);
     }
 
     if (!created) {
       throw new Error("Package session booking failed without throwing");
     }
 
-    await this.syncBookingCreatedToGoogleCalendar(created);
-    await this.dispatchBookingCreatedNotifications(created, business);
-    await this.dispatchAppointmentReminderScheduling(created);
+    await this.afterBookingCommitted(created, business);
 
     return { status: "confirmed", booking: created, ...(computedTax ? { computedTax } : {}) };
   }
@@ -1947,213 +2073,258 @@ export class BookingCreationService {
     let succeededTransactionId: Types.ObjectId | undefined;
 
     try {
-      await dbSession.withTransaction(async () => {
-        const reservationsByLineIndex = new Map<number, Types.ObjectId>();
-
-        for (const [index, line] of params.lines.entries()) {
-          const reservation = await this.reservationService.reserveOrJoin(
-            {
-              businessId: params.business._id,
-              staffMembershipId: line.staffMembership._id,
-              serviceId: line.service._id,
-              timezone: params.business.timezone,
-              startAt: params.startAt,
-              endAt: line.endAt,
-              capacityMax: line.capacityMax,
-              partySize: line.partySize,
-              idempotencyKey: `${params.idempotencyKey}:${index}`,
-            },
-            dbSession,
-          );
-          reservationsByLineIndex.set(index, reservation.reservationId);
-        }
-
-        const reference = await this.generateUniqueReference();
-        const overallEndAt = params.lines.reduce(
-          (max, line) => (line.endAt > max ? line.endAt : max),
-          params.lines[0]?.endAt ?? params.startAt,
-        );
-        const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
-          params.lines,
-          overallEndAt,
-        );
-
-        const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
-          serviceId: line.service._id,
-          serviceSnapshot: line.serviceSnapshot,
-          ...(line.staffSnapshot ? { staffSnapshot: line.staffSnapshot } : {}),
-          pricingInput: line.pricingInput,
-          responsibleStaffMembershipId: line.staffMembership._id,
-          addons: line.addons,
-          amountCents: line.amountCents,
-          reservationId: reservationsByLineIndex.get(index) as Types.ObjectId,
-        }));
-
-        // P1 — first/returning was decided atomically BEFORE the charge (the relationship claim)
-        // and frozen in the Financial Contract, so there is no post-charge race left to
-        // resolve here: the previous `markActivated`-decides-the-ledger-after-money-moved
-        // pattern is gone. A concurrent competing first operation never reached a charge.
-        // `hasDepositObligation` (not `paymentResult` truthiness) gates ledger-writing: a zero
-        // obligation (P2: e.g. a 100% promo on a FIRST booking) writes no ledger row.
-        const hasDepositObligation = params.financials.depositCents > 0;
-        const financials = params.financials;
-
-        // The authoritative, atomic usage consumption — only here, inside the persistence
-        // transaction (no pre-payment reservation); an ALL_FIRST_BOOKINGS promo re-validates
-        // against the authoritative classification. A rollback removes the consumption.
-        if (params.resolvedPromo) {
-          await this.promoApplicationService.claimRedemption(
-            {
-              resolved: params.resolvedPromo,
-              requiredUpfrontCents: params.contract.requiredUpfrontCents,
-              bookingId: params.bookingId,
-              businessId: params.business._id,
-              customerUserId: params.createdBy.actorUserId,
-              isFirstBooking: isFirst,
-            },
-            dbSession,
-          );
-        }
-
-        created = await this.bookingRepository.create(
-          {
-            _id: params.bookingId,
-            businessId: params.business._id,
-            reference,
-            source: "BOOKLY_MANAGED",
-            status: "UPCOMING",
-            customer: params.customer,
-            createdBy: params.createdBy,
-            fulfilment: params.fulfilment,
-            serviceLines,
-            financials,
-            schedule: {
-              timezone: params.business.timezone,
-              startAt: params.startAt,
-              endAt: overallEndAt,
-            },
-            customerRescheduleCount: 0,
-            rescheduleHistory: [],
-            eventHistory: [
+      const recovered = await this.runBookingTransaction(
+        dbSession,
+        async () => {
+          const currentBusiness = await acquireSchedulingAdmission(params.business, dbSession);
+          for (const line of params.lines) {
+            await validateSchedulingLine(
               {
-                type: "CREATED",
-                nextStatus: "UPCOMING",
-                actorUserId: params.createdBy.actorUserId,
-                actorRole: params.createdBy.actorRole,
-                createdAt: new Date(),
+                business: currentBusiness,
+                serviceId: line.service._id,
+                staffMembershipId: line.staffMembership._id,
+                startAt: params.startAt,
+                endAt: line.endAt,
+                partySize: line.partySize,
+                capacityMax: line.capacityMax,
+                allowInactive: false,
+                expectedService: line.service,
+                fulfilment: params.fulfilment,
               },
-            ],
-            ...(params.cancellationPolicySnapshot
-              ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
-              : {}),
-            ...(params.noShowEligibilitySnapshot
-              ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
-              : {}),
-            sessionEndReminderSnapshot,
-            ...(params.notes ? { notes: params.notes } : {}),
-            ...(params.resolvedPromo
-              ? {
-                  promo: {
-                    promoId: params.resolvedPromo.promo._id,
-                    code: params.resolvedPromo.promo.code,
-                    type: params.resolvedPromo.promo.type,
-                    value: params.resolvedPromo.promo.value,
-                    discountCents: params.resolvedPromo.promoDiscountCents,
-                    chargeCents: params.customerChargeNowCents,
-                    // P2 — only a V3 contract can carry a promo (see establishFinancialTerms).
-                    fundingOwner: "BUSINESS" as const,
-                    appliedAt: new Date(),
-                  },
-                }
-              : {}),
-            financialContract: params.contract,
-          },
-          dbSession,
-        );
+              this.availabilityService,
+              dbSession,
+            );
+          }
+          const reservationsByLineIndex = new Map<number, Types.ObjectId>();
 
-        if (params.packageProgressCreate) {
-          await this.requirePackageProgressRepository().create(
-            params.packageProgressCreate,
-            dbSession,
-          );
-        }
-
-        if (hasDepositObligation) {
-          // The upfront charge — the ledger TYPE alone records who economically owns it (see
-          // BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first purchase.
-          // Since P3 a RETURNING purchase has no upfront at all (depositCents 0), so this block
-          // never runs for it; DEPOSIT remains the contract's ledger type for RETURNING and is
-          // only ever found on pre-P3 history. `amountCents` is the amount ACTUALLY charged
-          // (P2: the full upfront computed on the promo-discounted price, never upfront − promo)
-          // — every downstream reader of "the customer's upfront payment" (cancellation/no-show
-          // netting, refunds — see BookingFinancialTransactionService.findSucceededUpfrontPayment)
-          // reads this real ledger amount. Skipped entirely for a zero charge: the ledger
-          // schema's own `amountCents` invariant requires a positive amount (a real, immutable
-          // financial event must represent SOME money movement), so a fake €0 row is never
-          // written.
-          if (params.customerChargeNowCents > 0) {
-            const transaction = await this.financialTransactionService.record(
+          for (const [index, line] of [...params.lines.entries()].sort(
+            (a, b) =>
+              String(a[1].staffMembership._id).localeCompare(String(b[1].staffMembership._id)) ||
+              a[1].endAt.getTime() - b[1].endAt.getTime() ||
+              a[0] - b[0],
+          )) {
+            const reservation = await this.reservationService.reserveOrJoin(
               {
                 businessId: params.business._id,
-                bookingId: params.bookingId,
-                businessClientId: params.client._id,
-                customerUserId: params.createdBy.actorUserId,
-                // FIRST upfront is always Bookly's PLATFORM_FEE — exactly as the contract
-                // recorded before the charge (a P3 RETURNING contract never reaches here).
-                type: params.contract.upfrontLedgerType,
-                direction: "DEBIT",
-                amountCents: params.customerChargeNowCents,
-                currency: params.financials.currency,
-                status: "SUCCEEDED",
-                ...(params.paymentResult
-                  ? { providerReference: params.paymentResult.paymentIntentId }
-                  : {}),
-                idempotencyKey: `${params.idempotencyKey}:deposit`,
+                staffMembershipId: line.staffMembership._id,
+                serviceId: line.service._id,
+                timezone: params.business.timezone,
+                startAt: params.startAt,
+                endAt: line.endAt,
+                capacityMax: line.capacityMax,
+                partySize: line.partySize,
+                idempotencyKey: `${params.idempotencyKey}:${index}`,
               },
               dbSession,
             );
-            succeededTransactionId = transaction._id;
+            reservationsByLineIndex.set(index, reservation.reservationId);
           }
-          // P2 — no PROMO_SUBSIDY: the Business funds the promo (its booking price, and so its
-          // entitlement, is already discounted). The ledger type stays readable for Batch 13
-          // history only.
-        }
 
-        // P1 — FIRST_PENDING -> CONSUMED in this SAME transaction, fenced on this exact logical
-        // operation and its bound PaymentAttempt (none for a zero-upfront FIRST). Losing the
-        // claim aborts the whole transaction (the caller then compensates any charge).
-        if (isFirst) {
-          const consumed = await this.relationships.consumeFirst(
-            params.client._id,
+          const reference = await this.generateUniqueReference();
+          const overallEndAt = params.lines.reduce(
+            (max, line) => (line.endAt > max ? line.endAt : max),
+            params.lines[0]?.endAt ?? params.startAt,
+          );
+          const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
+            params.lines,
+            overallEndAt,
+          );
+
+          const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
+            serviceId: line.service._id,
+            serviceSnapshot: line.serviceSnapshot,
+            ...(line.staffSnapshot ? { staffSnapshot: line.staffSnapshot } : {}),
+            pricingInput: line.pricingInput,
+            responsibleStaffMembershipId: line.staffMembership._id,
+            addons: line.addons,
+            amountCents: line.amountCents,
+            reservationId: reservationsByLineIndex.get(index) as Types.ObjectId,
+            reservationOperationKey: `${params.idempotencyKey}:${index}`,
+          }));
+
+          // P1 — first/returning was decided atomically BEFORE the charge (the relationship claim)
+          // and frozen in the Financial Contract, so there is no post-charge race left to
+          // resolve here: the previous `markActivated`-decides-the-ledger-after-money-moved
+          // pattern is gone. A concurrent competing first operation never reached a charge.
+          // `hasDepositObligation` (not `paymentResult` truthiness) gates ledger-writing: a zero
+          // obligation (P2: e.g. a 100% promo on a FIRST booking) writes no ledger row.
+          const hasDepositObligation = params.financials.depositCents > 0;
+          const financials = params.financials;
+
+          // The authoritative, atomic usage consumption — only here, inside the persistence
+          // transaction (no pre-payment reservation); an ALL_FIRST_BOOKINGS promo re-validates
+          // against the authoritative classification. A rollback removes the consumption.
+          if (params.resolvedPromo) {
+            await this.promoApplicationService.claimRedemption(
+              {
+                resolved: params.resolvedPromo,
+                requiredUpfrontCents: params.contract.requiredUpfrontCents,
+                bookingId: params.bookingId,
+                businessId: params.business._id,
+                customerUserId: params.createdBy.actorUserId,
+                isFirstBooking: isFirst,
+              },
+              dbSession,
+            );
+          }
+
+          created = await this.bookingRepository.create(
             {
-              idempotencyKey: params.idempotencyKey,
-              bookingId: params.bookingId,
-              productKind: params.contract.productKind,
-              paymentAttemptId: params.paymentResult?.paymentAttemptId,
-              financialTransactionId: succeededTransactionId,
+              _id: params.bookingId,
+              businessId: params.business._id,
+              reference,
+              source: "BOOKLY_MANAGED",
+              status: "UPCOMING",
+              customer: params.customer,
+              createdBy: params.createdBy,
+              fulfilment: params.fulfilment,
+              serviceLines,
+              financials,
+              schedule: {
+                timezone: params.business.timezone,
+                startAt: params.startAt,
+                endAt: overallEndAt,
+              },
+              customerRescheduleCount: 0,
+              rescheduleHistory: [],
+              eventHistory: [
+                {
+                  type: "CREATED",
+                  nextStatus: "UPCOMING",
+                  actorUserId: params.createdBy.actorUserId,
+                  actorRole: params.createdBy.actorRole,
+                  createdAt: new Date(),
+                },
+              ],
+              ...(params.cancellationPolicySnapshot
+                ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
+                : {}),
+              ...(params.noShowEligibilitySnapshot
+                ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
+                : {}),
+              sessionEndReminderSnapshot,
+              ...(params.notes ? { notes: params.notes } : {}),
+              ...(params.resolvedPromo
+                ? {
+                    promo: {
+                      promoId: params.resolvedPromo.promo._id,
+                      code: params.resolvedPromo.promo.code,
+                      type: params.resolvedPromo.promo.type,
+                      value: params.resolvedPromo.promo.value,
+                      discountCents: params.resolvedPromo.promoDiscountCents,
+                      chargeCents: params.customerChargeNowCents,
+                      // P2 — only a V3 contract can carry a promo (see establishFinancialTerms).
+                      fundingOwner: "BUSINESS" as const,
+                      appliedAt: new Date(),
+                    },
+                  }
+                : {}),
+              financialContract: params.contract,
             },
             dbSession,
           );
-          if (!consumed) throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
-        }
 
-        const completed = await this.paymentService.markPaymentCompleted(
-          params.paymentResult?.paymentAttemptId,
-          {
-            bookingId: params.bookingId,
-            ...(params.packageProgressCreate
-              ? { packageProgressId: params.packageProgressCreate._id }
-              : {}),
-            ...(succeededTransactionId ? { succeededTransactionId } : {}),
-          },
-          params.persistenceLeaseToken,
-          dbSession,
-        );
-        if (!completed) throw new Error("Payment persistence lease was lost");
-      });
+          if (params.packageProgressCreate) {
+            await this.requirePackageProgressRepository().create(
+              params.packageProgressCreate,
+              dbSession,
+            );
+          }
+
+          if (hasDepositObligation) {
+            // The upfront charge — the ledger TYPE alone records who economically owns it (see
+            // BookingFinancials's own doc comment): PLATFORM_FEE for the genuine first purchase.
+            // Since P3 a RETURNING purchase has no upfront at all (depositCents 0), so this block
+            // never runs for it; DEPOSIT remains the contract's ledger type for RETURNING and is
+            // only ever found on pre-P3 history. `amountCents` is the amount ACTUALLY charged
+            // (P2: the full upfront computed on the promo-discounted price, never upfront − promo)
+            // — every downstream reader of "the customer's upfront payment" (cancellation/no-show
+            // netting, refunds — see BookingFinancialTransactionService.findSucceededUpfrontPayment)
+            // reads this real ledger amount. Skipped entirely for a zero charge: the ledger
+            // schema's own `amountCents` invariant requires a positive amount (a real, immutable
+            // financial event must represent SOME money movement), so a fake €0 row is never
+            // written.
+            if (params.customerChargeNowCents > 0) {
+              const transaction = await this.financialTransactionService.record(
+                {
+                  businessId: params.business._id,
+                  bookingId: params.bookingId,
+                  businessClientId: params.client._id,
+                  customerUserId: params.createdBy.actorUserId,
+                  // FIRST upfront is always Bookly's PLATFORM_FEE — exactly as the contract
+                  // recorded before the charge (a P3 RETURNING contract never reaches here).
+                  type: params.contract.upfrontLedgerType,
+                  direction: "DEBIT",
+                  amountCents: params.customerChargeNowCents,
+                  currency: params.financials.currency,
+                  status: "SUCCEEDED",
+                  ...(params.paymentResult
+                    ? { providerReference: params.paymentResult.paymentIntentId }
+                    : {}),
+                  idempotencyKey: `${params.idempotencyKey}:deposit`,
+                },
+                dbSession,
+              );
+              succeededTransactionId = transaction._id;
+            }
+            // P2 — no PROMO_SUBSIDY: the Business funds the promo (its booking price, and so its
+            // entitlement, is already discounted). The ledger type stays readable for Batch 13
+            // history only.
+          }
+
+          // P1 — FIRST_PENDING -> CONSUMED in this SAME transaction, fenced on this exact logical
+          // operation and its bound PaymentAttempt (none for a zero-upfront FIRST). Losing the
+          // claim aborts the whole transaction (the caller then compensates any charge).
+          if (isFirst) {
+            const consumed = await this.relationships.consumeFirst(
+              params.client._id,
+              {
+                idempotencyKey: params.idempotencyKey,
+                bookingId: params.bookingId,
+                productKind: params.contract.productKind,
+                paymentAttemptId: params.paymentResult?.paymentAttemptId,
+                financialTransactionId: succeededTransactionId,
+              },
+              dbSession,
+            );
+            if (!consumed) throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+          }
+
+          const completed = await this.paymentService.markPaymentCompleted(
+            params.paymentResult?.paymentAttemptId,
+            {
+              bookingId: params.bookingId,
+              ...(params.packageProgressCreate
+                ? { packageProgressId: params.packageProgressCreate._id }
+                : {}),
+              ...(succeededTransactionId ? { succeededTransactionId } : {}),
+            },
+            params.persistenceLeaseToken,
+            dbSession,
+          );
+          if (!completed) throw new Error("Payment persistence lease was lost");
+        },
+        () =>
+          this.resolveCommittedBooking(
+            {
+              businessId: params.business._id,
+              customerUserId: String(params.createdBy.actorUserId),
+              idempotencyKey: params.idempotencyKey,
+              kind: params.contract.productKind,
+            },
+            params.bookingId,
+          ),
+      );
+      if (recovered) created = recovered;
     } catch (error) {
+      if (error instanceof BookingPersistenceUnresolvedError) throw error;
       if (!params.paymentResult?.paymentAttemptId) {
-        await this.claimRepository.release(params.idempotencyKey);
+        await this.claimRepository.releaseUncommitted({
+          idempotencyKey: params.idempotencyKey,
+          businessId: params.business._id,
+          actorUserId: params.createdBy.actorUserId,
+          bookingId: params.bookingId,
+        });
       }
 
       if (this.isTransactionUnsupported(error)) {
@@ -2161,16 +2332,14 @@ export class BookingCreationService {
       }
       throw error;
     } finally {
-      await dbSession.endSession();
+      await dbSession.endSession().catch(() => undefined);
     }
 
     if (!created) {
       throw new Error("Booking creation failed without throwing");
     }
 
-    await this.syncBookingCreatedToGoogleCalendar(created);
-    await this.dispatchBookingCreatedNotifications(created, params.business);
-    await this.dispatchAppointmentReminderScheduling(created);
+    await this.afterBookingCommitted(created, params.business);
 
     return created;
   }
@@ -2925,115 +3094,400 @@ export class BookingCreationService {
     });
 
     if (!claimResult.isNew) {
-      return this.awaitIdempotentBooking(params, claimResult.bookingId);
+      return this.awaitIdempotentBooking(
+        { ...params, manualActorUserId: params.actorUserId },
+        claimResult.bookingId,
+      );
     }
 
-    const dbSession = await mongoose.startSession();
+    const dbSession = await mongoose.startSession().catch(async (error) => {
+      await this.claimRepository.releaseUncommitted({
+        idempotencyKey: params.idempotencyKey,
+        businessId: params.business._id,
+        actorUserId: new Types.ObjectId(params.actorUserId),
+        bookingId,
+      });
+      throw error;
+    });
     let created: BookingDocument | undefined;
 
     try {
-      await dbSession.withTransaction(async () => {
-        const reservationsByLineIndex = new Map<number, Types.ObjectId>();
+      const recovered = await this.runBookingTransaction(
+        dbSession,
+        async () => {
+          const currentBusiness = await acquireSchedulingAdmission(params.business, dbSession);
+          for (const line of params.lines) {
+            await validateSchedulingLine(
+              {
+                business: currentBusiness,
+                serviceId: line.service._id,
+                staffMembershipId: line.staffMembership._id,
+                startAt: params.startAt,
+                endAt: line.endAt,
+                partySize: line.partySize,
+                capacityMax: line.capacityMax,
+                allowInactive: false,
+                expectedService: line.service,
+                fulfilment: params.fulfilment,
+              },
+              this.availabilityService,
+              dbSession,
+            );
+          }
+          const reservationsByLineIndex = new Map<number, Types.ObjectId>();
 
-        for (const [index, line] of params.lines.entries()) {
-          const reservation = await this.reservationService.reserveOrJoin(
+          for (const [index, line] of [...params.lines.entries()].sort(
+            (a, b) =>
+              String(a[1].staffMembership._id).localeCompare(String(b[1].staffMembership._id)) ||
+              a[1].endAt.getTime() - b[1].endAt.getTime() ||
+              a[0] - b[0],
+          )) {
+            const reservation = await this.reservationService.reserveOrJoin(
+              {
+                businessId: params.business._id,
+                staffMembershipId: line.staffMembership._id,
+                serviceId: line.service._id,
+                timezone: params.business.timezone,
+                startAt: params.startAt,
+                endAt: line.endAt,
+                capacityMax: line.capacityMax,
+                partySize: line.partySize,
+                idempotencyKey: `${params.idempotencyKey}:${index}`,
+              },
+              dbSession,
+            );
+            reservationsByLineIndex.set(index, reservation.reservationId);
+          }
+
+          const reference = await this.generateUniqueReference();
+          const overallEndAt = params.lines.reduce(
+            (max, line) => (line.endAt > max ? line.endAt : max),
+            params.lines[0]?.endAt ?? params.startAt,
+          );
+          const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
+            params.lines,
+            overallEndAt,
+          );
+
+          const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
+            serviceId: line.service._id,
+            serviceSnapshot: line.serviceSnapshot,
+            ...(line.staffSnapshot ? { staffSnapshot: line.staffSnapshot } : {}),
+            pricingInput: line.pricingInput,
+            responsibleStaffMembershipId: line.staffMembership._id,
+            addons: line.addons,
+            amountCents: line.amountCents,
+            reservationId: reservationsByLineIndex.get(index) as Types.ObjectId,
+            reservationOperationKey: `${params.idempotencyKey}:${index}`,
+          }));
+
+          created = await this.bookingRepository.create(
             {
+              _id: bookingId,
               businessId: params.business._id,
-              staffMembershipId: line.staffMembership._id,
-              serviceId: line.service._id,
-              timezone: params.business.timezone,
-              startAt: params.startAt,
-              endAt: line.endAt,
-              capacityMax: line.capacityMax,
-              partySize: line.partySize,
-              idempotencyKey: `${params.idempotencyKey}:${index}`,
+              reference,
+              source: params.source,
+              status: "UPCOMING",
+              customer: params.customer,
+              createdBy: params.createdBy,
+              fulfilment: params.fulfilment,
+              serviceLines,
+              financials: params.financials,
+              schedule: {
+                timezone: params.business.timezone,
+                startAt: params.startAt,
+                endAt: overallEndAt,
+              },
+              customerRescheduleCount: 0,
+              rescheduleHistory: [],
+              eventHistory: [
+                {
+                  type: "CREATED",
+                  nextStatus: "UPCOMING",
+                  actorUserId: params.createdBy.actorUserId,
+                  actorRole: params.createdBy.actorRole,
+                  createdAt: new Date(),
+                },
+              ],
+              ...(params.cancellationPolicySnapshot
+                ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
+                : {}),
+              ...(params.noShowEligibilitySnapshot
+                ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
+                : {}),
+              sessionEndReminderSnapshot,
+              ...(params.notes ? { notes: params.notes } : {}),
             },
             dbSession,
           );
-          reservationsByLineIndex.set(index, reservation.reservationId);
-        }
-
-        const reference = await this.generateUniqueReference();
-        const overallEndAt = params.lines.reduce(
-          (max, line) => (line.endAt > max ? line.endAt : max),
-          params.lines[0]?.endAt ?? params.startAt,
-        );
-        const sessionEndReminderSnapshot = this.buildSessionEndReminderSnapshot(
-          params.lines,
-          overallEndAt,
-        );
-
-        const serviceLines: BookingServiceLine[] = params.lines.map((line, index) => ({
-          serviceId: line.service._id,
-          serviceSnapshot: line.serviceSnapshot,
-          ...(line.staffSnapshot ? { staffSnapshot: line.staffSnapshot } : {}),
-          pricingInput: line.pricingInput,
-          responsibleStaffMembershipId: line.staffMembership._id,
-          addons: line.addons,
-          amountCents: line.amountCents,
-          reservationId: reservationsByLineIndex.get(index) as Types.ObjectId,
-        }));
-
-        created = await this.bookingRepository.create(
-          {
-            _id: bookingId,
-            businessId: params.business._id,
-            reference,
-            source: params.source,
-            status: "UPCOMING",
-            customer: params.customer,
-            createdBy: params.createdBy,
-            fulfilment: params.fulfilment,
-            serviceLines,
-            financials: params.financials,
-            schedule: {
-              timezone: params.business.timezone,
-              startAt: params.startAt,
-              endAt: overallEndAt,
-            },
-            customerRescheduleCount: 0,
-            rescheduleHistory: [],
-            eventHistory: [
-              {
-                type: "CREATED",
-                nextStatus: "UPCOMING",
-                actorUserId: params.createdBy.actorUserId,
-                actorRole: params.createdBy.actorRole,
-                createdAt: new Date(),
-              },
-            ],
-            ...(params.cancellationPolicySnapshot
-              ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
-              : {}),
-            ...(params.noShowEligibilitySnapshot
-              ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
-              : {}),
-            sessionEndReminderSnapshot,
-            ...(params.notes ? { notes: params.notes } : {}),
-          },
-          dbSession,
-        );
-      });
+        },
+        () =>
+          this.resolveManualBooking(
+            params.business._id,
+            params.idempotencyKey,
+            params.actorUserId,
+            bookingId,
+            true,
+          ),
+      );
+      if (recovered) created = recovered;
     } catch (error) {
-      await this.claimRepository.release(params.idempotencyKey);
+      if (error instanceof BookingPersistenceUnresolvedError) throw error;
+      await this.claimRepository.releaseUncommitted({
+        idempotencyKey: params.idempotencyKey,
+        businessId: params.business._id,
+        actorUserId: new Types.ObjectId(params.actorUserId),
+        bookingId,
+      });
 
       if (this.isTransactionUnsupported(error)) {
         throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
       }
       throw error;
     } finally {
-      await dbSession.endSession();
+      await dbSession.endSession().catch(() => undefined);
     }
 
     if (!created) {
       throw new Error("Booking creation failed without throwing");
     }
 
-    await this.syncBookingCreatedToGoogleCalendar(created);
-    await this.dispatchBookingCreatedNotifications(created, params.business);
-    await this.dispatchAppointmentReminderScheduling(created);
+    await this.afterBookingCommitted(created, params.business);
 
     return created;
+  }
+
+  private persistenceLeaseActive(attempt: {
+    persistenceStatus: string;
+    persistenceLeaseExpiresAt?: Date | undefined;
+  }) {
+    return (
+      attempt.persistenceStatus === "PERSISTING" &&
+      !!attempt.persistenceLeaseExpiresAt &&
+      attempt.persistenceLeaseExpiresAt.getTime() > Date.now()
+    );
+  }
+
+  /** Driver owns callback/commit retries. Our callbacks never commit themselves. Once
+   * a callback finishes, an exception is NOT proof of abort (including an unlabelled
+   * timeout). Preserve the operation unless an authorized complete winner is readable. */
+  private async runBookingTransaction(
+    session: ClientSession,
+    work: () => Promise<void>,
+    resolveWinner: () => Promise<BookingDocument | null>,
+  ): Promise<BookingDocument | undefined> {
+    let callbackCompleted = false;
+    try {
+      await session.withTransaction(async () => {
+        // The driver only restarts the callback after a definite transient abort;
+        // unknown commit results retry commit, not the application callback.
+        callbackCompleted = false;
+        await work();
+        callbackCompleted = true;
+      });
+      return undefined;
+    } catch (error) {
+      const unknown =
+        error instanceof mongoose.mongo.MongoError &&
+        error.hasErrorLabel("UnknownTransactionCommitResult");
+      if (!callbackCompleted && !unknown) throw error;
+      try {
+        const winner = await resolveWinner();
+        if (winner) return winner;
+      } catch {
+        // Read failure, absence or conflicting evidence cannot establish rollback.
+      }
+      throw new BookingPersistenceUnresolvedError();
+    }
+  }
+
+  private async hasLegacyResult(booking: BookingDocument): Promise<boolean> {
+    const line = booking.serviceLines.length === 1 ? booking.serviceLines[0] : undefined;
+    if (line?.serviceSnapshot.pricingMode !== "PACKAGE") return true;
+    if (!line.pricingInput.packageProgressId || !booking.customer.customerUserId) return false;
+    const progress = await this.requirePackageProgressRepository().findByIdForCustomerAndBusiness(
+      line.pricingInput.packageProgressId,
+      booking.businessId,
+      booking.customer.customerUserId,
+    );
+    return (
+      !!progress &&
+      String(progress.businessClientId) === String(booking.customer.businessClientId) &&
+      String(progress.serviceId) === String(line.serviceId) &&
+      (line.pricingInput.sessionIndex !== 1 ||
+        String(progress.originBookingId) === String(booking._id)) &&
+      progress.sessions.some(
+        (entry) =>
+          String(entry.bookingId) === String(booking._id) &&
+          entry.sessionIndex === line.pricingInput.sessionIndex,
+      )
+    );
+  }
+
+  private async hasCommittedReservations(booking: BookingDocument): Promise<boolean> {
+    for (const line of booking.serviceLines) {
+      const row = await BookingSlotReservationModel.exists({
+        businessId: booking.businessId,
+        staffMembershipId: line.responsibleStaffMembershipId,
+        intervals: { $elemMatch: { reservationId: line.reservationId, serviceId: line.serviceId } },
+      }).read("primary");
+      if (!row) return false;
+    }
+    return true;
+  }
+
+  private async resolveCommittedBooking(scope: CustomerReplayScope, bookingId: Types.ObjectId) {
+    const { booking } = await this.readCustomerReplay(scope, bookingId, false);
+    if (!booking || !(await this.hasCommittedReservations(booking))) return null;
+    const attempt = await this.paymentService.findPaymentAttempt(scope.idempotencyKey);
+    if (
+      attempt &&
+      (attempt.persistenceStatus !== "COMPLETED" ||
+        attempt.providerStatus !== "SUCCEEDED" ||
+        attempt.compensationStatus !== "NOT_REQUIRED" ||
+        String(attempt.bookingId) !== String(bookingId) ||
+        String(attempt.businessId) !== String(scope.businessId) ||
+        String(attempt.customerUserId) !== scope.customerUserId)
+    )
+      return null;
+    if (
+      (booking.financialContract?.onlineChargeCents ?? booking.financials.depositCents) > 0 &&
+      !attempt
+    )
+      return null;
+    return booking;
+  }
+
+  private async resolveManualBooking(
+    businessId: Types.ObjectId,
+    key: string,
+    actorUserId: string,
+    bookingId: Types.ObjectId,
+    verifyReservations = false,
+  ) {
+    const claim = await this.claimRepository.findForCustomerReplay(key, businessId, actorUserId);
+    if (!claim) return null;
+    if (String(claim.bookingId) !== String(bookingId) || claim.financialContract)
+      throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    const booking = await this.bookingRepository.findById(businessId, bookingId);
+    if (!booking) return null;
+    if (
+      booking.source !== "MANUAL" ||
+      String(booking.createdBy.actorUserId) !== actorUserId ||
+      String(booking.businessId) !== String(businessId) ||
+      String(booking._id) !== String(bookingId) ||
+      !booking.customer.businessClientId ||
+      booking.financialContract
+    )
+      throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    return !verifyReservations || (await this.hasCommittedReservations(booking)) ? booking : null;
+  }
+
+  /** These ports are documented best-effort. Their failure follows commit and must
+   * never enter abort cleanup or paid compensation. Delivery recovery is unchanged. */
+  private async afterBookingCommitted(booking: BookingDocument, business: BusinessDocument) {
+    await this.syncBookingCreatedToGoogleCalendar(booking).catch(() => undefined);
+    await this.dispatchBookingCreatedNotifications(booking, business).catch(() => undefined);
+    await this.dispatchAppointmentReminderScheduling(booking).catch(() => undefined);
+  }
+
+  /** Check the canonical claim BEFORE reading/returning a Booking or resuming money.
+   * Bare pending pre-contract/redemption claims have no persisted kind: wait for evidence;
+   * never infer a kind from the caller's key. Completed legacy rows use their stored shape. */
+  private async readCustomerReplay(
+    scope: CustomerReplayScope,
+    expectedBookingId?: Types.ObjectId,
+    readAttempt = true,
+  ) {
+    const conflict = () => new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    const claim = await this.claimRepository.findForCustomerReplay(
+      scope.idempotencyKey,
+      scope.businessId,
+      scope.customerUserId,
+    );
+    if (!claim) return { claim: null, booking: null, attempt: null };
+    if (expectedBookingId && String(claim.bookingId) !== String(expectedBookingId))
+      throw conflict();
+    const contract = claim.financialContract;
+    if (
+      contract &&
+      (contract.productKind !== scope.kind ||
+        contract.idempotencyKey !== scope.idempotencyKey ||
+        String(contract.businessId) !== String(scope.businessId) ||
+        String(contract.customerUserId) !== scope.customerUserId ||
+        String(contract.bookingId) !== String(claim.bookingId) ||
+        !contract.businessClientId)
+    )
+      throw conflict();
+    const booking = await this.bookingRepository.findById(scope.businessId, claim.bookingId);
+    if (booking) {
+      if (
+        String(booking._id) !== String(claim.bookingId) ||
+        String(booking.businessId) !== String(scope.businessId) ||
+        String(booking.customer?.customerUserId) !== scope.customerUserId ||
+        !booking.customer?.businessClientId ||
+        booking.source !== "BOOKLY_MANAGED"
+      )
+        throw conflict();
+      const lines = booking.serviceLines;
+      const packageLine = lines.length === 1 ? lines[0] : undefined;
+      const legacy =
+        packageLine?.serviceSnapshot.pricingMode === "PACKAGE" &&
+        !!packageLine.pricingInput.packageProgressId &&
+        !packageLine.pricingInput.packageItemId &&
+        !packageLine.packageContext;
+      const matchesKind =
+        scope.kind === "NORMAL_BOOKING"
+          ? lines.length > 0 &&
+            lines.every(
+              (line) =>
+                line.serviceSnapshot.pricingMode !== "PACKAGE" &&
+                !line.pricingInput.packageProgressId &&
+                !line.pricingInput.packageItemId &&
+                !line.packageContext,
+            )
+          : legacy &&
+            (scope.kind === "PACKAGE_PURCHASE"
+              ? packageLine.pricingInput.sessionIndex === 1
+              : (packageLine.pricingInput.sessionIndex ?? 0) > 1 &&
+                String(packageLine.pricingInput.packageProgressId) ===
+                  String(scope.packageProgressId));
+      if (!matchesKind || Boolean(contract) !== Boolean(booking.financialContract))
+        throw conflict();
+      if (
+        contract &&
+        (String(contract.businessClientId) !== String(booking.customer.businessClientId) ||
+          !booking.financialContract ||
+          findFinancialContractMismatch(contract, booking.financialContract))
+      )
+        throw conflict();
+      if (legacy && !(await this.hasLegacyResult(booking)))
+        throw new BookingPersistenceUnresolvedError();
+      return { claim, booking, attempt: null };
+    }
+    const attempt = readAttempt
+      ? await this.paymentService.findPaymentAttempt(scope.idempotencyKey)
+      : null;
+    if (attempt) {
+      const purpose =
+        scope.kind === "NORMAL_BOOKING"
+          ? "BOOKING_DEPOSIT"
+          : scope.kind === "PACKAGE_PURCHASE"
+            ? "PACKAGE_PURCHASE"
+            : "PACKAGE_SESSION_EXTRAS";
+      if (
+        attempt.logicalIdempotencyKey !== scope.idempotencyKey ||
+        attempt.purpose !== purpose ||
+        String(attempt.customerUserId) !== scope.customerUserId ||
+        String(attempt.businessId) !== String(scope.businessId) ||
+        String(attempt.bookingId) !== String(claim.bookingId) ||
+        (scope.kind !== "PACKAGE_REDEMPTION" &&
+          (!contract || attempt.productKind !== scope.kind)) ||
+        (scope.kind === "PACKAGE_REDEMPTION" && (contract || attempt.productKind))
+      )
+        throw conflict();
+    }
+    return { claim, booking: null, attempt };
   }
 
   /** Idempotent-retry resolution: the claim already belongs to a prior (this call's own retry,
@@ -3041,18 +3495,34 @@ export class BookingCreationService {
    * if the claim disappears (the earlier attempt failed and released it) before a Booking ever
    * appears, this is a fresh slot — recurse into a brand-new persist attempt exactly once. */
   private async awaitIdempotentBooking(
-    params: { business: BusinessDocument; idempotencyKey: string },
+    params: {
+      business: BusinessDocument;
+      idempotencyKey: string;
+      customerReplay?: CustomerReplayScope;
+      manualActorUserId?: string;
+    },
     bookingId: Types.ObjectId,
   ): Promise<BookingDocument> {
     for (let attempt = 0; attempt < IDEMPOTENCY_CLAIM_POLL_ATTEMPTS; attempt += 1) {
-      const existing = await this.bookingRepository.findById(params.business._id, bookingId);
-      if (existing) {
-        return existing;
-      }
+      // Manual management replay keeps its existing contract. Every Customer call supplies scope.
+      const replay = params.customerReplay
+        ? await this.readCustomerReplay(params.customerReplay, bookingId, false)
+        : undefined;
+      const claimStillPresent = replay
+        ? replay.claim
+        : await this.claimRepository.findByIdempotencyKey(params.idempotencyKey);
+      const existing = replay
+        ? replay.booking
+        : params.manualActorUserId
+          ? await this.resolveManualBooking(
+              params.business._id,
+              params.idempotencyKey,
+              params.manualActorUserId,
+              bookingId,
+            )
+          : null;
+      if (existing) return existing;
 
-      const claimStillPresent = await this.claimRepository.findByIdempotencyKey(
-        params.idempotencyKey,
-      );
       if (!claimStillPresent) {
         // The earlier attempt failed and released its claim — this call can now become the
         // winner. Caller (persistBooking) already validated everything; a bare re-throw here

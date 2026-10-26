@@ -82,6 +82,8 @@ const schema = new Schema<PaymentDisputeDocument>(
   { timestamps: true },
 );
 
+// Customer-owned detail: bounded, deterministic read; no financial transition.
+schema.index({ bookingId: 1, createdAt: -1, _id: -1 });
 schema.index({ providerDisputeId: 1 }, { unique: true });
 // Support list / open-dispute backstop.
 schema.index({ final: 1, updatedAt: 1 });

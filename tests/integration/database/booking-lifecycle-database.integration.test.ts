@@ -1,21 +1,45 @@
-import { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-
+import express from "express";
+import mongoose, { Types } from "mongoose";
+import request from "supertest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
+import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
+import { validateRequest } from "../../../src/common/middleware/validate-request.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+  requireRoles,
+} from "../../../src/modules/auth/auth.middleware.js";
+import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { BookingController } from "../../../src/modules/booking/booking.controller.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import {
+  bookingIdOnlyParamsSchema,
+  bookingIdParamsSchema,
+  rescheduleAvailabilityQuerySchema,
+  rescheduleBookingBodySchema,
+} from "../../../src/modules/booking/booking.schema.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import { BookingRescheduleAvailabilityService } from "../../../src/modules/booking/booking-reschedule-availability.service.js";
+import {
+  acquireSchedulingAdmission,
+  validateSchedulingLine,
+} from "../../../src/modules/booking/booking-scheduling-admission.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BookingSlotReservationClaimModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation-claim.model.js";
+import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
@@ -34,11 +58,14 @@ import { PromoRepository } from "../../../src/modules/promo/promo.repository.js"
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
+import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
+import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
@@ -237,6 +264,11 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       briefDescription: "A great business",
       category: "Barber",
       subcategories: ["Haircut"],
+    });
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
     });
     return { owner, business };
   };
@@ -819,6 +851,571 @@ describe("database-backed Booking creation + lifecycle integration", () => {
 
   // --- Reschedule --------------------------------------------------------------------------------
 
+  describe("F1C-A booking-owned availability", () => {
+    const reader = () =>
+      new BookingRescheduleAvailabilityService(bookingService, availabilityService);
+    const read = (f: Awaited<ReturnType<typeof createUpcomingBooking>>) =>
+      reader().forBusiness(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        DATE,
+        DATE,
+      );
+    const newBooking = async (hours = 4) => {
+      const f = await setupBookableBusiness();
+      await ServiceModel.updateOne(
+        { _id: f.service._id },
+        {
+          $set: {
+            pricingMode: "HOURLY",
+            hourlyPricing: { ratePerHourCents: 1000, minHours: 2, maxHours: 4, bufferAfterMin: 15 },
+          },
+          $unset: { fixedPricing: "" },
+        },
+      );
+      const booking = await creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        {
+          businessClientId: String(f.client._id),
+          idempotencyKey: new Types.ObjectId().toString(),
+          startAt: businessLocalToUtc(TIMEZONE, "2030-08-19", "09:00").toISOString(),
+          serviceLines: [
+            {
+              serviceId: String(f.service._id),
+              staffMembershipId: String(f.membership._id),
+              addonIds: [],
+              pricingInput: { hours },
+            },
+          ],
+        },
+      );
+      return { ...f, booking };
+    };
+    const appAndToken = () => {
+      const tokens = new TokenService(new SessionRepository());
+      const controller = new BookingController(
+        bookingService,
+        creationService,
+        lifecycleService,
+        reader(),
+      );
+      const authenticate = createAuthenticateAccessTokenMiddleware(tokens, userRepository);
+      const app = express();
+      app.use(express.json());
+      app.get(
+        "/me/bookings/:bookingId/reschedule-availability",
+        authenticate,
+        requireActiveUser(),
+        requireRoles(["CUSTOMER"]),
+        validateRequest({
+          params: bookingIdOnlyParamsSchema,
+          query: rescheduleAvailabilityQuerySchema,
+        }),
+        asyncHandler(controller.getRescheduleAvailabilityForCustomer),
+      );
+      app.get(
+        "/businesses/:businessId/bookings/:bookingId/reschedule-availability",
+        authenticate,
+        requireActiveUser(),
+        requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+        validateRequest({
+          params: bookingIdParamsSchema,
+          query: rescheduleAvailabilityQuerySchema,
+        }),
+        asyncHandler(controller.getRescheduleAvailabilityForBusiness),
+      );
+      app.post(
+        "/me/bookings/:bookingId/reschedule",
+        authenticate,
+        requireActiveUser(),
+        requireRoles(["CUSTOMER"]),
+        validateRequest({ params: bookingIdOnlyParamsSchema, body: rescheduleBookingBodySchema }),
+        asyncHandler(controller.rescheduleByCustomer),
+      );
+      app.use(createErrorHandler({ isProduction: true }));
+      return {
+        app,
+        token: async (
+          userId: Types.ObjectId,
+          role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
+        ) => `Bearer ${await issueTestAccessToken(tokens, { userId, role })}`,
+      };
+    };
+    it.each([2, 2.5, 4])(
+      "retains original %s hours plus buffer after live timing/bounds drift and final reschedule",
+      async (hours) => {
+        const f = await newBooking(hours);
+        await ServiceModel.updateOne(
+          { _id: f.service._id },
+          { $set: { "hourlyPricing.bufferAfterMin": 0, "hourlyPricing.maxHours": 3 } },
+        );
+        const result = await read(f);
+        expect(result.bookingId).toBe(String(f.booking._id));
+        expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+        for (const slot of result.days[0]!.slots)
+          expect(Date.parse(slot.endAt) - Date.parse(slot.startAt)).toBe(
+            (hours * 60 + 15) * 60_000,
+          );
+        const moved = await lifecycleService.rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          result.days[0]!.slots[0]!.startAt,
+        );
+        expect(moved.schedule.endAt.getTime() - moved.schedule.startAt.getTime()).toBe(
+          (hours * 60 + 15) * 60_000,
+        );
+        expect(moved.serviceLines[0]!.pricingInput.hours).toBe(hours);
+        expect(moved.financials).toEqual(f.booking.financials);
+        expect(moved.customerRescheduleCount).toBe(0);
+      },
+    );
+    it("protects actual Customer and management HTTP reads and leaves the final POST payload unchanged", async () => {
+      const f = await newBooking();
+      const customer = await userRepository.create({
+        normalizedEmail: "f1ca-customer@example.com",
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      const stranger = await userRepository.create({
+        normalizedEmail: "f1ca-stranger@example.com",
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      await BookingModel.updateOne(
+        { _id: f.booking._id },
+        { $set: { "customer.customerUserId": customer._id } },
+      );
+      const { user: supervisor } = await createStaff(f.business._id, "SUPERVISOR");
+      const other = await createBusiness("f1ca-other@example.com", "Other");
+      const { user: foreignSupervisor } = await createStaff(other.business._id, "SUPERVISOR");
+      const { app, token } = appAndToken();
+      const customerUrl = `/me/bookings/${f.booking._id}/reschedule-availability`;
+      const managerUrl = `/businesses/${f.business._id}/bookings/${f.booking._id}/reschedule-availability`;
+      const query = { fromDate: DATE, toDate: DATE };
+      const own = await request(app)
+        .get(customerUrl)
+        .query(query)
+        .set("Authorization", await token(customer._id, "CUSTOMER"));
+      expect(own.status).toBe(200);
+      expect(
+        (
+          await request(app)
+            .get(customerUrl)
+            .query(query)
+            .set("Authorization", await token(stranger._id, "CUSTOMER"))
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(app)
+            .get(managerUrl)
+            .query(query)
+            .set("Authorization", await token(other.owner._id, "BUSINESS_OWNER"))
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(app)
+            .get(managerUrl)
+            .query(query)
+            .set("Authorization", await token(foreignSupervisor._id, "SUPERVISOR"))
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await request(app)
+            .get(managerUrl)
+            .query(query)
+            .set("Authorization", await token(f.owner._id, "BUSINESS_OWNER"))
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(app)
+            .get(managerUrl)
+            .query(query)
+            .set("Authorization", await token(supervisor._id, "SUPERVISOR"))
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(app)
+            .get(managerUrl)
+            .query(query)
+            .set("Authorization", await token(f.membership.userId, "STAFF"))
+        ).status,
+      ).toBe(403);
+      for (const injection of [
+        { hours: 2 },
+        { partySize: 1 },
+        { reservationId: String(f.booking.serviceLines[0]!.reservationId) },
+        { staffMembershipId: String(f.membership._id) },
+      ]) {
+        expect(
+          (
+            await request(app)
+              .get(customerUrl)
+              .query({ ...query, ...injection })
+              .set("Authorization", await token(customer._id, "CUSTOMER"))
+          ).status,
+        ).toBe(400);
+      }
+      for (const invalid of [
+        { fromDate: DATE, toDate: "2030-08-01" },
+        { fromDate: "bad", toDate: DATE },
+        { fromDate: DATE, toDate: "2031-08-20" },
+      ]) {
+        expect(
+          (
+            await request(app)
+              .get(customerUrl)
+              .query(invalid)
+              .set("Authorization", await token(customer._id, "CUSTOMER"))
+          ).status,
+        ).toBe(400);
+      }
+      const saved = await request(app)
+        .post(`/me/bookings/${f.booking._id}/reschedule`)
+        .send({ startAt: own.body.data.days[0].slots[0].startAt })
+        .set("Authorization", await token(customer._id, "CUSTOMER"));
+      expect(saved.status).toBe(200);
+      expect(saved.body.data.serviceLines[0].hours).toBe(4);
+      expect(saved.body.data.customerRescheduleCount).toBe(1);
+    });
+    it("rejects missing/contradictory original proof and missing quantities without fallback", async () => {
+      const f = await newBooking();
+      await BookingSlotReservationClaimModel.collection.updateOne(
+        { idempotencyKey: f.booking.serviceLines[0]!.reservationOperationKey },
+        { $set: { "originalIntent.endAt": new Date(startAtFor("10:00")) } },
+      );
+      await expect(read(f)).rejects.toMatchObject({ statusCode: 409 });
+      expect(
+        (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+      ).toEqual(f.booking.schedule.startAt);
+      const other = await newBooking(2.5);
+      await BookingModel.collection.updateOne(
+        { _id: other.booking._id },
+        { $unset: { "serviceLines.0.pricingInput.hours": "" } },
+      );
+      await expect(read(other)).rejects.toMatchObject({ statusCode: 409 });
+    });
+    it("excludes full-window breaks, stale staff assignment and occupied targets while retaining old reservations", async () => {
+      const f = await newBooking();
+      await staffScheduleRepository.replace(f.membership._id, f.business._id, [
+        {
+          dayOfWeek: "TUESDAY",
+          intervals: [
+            { startTime: "09:00", endTime: "12:00" },
+            { startTime: "13:00", endTime: "17:00" },
+          ],
+        },
+      ]);
+      expect((await read(f)).days[0]!.slots).toEqual([]);
+      await staffWorksMondayToFriday(f.membership._id, f.business._id);
+      await reservationService.reserveOrJoin({
+        businessId: f.business._id,
+        staffMembershipId: f.membership._id,
+        serviceId: f.service._id,
+        timezone: TIMEZONE,
+        startAt: new Date(startAtFor("12:00")),
+        endAt: new Date(startAtFor("14:00")),
+        capacityMax: 1,
+        partySize: 1,
+        idempotencyKey: new Types.ObjectId().toString(),
+      });
+      expect((await read(f)).days[0]!.slots).toEqual([]);
+      await ServiceModel.updateOne(
+        { _id: f.service._id },
+        { $set: { assignedStaffMembershipIds: [] } },
+      );
+      expect((await read(f)).days[0]!.slots).toEqual([]);
+    });
+    it("ordinary group reads retain the complete party and exact-group same-slot remains a real lifecycle operation", async () => {
+      const f = await setupBookableBusiness();
+      const service = await createGroupService(f.business._id, f.membership._id, 6);
+      const booking = await creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        {
+          businessClientId: String(f.client._id),
+          idempotencyKey: new Types.ObjectId().toString(),
+          startAt: startAtFor("10:00"),
+          serviceLines: [
+            {
+              serviceId: String(service._id),
+              staffMembershipId: String(f.membership._id),
+              addonIds: [],
+              pricingInput: { personCount: 4 },
+            },
+          ],
+        },
+      );
+      const context = { ...f, service, booking };
+      expect(
+        (await read(context)).days[0]!.slots.some((s) => s.startAt === startAtFor("10:00")),
+      ).toBe(false); // only 2 spare, original party=4
+      await reservationService.reserveOrJoin({
+        businessId: f.business._id,
+        staffMembershipId: f.membership._id,
+        serviceId: service._id,
+        timezone: TIMEZONE,
+        startAt: new Date(startAtFor("15:00")),
+        endAt: new Date(startAtFor("16:00")),
+        capacityMax: 6,
+        partySize: 3,
+        idempotencyKey: new Types.ObjectId().toString(),
+      });
+      expect(
+        (await read(context)).days[0]!.slots.some((s) => s.startAt === startAtFor("15:00")),
+      ).toBe(false);
+      // A party of two has enough spare capacity for the existing join-before-release rule.
+      const small = await creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        {
+          businessClientId: String(f.client._id),
+          idempotencyKey: new Types.ObjectId().toString(),
+          startAt: startAtFor("12:00"),
+          serviceLines: [
+            {
+              serviceId: String(service._id),
+              staffMembershipId: String(f.membership._id),
+              addonIds: [],
+              pricingInput: { personCount: 2 },
+            },
+          ],
+        },
+      );
+      expect(
+        (await read({ ...context, booking: small })).days[0]!.slots.some(
+          (s) => s.startAt === startAtFor("12:00"),
+        ),
+      ).toBe(true);
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(small._id),
+        startAtFor("12:00"),
+      );
+      expect(moved.rescheduleHistory).toHaveLength(1);
+      expect(moved.serviceLines[0]!.pricingInput.personCount).toBe(2);
+    });
+    it("fixed historical occupancy and suspended-business lifecycle eligibility remain compatible", async () => {
+      const f = await createUpcomingBooking();
+      await ServiceModel.updateOne(
+        { _id: f.service._id },
+        { $set: { "fixedPricing.durationMin": 120, "fixedPricing.bufferAfterMin": 60 } },
+      );
+      await BusinessModel.collection.updateOne(
+        { _id: f.business._id },
+        { $set: { status: "SUSPENDED" } },
+      );
+      const result = await read(f);
+      expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+      expect(
+        result.days[0]!.slots.every(
+          (s) => Date.parse(s.endAt) - Date.parse(s.startAt) === 60 * 60_000,
+        ),
+      ).toBe(true);
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        result.days[0]!.slots[0]!.startAt,
+      );
+      expect(moved.financials).toEqual(f.booking.financials);
+    });
+    it("all-line availability preserves distinct ends and excludes secondary-line failures", async () => {
+      const f = await setupBookableBusiness();
+      const other = await createStaff(f.business._id);
+      await staffWorksMondayToFriday(other.membership._id, f.business._id);
+      const service = await createFixedService(f.business._id, other.membership._id);
+      await ServiceModel.updateOne(
+        { _id: service._id },
+        { $set: { "fixedPricing.durationMin": 240, "fixedPricing.bufferAfterMin": 15 } },
+      );
+      const booking = await creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        {
+          businessClientId: String(f.client._id),
+          idempotencyKey: new Types.ObjectId().toString(),
+          startAt: businessLocalToUtc(TIMEZONE, "2030-08-19", "09:00").toISOString(),
+          serviceLines: [f.service, service].map((s, index) => ({
+            serviceId: String(s._id),
+            staffMembershipId: String(index === 0 ? f.membership._id : other.membership._id),
+            addonIds: [],
+            pricingInput: {},
+          })),
+        },
+      );
+      const context = { ...f, booking };
+      const before = await read(context);
+      expect(before.days[0]!.slots.length).toBeGreaterThan(0);
+      expect(
+        before.days[0]!.slots.every(
+          (slot) => Date.parse(slot.endAt) - Date.parse(slot.startAt) === 255 * 60_000,
+        ),
+      ).toBe(true);
+      await staffScheduleRepository.replace(other.membership._id, f.business._id, [
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "12:00" }] },
+      ]);
+      expect((await read(context)).days[0]!.slots).toEqual([]);
+      await staffWorksMondayToFriday(other.membership._id, f.business._id);
+      const offered = (await read(context)).days[0]!.slots[0]!;
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(booking._id),
+        offered.startAt,
+      );
+      expect(moved.schedule.endAt.toISOString()).toBe(offered.endAt);
+      expect(moved.serviceLines.map((line) => line.serviceSnapshot.durationMin)).toEqual([60, 255]);
+      expect(moved.financials).toEqual(booking.financials);
+    });
+    it("read snapshots do not mutate the business fence, operations, booking or financials; failed moves roll back", async () => {
+      const f = await newBooking();
+      const businessBefore = await businessRepository.findById(f.business._id);
+      const claimsBefore = await BookingSlotReservationClaimModel.countDocuments();
+      const first = await read(f);
+      expect(await read(f)).toEqual(first);
+      expect((await businessRepository.findById(f.business._id))?.packageEligibilityVersion).toBe(
+        businessBefore?.packageEligibilityVersion,
+      );
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(claimsBefore);
+      const failure = vi
+        .spyOn(reservationService, "release")
+        .mockRejectedValueOnce(new Error("F1C-A injected release failure"));
+      await expect(
+        lifecycleService.rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          first.days[0]!.slots[0]!.startAt,
+        ),
+      ).rejects.toThrow("F1C-A injected release failure");
+      failure.mockRestore();
+      const original = await bookingRepository.findById(f.business._id, f.booking._id);
+      expect(original?.schedule).toEqual(f.booking.schedule);
+      expect(original?.financials).toEqual(f.booking.financials);
+      expect(original?.rescheduleHistory).toHaveLength(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(claimsBefore);
+      expect(await read(f)).toEqual(first);
+    });
+    it("a concurrent ordinary booking and reschedule cannot both occupy the offered historical interval", async () => {
+      const f = await newBooking();
+      const offered = (await read(f)).days[0]!.slots[0]!;
+      const results = await Promise.allSettled([
+        lifecycleService.rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          offered.startAt,
+        ),
+        creationService.createManualBooking(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          {
+            businessClientId: String(f.client._id),
+            idempotencyKey: new Types.ObjectId().toString(),
+            startAt: offered.startAt,
+            serviceLines: [
+              {
+                serviceId: String(f.service._id),
+                staffMembershipId: String(f.membership._id),
+                addonIds: [],
+                pricingInput: { hours: 4 },
+              },
+            ],
+          },
+        ),
+      ]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      const day = await BookingSlotReservationModel.findOne({
+        businessId: f.business._id,
+        staffMembershipId: f.membership._id,
+        occupancyDate: DATE,
+      }).orFail();
+      expect(day.intervals).toHaveLength(1);
+      expect(day.intervals[0]!.capacityUsed).toBe(1);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+    });
+    it("time off and missing live travel eligibility cannot advertise a final-invalid slot", async () => {
+      const f = await newBooking();
+      await new StaffTimeOffRepository().create({
+        membershipId: f.membership._id,
+        businessId: f.business._id,
+        type: "ANNUAL_HOLIDAY",
+        startDate: DATE,
+        endDate: DATE,
+        createdByUserId: f.owner._id,
+      });
+      expect((await read(f)).days[0]!.slots).toEqual([]);
+      const other = await newBooking();
+      await BusinessModel.collection.updateOne(
+        { _id: other.business._id },
+        { $set: { visitType: "TRAVEL_TO_CUSTOMER" } },
+      );
+      expect((await read(other)).days[0]!.slots).toEqual([]); // original at-business fulfilment supplies no travel city
+    });
+    it("first-class activation remains denied instead of entering a new read-side entitlement path", async () => {
+      const f = await newBooking();
+      await BookingModel.collection.updateOne(
+        { _id: f.booking._id },
+        { $set: { "serviceLines.0.pricingInput.packageItemId": new Types.ObjectId() } },
+      );
+      await expect(read(f)).rejects.toMatchObject({ code: "PACKAGE_BATCH_ACTIVATION_UNAVAILABLE" });
+    });
+    it("a current pricing-mode edit cannot replace the historical occupied interval or original quantity", async () => {
+      const f = await newBooking();
+      await ServiceModel.updateOne(
+        { _id: f.service._id },
+        {
+          $set: {
+            pricingMode: "FIXED",
+            fixedPricing: { priceCents: 1000, durationMin: 30, bookingIntervalMin: 60 },
+          },
+          $unset: { hourlyPricing: "" },
+        },
+      );
+      const result = await read(f);
+      expect(result.days[0]!.slots.length).toBeGreaterThan(0);
+      expect(
+        result.days[0]!.slots.every(
+          (slot) => Date.parse(slot.endAt) - Date.parse(slot.startAt) === 255 * 60_000,
+        ),
+      ).toBe(true);
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        result.days[0]!.slots[0]!.startAt,
+      );
+      expect(moved.serviceLines[0]!.serviceSnapshot.pricingMode).toBe("HOURLY");
+      expect(moved.serviceLines[0]!.pricingInput.hours).toBe(4);
+      expect(moved.financials).toEqual(f.booking.financials);
+    });
+  });
+
   it("owner reschedule moves the booking and never increments customerRescheduleCount", async () => {
     const { owner, business, booking } = await createUpcomingBooking();
     const newStartAt = startAtFor("15:00");
@@ -1384,6 +1981,975 @@ describe("database-backed Booking creation + lifecycle integration", () => {
 
       expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
       expect(fakeIntegration.patchCalls).toHaveLength(0);
+    });
+  });
+
+  it("B3 manual Group reschedule changes canonical membership atomically and retains old released evidence", async () => {
+    const f = await setupBookableBusiness();
+    const group = await createGroupService(f.business._id, f.membership._id, 5);
+    const make = (time: string, partySize: number) =>
+      creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        {
+          serviceLines: [
+            {
+              serviceId: String(group._id),
+              staffMembershipId: String(f.membership._id),
+              addonIds: [],
+              pricingInput: { personCount: partySize },
+            },
+          ],
+          startAt: startAtFor(time),
+          businessClientId: String(f.client._id),
+          idempotencyKey: `b3-manual-${new Types.ObjectId()}`,
+        },
+      );
+    const creator = await make("10:00", 1);
+    const joiner = await make("10:00", 2);
+    const target = await make("15:00", 1);
+    const original = joiner.serviceLines[0];
+    if (!original?.reservationOperationKey) throw new Error("Real line operation required");
+    const moved = await lifecycleService.rescheduleByOwner(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(joiner._id),
+      startAtFor("15:00"),
+    );
+    const line = moved.serviceLines[0];
+    if (!line?.reservationOperationKey) throw new Error("Rescheduled operation required");
+    expect(String(line.reservationId)).toBe(String(target.serviceLines[0]?.reservationId));
+    expect(line.reservationOperationKey).not.toBe(original.reservationOperationKey);
+    expect(
+      (
+        await BookingSlotReservationClaimModel.findOne({
+          idempotencyKey: original.reservationOperationKey,
+        }).orFail()
+      ).effect?.state,
+    ).toBe("RELEASED");
+    expect(
+      (
+        await BookingSlotReservationClaimModel.findOne({
+          idempotencyKey: line.reservationOperationKey,
+        }).orFail()
+      ).effect?.state,
+    ).toBe("APPLIED");
+    const doc = await BookingSlotReservationModel.findOne().orFail();
+    expect(
+      doc.intervals.find((i) => i.reservationId.equals(creator.serviceLines[0]?.reservationId))
+        ?.capacityUsed,
+    ).toBe(1);
+    expect(
+      doc.intervals.find((i) => i.reservationId.equals(line.reservationId))?.capacityUsed,
+    ).toBe(3);
+    await lifecycleService.cancelByBusiness(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(moved._id),
+      undefined,
+    );
+    expect(
+      (await BookingSlotReservationModel.findOne().orFail()).intervals.find((i) =>
+        i.reservationId.equals(line.reservationId),
+      )?.capacityUsed,
+    ).toBe(1);
+    expect(
+      (
+        await BookingSlotReservationClaimModel.findOne({
+          idempotencyKey: line.reservationOperationKey,
+        }).orFail()
+      ).effect?.state,
+    ).toBe("RELEASED");
+  });
+
+  it("C1 freezes a different Business timezone after Booking commitment", async () => {
+    const f = await createUpcomingBooking();
+    await expect(
+      businessRepository.updateOwnedById(f.owner._id, f.business._id, { timezone: "UTC" }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect((await businessRepository.findById(f.business._id))?.timezone).toBe(TIMEZONE);
+  });
+  it("C1 reschedule rejects an employment-inactive exact provider without moving occupancy", async () => {
+    const f = await createUpcomingBooking();
+    await staffRepository.updateActiveById(f.business._id, f.membership._id, {
+      employmentActive: false,
+    });
+    await expect(
+      lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+    ).toEqual(f.booking.schedule.startAt);
+  });
+
+  describe("C1 ordered scheduling admission", () => {
+    afterEach(() => vi.restoreAllMocks());
+    const signal = () => {
+      let resolve = () => {};
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    type Fixture = Awaited<ReturnType<typeof setupBookableBusiness>>;
+    const manualInput = (f: Fixture, time = "10:00", key = `c1-${new Types.ObjectId()}`) => ({
+      serviceLines: [
+        {
+          serviceId: String(f.service._id),
+          staffMembershipId: String(f.membership._id),
+          addonIds: [],
+          pricingInput: {},
+        },
+      ],
+      startAt: startAtFor(time),
+      businessClientId: String(f.client._id),
+      idempotencyKey: key,
+    });
+    const admit = (f: Fixture, input = manualInput(f)) =>
+      creationService.createManualBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        input,
+      );
+    const editService = async (f: Fixture, kind: "assignment" | "timing" | "manual") => {
+      const doc = await ServiceModel.findById(f.service._id).orFail();
+      if (!doc.fixedPricing) throw new Error("Fixed fixture required");
+      const fields = doc.toObject();
+      if (kind === "assignment") fields.assignedStaffMembershipIds = [];
+      if (kind === "timing") {
+        const pricing = fields.fixedPricing;
+        if (!pricing) throw new Error("Fixed fixture required");
+        fields.fixedPricing = { ...pricing, bufferAfterMin: 15 };
+      }
+      if (kind === "manual") {
+        fields.scheduleMode = "MANUAL";
+        fields.manualSchedule = [{ dayOfWeek: "TUESDAY", isOpen: true, times: ["19:00"] }];
+      }
+      return serviceRepository.replaceById(f.business._id, f.service._id, fields);
+    };
+    const mutate = async (f: Fixture, kind: string) => {
+      switch (kind) {
+        case "shift":
+          return staffScheduleRepository.replace(f.membership._id, f.business._id, [], ["TUESDAY"]);
+        case "hours":
+          return businessHoursRepository.replace(f.business._id, [
+            { dayOfWeek: "TUESDAY", isOpen: false, slots: [] },
+          ]);
+        case "leave":
+          return new StaffTimeOffRepository().create({
+            businessId: f.business._id,
+            membershipId: f.membership._id,
+            type: "SICK_LEAVE",
+            startDate: DATE,
+            endDate: DATE,
+            createdByUserId: f.owner._id,
+          });
+        case "employment":
+          return staffRepository.updateActiveById(f.business._id, f.membership._id, {
+            employmentActive: false,
+          });
+        case "assignment":
+          return editService(f, "assignment");
+        case "timing":
+          return editService(f, "timing");
+        case "suspension":
+          return businessRepository.casUpdateStatus(f.business._id, ["APPROVED"], "SUSPENDED", {
+            fromStatus: "APPROVED",
+            actorUserId: f.owner._id,
+            changedAt: new Date(),
+          });
+        default:
+          throw new Error("Unknown mutation");
+      }
+    };
+    for (const kind of [
+      "shift",
+      "hours",
+      "leave",
+      "employment",
+      "assignment",
+      "timing",
+      "suspension",
+    ]) {
+      it(`C1 ${kind} mutation after preview wins before final admission`, async () => {
+        const f = await setupBookableBusiness();
+        const reached = signal(),
+          proceed = signal();
+        const original = availabilityService.assertSlotIsBookable.bind(availabilityService);
+        vi.spyOn(availabilityService, "assertSlotIsBookable").mockImplementation(
+          async (input, session) => {
+            const result = await original(input, session);
+            if (!session) {
+              reached.resolve();
+              await proceed.promise;
+            }
+            return result;
+          },
+        );
+        const pending = admit(f).then(
+          (value) => ({ value, error: undefined }),
+          (error) => ({ value: undefined, error }),
+        );
+        try {
+          await reached.promise;
+          await mutate(f, kind);
+        } finally {
+          proceed.resolve();
+        }
+        expect((await pending).error).toMatchObject({ statusCode: 409 });
+        expect(await BookingModel.countDocuments({ businessId: f.business._id })).toBe(0);
+        expect(
+          await BookingSlotReservationClaimModel.countDocuments({ businessId: f.business._id }),
+        ).toBe(0);
+      });
+      it(`C1 final admission wins before prospective ${kind} mutation`, async () => {
+        const f = await setupBookableBusiness();
+        const reached = signal(),
+          proceed = signal();
+        const original = reservationService.reserveOrJoin.bind(reservationService);
+        vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+          async (input, session) => {
+            expect(session?.inTransaction()).toBe(true);
+            reached.resolve();
+            await proceed.promise;
+            return original(input, session);
+          },
+        );
+        const pending = admit(f);
+        await reached.promise;
+        const mutation = mutate(f, kind);
+        proceed.resolve();
+        const booking = await pending;
+        await mutation;
+        expect((await bookingRepository.findById(f.business._id, booking._id))?.status).toBe(
+          "UPCOMING",
+        );
+        expect(
+          await BookingSlotReservationClaimModel.countDocuments({
+            businessId: f.business._id,
+            "effect.state": "APPLIED",
+          }),
+        ).toBe(1);
+        expect(
+          (await BookingSlotReservationModel.findOne({ businessId: f.business._id }).orFail())
+            .intervals[0]?.capacityUsed,
+        ).toBe(1);
+        const claim = await BookingSlotReservationClaimModel.findOne({
+          businessId: f.business._id,
+        }).orFail();
+        expect(claim.originalIntent?.startAt).toEqual(booking.schedule.startAt);
+        expect(claim.originalIntent?.endAt).toEqual(booking.schedule.endAt);
+        expect(claim.originalIntent?.timezone).toBe(TIMEZONE);
+        expect(claim.effect?.actualReservationId).toEqual(booking.serviceLines[0]?.reservationId);
+        expect(booking.serviceLines[0]?.serviceSnapshot.durationMin).toBe(60);
+      });
+    }
+    it("C1 manual Service outside general hours still requires a Staff shift", async () => {
+      const f = await setupBookableBusiness();
+      await editService(f, "manual");
+      await staffScheduleRepository.replace(f.membership._id, f.business._id, [
+        { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "21:00" }] },
+      ]);
+      const booking = await admit(f, manualInput(f, "19:00"));
+      expect(booking.schedule.startAt).toEqual(new Date(startAtFor("19:00")));
+      await new StaffTimeOffRepository().create({
+        businessId: f.business._id,
+        membershipId: f.membership._id,
+        type: "SICK_LEAVE",
+        startDate: DATE,
+        endDate: DATE,
+        createdByUserId: f.owner._id,
+      });
+      await expect(admit(f, manualInput(f, "19:00"))).rejects.toMatchObject({ statusCode: 409 });
+    });
+    it("C1 manual committed replay ignores a later shift edit without new effects", async () => {
+      const f = await setupBookableBusiness(),
+        input = manualInput(f);
+      const first = await admit(f, input);
+      await mutate(f, "shift");
+      const version = (await businessRepository.findById(f.business._id))
+        ?.packageEligibilityVersion;
+      const replay = await admit(f, input);
+      expect(replay._id).toEqual(first._id);
+      expect((await businessRepository.findById(f.business._id))?.packageEligibilityVersion).toBe(
+        version,
+      );
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(1);
+    });
+    it("C1 overlapping leave writers elect one range", async () => {
+      const f = await setupBookableBusiness();
+      const input = {
+        businessId: f.business._id,
+        membershipId: f.membership._id,
+        type: "SICK_LEAVE" as const,
+        startDate: DATE,
+        endDate: DATE,
+        createdByUserId: f.owner._id,
+      };
+      const repo = new StaffTimeOffRepository();
+      const results = await Promise.allSettled([repo.create(input), repo.create(input)]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(await repo.listByMembershipId(f.membership._id)).toHaveLength(1);
+    });
+    it("C1 first admission rejects a timezone change committed after preview", async () => {
+      const f = await setupBookableBusiness();
+      const reached = signal(),
+        proceed = signal();
+      const original = availabilityService.assertSlotIsBookable.bind(availabilityService);
+      vi.spyOn(availabilityService, "assertSlotIsBookable").mockImplementation(
+        async (input, session) => {
+          const result = await original(input, session);
+          if (!session) {
+            reached.resolve();
+            await proceed.promise;
+          }
+          return result;
+        },
+      );
+      const pending = admit(f).then(
+        (value) => ({ value, error: undefined }),
+        (error) => ({ value: undefined, error }),
+      );
+      try {
+        await reached.promise;
+        await businessRepository.updateOwnedById(f.owner._id, f.business._id, { timezone: "UTC" });
+      } finally {
+        proceed.resolve();
+      }
+      expect((await pending).error).toMatchObject({ statusCode: 409 });
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+    });
+    it("C1 first admission freezes the zone before a concurrent profile change", async () => {
+      const f = await setupBookableBusiness();
+      const reached = signal(),
+        proceed = signal();
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+        async (input, session) => {
+          reached.resolve();
+          await proceed.promise;
+          return original(input, session);
+        },
+      );
+      const pending = admit(f);
+      await reached.promise;
+      const change = businessRepository
+        .updateOwnedById(f.owner._id, f.business._id, {
+          timezone: "UTC",
+          name: "Must not partially apply",
+        })
+        .then(
+          (value) => ({ value, error: undefined }),
+          (error) => ({ value: undefined, error }),
+        );
+      proceed.resolve();
+      await pending;
+      expect((await change).error).toMatchObject({ statusCode: 409 });
+      const business = await businessRepository.findById(f.business._id);
+      expect(business?.timezone).toBe(TIMEZONE);
+      expect(business?.name).toBe(f.business.name);
+    });
+    it("C1 same-zone and unrelated edits remain permitted after terminal history", async () => {
+      const f = await createUpcomingBooking();
+      await lifecycleService.cancelByBusiness(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        undefined,
+      );
+      const changed = await businessRepository.updateOwnedById(f.owner._id, f.business._id, {
+        timezone: TIMEZONE,
+        name: "New display name",
+      });
+      expect(changed?.name).toBe("New display name");
+      await expect(
+        businessRepository.updateOwnedById(f.owner._id, f.business._id, { timezone: "UTC" }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    });
+    it("C1 reschedule preserves verified occupied duration after catalogue timing changes", async () => {
+      const f = await createUpcomingBooking();
+      await editService(f, "timing");
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      );
+      expect(moved.schedule.endAt.getTime() - moved.schedule.startAt.getTime()).toBe(60 * 60_000);
+    });
+    it("C1 contradictory original intent denies a move and preserves the old Booking", async () => {
+      const f = await createUpcomingBooking();
+      await BookingSlotReservationClaimModel.collection.updateOne(
+        { idempotencyKey: f.booking.serviceLines[0]?.reservationOperationKey },
+        { $set: { "originalIntent.endAt": new Date(startAtFor("10:30")) } },
+      );
+      await expect(
+        lifecycleService.rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          startAtFor("15:00"),
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(
+        (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+      ).toEqual(f.booking.schedule.startAt);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(1);
+    });
+    it("C1 lifecycle reschedule remains allowed on a suspended Business", async () => {
+      const f = await createUpcomingBooking();
+      await mutate(f, "suspension");
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      );
+      expect(moved.schedule.startAt).toEqual(new Date(startAtFor("15:00")));
+    });
+    it("C1 shared coordinator and schedule mutation roll back with the caller", async () => {
+      const f = await setupBookableBusiness();
+      const before = await businessRepository.findById(f.business._id);
+      const session = await mongoose.startSession();
+      try {
+        await expect(
+          session.withTransaction(async () => {
+            await acquireSchedulingAdmission(f.business, session);
+            await staffScheduleRepository.replace(
+              f.membership._id,
+              f.business._id,
+              [],
+              ["TUESDAY"],
+              session,
+            );
+            throw new Error("abort C1");
+          }),
+        ).rejects.toThrow("abort C1");
+      } finally {
+        await session.endSession();
+      }
+      expect((await businessRepository.findById(f.business._id))?.packageEligibilityVersion).toBe(
+        before?.packageEligibilityVersion,
+      );
+      expect(
+        (await staffScheduleRepository.findByMembershipId(f.membership._id))?.days,
+      ).toHaveLength(5);
+    });
+    it("C1 counter exhaustion rejects without occupancy or Booking effects", async () => {
+      const f = await setupBookableBusiness();
+      await BusinessModel.updateOne(
+        { _id: f.business._id },
+        { $set: { packageEligibilityVersion: Number.MAX_SAFE_INTEGER } },
+      );
+      await expect(admit(f)).rejects.toMatchObject({ statusCode: 409 });
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+    });
+    it("C1 a real stale-snapshot write conflict retries with one stable operation key", async () => {
+      const f = await setupBookableBusiness(),
+        read = signal(),
+        proceed = signal();
+      const session = await mongoose.startSession();
+      const key = `c1-retry:${new Types.ObjectId()}`;
+      let attempts = 0;
+      const serverCodes: unknown[] = [];
+      const pending = session.withTransaction(async () => {
+        attempts++;
+        await BusinessModel.findById(f.business._id).session(session);
+        if (attempts === 1) {
+          read.resolve();
+          await proceed.promise;
+        }
+        const current = await acquireSchedulingAdmission(f.business, session).catch((error) => {
+          if (error instanceof mongoose.mongo.MongoServerError) serverCodes.push(error.code);
+          throw error;
+        });
+        await validateSchedulingLine(
+          {
+            business: current,
+            serviceId: f.service._id,
+            staffMembershipId: f.membership._id,
+            startAt: new Date(startAtFor("10:00")),
+            endAt: new Date(startAtFor("11:00")),
+            partySize: 1,
+            capacityMax: 1,
+            allowInactive: false,
+            expectedService: f.service,
+            fulfilment: {
+              mode: "AT_BUSINESS_LOCATION",
+              businessLocation: {
+                city: "Larnaca",
+                area: "Center",
+                streetName: "Main",
+                streetNumber: "1",
+              },
+            },
+          },
+          availabilityService,
+          session,
+        );
+        const schedule = await staffScheduleRepository.findByMembershipId(
+          f.membership._id,
+          session,
+        );
+        expect(schedule?.days[0]?.intervals[0]?.endTime).toBe("17:00");
+        return reservationService.reserveOrJoin(
+          {
+            businessId: f.business._id,
+            staffMembershipId: f.membership._id,
+            serviceId: f.service._id,
+            timezone: TIMEZONE,
+            startAt: new Date(startAtFor("10:00")),
+            endAt: new Date(startAtFor("11:00")),
+            partySize: 1,
+            capacityMax: 1,
+            idempotencyKey: key,
+          },
+          session,
+        );
+      });
+      try {
+        await read.promise;
+        await staffScheduleRepository.replace(f.membership._id, f.business._id, [
+          { dayOfWeek: "TUESDAY", intervals: [{ startTime: "09:00", endTime: "17:00" }] },
+        ]);
+        proceed.resolve();
+        await pending;
+      } finally {
+        proceed.resolve();
+        await session.endSession();
+      }
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(serverCodes).toContain(112);
+      expect(
+        await BookingSlotReservationClaimModel.countDocuments({
+          idempotencyKey: key,
+          "effect.state": "APPLIED",
+        }),
+      ).toBe(1);
+      expect((await BookingSlotReservationModel.findOne().orFail()).intervals).toHaveLength(1);
+    });
+    it.each(["Booking", "claim", "day"] as const)(
+      "C1 isolated %s history independently freezes the timezone",
+      async (evidence) => {
+        const f = await createUpcomingBooking();
+        // Disposable historical evidence fixtures; never a production history cleanup.
+        if (evidence !== "Booking")
+          await BookingModel.collection.deleteMany({ businessId: f.business._id });
+        if (evidence !== "claim")
+          await BookingSlotReservationClaimModel.collection.deleteMany({
+            businessId: f.business._id,
+          });
+        if (evidence !== "day")
+          await BookingSlotReservationModel.collection.deleteMany({ businessId: f.business._id });
+        await expect(
+          businessRepository.updateOwnedById(f.owner._id, f.business._id, { timezone: "UTC" }),
+        ).rejects.toMatchObject({ statusCode: 409 });
+      },
+    );
+    it("C1 identical UTC interval cannot be moved into a second timezone partition", async () => {
+      const f = await setupBookableBusiness();
+      const doc = await ServiceModel.findById(f.service._id).orFail();
+      const fields = doc.toObject();
+      if (!fields.fixedPricing) throw new Error("Fixed fixture required");
+      fields.fixedPricing.durationMin = 30;
+      await serviceRepository.replaceById(f.business._id, f.service._id, fields);
+      const days = ["TUESDAY", "WEDNESDAY"] as const;
+      await staffScheduleRepository.replace(
+        f.membership._id,
+        f.business._id,
+        days.map((dayOfWeek) => ({
+          dayOfWeek,
+          intervals: [{ startTime: "00:00", endTime: "23:59" }],
+        })),
+      );
+      await businessHoursRepository.replace(
+        f.business._id,
+        days.map((dayOfWeek) => ({
+          dayOfWeek,
+          isOpen: true,
+          slots: [{ startTime: "00:00", endTime: "23:59" }],
+        })),
+      );
+      const input = { ...manualInput(f), startAt: "2030-08-20T21:30:00.000Z" };
+      await admit(f, input);
+      await expect(
+        businessRepository.updateOwnedById(f.owner._id, f.business._id, { timezone: "UTC" }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      await expect(
+        admit(f, { ...input, idempotencyKey: `c1-second-${new Types.ObjectId()}` }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await BookingModel.countDocuments()).toBe(1);
+      const day = await BookingSlotReservationModel.findOne().orFail();
+      expect(day.occupancyDate).toBe("2030-08-21");
+      expect(day.intervals).toHaveLength(1);
+    });
+    it("C1 inactive supplied mutation sessions reject without writes", async () => {
+      const f = await setupBookableBusiness();
+      const session = await mongoose.startSession();
+      try {
+        await expect(
+          staffScheduleRepository.replace(f.membership._id, f.business._id, [], [], session),
+        ).rejects.toMatchObject({ statusCode: 503 });
+      } finally {
+        await session.endSession();
+      }
+      expect(
+        (await staffScheduleRepository.findByMembershipId(f.membership._id))?.days,
+      ).toHaveLength(5);
+    });
+
+    it("C1 multi-line reschedule preserves independent occupied durations and sorted reservation order", async () => {
+      const f = await setupBookableBusiness();
+      const second = await createStaff(f.business._id);
+      await staffWorksMondayToFriday(second.membership._id, f.business._id);
+      const service = await createFixedService(f.business._id, second.membership._id);
+      const doc = await ServiceModel.findById(service._id).orFail();
+      const fields = doc.toObject();
+      if (!fields.fixedPricing) throw new Error("Fixed fixture required");
+      fields.fixedPricing.durationMin = 30;
+      await serviceRepository.replaceById(f.business._id, service._id, fields);
+      const input = manualInput(f);
+      input.serviceLines.unshift({
+        serviceId: String(service._id),
+        staffMembershipId: String(second.membership._id),
+        addonIds: [],
+        pricingInput: {},
+      });
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      const order: string[] = [];
+      vi.spyOn(reservationService, "reserveOrJoin").mockImplementation(async (request, session) => {
+        order.push(String(request.staffMembershipId));
+        return original(request, session);
+      });
+      const booking = await admit(f, input);
+      const expected = [String(f.membership._id), String(second.membership._id)].sort();
+      expect(order).toEqual(expected);
+      order.length = 0;
+      const moved = await lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(booking._id),
+        startAtFor("15:00"),
+      );
+      expect(order).toEqual(expected);
+      const day = await BookingSlotReservationModel.findOne({
+        staffMembershipId: second.membership._id,
+      }).orFail();
+      const interval = day.intervals.find((entry) =>
+        entry.reservationId.equals(moved.serviceLines[0]?.reservationId),
+      );
+      expect(interval?.endAt.getTime()).toBe(new Date(startAtFor("15:30")).getTime());
+      expect(moved.schedule.endAt).toEqual(new Date(startAtFor("16:00")));
+    });
+    it("C1 a failed second reservation rolls back every line and the coordinator", async () => {
+      const f = await setupBookableBusiness();
+      const second = await createStaff(f.business._id);
+      await staffWorksMondayToFriday(second.membership._id, f.business._id);
+      const service = await createFixedService(f.business._id, second.membership._id);
+      const input = manualInput(f);
+      input.serviceLines.push({
+        serviceId: String(service._id),
+        staffMembershipId: String(second.membership._id),
+        addonIds: [],
+        pricingInput: {},
+      });
+      const version = (await businessRepository.findById(f.business._id))
+        ?.packageEligibilityVersion;
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      vi.spyOn(reservationService, "reserveOrJoin")
+        .mockImplementationOnce(original)
+        .mockRejectedValueOnce(new Error("second-line failure"));
+      await expect(admit(f, input)).rejects.toThrow("second-line failure");
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments()).toBe(0);
+      expect((await businessRepository.findById(f.business._id))?.packageEligibilityVersion).toBe(
+        version,
+      );
+    });
+
+    it.each(["assignment", "removed", "inactive Service"] as const)(
+      "C1 reschedule denies %s and keeps original membership",
+      async (kind) => {
+        const f = await createUpcomingBooking();
+        if (kind === "assignment") await editService(f, "assignment");
+        else if (kind === "removed")
+          await staffRepository.softRemoveById(f.business._id, f.membership._id);
+        else await serviceRepository.updateStatusById(f.business._id, f.service._id, "INACTIVE");
+        const original = JSON.stringify(
+          await BookingSlotReservationModel.find({ businessId: f.business._id }).lean(),
+        );
+        await expect(
+          lifecycleService.rescheduleByOwner(
+            String(f.owner._id),
+            "BUSINESS_OWNER",
+            String(f.business._id),
+            String(f.booking._id),
+            startAtFor("15:00"),
+          ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+        expect(
+          JSON.stringify(
+            await BookingSlotReservationModel.find({ businessId: f.business._id }).lean(),
+          ),
+        ).toBe(original);
+        expect(
+          (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+        ).toEqual(f.booking.schedule.startAt);
+      },
+    );
+    it("C1 reschedule sees a shift edit committed after its original Booking read", async () => {
+      const f = await createUpcomingBooking(),
+        reached = signal(),
+        proceed = signal();
+      const original = bookingRepository.findById.bind(bookingRepository);
+      vi.spyOn(bookingRepository, "findById").mockImplementationOnce(async (...args) => {
+        const result = await original(...args);
+        reached.resolve();
+        await proceed.promise;
+        return result;
+      });
+      const pending = lifecycleService
+        .rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          startAtFor("15:00"),
+        )
+        .then(
+          (value) => ({ value, error: undefined }),
+          (error) => ({ value: undefined, error }),
+        );
+      try {
+        await reached.promise;
+        await mutate(f, "shift");
+      } finally {
+        proceed.resolve();
+      }
+      expect((await pending).error).toMatchObject({ statusCode: 409 });
+      expect(
+        (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+      ).toEqual(f.booking.schedule.startAt);
+      expect(
+        await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "APPLIED" }),
+      ).toBe(1);
+    });
+    it("C1 reschedule commits before a prospective shift edit", async () => {
+      const f = await createUpcomingBooking(),
+        reached = signal(),
+        proceed = signal();
+      const original = reservationService.reserveOrJoin.bind(reservationService);
+      vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+        async (input, session) => {
+          reached.resolve();
+          await proceed.promise;
+          return original(input, session);
+        },
+      );
+      const pending = lifecycleService.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      );
+      await reached.promise;
+      const change = mutate(f, "shift");
+      proceed.resolve();
+      const moved = await pending;
+      await change;
+      expect(moved.schedule.startAt).toEqual(new Date(startAtFor("15:00")));
+      expect(
+        await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "APPLIED" }),
+      ).toBe(1);
+      expect(
+        await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "RELEASED" }),
+      ).toBe(1);
+    });
+
+    it.each(["mutation-first", "admission-first"] as const)(
+      "C1 existing Group join obeys scheduling order: %s",
+      async (order) => {
+        const f = await setupBookableBusiness();
+        const group = await createGroupService(f.business._id, f.membership._id, 3);
+        const input = {
+          ...manualInput(f),
+          serviceLines: [
+            {
+              serviceId: String(group._id),
+              staffMembershipId: String(f.membership._id),
+              addonIds: [],
+              pricingInput: { personCount: 1 },
+            },
+          ],
+        };
+        await admit(f, input);
+        const reached = signal(),
+          proceed = signal();
+        if (order === "mutation-first") {
+          const original = availabilityService.assertSlotIsBookable.bind(availabilityService);
+          vi.spyOn(availabilityService, "assertSlotIsBookable").mockImplementation(
+            async (request, session) => {
+              const result = await original(request, session);
+              if (!session) {
+                reached.resolve();
+                await proceed.promise;
+              }
+              return result;
+            },
+          );
+        } else {
+          const original = reservationService.reserveOrJoin.bind(reservationService);
+          vi.spyOn(reservationService, "reserveOrJoin").mockImplementationOnce(
+            async (request, session) => {
+              reached.resolve();
+              await proceed.promise;
+              return original(request, session);
+            },
+          );
+        }
+        const pending = admit(f, {
+          ...input,
+          idempotencyKey: `group-c1-${new Types.ObjectId()}`,
+        }).then(
+          (value) => ({ value, error: undefined }),
+          (error) => ({ value: undefined, error }),
+        );
+        await reached.promise;
+        if (order === "mutation-first") {
+          try {
+            await mutate(f, "leave");
+          } finally {
+            proceed.resolve();
+          }
+        } else {
+          const mutation = mutate(f, "leave");
+          proceed.resolve();
+          await pending;
+          await mutation;
+        }
+        const result = await pending;
+        if (order === "mutation-first") expect(result.error).toMatchObject({ statusCode: 409 });
+        else expect(result.value?.status).toBe("UPCOMING");
+        expect(
+          (await BookingSlotReservationModel.findOne({ businessId: f.business._id }).orFail())
+            .intervals[0]?.capacityUsed,
+        ).toBe(order === "mutation-first" ? 1 : 2);
+        expect(
+          await BookingSlotReservationClaimModel.countDocuments({ "effect.state": "APPLIED" }),
+        ).toBe(order === "mutation-first" ? 1 : 2);
+      },
+    );
+    it("C1 missing historical exclusive evidence cannot authorize a guessed move", async () => {
+      const f = await createUpcomingBooking();
+      await BookingModel.collection.updateOne(
+        { _id: f.booking._id },
+        { $unset: { "serviceLines.0.reservationOperationKey": "" } },
+      );
+      await BookingSlotReservationClaimModel.collection.deleteMany({ businessId: f.business._id });
+      await BookingSlotReservationModel.collection.deleteMany({ businessId: f.business._id });
+      await expect(
+        lifecycleService.rescheduleByOwner(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.booking._id),
+          startAtFor("15:00"),
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(
+        (await bookingRepository.findById(f.business._id, f.booking._id))?.schedule.startAt,
+      ).toEqual(f.booking.schedule.startAt);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+    });
+    it("C1 schedule deletion and leave deletion primitives use owned or joined coordination", async () => {
+      const f = await setupBookableBusiness();
+      await staffScheduleRepository.deleteByMembershipId(f.membership._id);
+      await expect(admit(f)).rejects.toMatchObject({ statusCode: 409 });
+      await staffWorksMondayToFriday(f.membership._id, f.business._id);
+      const repo = new StaffTimeOffRepository();
+      await repo.create({
+        businessId: f.business._id,
+        membershipId: f.membership._id,
+        type: "SICK_LEAVE",
+        startDate: DATE,
+        endDate: DATE,
+        createdByUserId: f.owner._id,
+      });
+      const session = await mongoose.startSession();
+      try {
+        await expect(
+          session.withTransaction(async () => {
+            await repo.deleteByMembershipId(f.membership._id, session);
+            throw new Error("abort leave deletion");
+          }),
+        ).rejects.toThrow("abort leave deletion");
+      } finally {
+        await session.endSession();
+      }
+      expect(await repo.listByMembershipId(f.membership._id)).toHaveLength(1);
+      await repo.deleteByMembershipId(f.membership._id);
+      expect((await admit(f)).status).toBe("UPCOMING");
+    });
+
+    it("C1 multi-line admission rejects one changed provider schedule without a partial result", async () => {
+      const f = await setupBookableBusiness();
+      const second = await createStaff(f.business._id);
+      await staffWorksMondayToFriday(second.membership._id, f.business._id);
+      const service = await createFixedService(f.business._id, second.membership._id);
+      const input = manualInput(f);
+      input.serviceLines.push({
+        serviceId: String(service._id),
+        staffMembershipId: String(second.membership._id),
+        addonIds: [],
+        pricingInput: {},
+      });
+      const reached = signal(),
+        proceed = signal();
+      let previews = 0;
+      const original = availabilityService.assertSlotIsBookable.bind(availabilityService);
+      vi.spyOn(availabilityService, "assertSlotIsBookable").mockImplementation(
+        async (request, session) => {
+          const result = await original(request, session);
+          if (!session && ++previews === 2) {
+            reached.resolve();
+            await proceed.promise;
+          }
+          return result;
+        },
+      );
+      const pending = admit(f, input).then(
+        (value) => ({ value, error: undefined }),
+        (error) => ({ value: undefined, error }),
+      );
+      try {
+        await reached.promise;
+        await staffScheduleRepository.replace(second.membership._id, f.business._id, []);
+      } finally {
+        proceed.resolve();
+      }
+      expect((await pending).error).toMatchObject({ statusCode: 409 });
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments()).toBe(0);
     });
   });
 });
