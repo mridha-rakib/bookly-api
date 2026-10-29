@@ -1,6 +1,7 @@
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import { bookingDeliveryPurchaseVerified } from "../booking/booking-email-delivery-eligibility.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { buildAppointmentReminderEmailData } from "../email/templates/booking/appointment-reminder-24h.template.js";
 import { buildSessionEndReminderEmailData } from "../email/templates/booking/session-end-reminder.template.js";
@@ -118,7 +119,9 @@ export class AppointmentReminderWorker {
     private readonly clock: () => Date = () => new Date(),
   ) {}
 
-  public async runOnce(): Promise<AppointmentReminderPassCounts> {
+  public async runOnce(
+    shouldStop: () => boolean = () => false,
+  ): Promise<AppointmentReminderPassCounts> {
     const c: AppointmentReminderPassCounts = {
       claimed: 0,
       recoveredStale: 0,
@@ -149,7 +152,7 @@ export class AppointmentReminderWorker {
     const claimLock = { taken: 0 };
 
     const runner = async (): Promise<void> => {
-      while (claimLock.taken < remaining) {
+      while (claimLock.taken < remaining && !shouldStop()) {
         claimLock.taken += 1;
         const record = await this.reminderRepository.claimNext({
           workerId: this.options.workerId,
@@ -167,7 +170,9 @@ export class AppointmentReminderWorker {
     };
 
     const poolSize = Math.max(1, Math.min(this.options.concurrency, this.options.batchSize));
-    await Promise.all(Array.from({ length: poolSize }, () => runner()));
+    const settled = await Promise.allSettled(Array.from({ length: poolSize }, () => runner()));
+    const rejected = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (rejected) throw rejected.reason;
 
     return c;
   }
@@ -214,7 +219,11 @@ export class AppointmentReminderWorker {
 
     // ---- 0. eligibility -------------------------------------------------------------------
     const booking = await this.bookingRepository.findByIdOnly(reminder.bookingId);
-    const eligFail = this.eligibilityFailure(booking, reminder, now);
+    const eligFail =
+      this.eligibilityFailure(booking, reminder, now) ??
+      (booking && !(await bookingDeliveryPurchaseVerified(booking))
+        ? "PACKAGE_PURCHASE_UNVERIFIED"
+        : undefined);
 
     if (eligFail && !emailFinal && !smsFinal) {
       const skipped = await this.reminderRepository.markSkipped(reminder._id, token, {

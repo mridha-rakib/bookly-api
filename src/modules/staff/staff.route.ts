@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { type RequestHandler, Router } from "express";
 
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
@@ -9,6 +9,13 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import { StaffAppointmentController } from "../booking/staff-appointment.controller.js";
+import {
+  staffAppointmentDetailParamsSchema,
+  staffAppointmentListQuerySchema,
+  staffAppointmentParamsSchema,
+} from "../booking/staff-appointment.schema.js";
+import { StaffAppointmentService } from "../booking/staff-appointment.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { StaffAccessNotifier } from "../notification/staff-access.notifier.js";
@@ -168,6 +175,35 @@ export const createStaffScheduleRoute = (): Router => {
     ...anyStaffRole,
     validateRequest({ params: staffBusinessParamsSchema }),
     asyncHandler(controller.listMyAssignedServices),
+  );
+
+  // P4C-1 (Owner decision D-S1) — a STAFF member's own currently assigned appointments,
+  // READ-ONLY. Its own narrow guard: Owner/Supervisor management guards are not widened, and
+  // no POST/PATCH/DELETE Booking route accepts STAFF.
+  const staffOnly = [authenticate, requireActiveUser(), requireRoles(["STAFF"])];
+  const appointments = new StaffAppointmentController(new StaffAppointmentService());
+  // Set before authentication/validation so denials and errors are also never cached.
+  const privateAppointmentResponse: RequestHandler = (_request, response, next) => {
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Pragma", "no-cache");
+    next();
+  };
+  router.get(
+    "/:businessId/staff/me/appointments",
+    privateAppointmentResponse,
+    ...staffOnly,
+    validateRequest({
+      params: staffAppointmentParamsSchema,
+      query: staffAppointmentListQuerySchema,
+    }),
+    asyncHandler(appointments.list),
+  );
+  router.get(
+    "/:businessId/staff/me/appointments/:bookingId",
+    privateAppointmentResponse,
+    ...staffOnly,
+    validateRequest({ params: staffAppointmentDetailParamsSchema }),
+    asyncHandler(appointments.get),
   );
 
   router.get(

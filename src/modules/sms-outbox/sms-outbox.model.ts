@@ -8,12 +8,11 @@ import { type SmsOutboxStatus, smsOutboxStatuses } from "./sms-outbox.types.js";
  * DB, mirroring EmailOutbox:
  *  - unique `dedupeKey` index  → a duplicate enqueue cannot create a second row.
  *  - atomic `findOneAndUpdate` claim (see repository) → two workers can't process one row.
- *  - `attemptCount` incremented ON claim → a worker that crashes mid-send still burns an
- *    attempt, so a poisoned row can't be re-claimed forever.
+ *  - `providerStarted` consumed before transport → a possibly-issued send is never reclaimed.
  *
  * The row stores the FINAL `body` (not a rendering payload): the worker sends it verbatim and
- * never reads Booking/User data, so a retry always sends the same logical content. Never stores
- * provider credentials.
+ * never reads Booking/User data; the optional worker eligibility guard checks live Booking state
+ * before consuming send permission. Never stores provider credentials.
  */
 export type SmsOutboxDocument = {
   _id: Types.ObjectId;
@@ -31,6 +30,8 @@ export type SmsOutboxDocument = {
   nextAttemptAt?: Date | undefined;
   claimedAt?: Date | undefined;
   claimedBy?: string | undefined;
+  /** Durable barrier: a provider request may have started. Never auto-reclaim this row. */
+  providerStarted?: boolean | undefined;
   provider?: string | undefined;
   providerMessageId?: string | undefined;
   lastErrorCategory?: string | undefined;
@@ -52,6 +53,7 @@ const smsOutboxSchema = new Schema<SmsOutboxDocument>(
     nextAttemptAt: { type: Date },
     claimedAt: { type: Date },
     claimedBy: { type: String, trim: true, maxlength: 200 },
+    providerStarted: { type: Boolean, default: false },
     provider: { type: String, trim: true, maxlength: 40 },
     providerMessageId: { type: String, trim: true, maxlength: 200 },
     lastErrorCategory: { type: String, trim: true, maxlength: 80 },
@@ -68,8 +70,7 @@ smsOutboxSchema.index({ dedupeKey: 1 }, { unique: true });
 //     `findOneAndUpdate({ status: "PENDING", $or:[{nextAttemptAt exists:false},{nextAttemptAt <= now}] },
 //     …, { sort: { nextAttemptAt: 1, createdAt: 1 } })`.
 smsOutboxSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
-// (3) Stale-claim recovery: `updateMany({ status: "PROCESSING", claimedAt: { $lte: staleBefore } }, …)`
-//     and the PROCESSING branch of `claimNext`.
+// (3) Stale pre-dispatch claims only; issued requests remain quarantined.
 smsOutboxSchema.index({ status: 1, claimedAt: 1 });
 
 export const SmsOutboxModel = model<SmsOutboxDocument>("SmsOutbox", smsOutboxSchema);

@@ -1,5 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { Types } from "mongoose";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { BookingDocument } from "../../src/modules/booking/booking.model.js";
+import { PackageCalendarRepository } from "../../src/modules/booking/package-calendar.repository.js";
+import {
+  calendarBookingIntent,
+  calendarJournalSchema,
+} from "../../src/modules/booking/package-calendar-contract.js";
 
 import type { BusinessDocument } from "../../src/modules/business/business.model.js";
 import type { BusinessRepository } from "../../src/modules/business/business.repository.js";
@@ -27,6 +34,10 @@ const refreshGoogleAccessToken = vi.fn();
 const createGoogleCalendarEvent = vi.fn();
 const deleteGoogleCalendarEvent = vi.fn();
 const patchGoogleCalendarEventSchedule = vi.fn();
+const getGoogleCalendarEvent = vi.fn();
+const insertGoogleCalendarEventWithId = vi.fn();
+const resolveGoogleCalendarDestination = vi.fn();
+const deleteGoogleCalendarEventConditionally = vi.fn();
 
 vi.mock("../../src/modules/integration/integration.google-client.js", () => ({
   buildGoogleAuthUrl,
@@ -35,6 +46,10 @@ vi.mock("../../src/modules/integration/integration.google-client.js", () => ({
   createGoogleCalendarEvent,
   deleteGoogleCalendarEvent,
   patchGoogleCalendarEventSchedule,
+  getGoogleCalendarEvent,
+  insertGoogleCalendarEventWithId,
+  resolveGoogleCalendarDestination,
+  deleteGoogleCalendarEventConditionally,
 }));
 
 const { IntegrationService } = await import("../../src/modules/integration/integration.service.js");
@@ -69,6 +84,282 @@ const buildIntegration = (
 describe("IntegrationService (Google Calendar)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe("P2C delivery adapter", () => {
+    it("behind the mocked rollout gate, consumes the persisted request once and uses its concrete destination", async () => {
+      const authority = await import("../../src/modules/booking/package-calendar-authority.js");
+      const permission = vi
+        .spyOn(authority, "verifyPackageCalendarProductionAuthority")
+        .mockResolvedValue(undefined);
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        connectionGeneration: randomUUID(),
+        googleAccountId: "google-test-subject",
+        encryptedAccessToken: crypto.encryptSecret("scoped-access"),
+      });
+      const booking = {
+        _id: new Types.ObjectId(),
+        businessId: integration.businessId,
+        reference: "BK-DURABLE",
+        status: "UPCOMING",
+        eventHistory: [],
+        rescheduleHistory: [],
+        schedule: {
+          startAt: new Date("2030-08-20T09:00:00Z"),
+          endAt: new Date("2030-08-20T10:00:00Z"),
+          timezone: "Europe/Nicosia",
+        },
+        serviceLines: [{ serviceSnapshot: { name: "Cut" } }],
+      } as unknown as BookingDocument;
+      const destination = {
+        businessId: String(integration.businessId),
+        integrationId: String(integration._id),
+        generation: integration.connectionGeneration!,
+        accountEmail: integration.googleAccountEmail,
+        accountId: integration.googleAccountId!,
+        configuredCalendarId: "primary",
+        calendarId: "resolved-calendar@example.test",
+      };
+      const intended = calendarBookingIntent(booking);
+      const eventId = `b${booking._id.toHexString()}`;
+      const task = {
+        kind: "BATCH" as const,
+        claimId: new Types.ObjectId().toHexString(),
+        key: "created-task",
+      };
+      booking.packageCalendarDelivery = calendarJournalSchema.parse({
+        version: 1,
+        businessId: destination.businessId,
+        bookingId: String(booking._id),
+        customerUserId: new Types.ObjectId().toHexString(),
+        businessClientId: new Types.ObjectId().toHexString(),
+        packageProgressId: new Types.ObjectId().toHexString(),
+        purchaseClaimId: task.claimId,
+        destination,
+        eventId,
+        createIssued: true,
+        decisions: [],
+        state: "REQUEST_ISSUED",
+        latest: {
+          task,
+          taskId: `BATCH:${task.claimId}:${task.key}`,
+          ...intended,
+          actorUserId: new Types.ObjectId().toHexString(),
+          decisionId: randomUUID(),
+          releasedAt: new Date(),
+          sessionFamilyId: "verified-owner-test-session",
+        },
+        request: {
+          id: randomUUID(),
+          kind: "INSERT",
+          revision: intended.revision,
+          issuedAt: new Date(),
+          settled: false,
+        },
+      });
+      const read = vi.spyOn(PackageCalendarRepository.prototype, "read").mockResolvedValue(booking);
+      const cas = vi
+        .spyOn(PackageCalendarRepository.prototype, "compareAndSet")
+        .mockImplementation(async (_booking, previous, next) => {
+          if (JSON.stringify(booking.packageCalendarDelivery) !== JSON.stringify(previous))
+            return false;
+          booking.packageCalendarDelivery = next;
+          return true;
+        });
+      try {
+        insertGoogleCalendarEventWithId.mockResolvedValue("CREATED");
+        const service = new IntegrationService(
+          {
+            findByBusinessId: vi.fn().mockResolvedValue(integration),
+            markSyncError: vi.fn(),
+          } as unknown as IntegrationRepository,
+          {} as BusinessRepository,
+        );
+        const port = service.packageCalendarPort(destination, {
+          bookingId: String(booking._id),
+          eventId,
+        });
+        if (intended.desired.kind !== "PRESENT") throw new Error("fixture must be upcoming");
+        const marker = {
+          booklyBookingId: String(booking._id),
+          booklyBusinessId: destination.businessId,
+        };
+        const requestId = calendarJournalSchema.parse(booking.packageCalendarDelivery).request!.id;
+        await expect(
+          port.insert(destination.businessId, eventId, intended.desired, marker, randomUUID()),
+        ).rejects.toThrow();
+        expect(
+          await port.insert(destination.businessId, eventId, intended.desired, marker, requestId),
+        ).toBe("CREATED");
+        expect(insertGoogleCalendarEventWithId).toHaveBeenCalledWith(
+          "scoped-access",
+          destination.calendarId,
+          eventId,
+          intended.desired,
+          marker,
+        );
+        await expect(
+          port.insert(destination.businessId, eventId, intended.desired, marker, requestId),
+        ).rejects.toThrow();
+        expect(insertGoogleCalendarEventWithId).toHaveBeenCalledTimes(1);
+        let journal = calendarJournalSchema.parse(booking.packageCalendarDelivery);
+        booking.packageCalendarDelivery = {
+          ...journal,
+          state: "REQUEST_ISSUED",
+          request: {
+            id: randomUUID(),
+            kind: "PATCH",
+            revision: intended.revision,
+            issuedAt: new Date(),
+            settled: false,
+            etag: '"v1"',
+          },
+        };
+        patchGoogleCalendarEventSchedule.mockResolvedValue("UPDATED");
+        const patchRequest = calendarJournalSchema.parse(booking.packageCalendarDelivery).request!
+          .id;
+        expect(
+          await port.patchSchedule(
+            destination.businessId,
+            eventId,
+            intended.desired,
+            '"v1"',
+            patchRequest,
+          ),
+        ).toBe("UPDATED");
+        expect(patchGoogleCalendarEventSchedule).toHaveBeenCalledWith(
+          "scoped-access",
+          destination.calendarId,
+          eventId,
+          intended.desired,
+          { etag: '"v1"' },
+        );
+        booking.status = "CANCELLED_BY_CUSTOMER";
+        const cancelled = calendarBookingIntent(booking);
+        journal = calendarJournalSchema.parse(booking.packageCalendarDelivery);
+        booking.packageCalendarDelivery = {
+          ...journal,
+          latest: { ...journal.latest, ...cancelled },
+          state: "REQUEST_ISSUED",
+          request: {
+            id: randomUUID(),
+            kind: "DELETE",
+            revision: cancelled.revision,
+            issuedAt: new Date(),
+            settled: false,
+            etag: '"v2"',
+          },
+        };
+        deleteGoogleCalendarEventConditionally.mockResolvedValue("DELETED");
+        const deleteRequest = calendarJournalSchema.parse(booking.packageCalendarDelivery).request!
+          .id;
+        expect(await port.remove(destination.businessId, eventId, '"v2"', deleteRequest)).toBe(
+          "DELETED",
+        );
+        expect(deleteGoogleCalendarEventConditionally).toHaveBeenCalledWith(
+          "scoped-access",
+          destination.calendarId,
+          eventId,
+          '"v2"',
+        );
+        integration.connectionGeneration = randomUUID();
+        await expect(port.read(destination.businessId, eventId)).rejects.toMatchObject({
+          kind: "BLOCKED_AUTHORITY",
+        });
+        expect(getGoogleCalendarEvent).not.toHaveBeenCalled();
+      } finally {
+        read.mockRestore();
+        cas.mockRestore();
+        permission.mockRestore();
+      }
+    });
+
+    it("rejects insert, patch and delete before repository, token or provider access", async () => {
+      const findByBusinessId = vi.fn();
+      const service = new IntegrationService(
+        { findByBusinessId } as unknown as IntegrationRepository,
+        {} as BusinessRepository,
+      );
+      const port = service.packageCalendarPort();
+      const businessId = new Types.ObjectId().toHexString();
+      const bookingId = new Types.ObjectId().toHexString();
+      const event = {
+        summary: "Bookly — BK-P2C",
+        description: "Package session",
+        startAt: new Date("2030-08-20T09:00:00Z"),
+        endAt: new Date("2030-08-20T10:00:00Z"),
+        timezone: "Europe/Nicosia",
+      };
+      for (const write of [
+        () =>
+          port.insert(businessId, `b${bookingId}`, event, {
+            booklyBookingId: bookingId,
+            booklyBusinessId: businessId,
+          }),
+        () => port.patchSchedule(businessId, `b${bookingId}`, event),
+        () => port.remove(businessId, `b${bookingId}`),
+      ])
+        await expect(write()).rejects.toMatchObject({
+          code: "PACKAGE_CALENDAR_WRITE_AUTHORITY_UNAVAILABLE",
+          statusCode: 503,
+        });
+      expect(findByBusinessId).not.toHaveBeenCalled();
+      expect(refreshGoogleAccessToken).not.toHaveBeenCalled();
+      expect(insertGoogleCalendarEventWithId).not.toHaveBeenCalled();
+      expect(patchGoogleCalendarEventSchedule).not.toHaveBeenCalled();
+      expect(deleteGoogleCalendarEvent).not.toHaveBeenCalled();
+    });
+
+    it("missing, errored or cross-business integrations cannot authorize a Calendar read", async () => {
+      const businessId = new Types.ObjectId().toHexString();
+      const findByBusinessId = vi.fn();
+      const service = new IntegrationService(
+        { findByBusinessId } as unknown as IntegrationRepository,
+        {} as BusinessRepository,
+      );
+      for (const integration of [
+        null,
+        buildIntegration({ businessId: new Types.ObjectId(businessId), status: "ERROR" }),
+        buildIntegration(),
+      ]) {
+        findByBusinessId.mockResolvedValue(integration);
+        expect(await service.packageCalendarPort().read(businessId, "event")).toEqual({
+          outcome: "NOT_CONNECTED",
+        });
+      }
+      expect(getGoogleCalendarEvent).not.toHaveBeenCalled();
+      expect(refreshGoogleAccessToken).not.toHaveBeenCalled();
+    });
+
+    it("reads only the Business's connected destination and preserves provider failures", async () => {
+      const crypto = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        calendarId: "owner-calendar@example.test",
+        encryptedAccessToken: crypto.encryptSecret("p2c-test-access"),
+      });
+      const findByBusinessId = vi.fn().mockResolvedValue(integration);
+      const markSyncError = vi.fn();
+      const service = new IntegrationService(
+        { findByBusinessId, markSyncError } as unknown as IntegrationRepository,
+        {} as BusinessRepository,
+      );
+      getGoogleCalendarEvent.mockResolvedValueOnce({ outcome: "NOT_FOUND" });
+      expect(
+        await service.packageCalendarPort().read(String(integration.businessId), "event"),
+      ).toEqual({ outcome: "NOT_FOUND" });
+      expect(getGoogleCalendarEvent).toHaveBeenCalledWith(
+        "p2c-test-access",
+        integration.calendarId,
+        "event",
+      );
+      const failure = new Error("controlled provider failure");
+      getGoogleCalendarEvent.mockRejectedValueOnce(failure);
+      await expect(
+        service.packageCalendarPort().read(String(integration.businessId), "event"),
+      ).rejects.toBe(failure);
+      expect(markSyncError).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("getConnectAuthUrl", () => {

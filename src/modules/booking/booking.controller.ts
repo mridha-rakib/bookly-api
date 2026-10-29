@@ -31,19 +31,56 @@ import type {
   VoidPackageBody,
   WaiveFeeBody,
 } from "./booking.schema.js";
+import {
+  bookingBusinessParamsSchema,
+  bookingPaymentStatusQuerySchema,
+  bookingRecoveryInboxQuerySchema,
+} from "./booking.schema.js";
 import type { BookingService } from "./booking.service.js";
 import type { BookingCreationService } from "./booking-creation.service.js";
 import type { BookingLifecycleService } from "./booking-lifecycle.service.js";
+import type { BookingRecoveryInbox } from "./booking-recovery-inbox.js";
 import type { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
 import type { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
 
 export class BookingController {
+  public listCustomerRecoveryInbox = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const customerId = this.requireCustomerId(request);
+    if (!this.recoveryInbox) throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+    const { limit, cursor } = bookingRecoveryInboxQuerySchema.parse(request.validated?.query);
+    response.setHeader("Cache-Control", "private, no-store");
+    sendSuccess(
+      response,
+      200,
+      "Booking requests needing attention",
+      await this.recoveryInbox.list(customerId, limit, cursor),
+    );
+  };
+  public readCustomerBookingPayment = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const { businessId } = bookingBusinessParamsSchema.parse(request.validated?.params);
+    const { idempotencyKey } = bookingPaymentStatusQuerySchema.parse(request.validated?.query);
+    const status = await this.creationService.readCustomerBookingPayment(
+      userId,
+      businessId,
+      idempotencyKey,
+    );
+    response.setHeader("Cache-Control", "private, no-store");
+    sendSuccess(response, 200, "Original Booking payment status", status);
+  };
   public constructor(
     private readonly bookingService: BookingService,
     private readonly creationService: BookingCreationService,
     private readonly lifecycleService: BookingLifecycleService,
     private readonly rescheduleAvailability?: BookingRescheduleAvailabilityService,
     private readonly financialOutcomeRead?: CustomerFinancialOutcomeRead,
+    private readonly recoveryInbox?: BookingRecoveryInbox,
   ) {}
 
   // --- Business-side ------------------------------------------------------------------------
@@ -210,6 +247,8 @@ export class BookingController {
       params.businessId,
       params.bookingId,
       body.venuePayment,
+      body.expectedBalanceDueCents,
+      body.expectedOutstandingVenueBalanceCents,
     );
 
     sendSuccess(response, 200, "Booking completed", toBookingDetailDto(booking));

@@ -42,6 +42,32 @@ const makeRepo = () => {
   };
 };
 
+it("P4B creation and reschedule reminder intents use the caller transaction and propagate pre-commit failure", async () => {
+  const r = makeRepo(),
+    scheduler = new AppointmentReminderScheduler(r.repo),
+    booking = makeBooking();
+  const session = { inTransaction: () => true } as never;
+  await scheduler.onBookingCreatedInTransaction(booking, session);
+  expect(r.schedule).toHaveBeenCalledWith(
+    expect.objectContaining({ bookingId: booking._id }),
+    session,
+  );
+  await scheduler.onBookingRescheduledInTransaction(booking, session);
+  expect(r.retireActiveForBooking).toHaveBeenCalledWith(
+    booking._id,
+    "SUPERSEDED_BY_RESCHEDULE",
+    expect.any(Object),
+    session,
+  );
+  r.schedule.mockRejectedValueOnce(Error("intent persistence unavailable"));
+  await expect(scheduler.onBookingCreatedInTransaction(booking, session)).rejects.toThrow(
+    "intent persistence unavailable",
+  );
+  await expect(
+    scheduler.onBookingCreatedInTransaction(booking, { inTransaction: () => false } as never),
+  ).rejects.toThrow("Booking transaction");
+});
+
 describe("AppointmentReminderScheduler", () => {
   let repo: ReturnType<typeof makeRepo>;
   let scheduler: AppointmentReminderScheduler;

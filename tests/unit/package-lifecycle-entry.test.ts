@@ -105,6 +105,24 @@ describe("S5 shipped lifecycle denial without authority mock", () => {
       }),
     ).rejects.toThrow();
   });
+  it("ordinary completion retains the shipped activation denial before the new domain boundary", async () => {
+    const row = { status: "UPCOMING", serviceLines: [{ pricingInput: { packageItemId: id } }] };
+    const casUpdate = vi.fn();
+    const ordinary: BookingLifecycleService = Object.assign(
+      Object.create(BookingLifecycleService.prototype),
+      {
+        bookingService: { requireBookingManagementAccess: vi.fn(async () => ({ _id: id })) },
+        bookingRepository: { findById: vi.fn(async () => row), casUpdate },
+      },
+    );
+    await expect(
+      ordinary.completeBooking(String(id), "BUSINESS_OWNER", String(id), String(id), {
+        settlement: "FULL",
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_BATCH_ACTIVATION_UNAVAILABLE", statusCode: 503 });
+    expect(casUpdate).not.toHaveBeenCalled();
+  });
+
   it("legacy Customer cancellation stops before monetary lookup on first-class rows", async () => {
     const row = { serviceLines: [{ pricingInput: { packageItemId: id } }] };
     const legacy: BookingLifecycleService = Object.assign(

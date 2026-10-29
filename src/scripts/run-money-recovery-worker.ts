@@ -14,6 +14,10 @@ import { PaymentService } from "../modules/payment/payment.service.js";
 import { PaymentAttemptRepository } from "../modules/payment/payment-attempt.repository.js";
 import { PaymentTaxAssociationReconciler } from "../modules/payment/payment-tax-association-reconciler.js";
 import { RefundOperationRepository } from "../modules/payment/refund-operation.repository.js";
+import {
+  parseRefundIncidentAlertPolicy,
+  RefundRecoveryIncidentService,
+} from "../modules/payment/refund-recovery-incident.js";
 import { StripePaymentGateway } from "../modules/payment/stripe-payment-gateway.js";
 import { createProviderReversalService } from "../modules/provider-reversal/provider-reversal.factory.js";
 import { StripeWebhookService } from "../modules/stripe-webhook/stripe-webhook.service.js";
@@ -29,6 +33,12 @@ import {
 const POLL_INTERVAL_MS = 30_000;
 
 const buildService = (): MoneyRecoveryService => {
+  const incidentAlertPolicy = parseRefundIncidentAlertPolicy(process.env);
+  if (!incidentAlertPolicy)
+    logger.warn(
+      { event: "REFUND_RECOVERY_INCIDENT_ALERTS_UNCONFIGURED" },
+      "Refund incidents are durable and logged; explicit alert recipients and thresholds are not configured",
+    );
   const gateway = new StripePaymentGateway();
   const attempts = new PaymentAttemptRepository();
   const refunds = new RefundOperationRepository();
@@ -86,6 +96,7 @@ const buildService = (): MoneyRecoveryService => {
     relationshipService,
     penaltyCollection,
     providerReversals,
+    new RefundRecoveryIncidentService(incidentAlertPolicy),
   );
 };
 

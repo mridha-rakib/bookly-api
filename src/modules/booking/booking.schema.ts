@@ -9,6 +9,15 @@ const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid id");
 const isoDateTimeSchema = z.string().datetime({ offset: true }).or(z.string().datetime());
 
 export const bookingBusinessParamsSchema = z.object({ businessId: objectIdSchema }).strict();
+export const bookingPaymentStatusQuerySchema = z
+  .object({ idempotencyKey: z.string().trim().min(1).max(200) })
+  .strict();
+export const bookingRecoveryInboxQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(20).default(10),
+    cursor: z.string().min(1).max(512).optional(),
+  })
+  .strict();
 
 export const bookingIdParamsSchema = z
   .object({ businessId: objectIdSchema, bookingId: objectIdSchema })
@@ -168,6 +177,11 @@ export const markNoShowBodySchema = z
  */
 export const completeBookingBodySchema = z
   .object({
+    // Legacy original-balance precondition; does not represent displayed outstanding dues.
+    // Both optional preconditions only reject; neither supplies financial authority.
+    expectedBalanceDueCents: z.number().int().nonnegative().safe().optional(),
+    // The displayed outstanding balance, including any recorded venue payment.
+    expectedOutstandingVenueBalanceCents: z.number().int().nonnegative().safe().optional(),
     venuePayment: z
       .discriminatedUnion("settlement", [
         z

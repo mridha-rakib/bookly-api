@@ -2,6 +2,10 @@ import mongoose, { type ClientSession, Types } from "mongoose";
 import type { AppointmentReminderSchedulingPort } from "../appointment-reminder/appointment-reminder-scheduler.js";
 import { AvailabilityError } from "../availability/availability.errors.js";
 import type { AvailabilityService } from "../availability/availability.service.js";
+import {
+  type BookingFinancialTransactionDocument,
+  BookingFinancialTransactionModel,
+} from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationModel } from "../booking-slot-reservation/booking-slot-reservation.model.js";
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
@@ -19,6 +23,7 @@ import type { ClientRepository } from "../client/client.repository.js";
 import { FinancialRelationshipRepository } from "../client/financial-relationship.repository.js";
 import { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { IntegrationService } from "../integration/integration.service.js";
+import type { BookingCreatedPaymentEvidence } from "../notification/booking-created.notifier.js";
 import {
   buildPackageFulfilmentEntitlement,
   resolvePackageFulfilmentEntitlement,
@@ -36,6 +41,7 @@ import { computePackageBalanceSettlement } from "../package-progress/package-pro
 import { PaymentError } from "../payment/payment.errors.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentIntentResult } from "../payment/payment.types.js";
+import { isProviderCreationClosed, PaymentAttemptModel } from "../payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import {
   buildPaymentIntentMetadata,
@@ -64,12 +70,15 @@ import type {
   BookingServiceLineAddon,
   BookingSessionEndReminderSnapshot,
 } from "./booking.model.js";
+import { BookingModel } from "./booking.model.js";
 import type { BookingRepository } from "./booking.repository.js";
 import type { BookingService } from "./booking.service.js";
 import type { BookingActorRole, BookingSource } from "./booking.types.js";
 import { generateBookingReference } from "./booking.utils.js";
 import type { CreateBookingInput, CreateManualBookingInput } from "./booking-creation.types.js";
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
+import { resolveCustomerBusinessClient } from "./booking-customer-client.js";
+import { type BookingPaymentState, bookingPaymentState } from "./booking-payment-status.js";
 import {
   acquireSchedulingAdmission,
   validateSchedulingLine,
@@ -84,6 +93,7 @@ import {
   findFinancialContractMismatch,
   type RelationshipClassification,
 } from "./financial-contract.js";
+import type { OrdinaryCalendarJournalPort } from "./ordinary-calendar-journal.js";
 
 type CustomerReplayScope = {
   businessId: Types.ObjectId;
@@ -101,11 +111,21 @@ class BookingPersistenceUnresolvedError extends BookingError {
 
 /**
  * Stage B mailing observer for Triggers 2/3/4. Optional + trailing so every existing
- * construction site is unchanged; invoked only from the post-commit tail and must never throw
- * (the implementation swallows its own errors, exactly like syncBookingCreatedToGoogleCalendar).
+ * construction site is unchanged.
+ *
+ * F4A Tier 2: the confirmation intent is written INSIDE the Booking transaction via
+ * `enqueueBookingCreatedInTransaction` (see recordBookingCreatedIntent). Its outbox insert
+ * failure throws and aborts the transaction (Owner decision O1). `notifyBookingCreated` is the
+ * legacy best-effort entry point and is no longer called from the post-commit tail (O2).
  */
 export type BookingCreatedNotificationPort = {
   notifyBookingCreated(booking: BookingDocument, business: BusinessDocument): Promise<void>;
+  enqueueBookingCreatedInTransaction(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+    payment?: BookingCreatedPaymentEvidence,
+  ): Promise<void>;
 };
 
 const REFERENCE_GENERATION_MAX_ATTEMPTS = 5;
@@ -310,8 +330,8 @@ export class BookingCreationService {
       "getMaxServicesPerBooking" | "resolveNoShowWindow"
     >,
     // Optional trailing dep (same rationale as integrationService above). Stage B mailing:
-    // enqueues booking-creation notifications from the post-commit tail. Absent in the many
-    // integration suites that construct this service directly — a safe no-op there.
+    // writes booking-creation notifications inside the Booking transaction (F4A Tier 2). Absent
+    // in the many integration suites that construct this service directly — a safe no-op there.
     private readonly bookingCreatedNotifier?: BookingCreatedNotificationPort,
     // Optional trailing dep (same rationale). Appointment reminders: schedules the 24h reminder
     // row from the post-commit tail. Best-effort, never throws — a reminder problem can never
@@ -335,6 +355,9 @@ export class BookingCreationService {
     // absent it is assembled from the same repositories, so no construction site can end up
     // classifying from a different source.
     financialRelationshipService?: FinancialRelationshipService,
+    // P4B-2A — durable ordinary Calendar desired state, written in the Booking transaction.
+    // Optional trailing dep; absent in suites that construct this service directly.
+    private readonly ordinaryCalendarJournal?: OrdinaryCalendarJournalPort,
   ) {
     this.relationships =
       financialRelationshipService ??
@@ -692,6 +715,139 @@ export class BookingCreationService {
    *     relationship moves to RESTORATION_PENDING and only returns to ELIGIBLE once that exact
    *     full refund is confirmed. The same logical key can never create a replacement PI.
    */
+  /** Customer-owned, read-only ordinary operation recovery. No provider, admission or money
+   * calls. Deliberately available even when the Business stops accepting new bookings. */
+  public async readCustomerBookingPayment(customerUserId: string, businessId: string, key: string) {
+    this.requireIdempotencyKey(key);
+    const scope: CustomerReplayScope = {
+      businessId: new Types.ObjectId(businessId),
+      customerUserId,
+      idempotencyKey: key,
+      kind: "NORMAL_BOOKING",
+    };
+    const { claim, booking } = await this.readCustomerReplay(scope, undefined, false);
+    const attempt = await PaymentAttemptModel.findOne({ logicalIdempotencyKey: key })
+      .select("+clientSecret")
+      .read("primary")
+      .readConcern("majority")
+      .maxTimeMS(2000);
+    const conflict = () => new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    if (
+      attempt &&
+      (String(attempt.customerUserId) !== customerUserId ||
+        String(attempt.businessId) !== String(scope.businessId) ||
+        attempt.productKind !== "NORMAL_BOOKING" ||
+        attempt.purpose !== "BOOKING_DEPOSIT" ||
+        attempt.packageBatchBinding ||
+        attempt.packageLifecycleBinding ||
+        (claim && String(attempt.bookingId) !== String(claim.bookingId)))
+    )
+      throw conflict();
+    const contract = claim?.financialContract;
+    if (
+      attempt &&
+      contract &&
+      (attempt.expectedAmountCents !== contract.onlineChargeCents ||
+        attempt.currency !== contract.currency ||
+        attempt.financialContractVersion !== contract.version ||
+        attempt.relationshipClassification !== contract.classification ||
+        String(attempt.businessClientId) !== String(contract.businessClientId))
+    )
+      throw conflict();
+    let state: BookingPaymentState =
+      !claim && !attempt ? "NOT_OBSERVED" : bookingPaymentState(attempt);
+    let committed = false;
+    const durableBooking =
+      booking && contract
+        ? await BookingModel.findOne({
+            _id: booking._id,
+            businessId: scope.businessId,
+            "customer.customerUserId": scope.customerUserId,
+          })
+            .read("primary")
+            .readConcern("majority")
+            .maxTimeMS(2000)
+        : null;
+    if (
+      durableBooking &&
+      contract &&
+      durableBooking.financialContract &&
+      !findFinancialContractMismatch(contract, durableBooking.financialContract)
+    ) {
+      if (contract.onlineChargeCents === 0) committed = !attempt;
+      else if (
+        attempt?.providerStatus === "SUCCEEDED" &&
+        attempt.persistenceStatus === "COMPLETED" &&
+        attempt.compensationStatus === "NOT_REQUIRED" &&
+        attempt.succeededTransactionId &&
+        attempt.providerPaymentIntentId
+      ) {
+        const ledger = await BookingFinancialTransactionModel.findOne({
+          _id: attempt.succeededTransactionId,
+          bookingId: durableBooking._id,
+          businessId: scope.businessId,
+          businessClientId: contract.businessClientId,
+          customerUserId: scope.customerUserId,
+          type: contract.upfrontLedgerType,
+          direction: "DEBIT",
+          status: "SUCCEEDED",
+          amountCents: contract.onlineChargeCents,
+          currency: contract.currency,
+          providerReference: attempt.providerPaymentIntentId,
+          idempotencyKey: `${key}:deposit`,
+        })
+          .read("primary")
+          .readConcern("majority")
+          .maxTimeMS(2000);
+        committed = Boolean(ledger);
+      }
+    }
+    if (committed) state = "COMMITTED";
+    const canDismiss =
+      committed ||
+      state === "REFUNDED" ||
+      Boolean(
+        attempt &&
+          state === "PAYMENT_FAILED" &&
+          (attempt.providerStatus === "CANCELED" || isProviderCreationClosed(attempt)),
+      );
+    const business = await this.businessRepository.findById(scope.businessId);
+    const businessAvailable = Boolean(
+      business && ["APPROVED", "WARNING"].includes(business.status),
+    );
+    const canResume =
+      businessAvailable &&
+      !canDismiss &&
+      !["REFUND_PENDING", "RECONCILIATION_REQUIRED"].includes(state);
+    return {
+      state,
+      businessId,
+      idempotencyKey: key,
+      canDismiss,
+      canResume,
+      ...(!businessAvailable ? { resumeBlockedReason: "BUSINESS_UNAVAILABLE" as const } : {}),
+      ...(committed && booking
+        ? { bookingId: String(booking._id), reference: booking.reference }
+        : {}),
+      ...(attempt
+        ? {
+            providerStatus: attempt.providerStatus,
+            persistenceStatus: attempt.persistenceStatus,
+            compensationStatus: attempt.compensationStatus,
+          }
+        : {}),
+      // An exact owned claim/contract is mandatory before exposing the ephemeral SCA secret.
+      ...(claim &&
+      contract &&
+      canResume &&
+      ["AUTHENTICATION_REQUIRED", "PAYMENT_FAILED"].includes(state) &&
+      attempt?.providerPaymentIntentId &&
+      attempt.clientSecret
+        ? { clientSecret: attempt.clientSecret }
+        : {}),
+    };
+  }
+
   public async finalizeCustomerBooking(
     customerUserId: string,
     businessId: string,
@@ -1555,6 +1711,7 @@ export class BookingCreationService {
     });
     let created: BookingDocument | undefined;
     let succeededTransactionId: Types.ObjectId | undefined;
+    let succeededTransaction: BookingFinancialTransactionDocument | undefined;
     const persistenceLeaseToken = await this.paymentService.claimPaymentPersistence(
       paymentResult?.paymentAttemptId,
     );
@@ -1690,7 +1847,22 @@ export class BookingCreationService {
               dbSession,
             );
             succeededTransactionId = transaction._id;
+            succeededTransaction = transaction;
           }
+
+          // F4A Tier 2 — confirmation intent commits with the Booking (last domain write,
+          // before the PaymentAttempt completion fence; a failure takes the existing abort path).
+          // Tier 3 — plus the payment facts this transaction holds (package credits are not money).
+          await this.recordBookingCreatedIntent(
+            created,
+            business,
+            dbSession,
+            await this.bookingPaymentEvidence(
+              paymentResult,
+              succeededTransaction,
+              "PACKAGE_SESSION_EXTRAS",
+            ),
+          );
 
           const completed = await this.paymentService.markPaymentCompleted(
             paymentResult?.paymentAttemptId,
@@ -1967,66 +2139,14 @@ export class BookingCreationService {
     customerUserId: string,
     fulfilment: BookingFulfilment,
   ): Promise<BusinessClientDocument> {
-    const existing = await this.clientRepository.findByBusinessIdAndLinkedUserId(
-      business._id,
+    return resolveCustomerBusinessClient(
+      this.clientRepository,
+      this.userRepository,
+      business,
       customerUserId,
+      fulfilment,
     );
-    if (existing) {
-      return existing;
-    }
-
-    const [user, profile] = await Promise.all([
-      this.userRepository.findById(customerUserId),
-      this.userRepository.findProfileByUserId(customerUserId),
-    ]);
-    if (!user || !profile?.phone) {
-      throw new BookingError("BOOKING_CUSTOMER_CLIENT_PROFILE_REQUIRED", 409);
-    }
-
-    const travelAddress =
-      fulfilment.mode === "TRAVEL_TO_CUSTOMER" ? fulfilment.travelAddress : undefined;
-
-    try {
-      return await this.clientRepository.create({
-        businessId: business._id,
-        createdByUserId: new Types.ObjectId(customerUserId),
-        firstName: profile.firstName,
-        lastName: profile.lastName,
-        normalizedEmail: user.normalizedEmail,
-        phone: profile.phone,
-        ...(travelAddress
-          ? {
-              address: {
-                city: travelAddress.city,
-                propertyType: travelAddress.propertyType,
-                area: travelAddress.area,
-                streetName: travelAddress.streetName,
-                streetNumber: travelAddress.streetNumber,
-                floorUnit: travelAddress.floorUnit,
-                aptRoom: travelAddress.aptRoom,
-              },
-            }
-          : {}),
-        linkState: "LINKED",
-        linkedUserId: new Types.ObjectId(customerUserId),
-      });
-    } catch (error) {
-      if (!this.isDuplicateKeyError(error)) {
-        throw error;
-      }
-
-      const winner = await this.clientRepository.findByBusinessIdAndLinkedUserId(
-        business._id,
-        customerUserId,
-      );
-      if (winner) {
-        return winner;
-      }
-
-      throw new BookingError("BOOKING_CUSTOMER_CLIENT_CONTACT_CONFLICT", 409);
-    }
   }
-
   private isDuplicateKeyError(error: unknown): boolean {
     return (
       typeof error === "object" &&
@@ -2071,6 +2191,7 @@ export class BookingCreationService {
     const dbSession = await mongoose.startSession();
     let created: BookingDocument | undefined;
     let succeededTransactionId: Types.ObjectId | undefined;
+    let succeededTransaction: BookingFinancialTransactionDocument | undefined;
 
     try {
       const recovered = await this.runBookingTransaction(
@@ -2266,6 +2387,7 @@ export class BookingCreationService {
                 dbSession,
               );
               succeededTransactionId = transaction._id;
+              succeededTransaction = transaction;
             }
             // P2 — no PROMO_SUBSIDY: the Business funds the promo (its booking price, and so its
             // entitlement, is already discounted). The ledger type stays readable for Batch 13
@@ -2289,6 +2411,20 @@ export class BookingCreationService {
             );
             if (!consumed) throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
           }
+
+          // F4A Tier 2 — confirmation intent commits with the Booking (last domain write,
+          // before the PaymentAttempt completion fence; a failure takes the existing abort path).
+          // Tier 3 — plus the payment facts this transaction actually holds.
+          await this.recordBookingCreatedIntent(
+            created,
+            params.business,
+            dbSession,
+            await this.bookingPaymentEvidence(
+              params.paymentResult,
+              succeededTransaction,
+              params.packageProgressCreate ? "PACKAGE_PURCHASE" : "BOOKING",
+            ),
+          );
 
           const completed = await this.paymentService.markPaymentCompleted(
             params.paymentResult?.paymentAttemptId,
@@ -3220,6 +3356,12 @@ export class BookingCreationService {
             },
             dbSession,
           );
+
+          // F4A Tier 2 — confirmation intent commits with the Booking (last write).
+          // Tier 3 — a MANUAL Booking never creates a PaymentIntent.
+          await this.recordBookingCreatedIntent(created, params.business, dbSession, {
+            kind: "NONE",
+          });
         },
         () =>
           this.resolveManualBooking(
@@ -3384,11 +3526,61 @@ export class BookingCreationService {
   }
 
   /** These ports are documented best-effort. Their failure follows commit and must
-   * never enter abort cleanup or paid compensation. Delivery recovery is unchanged. */
-  private async afterBookingCommitted(booking: BookingDocument, business: BusinessDocument) {
+   * never enter abort cleanup or paid compensation. Delivery recovery is unchanged.
+   * F4A Tier 2 (O2): booking-created email is no longer dispatched here — its outbox rows are
+   * written inside the Booking transaction by recordBookingCreatedIntent. */
+  private async afterBookingCommitted(booking: BookingDocument, _business: BusinessDocument) {
     await this.syncBookingCreatedToGoogleCalendar(booking).catch(() => undefined);
-    await this.dispatchBookingCreatedNotifications(booking, business).catch(() => undefined);
     await this.dispatchAppointmentReminderScheduling(booking).catch(() => undefined);
+  }
+
+  /**
+   * F4A Tier 2 (O1) — writes the booking-created EmailOutbox rows with the Booking transaction
+   * session, as the callback's last domain write. Rows commit if and only if the Booking
+   * commits; nothing is visible to the email worker before commit. An outbox insert failure
+   * throws and aborts the transaction; the caller's existing abort handling (claim release or
+   * paid compensation) applies. A rollback is never itself a refund. No-op without a notifier.
+   */
+  private async recordBookingCreatedIntent(
+    created: BookingDocument | undefined,
+    business: BusinessDocument,
+    session: ClientSession,
+    payment?: BookingCreatedPaymentEvidence,
+  ): Promise<void> {
+    if (created)
+      await this.appointmentReminderScheduler?.onBookingCreatedInTransaction?.(created, session);
+    // P4B-2A — the Calendar desired state commits iff this Booking (and any paid completion
+    // fence later in the same transaction) commits. A failure aborts like any other intent.
+    if (created) await this.ordinaryCalendarJournal?.recordCreatedInTransaction(created, session);
+    if (!this.bookingCreatedNotifier) return;
+    if (!created) throw new Error("Booking-created intent requires the persisted Booking");
+    await this.bookingCreatedNotifier.enqueueBookingCreatedInTransaction(
+      created,
+      business,
+      session,
+      payment,
+    );
+  }
+
+  /**
+   * F4A Tier 3 — read-only payment facts for the confirmation's receipt section. No payment,
+   * ledger or attempt state is written here. `paymentResult` exists only when a PaymentIntent
+   * was created; persistence is reached only after it `succeeded` (automatic capture). The
+   * attempt read is best-effort: a failure leaves the receipt UNVERIFIED and never aborts.
+   */
+  private async bookingPaymentEvidence(
+    paymentResult: PaymentIntentResult | undefined,
+    ledger: BookingFinancialTransactionDocument | undefined,
+    paymentFor: "BOOKING" | "PACKAGE_PURCHASE" | "PACKAGE_SESSION_EXTRAS",
+  ): Promise<BookingCreatedPaymentEvidence | undefined> {
+    if (!this.bookingCreatedNotifier) return undefined;
+    if (!paymentResult) return { kind: "NONE" };
+    const attempt = paymentResult.paymentAttemptId
+      ? await this.paymentService
+          .findPaymentAttemptById(paymentResult.paymentAttemptId)
+          .catch(() => null)
+      : null;
+    return { kind: "CHARGED", paymentFor, ledger, attempt };
   }
 
   /** Check the canonical claim BEFORE reading/returning a Booking or resuming money.
@@ -3557,6 +3749,12 @@ export class BookingCreationService {
     if (!this.integrationService) {
       return;
     }
+    // P4B-2A — an AUTHORITATIVE journal owns this Booking's event; never add a second writer.
+    if (
+      this.ordinaryCalendarJournal &&
+      !(await this.ordinaryCalendarJournal.legacySyncPermitted(created))
+    )
+      return;
 
     const eventId = await this.integrationService.createEventForBooking(created.businessId, {
       summary: `Bookly — ${created.reference}`,
@@ -3580,22 +3778,6 @@ export class BookingCreationService {
   }
 
   /**
-   * Stage B mailing (Triggers 2/3/4): enqueue booking-creation notifications strictly AFTER the
-   * booking transaction has committed. Same discipline as syncBookingCreatedToGoogleCalendar —
-   * best-effort, never throws (the notifier swallows its own errors), so a notification problem
-   * can never roll back a real booking. No-op when no notifier was injected.
-   */
-  private async dispatchBookingCreatedNotifications(
-    created: BookingDocument,
-    business: BusinessDocument,
-  ): Promise<void> {
-    if (!this.bookingCreatedNotifier) {
-      return;
-    }
-    await this.bookingCreatedNotifier.notifyBookingCreated(created, business);
-  }
-
-  /**
    * Post-commit tail — schedule the 24h appointment reminder. Same best-effort discipline as the
    * mailing / Google Calendar side effects: the scheduler itself never throws (it swallows and
    * logs its own errors), so a reminder problem can never roll back a committed booking. No-op
@@ -3605,7 +3787,8 @@ export class BookingCreationService {
     if (!this.appointmentReminderScheduler) {
       return;
     }
-    await this.appointmentReminderScheduler.onBookingCreated(created);
+    if (!this.appointmentReminderScheduler.onBookingCreatedInTransaction)
+      await this.appointmentReminderScheduler.onBookingCreated(created);
   }
 
   private async generateUniqueReference(): Promise<string> {

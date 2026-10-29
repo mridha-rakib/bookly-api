@@ -6,6 +6,34 @@ import type { EmailOutboxService } from "../../src/modules/email-outbox/email-ou
 import { BookingRescheduledCustomerNotifier } from "../../src/modules/notification/booking-rescheduled-customer.notifier.js";
 import { buildBooking, buildBusiness } from "./stage-b-fixtures.js";
 
+it("P4B transactional reschedule enqueue retains the existing event key and propagates a pre-commit outbox failure", async () => {
+  const booking = buildBooking({
+    rescheduleHistory: [
+      {
+        previousStart: new Date("2030-01-01T08:00:00Z"),
+        newStart: new Date("2030-01-02T08:00:00Z"),
+      },
+    ],
+  } as never);
+  const session = { inTransaction: () => true } as never;
+  const enqueue = vi.fn().mockResolvedValue({});
+  const notifier = new BookingRescheduledCustomerNotifier({ enqueue } as never);
+  await notifier.enqueueBookingRescheduledInTransaction(booking, buildBusiness(), session);
+  expect(enqueue).toHaveBeenCalledWith(
+    expect.objectContaining({ eventKey: `BOOKING_RESCHEDULED:${booking._id}:1` }),
+    session,
+  );
+  enqueue.mockRejectedValueOnce(Error("outbox unavailable"));
+  await expect(
+    notifier.enqueueBookingRescheduledInTransaction(booking, buildBusiness(), session),
+  ).rejects.toThrow("outbox unavailable");
+  await expect(
+    notifier.enqueueBookingRescheduledInTransaction(booking, buildBusiness(), {
+      inTransaction: () => false,
+    } as never),
+  ).rejects.toThrow("Booking transaction");
+});
+
 /**
  * CUSTOMER RESCHEDULE CONFIRMATION EMAIL — notifier unit coverage. Mandatory transactional:
  * fires for a customer AND an Owner/Supervisor reschedule, is never gated by a reminder

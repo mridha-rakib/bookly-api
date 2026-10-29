@@ -50,7 +50,7 @@ export const batchDeliveryTaskSchema = z
   })
   .strict();
 export type BatchDeliveryTask = z.output<typeof batchDeliveryTaskSchema>;
-export const batchCompletionSchema = z
+export const syntheticBatchCompletionSchema = z
   .object({
     version: z.literal(1),
     state: z.literal("PREPARATION_ONLY_COMPLETE_BATCH"),
@@ -75,4 +75,17 @@ export const batchCompletionSchema = z
     ),
   })
   .strict();
+export const genuineBatchCompletionSchema = syntheticBatchCompletionSchema
+  .extend({
+    version: z.literal(2),
+    state: z.literal("GENUINE_COMPLETE_BATCH"),
+    activation: z.literal("CERTIFIED_ORIGINAL_CONSENT"),
+    consentCertificateId: id,
+    consentCertificateHash: hash,
+  })
+  .strict();
+export const batchCompletionSchema = z.discriminatedUnion("version", [
+  syntheticBatchCompletionSchema,
+  genuineBatchCompletionSchema,
+]);
 export type BatchCompletion = z.output<typeof batchCompletionSchema>;

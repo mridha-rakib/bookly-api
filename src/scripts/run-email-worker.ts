@@ -3,22 +3,29 @@ import { pathToFileURL } from "node:url";
 import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
+import { BookingEmailDeliveryEligibility } from "../modules/booking/booking-email-delivery-eligibility.js";
 import { EmailService } from "../modules/email/email.service.js";
 import { EmailOutboxRepository } from "../modules/email-outbox/email-outbox.repository.js";
 import {
   EmailOutboxWorker,
   type EmailWorkerOptions,
+  type EmailWorkerPassCounts,
 } from "../modules/email-outbox/email-outbox-worker.js";
 import { InvoiceAttachmentResolver } from "../modules/invoice/invoice-attachment.resolver.js";
 
+import { assertEmailWorkerLaunch, EmailWorkerLaunchError } from "./email-worker-runtime.js";
+import { withMoneyRecoveryLifecycle as withWorkerLifecycle } from "./money-recovery-runtime.js";
+
 /**
- * Runnable entry point for the transactional-email outbox worker (Phase S) — the same shape as
- * scripts/run-no-show-worker.ts. Not a queue framework: the atomic claim + unique dedupe index
- * in EmailOutboxRepository are the correctness guarantee, so running this from one host or
- * several, once or continuously, is all safe.
+ * Runnable entry point for the transactional-email outbox worker (Phase S). Not a queue
+ * framework: the atomic claim + unique dedupe index in EmailOutboxRepository are the
+ * correctness guarantee, so concurrent consumers cannot claim the same row. Delivery is
+ * AT-LEAST-ONCE, not exactly-once — see docs/EMAIL-WORKER.md.
+ *
+ * Disabled unless BOOKLY_EMAIL_WORKER_ENABLED=true and an explicit EMAIL_PROVIDER is configured.
  *
  *   node dist/scripts/run-email-worker.js --once   # single pass (external scheduler)
- *   node dist/scripts/run-email-worker.js          # poll every EMAIL_WORKER_POLL_INTERVAL_MS
+ *   node dist/scripts/run-email-worker.js          # serial passes, EMAIL_WORKER_POLL_INTERVAL_MS apart
  */
 const buildWorker = (): EmailOutboxWorker => {
   const options: EmailWorkerOptions = {
@@ -34,64 +41,88 @@ const buildWorker = (): EmailOutboxWorker => {
     options,
     () => new Date(),
     new InvoiceAttachmentResolver(),
+    new BookingEmailDeliveryEligibility(),
   );
 };
 
-const runOnce = async (worker: EmailOutboxWorker): Promise<void> => {
-  const counts = await worker.runOnce(env.EMAIL_WORKER_BATCH_SIZE);
-  logger.info({ counts }, "Email worker pass complete");
+const runOnce = async (
+  worker: EmailOutboxWorker,
+  shouldStop: () => boolean = () => false,
+): Promise<EmailWorkerPassCounts> => {
+  const counts = await worker.runOnce(env.EMAIL_WORKER_BATCH_SIZE, shouldStop);
+  // "sent" = provider accepted. Bookly has no delivery receipt; never report it as delivered.
+  if (counts.failed > 0 || counts.acceptedNotRecorded > 0 || counts.ownershipLost > 0) {
+    logger.warn({ counts }, "Email worker pass completed with failures or unrecorded outcomes");
+  } else {
+    logger.info({ counts }, "Email worker pass complete");
+  }
+  return counts;
 };
 
-const runCli = async (): Promise<void> => {
-  const databaseManager = new DatabaseManager();
-  const worker = buildWorker();
-  const runForever = !process.argv.includes("--once");
-
-  try {
-    await databaseManager.connect();
-
-    if (!runForever) {
-      await runOnce(worker);
-      return;
+/** One pass at a time: the next pass starts only after the previous one fully settles. */
+const runContinuous = async (
+  worker: EmailOutboxWorker,
+  intervalMs: number,
+  shouldStop: () => boolean,
+  wait: (milliseconds: number) => Promise<void>,
+): Promise<void> => {
+  while (!shouldStop()) {
+    try {
+      await runOnce(worker, shouldStop);
+    } catch {
+      // Raw errors may carry connection details; the pass is retried on the next interval.
+      logger.error({ event: "EMAIL_WORKER_PASS_FAILED" }, "Email worker pass failed");
     }
-
-    logger.info(
-      { intervalMs: env.EMAIL_WORKER_POLL_INTERVAL_MS },
-      "Email worker starting continuous polling",
-    );
-
-    let stopping = false;
-    const shutdown = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      clearInterval(interval);
-      await databaseManager.disconnect();
-      logger.info("Email worker stopped");
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
-
-    const interval = setInterval(() => {
-      runOnce(worker).catch((error: unknown) => {
-        logger.error({ err: error }, "Email worker pass failed");
-      });
-    }, env.EMAIL_WORKER_POLL_INTERVAL_MS);
-
-    await runOnce(worker);
-    return;
-  } catch (error) {
-    logger.error({ err: error }, "Email worker failed to start");
-    throw error;
-  } finally {
-    if (!runForever) {
-      await databaseManager.disconnect();
-    }
+    if (!shouldStop()) await wait(intervalMs);
   }
 };
 
+const runCli = async (): Promise<void> => {
+  // env.ts still validates the shared configuration on import; this adds explicit intent.
+  assertEmailWorkerLaunch(process.env, process.argv.slice(2));
+  const databaseManager = new DatabaseManager();
+  const runForever = !process.argv.includes("--once");
+  await withWorkerLifecycle({
+    signals: process,
+    connect: () => databaseManager.connect(),
+    disconnect: () => databaseManager.disconnect(),
+    onStopping: () =>
+      logger.info("Email worker stopping: no new claims; finishing in-flight sends"),
+    execute: async (shouldStop, wait) => {
+      const worker = buildWorker();
+      logger.info(
+        {
+          mode: runForever ? "continuous" : "once",
+          intervalMs: env.EMAIL_WORKER_POLL_INTERVAL_MS,
+          provider: env.EMAIL_PROVIDER,
+        },
+        "Email worker started",
+      );
+      if (runForever) {
+        await runContinuous(worker, env.EMAIL_WORKER_POLL_INTERVAL_MS, shouldStop, wait);
+      } else if (!shouldStop()) {
+        await runOnce(worker, shouldStop);
+      }
+    },
+  });
+  logger.info("Email worker stopped");
+};
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await runCli();
+  try {
+    await runCli();
+  } catch (error) {
+    // Never serialize raw provider/connection exceptions or environment values here.
+    logger.error(
+      {
+        event: "EMAIL_WORKER_EXIT",
+        reason:
+          error instanceof EmailWorkerLaunchError ? error.message : "STARTUP_OR_EXECUTION_FAILURE",
+      },
+      "Email worker could not continue",
+    );
+    process.exitCode = 1;
+  }
 }
 
-export { buildWorker, runOnce };
+export { buildWorker, runContinuous, runOnce };

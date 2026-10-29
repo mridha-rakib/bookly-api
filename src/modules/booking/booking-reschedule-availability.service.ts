@@ -101,7 +101,7 @@ export class BookingRescheduleAvailabilityService {
               businessId: business._id,
               role: "SUPERVISOR",
               employmentActive: true,
-              removedAt: { $exists: false },
+              removedAt: null,
             }).session(session))
           )
             throw new BookingError("BOOKING_BUSINESS_NOT_FOUND", 404);
@@ -171,8 +171,9 @@ export class BookingRescheduleAvailabilityService {
                     capacityMax: context.capacityMax,
                     packageGroup: line.schedulingSnapshot?.group,
                     allowInactive:
-                      line.pricingInput.sessionIndex !== undefined &&
-                      line.pricingInput.sessionIndex > 1,
+                      line.packageContext?.role === "REDEMPTION" ||
+                      (line.pricingInput.sessionIndex !== undefined &&
+                        line.pricingInput.sessionIndex > 1),
                     existingAppointment: true,
                     fulfilment: booking.fulfilment,
                     ...(line.pricingInput.packageProgressId && !line.pricingInput.packageItemId

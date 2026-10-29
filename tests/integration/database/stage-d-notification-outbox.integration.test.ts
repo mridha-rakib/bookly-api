@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
@@ -62,6 +62,39 @@ describe("Stage D notifications → EmailOutbox integration", () => {
     expect(rows.every((r) => r.eventKey === `BOOKING_CANCELLED:${String(booking._id)}`)).toBe(true);
   });
 
+  it("cancellation outbox rows roll back with the domain session and dedupe after commit", async () => {
+    const business = buildBusiness();
+    const booking = buildCancelledBooking({}, { businessId: business._id });
+    const notifier = new BookingCancelledNotifier(outbox, {
+      findManyByIds: async () => [
+        { _id: business.ownerUserId, normalizedEmail: "owner@example.com" },
+      ],
+    });
+    const session = await mongoose.startSession();
+    try {
+      await expect(
+        session.withTransaction(async () => {
+          await notifier.enqueueBookingCancelledInTransaction(
+            booking,
+            business,
+            "CUSTOMER",
+            session,
+          );
+          throw new Error("domain rollback");
+        }),
+      ).rejects.toThrow("domain rollback");
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+      await session.withTransaction(async () => {
+        await notifier.enqueueBookingCancelledInTransaction(booking, business, "CUSTOMER", session);
+      });
+      expect(await EmailOutboxModel.countDocuments({})).toBe(2);
+      await notifier.notifyBookingCancelled(booking, business, "CUSTOMER");
+      expect(await EmailOutboxModel.countDocuments({})).toBe(2);
+    } finally {
+      await session.endSession();
+    }
+  });
+
   it("30 no-show: retried CHARGED enqueues exactly one PENDING row", async () => {
     const booking = buildNoShowBooking("NO_SHOW_CHARGED");
     const notifier = new NoShowNotifier(outbox);
@@ -81,6 +114,35 @@ describe("Stage D notifications → EmailOutbox integration", () => {
     expect(rows[0]?.dedupeKey).toBe(
       `NO_SHOW_CHARGED:${String(booking._id)}::NO_SHOW_CHARGED::dana@example.com`,
     );
+  });
+
+  it("no-show terminal notice rolls back with the Booking transition session", async () => {
+    const booking = buildNoShowBooking("NO_SHOW_CANCELLED");
+    const notifier = new NoShowNotifier(outbox);
+    const session = await mongoose.startSession();
+    try {
+      await expect(
+        session.withTransaction(async () => {
+          await notifier.enqueueNoShowCancelledInTransaction(
+            booking,
+            { businessName: "Soho" },
+            session,
+          );
+          throw new Error("domain rollback");
+        }),
+      ).rejects.toThrow("domain rollback");
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+      await session.withTransaction(async () => {
+        await notifier.enqueueNoShowCancelledInTransaction(
+          booking,
+          { businessName: "Soho" },
+          session,
+        );
+      });
+      expect(await EmailOutboxModel.countDocuments({})).toBe(1);
+    } finally {
+      await session.endSession();
+    }
   });
 
   it("no-show WAIVED and CANCELLED for one booking are separate rows and each retry-safe", async () => {

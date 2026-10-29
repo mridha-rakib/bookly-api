@@ -28,12 +28,19 @@ export const connectIsolatedDatabase = async (): Promise<string> => {
 
   await mongoose.connect(uri, {
     dbName: databaseName,
-    autoIndex: true,
+    autoIndex: false,
+    autoCreate: false,
     serverSelectionTimeoutMS: 10_000,
   });
 
   await Promise.all(
-    mongoose.modelNames().map((modelName) => mongoose.model(modelName).syncIndexes()),
+    // P4D: additive creation in this freshly named, test-owned database only. Never reconcile
+    // by dropping indexes; declared-versus-actual index inspection is a separate check.
+    mongoose.modelNames().map(async (modelName) => {
+      const fixtureModel = mongoose.model(modelName);
+      await fixtureModel.createCollection();
+      await fixtureModel.createIndexes();
+    }),
   );
   return databaseName;
 };

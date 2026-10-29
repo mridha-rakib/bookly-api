@@ -21,6 +21,7 @@ import {
 } from "./package-batch-contract.js";
 import { verifyPackageBatchMembers } from "./package-batch-membership.js";
 import { hashCanonicalPackageCheckoutContent as digest } from "./package-checkout-binding.js";
+import { verifyCertifiedPackageConsent } from "./package-consent-certification.js";
 
 export function assertCanonicalBatchFinance(claim: BookingCreationClaimDocument, input: unknown) {
   const finance = batchFinanceSchema.parse(input);
@@ -66,6 +67,14 @@ export async function verifyBatchCompletion(
   const { preparation: p, bookings } = internal;
   const finance = assertCanonicalBatchFinance(claim, claim.packageBatchFinance);
   const proof = batchCompletionSchema.parse(claim.packageBatchCompletion);
+  if (proof.version === 2) {
+    const certified = await verifyCertifiedPackageConsent(claim, session);
+    if (
+      !proof.consentCertificateId.equals(certified.certificateId) ||
+      proof.consentCertificateHash !== certified.certificateHash
+    )
+      throw batchConflict();
+  }
   const c = finance.contract;
   if (proof.preparationHash !== digest(p) || proof.financeHash !== digest(finance))
     throw batchConflict();

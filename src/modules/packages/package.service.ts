@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import { RequestValidationError } from "../../common/errors/validation-error.js";
 import { AuthError } from "../auth/auth.errors.js";
+import { readPackageCheckoutAvailability } from "../booking/package-checkout-availability.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { businessCities, normalizeBusinessVisitType } from "../business/business.types.js";
@@ -45,13 +46,16 @@ export class PackageService {
     private readonly travel: BusinessTravelSettingsRepository,
   ) {}
 
-  /** Read-only customer catalogue. Reuse publication dependencies; never grant checkout. */
+  /** Read-only customer catalogue. Reuse publication dependencies; never grant checkout.
+   * checkoutAvailable mirrors the shipped consent-host and purchase authorities (false today). */
   public async customerCatalog(businessId: string, packageId?: string) {
     const business = await this.businesses.findById(businessId);
     if (!business || !["APPROVED", "WARNING"].includes(business.status))
       throw new PackageError("PACKAGE_NOT_FOUND", 404);
     const definitions = await this.packages.list(business._id, { status: "ACTIVE" });
     const issues = await this.dependencies(business, definitions);
+    // Display hint only; quote, consent and purchase routes re-check the same authorities.
+    const checkoutAvailable = await readPackageCheckoutAvailability();
     const services = await this.services.findManyByIdsForBusiness(business._id, [
       ...new Set(definitions.flatMap((d) => d.items.map((i) => String(i.serviceId)))),
     ]);
@@ -76,7 +80,7 @@ export class PackageService {
               ? definition.contractTerms.validity
               : { mode: "FINITE" as const, months: definition.contractTerms?.validityMonths },
           fulfilmentMode: normalizeBusinessVisitType(business.visitType),
-          checkoutAvailable: false as const,
+          checkoutAvailable,
           items: definition.items.map((item) => {
             const service = services.find((s) => s._id.equals(item.serviceId));
             return {

@@ -15,7 +15,10 @@ export type GoogleCalendarIntegrationDocument = {
   _id: Types.ObjectId;
   businessId: Types.ObjectId;
   googleAccountEmail: string;
+  googleAccountId?: string | undefined;
   calendarId: string;
+  /** Absent on legacy connections: those require explicit reconnect before package release. */
+  connectionGeneration?: string | undefined;
   encryptedAccessToken: string;
   encryptedRefreshToken: string;
   tokenExpiresAt: Date;
@@ -30,7 +33,9 @@ const googleCalendarIntegrationSchema = new Schema<GoogleCalendarIntegrationDocu
   {
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     googleAccountEmail: { type: String, required: true, trim: true },
+    googleAccountId: { type: String },
     calendarId: { type: String, required: true, trim: true, default: "primary" },
+    connectionGeneration: { type: String },
     encryptedAccessToken: { type: String, required: true },
     encryptedRefreshToken: { type: String, required: true },
     tokenExpiresAt: { type: Date, required: true },

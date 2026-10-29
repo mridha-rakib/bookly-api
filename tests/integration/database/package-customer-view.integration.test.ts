@@ -96,6 +96,56 @@ describe("S6 authenticated customer/management transport with disposable records
       .set("Authorization", await other(t, "CUSTOMER"))
       .expect(404);
   });
+
+  it("P4E pages beyond 50 owned records with an exclusive Customer-scoped cursor and no proof promotion", async () => {
+    const t = await fixture(true);
+    const original = await PackageProgressV2Model.findOne().lean().orFail();
+    // Disposable read-pagination fixtures only: these clones have no genuine purchase proof
+    // and must remain NOT_ESTABLISHED. No production/history mutation or activation.
+    const clones = Array.from({ length: 50 }, () => ({
+      ...original,
+      _id: new Types.ObjectId(),
+      originBookingId: new Types.ObjectId(),
+    }));
+    await PackageProgressV2Model.collection.insertMany(clones as never);
+    const first = await request(app)
+      .get("/package-views/owned")
+      .set("Authorization", t.authorization)
+      .expect(200);
+    expect(first.body.data.packages).toHaveLength(50);
+    expect(first.body.data.hasMore).toBe(true);
+    expect(first.body.data.nextCursor).toBe(first.body.data.packages.at(-1).id);
+    expect(
+      first.body.data.packages.every(
+        (row: { purchaseCompletion: string; actionsAvailable: boolean }) =>
+          row.purchaseCompletion === "NOT_ESTABLISHED" && !row.actionsAvailable,
+      ),
+    ).toBe(true);
+    const next = await request(app)
+      .get(`/package-views/owned?before=${first.body.data.nextCursor}`)
+      .set("Authorization", t.authorization)
+      .expect(200);
+    expect(next.body.data.packages).toHaveLength(1);
+    expect(next.body.data.hasMore).toBe(false);
+    expect(next.body.data.nextCursor).toBeNull();
+    const ids = [...first.body.data.packages, ...next.body.data.packages].map(
+      (row: { id: string }) => row.id,
+    );
+    expect(new Set(ids).size).toBe(51);
+    const foreign = await request(app)
+      .get(`/package-views/owned?before=${first.body.data.nextCursor}`)
+      .set("Authorization", await other(t, "CUSTOMER"))
+      .expect(200);
+    expect(foreign.body.data.packages).toEqual([]);
+    await request(app)
+      .get("/package-views/owned?before=invalid")
+      .set("Authorization", t.authorization)
+      .expect(400);
+    await request(app)
+      .get(`/package-views/owned?customerUserId=${original.customerUserId}`)
+      .set("Authorization", t.authorization)
+      .expect(400);
+  });
   it("S6-FINAL inconsistent stored accounting fails safely for both owned reads", async () => {
     const t = await fixture(true);
     const progress = await PackageProgressV2Model.findOne().orFail();

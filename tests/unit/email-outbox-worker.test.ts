@@ -103,6 +103,47 @@ const buildWorker = (repo: FakeRepo, email: EmailService) =>
   new EmailOutboxWorker(repo as unknown as EmailOutboxRepository, email, OPTIONS, () => NOW);
 
 describe("EmailOutboxWorker", () => {
+  it("P4B ineligible queued Booking intent is retired without provider dispatch", async () => {
+    const repo = new FakeRepo();
+    repo.rows = [makeRow()];
+    const send = vi.fn().mockResolvedValue({ provider: "sendgrid" });
+    const guard = { check: vi.fn(async () => false) };
+    const worker = new EmailOutboxWorker(
+      repo as unknown as EmailOutboxRepository,
+      makeEmailService(send),
+      OPTIONS,
+      () => NOW,
+      undefined,
+      guard,
+    );
+    const result = await worker.runOnce(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(result.failed).toBe(1);
+    expect(repo.markFailed).toHaveBeenCalledWith(
+      repo.rows[0]!._id,
+      expect.objectContaining({ category: "BOOKING_DELIVERY_INELIGIBLE" }),
+    );
+  });
+  it("P4B eligibility outage uses existing retry state and never contacts provider", async () => {
+    const repo = new FakeRepo();
+    repo.rows = [makeRow()];
+    const send = vi.fn();
+    const guard = {
+      check: vi.fn(async () => {
+        throw new EmailError("PROVIDER_TRANSIENT");
+      }),
+    };
+    const worker = new EmailOutboxWorker(
+      repo as unknown as EmailOutboxRepository,
+      makeEmailService(send),
+      OPTIONS,
+      () => NOW,
+      undefined,
+      guard,
+    );
+    expect((await worker.runOnce(1)).retried).toBe(1);
+    expect(send).not.toHaveBeenCalled();
+  });
   beforeEach(() => vi.clearAllMocks());
 
   it("39/40 successful send marks the row SENT and persists the provider message id", async () => {

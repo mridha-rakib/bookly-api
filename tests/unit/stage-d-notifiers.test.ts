@@ -18,6 +18,24 @@ const makeOutbox = () => {
 };
 
 describe("BookingCancelledNotifier", () => {
+  it("enqueues cancellation on the domain session and lets persistence failure abort", async () => {
+    const outbox = makeOutbox();
+    const business = buildBusiness();
+    const booking = buildCancelledBooking({}, { businessId: business._id });
+    const notifier = new BookingCancelledNotifier(outbox.service, {
+      findManyByIds: async () => [],
+    });
+    const session = { inTransaction: () => true } as never;
+    await notifier.enqueueBookingCancelledInTransaction(booking, business, "CUSTOMER", session);
+    expect(outbox.spy).toHaveBeenCalledWith(
+      expect.objectContaining({ eventKey: `BOOKING_CANCELLED:${String(booking._id)}` }),
+      session,
+    );
+    outbox.spy.mockRejectedValueOnce(new Error("outbox unavailable"));
+    await expect(
+      notifier.enqueueBookingCancelledInTransaction(booking, business, "CUSTOMER", session),
+    ).rejects.toThrow("outbox unavailable");
+  });
   beforeEach(() => vi.clearAllMocks());
 
   it("1/2/6/7 enqueues customer + owner rows for both cancelledBy values", async () => {
@@ -195,6 +213,30 @@ describe("BookingCancelledNotifier", () => {
         (c) => c[0].eventKey === `BOOKING_CANCELLED:${String(booking._id)}`,
       ),
     ).toBe(true);
+  });
+});
+
+describe("NoShowNotifier transactional terminal intents", () => {
+  it("requires an active session and propagates a failed waiver enqueue", async () => {
+    const outbox = makeOutbox();
+    const notifier = new NoShowNotifier(outbox.service);
+    const booking = buildNoShowBooking("NO_SHOW_WAIVED");
+    const session = { inTransaction: () => true } as never;
+    await notifier.enqueueNoShowWaivedInTransaction(booking, { businessName: "Soho" }, session);
+    expect(outbox.spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventKey: `NO_SHOW_WAIVED:${String(booking._id)}`,
+      }),
+      session,
+    );
+    outbox.spy.mockRejectedValueOnce(new Error("outbox unavailable"));
+    await expect(
+      notifier.enqueueNoShowCancelledInTransaction(
+        buildNoShowBooking("NO_SHOW_CANCELLED"),
+        { businessName: "Soho" },
+        session,
+      ),
+    ).rejects.toThrow("outbox unavailable");
   });
 });
 

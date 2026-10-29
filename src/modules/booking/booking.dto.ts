@@ -6,6 +6,7 @@ import {
   isPackageSchedulingUnlocked,
 } from "../package-progress/package-progress.rules.js";
 import type { BookingDocument } from "./booking.model.js";
+import { bookingPaymentSummary } from "./booking-payment-summary.js";
 
 /**
  * Explicit response DTOs (item 12/13) — a controller must never serialize a raw Mongoose
@@ -133,34 +134,6 @@ export type BookingDetailDto = {
 export type BookingPackageProgressContext = {
   progress: PackageProgressDocument;
   originBooking?: BookingDocument | undefined;
-};
-
-const toPaymentSummary = (booking: BookingDocument): BookingDetailDto["paymentSummary"] => {
-  const actualOnlinePaidCents =
-    booking.source === "MANUAL"
-      ? 0
-      : (booking.promo?.chargeCents ?? booking.financials.depositCents);
-  const originalVenueBalanceCents = Math.max(0, booking.financials.balanceDueCents);
-  const venuePaidCents =
-    booking.completionPayment?.paid === true
-      ? Math.min(originalVenueBalanceCents, booking.completionPayment.amountCents ?? 0)
-      : 0;
-  const outstandingVenueBalanceCents = Math.max(0, originalVenueBalanceCents - venuePaidCents);
-
-  let venueSettlementStatus: BookingDetailDto["paymentSummary"]["venueSettlementStatus"];
-  if (originalVenueBalanceCents <= 0) venueSettlementStatus = "NOT_REQUIRED";
-  else if (!booking.completionPayment) venueSettlementStatus = "NOT_RECORDED";
-  else if (!booking.completionPayment.paid) venueSettlementStatus = "NOT_PAID";
-  else if (outstandingVenueBalanceCents > 0) venueSettlementStatus = "PARTIALLY_PAID";
-  else venueSettlementStatus = "PAID_IN_FULL";
-
-  return {
-    actualOnlinePaidCents,
-    originalVenueBalanceCents,
-    venuePaidCents,
-    outstandingVenueBalanceCents,
-    venueSettlementStatus,
-  };
 };
 
 const toPackageSessionDtos = (
@@ -328,6 +301,8 @@ export type BookingListItemDto = {
 };
 
 export type BookingCalendarEntryDto = {
+  /** Same member discriminator as Booking detail/list; legacy package linkage is distinct. */
+  firstClassPackage: boolean;
   id: string;
   reference: string;
   status: string;
@@ -425,7 +400,7 @@ export const toBookingDetailDto = (
   fulfilment: booking.fulfilment,
   serviceLines: booking.serviceLines.map(toServiceLineDto),
   financials: booking.financials,
-  paymentSummary: toPaymentSummary(booking),
+  paymentSummary: bookingPaymentSummary(booking),
   packageSessions: toPackageSessionDtos(booking, packageProgressContexts),
   schedule: {
     timezone: booking.schedule.timezone,
@@ -504,6 +479,7 @@ export const toBookingListItemDto = (booking: BookingDocument): BookingListItemD
 });
 
 export const toBookingCalendarEntryDto = (booking: BookingDocument): BookingCalendarEntryDto => ({
+  firstClassPackage: booking.serviceLines.some((line) => Boolean(line.pricingInput.packageItemId)),
   id: String(booking._id),
   reference: booking.reference,
   status: booking.status,

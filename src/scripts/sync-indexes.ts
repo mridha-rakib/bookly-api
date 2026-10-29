@@ -7,6 +7,9 @@ import { DatabaseManager } from "../database/database-manager.js";
 import "../modules/addons/addon-service-assignment.model.js";
 import "../modules/addons/addon.model.js";
 import "../modules/booking/booking-creation-claim.model.js";
+// P3C: register the additive evidence model explicitly for out-of-band provisioning.
+// Production autoIndex is disabled; importing only the old model list omits its unique index.
+import "../modules/booking/package-consent-evidence.js";
 import "../modules/booking/booking.model.js";
 import "../modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import "../modules/booking-slot-reservation/booking-slot-reservation-claim.model.js";

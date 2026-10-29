@@ -37,6 +37,13 @@ import {
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { FinancialRelationshipRepository } from "../../../src/modules/client/financial-relationship.repository.js";
 import { FinancialRelationshipService } from "../../../src/modules/client/financial-relationship.service.js";
+import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
+import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
+import {
+  BookingCreatedNotifier,
+  type BookingNotificationUserPort,
+} from "../../../src/modules/notification/booking-created.notifier.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { computePackageBalanceSettlement } from "../../../src/modules/package-progress/package-progress.rules.js";
@@ -5010,13 +5017,15 @@ describe("P1 — universal customer↔business financial relationship + Financia
       },
     );
     it.each(["normal", "paid"] as const)(
-      "A2 postcommit notification failure for %s never compensates or releases",
+      "A2 postcommit side-effect failure for %s never compensates or releases",
       async (kind) => {
         const f = await prepareA2(kind);
+        // F4A Tier 2 moved the booking-created email into the transaction; the reminder
+        // scheduler is the remaining best-effort post-commit port with the same contract.
         const port = creationService as unknown as {
-          dispatchBookingCreatedNotifications: () => Promise<void>;
+          dispatchAppointmentReminderScheduling: () => Promise<void>;
         };
-        vi.spyOn(port, "dispatchBookingCreatedNotifications").mockRejectedValue(
+        vi.spyOn(port, "dispatchAppointmentReminderScheduling").mockRejectedValue(
           new Error("A2 notification unavailable"),
         );
         const booking = await f.run();
@@ -5027,6 +5036,248 @@ describe("P1 — universal customer↔business financial relationship + Financia
         expect(String((await f.run())._id)).toBe(String(booking._id));
       },
     );
+    // --- F4A Tier 2: booking-created email intent inside the Booking transaction -------------
+    const injectNotifier = (users: BookingNotificationUserPort = userRepository) => {
+      (creationService as unknown as { bookingCreatedNotifier: unknown }).bookingCreatedNotifier =
+        new BookingCreatedNotifier(new EmailOutboxService(new EmailOutboxRepository()), users);
+    };
+    const createdRows = (bookingId: unknown) =>
+      EmailOutboxModel.find({ eventKey: `BOOKING_CREATED:${String(bookingId)}` }).lean();
+    const recordEnqueueSessions = () => {
+      const sessions: boolean[] = [];
+      const original = EmailOutboxRepository.prototype.enqueue;
+      vi.spyOn(EmailOutboxRepository.prototype, "enqueue").mockImplementation(async function (
+        this: EmailOutboxRepository,
+        input,
+        session,
+      ) {
+        sessions.push(session?.inTransaction() === true);
+        return original.call(this, input, session);
+      });
+      return sessions;
+    };
+
+    it.each(["normal", "manual", "purchase", "redemption", "paid"] as const)(
+      "F4A-T2 %s writes the confirmation intent inside the Booking transaction, once",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        injectNotifier();
+        const sessions = recordEnqueueSessions();
+
+        const booking = await f.run();
+
+        const rows = await createdRows(booking._id);
+        expect(rows.length).toBeGreaterThanOrEqual(1);
+        expect(rows.every((row) => row.status === "PENDING" && row.attemptCount === 0)).toBe(true);
+        // Every write used the Booking transaction; nothing was enqueued after commit.
+        expect(sessions).toHaveLength(rows.length);
+        expect(sessions.every(Boolean)).toBe(true);
+        const clientTemplate =
+          kind === "manual" ? "BOOKING_FOR_CLIENT_CONFIRMED" : "BOOKING_CUSTOMER_CONFIRMED";
+        const clientRow = rows.find((row) => row.templateKey === clientTemplate);
+        expect(clientRow?.recipient).toBe(booking.customer.contact.normalizedEmail);
+        expect(clientRow?.payload).toMatchObject({ reference: booking.reference });
+
+        // Replay of the committed operation: same Booking, no new rows, no new enqueue.
+        expect(String((await f.run())._id)).toBe(String(booking._id));
+        expect(await createdRows(booking._id)).toHaveLength(rows.length);
+        expect(sessions).toHaveLength(rows.length);
+      },
+    );
+
+    it.each(["normal", "manual", "purchase", "redemption"] as const)(
+      "F4A-T2 an outbox insert failure aborts %s: no Booking, no rows, retry still possible",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        injectNotifier();
+        const bookings = await BookingModel.countDocuments();
+        const progress = await PackageProgressModel.find({}).lean();
+        vi.spyOn(EmailOutboxRepository.prototype, "enqueue").mockRejectedValueOnce(
+          new Error("F4A-T2 outbox unavailable"),
+        );
+
+        await expect(f.run()).rejects.toThrow("F4A-T2 outbox unavailable");
+
+        expect(await BookingModel.countDocuments()).toBe(bookings);
+        expect(await PackageProgressModel.find({}).lean()).toEqual(progress);
+        expect(await EmailOutboxModel.countDocuments({ eventKey: /^BOOKING_CREATED:/ })).toBe(0);
+        expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).toBeNull();
+        const retried = await f.run();
+        expect((await createdRows(retried._id)).length).toBeGreaterThanOrEqual(1);
+      },
+    );
+
+    it("F4A-T2 a paid outbox insert failure takes the existing compensation path, not a confirmed refund", async () => {
+      const f = await prepareA2("paid");
+      injectNotifier();
+      const bookings = await BookingModel.countDocuments();
+      paymentGateway.queueNextRefundOutcome("pending");
+      vi.spyOn(EmailOutboxRepository.prototype, "enqueue").mockRejectedValueOnce(
+        new Error("F4A-T2 outbox unavailable"),
+      );
+
+      await expect(f.run()).rejects.toThrow("F4A-T2 outbox unavailable");
+
+      expect(await BookingModel.countDocuments()).toBe(bookings);
+      expect(await EmailOutboxModel.countDocuments({ eventKey: /^BOOKING_CREATED:/ })).toBe(0);
+      const attempt = await PaymentAttemptModel.findOne({
+        logicalIdempotencyKey: f.input.idempotencyKey,
+      })
+        .orFail()
+        .exec();
+      const refund = await RefundOperationModel.findOne({ sourcePaymentAttemptId: attempt._id })
+        .orFail()
+        .exec();
+      // Compensation was started by the existing P0 path; the provider has NOT confirmed it.
+      expect(refund).toMatchObject({
+        reason: "BOOKING_PERSISTENCE_COMPENSATION",
+        providerStatus: "PROVIDER_PENDING",
+      });
+    });
+
+    it("F4A-T2 the intent is durable before the post-commit tail (Calendar stall or crash)", async () => {
+      const f = await prepareA2("normal");
+      injectNotifier();
+      const reached = c1Signal(),
+        proceed = c1Signal();
+      const tail = creationService as unknown as {
+        syncBookingCreatedToGoogleCalendar: () => Promise<void>;
+      };
+      vi.spyOn(tail, "syncBookingCreatedToGoogleCalendar").mockImplementation(async () => {
+        reached.resolve();
+        await proceed.promise;
+        throw new Error("F4A-T2 calendar unavailable");
+      });
+
+      const pending = f.run();
+      await reached.promise;
+      // The process could die here: the Booking and its email intent are already committed.
+      const claim = await claimRepository.findByIdempotencyKey(f.input.idempotencyKey);
+      const rows = await createdRows(claim?.bookingId);
+      expect(await BookingModel.findById(claim?.bookingId)).not.toBeNull();
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      proceed.resolve();
+      expect(String((await pending)._id)).toBe(String(claim?.bookingId));
+      expect(await createdRows(claim?.bookingId)).toHaveLength(rows.length);
+    });
+
+    it("F4A-T2 a User lookup failure never aborts the Booking; only business-side mail is skipped", async () => {
+      const f = await prepareA2("normal");
+      injectNotifier({
+        findManyByIds: async () => {
+          throw new Error("F4A-T2 user read unavailable");
+        },
+        findProfilesByUserIds: async () => [],
+      });
+
+      const booking = await f.run();
+
+      const rows = await createdRows(booking._id);
+      expect(rows.map((row) => row.templateKey)).toEqual(["BOOKING_CUSTOMER_CONFIRMED"]);
+      expect(rows[0]?.recipient).toBe(booking.customer.contact.normalizedEmail);
+    });
+
+    it("F4A-T2 a transient callback retry writes each recipient's row exactly once", async () => {
+      const f = await prepareA2("paid");
+      injectNotifier();
+      const error = new mongoose.mongo.MongoServerError({
+        message: "F4A-T2 synthetic transient error",
+      });
+      error.addErrorLabel("TransientTransactionError");
+      const original = EmailOutboxRepository.prototype.enqueue;
+      let failed = false;
+      vi.spyOn(EmailOutboxRepository.prototype, "enqueue").mockImplementation(async function (
+        this: EmailOutboxRepository,
+        input,
+        session,
+      ) {
+        const result = await original.call(this, input, session);
+        if (!failed) {
+          failed = true;
+          throw error; // after the first in-session insert: the driver restarts the callback
+        }
+        return result;
+      });
+
+      const booking = await f.run();
+
+      const rows = await createdRows(booking._id);
+      const keys = rows.map((row) => row.dedupeKey);
+      expect(new Set(keys).size).toBe(keys.length);
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      expect(await BookingModel.countDocuments()).toBe(1);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    });
+
+    // --- F4A Tier 3: receipt facts and notification integrity --------------------------------
+    it("F4A-T3 a paid booking's confirmation carries a receipt from the ledger row and SUCCEEDED attempt", async () => {
+      const f = await prepareA2("paid");
+      injectNotifier();
+
+      const booking = await f.run();
+
+      const ledger = await BookingFinancialTransactionModel.findOne({
+        bookingId: booking._id,
+        status: "SUCCEEDED",
+      })
+        .orFail()
+        .lean();
+      const attempt = await PaymentAttemptModel.findOne({
+        logicalIdempotencyKey: f.input.idempotencyKey,
+      })
+        .orFail()
+        .lean();
+      expect(attempt.providerStatus).toBe("SUCCEEDED");
+      const row = (await createdRows(booking._id)).find(
+        (r) => r.templateKey === "BOOKING_CUSTOMER_CONFIRMED",
+      );
+      if (!row?.payload) throw new Error("Expected booking confirmation notification payload");
+      expect(row.payload).toMatchObject({
+        onlinePayment: {
+          kind: "PAID",
+          paymentReference: attempt.providerPaymentIntentId,
+          paymentFor: "BOOKING",
+        },
+      });
+      const payment = (row.payload as { onlinePayment: { amountFormatted: string } }).onlinePayment;
+      expect(payment.amountFormatted).toBe(`€${(ledger.amountCents / 100).toFixed(2)}`);
+      expect(ledger.providerReference).toBe(attempt.providerPaymentIntentId);
+    });
+
+    it.each(["normal", "manual", "redemption"] as const)(
+      "F4A-T3 %s with no online charge says nothing was paid and carries no receipt",
+      async (kind) => {
+        const f = await prepareA2(kind);
+        injectNotifier();
+
+        const booking = await f.run();
+
+        const rows = await createdRows(booking._id);
+        expect(rows.length).toBeGreaterThanOrEqual(1);
+        for (const row of rows) {
+          expect(row.payload).toMatchObject({ onlinePayment: { kind: "NONE" } });
+        }
+      },
+    );
+
+    it("F4A-T3 a payload-build failure aborts the Booking instead of committing it without intent", async () => {
+      const f = await prepareA2("normal");
+      injectNotifier();
+      const bookings = await BookingModel.countDocuments();
+      const notifierPrototype = BookingCreatedNotifier.prototype as unknown as {
+        plan: () => unknown;
+      };
+      vi.spyOn(notifierPrototype, "plan").mockImplementation(() => {
+        throw new Error("F4A-T3 payload defect");
+      });
+
+      await expect(f.run()).rejects.toThrow("F4A-T3 payload defect");
+
+      expect(await BookingModel.countDocuments()).toBe(bookings);
+      expect(await EmailOutboxModel.countDocuments({ eventKey: /^BOOKING_CREATED:/ })).toBe(0);
+      expect(await claimRepository.findByIdempotencyKey(f.input.idempotencyKey)).toBeNull();
+    });
+
     it("A2 driver callback retry reuses pinned identity and dispatches outside the callback", async () => {
       const f = await prepareA2("paid");
       const error = new mongoose.mongo.MongoServerError({

@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BusinessDocument } from "../business/business.model.js";
@@ -10,6 +11,11 @@ type OutboxEnqueue = Pick<EmailOutboxService, "enqueue">;
 
 /** Optional observer port for Stage C — see `BookingLifecycleService`. */
 export type BookingCompletedNotificationPort = {
+  enqueueBookingCompletedInTransaction?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+  ): Promise<void>;
   notifyBookingCompleted(booking: BookingDocument, business: BusinessDocument): Promise<void>;
 };
 
@@ -30,10 +36,20 @@ const formatBusinessAddress = (business: BusinessDocument): string | undefined =
  */
 export class BookingCompletedNotifier implements BookingCompletedNotificationPort {
   public constructor(private readonly emailOutbox: OutboxEnqueue) {}
+  public async enqueueBookingCompletedInTransaction(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Completion intent requires the Booking transaction");
+    await this.notifyBookingCompleted(booking, business, session);
+  }
 
   public async notifyBookingCompleted(
     booking: BookingDocument,
     business: BusinessDocument,
+    session?: ClientSession,
   ): Promise<void> {
     try {
       const recipient = normalizeRecipient(booking.customer.contact.normalizedEmail);
@@ -59,13 +75,16 @@ export class BookingCompletedNotifier implements BookingCompletedNotificationPor
           : {}),
       };
 
-      await this.emailOutbox.enqueue({
+      const input = {
         eventKey: `BOOKING_COMPLETED:${String(booking._id)}`,
-        templateKey: "BOOKING_COMPLETED",
+        templateKey: "BOOKING_COMPLETED" as const,
         recipient,
         payload: payload as unknown as Record<string, unknown>,
-      });
+      };
+      if (session) await this.emailOutbox.enqueue(input, session);
+      else await this.emailOutbox.enqueue(input);
     } catch (error) {
+      if (session) throw error;
       logger.error(
         { err: error, bookingId: String(booking._id) },
         "Failed to enqueue BOOKING_COMPLETED notification (the completed booking is unaffected)",

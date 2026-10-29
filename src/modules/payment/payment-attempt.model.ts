@@ -177,6 +177,8 @@ schema.index({
 schema.index({ providerStatus: 1, createdAt: 1 });
 schema.index({ compensationStatus: 1, persistenceLeaseExpiresAt: 1, updatedAt: 1 });
 schema.index({ nextRecoveryAt: 1, updatedAt: 1 });
+// P4A-2: Customer-owned ordinary history, stable keyset pages; additive rollout required.
+schema.index({ customerUserId: 1, productKind: 1, purpose: 1, createdAt: -1, _id: -1 });
 
 const batchPaymentTransitions = new WeakSet<object>();
 const batchIdentityRoots = [

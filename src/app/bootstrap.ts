@@ -18,15 +18,18 @@ export class ApplicationBootstrap {
       await bootstrapStorage();
 
       const expressApplication = new ExpressApplication(this.databaseManager);
-      this.server = expressApplication.app.listen(env.PORT, () => {
-        logger.info(
-          {
-            port: env.PORT,
-            environment: env.NODE_ENV,
-          },
-          "Bookly API server started",
-        );
-      });
+      this.server = expressApplication.app.listen(
+        { port: env.PORT, ...(env.HTTP_BIND_HOST ? { host: env.HTTP_BIND_HOST } : {}) },
+        () => {
+          logger.info(
+            {
+              port: env.PORT,
+              environment: env.NODE_ENV,
+            },
+            "Bookly API server started",
+          );
+        },
+      );
 
       this.registerProcessHandlers();
     } catch (error) {

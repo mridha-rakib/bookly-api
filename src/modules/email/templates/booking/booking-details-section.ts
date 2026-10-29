@@ -19,16 +19,35 @@ const row = (label: string, value: string): string =>
   )}</td>` +
   `</tr>`;
 
+/**
+ * F4A Tier 3 — the "paid online" line. With verified evidence it shows only what Bookly can
+ * prove (PAID amount, or that nothing was taken); UNVERIFIED shows nothing. Without evidence
+ * (legacy callers) the original persisted-field row is kept unchanged.
+ */
+const NOTHING_TAKEN_ONLINE = "Nothing — no upfront payment was taken";
+const paidOnline = (data: BookingEmailData): { label: string; value: string } | undefined => {
+  const payment = data.onlinePayment;
+  if (!payment) return { label: "Paid online now", value: data.money.paidNowFormatted };
+  if (payment.kind === "PAID") return { label: "Paid online", value: payment.amountFormatted };
+  if (payment.kind === "NONE") return { label: "Paid online", value: NOTHING_TAKEN_ONLINE };
+  return undefined;
+};
+
+const lineMeta = (line: BookingEmailData["serviceLines"][number]): string[] =>
+  [`${line.durationMin} min`, line.quantityLabel, line.staffName].filter((part): part is string =>
+    Boolean(part),
+  );
+
 export const renderBookingDetailsHtml = (data: BookingEmailData): string => {
   const serviceRows = data.serviceLines
     .map((line) => {
       const addonBits = line.addons
         .map((addon) => `+ ${escapeHtml(addon.name)} (${escapeHtml(addon.priceFormatted)})`)
         .join("<br />");
-      const staff = line.staffName ? ` · ${escapeHtml(line.staffName)}` : "";
+      const meta = lineMeta(line).map(escapeHtml).join(" · ");
       return (
         `<tr><td style="padding:8px 0;border-top:1px solid ${BOOKLY_BRAND.border};font-family:${EMAIL_FONT_STACK};font-size:14px;color:${BOOKLY_BRAND.ink};">` +
-        `${escapeHtml(line.name)} <span style="color:${BOOKLY_BRAND.mutedText};">(${line.durationMin} min${staff})</span>` +
+        `${escapeHtml(line.name)} <span style="color:${BOOKLY_BRAND.mutedText};">(${meta})</span>` +
         (addonBits
           ? `<br /><span style="color:${BOOKLY_BRAND.slate};font-size:13px;">${addonBits}</span>`
           : "") +
@@ -39,6 +58,7 @@ export const renderBookingDetailsHtml = (data: BookingEmailData): string => {
     })
     .join("");
 
+  const paid = paidOnline(data);
   const moneyRows =
     row("Services subtotal", data.money.servicesSubtotalFormatted) +
     (data.money.hasAddons ? row("Add-ons", data.money.addonsSubtotalFormatted) : "") +
@@ -47,7 +67,7 @@ export const renderBookingDetailsHtml = (data: BookingEmailData): string => {
       : "") +
     (data.money.hasTravelFee ? row("Travel fee", data.money.travelFeeFormatted) : "") +
     row("Total", data.money.totalFormatted) +
-    row("Paid online now", data.money.paidNowFormatted) +
+    (paid ? row(paid.label, paid.value) : "") +
     row("Balance due at the venue", data.money.balanceDueFormatted);
 
   const locationLabel =
@@ -60,6 +80,7 @@ export const renderBookingDetailsHtml = (data: BookingEmailData): string => {
     row("Business", data.businessName) +
     row("Date", data.appointmentDate) +
     row("Time", `${data.appointmentTime} (${data.durationMin} min)`) +
+    (data.timezone ? row("Time zone", data.timezone) : "") +
     row(locationLabel, locationValue) +
     `</table>` +
     `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:14px 0 4px;">${serviceRows}</table>` +
@@ -74,6 +95,7 @@ export const renderBookingDetailsText = (data: BookingEmailData): string => {
     `Business: ${data.businessName}`,
     `Date: ${data.appointmentDate}`,
     `Time: ${data.appointmentTime} (${data.durationMin} min)`,
+    ...(data.timezone ? [`Time zone: ${data.timezone}`] : []),
   ];
   const locationLabel =
     data.fulfilment.kind === "TRAVEL_TO_CUSTOMER" ? "At your address" : "At the venue";
@@ -82,7 +104,10 @@ export const renderBookingDetailsText = (data: BookingEmailData): string => {
   lines.push("Services:");
   for (const line of data.serviceLines) {
     const staff = line.staffName ? ` with ${line.staffName}` : "";
-    lines.push(`  - ${line.name} (${line.durationMin} min${staff}) — ${line.amountFormatted}`);
+    const quantity = line.quantityLabel ? `, ${line.quantityLabel}` : "";
+    lines.push(
+      `  - ${line.name} (${line.durationMin} min${quantity}${staff}) — ${line.amountFormatted}`,
+    );
     for (const addon of line.addons) {
       lines.push(`      + ${addon.name} (${addon.priceFormatted})`);
     }
@@ -94,7 +119,8 @@ export const renderBookingDetailsText = (data: BookingEmailData): string => {
     lines.push(`Discount: -${data.money.serviceDiscountFormatted}`);
   if (data.money.hasTravelFee) lines.push(`Travel fee: ${data.money.travelFeeFormatted}`);
   lines.push(`Total: ${data.money.totalFormatted}`);
-  lines.push(`Paid online now: ${data.money.paidNowFormatted}`);
+  const paid = paidOnline(data);
+  if (paid) lines.push(`${paid.label}: ${paid.value}`);
   lines.push(`Balance due at the venue: ${data.money.balanceDueFormatted}`);
   return lines.join("\n");
 };

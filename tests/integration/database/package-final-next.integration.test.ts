@@ -41,6 +41,15 @@ import { connectIsolatedDatabase, stopIsolatedReplicaSet } from "./mongo-replset
 // A process-local setup grant, closed permanently before the HTTP listener starts.
 // The actual verifier is used for every subsequent runtime call, including flags=true.
 const setup = vi.hoisted(() => ({ allow: true }));
+vi.mock("../../../src/modules/booking/package-purchase-authority.js", async (original) => ({
+  ...(await original<object>()),
+  verifyPackagePurchaseConsentCertification: vi.fn(async (...args: unknown[]) => {
+    if (setup.allow) return undefined; // Existing synthetic setup only, before the listener.
+    const shipped =
+      await original<typeof import("../../../src/modules/booking/package-purchase-authority.js")>();
+    return Reflect.apply(shipped.verifyPackagePurchaseConsentCertification, undefined, args);
+  }),
+}));
 vi.mock("../../../src/modules/booking/package-batch-authority.js", async (original) => {
   const shipped =
     await original<typeof import("../../../src/modules/booking/package-batch-authority.js")>();

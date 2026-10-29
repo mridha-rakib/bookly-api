@@ -208,6 +208,46 @@ describe("BookingService.requireBookingManagementAccess", () => {
     ).rejects.toMatchObject({ statusCode: 404 });
   });
 
+  it.each([false, undefined])(
+    "denies Supervisor employmentActive=%s without a permissive legacy fallback",
+    async (employmentActive) => {
+      const { service, business, staffRepository } = buildHarness();
+      const membership = buildStaffMembership(business._id, { role: "SUPERVISOR" });
+      if (employmentActive === undefined) Reflect.deleteProperty(membership, "employmentActive");
+      else membership.employmentActive = employmentActive;
+      staffRepository.findActiveByUserId.mockResolvedValue(membership);
+      await expect(
+        service.requireBookingManagementAccess(
+          String(membership.userId),
+          "SUPERVISOR",
+          String(business._id),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    },
+  );
+
+  it("accepts non-removed null membership but denies an actual removedAt even from a stale lookup", async () => {
+    const { service, business, staffRepository } = buildHarness();
+    const membership = buildStaffMembership(business._id, { role: "SUPERVISOR" });
+    Object.assign(membership, { removedAt: null });
+    staffRepository.findActiveByUserId.mockResolvedValue(membership);
+    await expect(
+      service.requireBookingManagementAccess(
+        String(membership.userId),
+        "SUPERVISOR",
+        String(business._id),
+      ),
+    ).resolves.toBe(business);
+    membership.removedAt = new Date();
+    await expect(
+      service.requireBookingManagementAccess(
+        String(membership.userId),
+        "SUPERVISOR",
+        String(business._id),
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
   it("rejects a STAFF membership even when it claims the SUPERVISOR role param", async () => {
     const { service, business, staffRepository } = buildHarness();
     const staffUserId = new Types.ObjectId();

@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BusinessDocument } from "../business/business.model.js";
@@ -20,6 +21,11 @@ type OutboxEnqueue = Pick<EmailOutboxService, "enqueue">;
  * committed booking-reschedule confirmation).
  */
 export type BookingRescheduledCustomerNotificationPort = {
+  enqueueBookingRescheduledInTransaction?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+  ): Promise<void>;
   notifyBookingRescheduledToCustomer(
     booking: BookingDocument,
     business: BusinessDocument,
@@ -30,6 +36,32 @@ export class BookingRescheduledCustomerNotifier
   implements BookingRescheduledCustomerNotificationPort
 {
   public constructor(private readonly emailOutbox: OutboxEnqueue) {}
+
+  /** P4B: the production reschedule writer retains the existing event identity in its
+   * transaction. An enqueue error aborts BEFORE commitment; delivery errors remain external. */
+  public async enqueueBookingRescheduledInTransaction(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Reschedule intent requires the Booking transaction");
+    const entry = booking.rescheduleHistory.at(-1);
+    if (!entry || entry.previousStart.getTime() === entry.newStart.getTime()) return;
+    const recipient = normalizeRecipient(booking.customer.contact.normalizedEmail);
+    if (!recipient) return;
+    await this.emailOutbox.enqueue(
+      {
+        eventKey: `BOOKING_RESCHEDULED:${booking._id}:${booking.rescheduleHistory.length}`,
+        templateKey: "BOOKING_RESCHEDULED_CUSTOMER",
+        recipient,
+        payload: buildBookingRescheduledEmailData(booking, {
+          businessName: business.name,
+        }) as unknown as Record<string, unknown>,
+      },
+      session,
+    );
+  }
 
   public async notifyBookingRescheduledToCustomer(
     booking: BookingDocument,

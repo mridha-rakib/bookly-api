@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
@@ -85,6 +85,41 @@ describe("Staff notifications → EmailOutbox integration", () => {
 
   afterAll(async () => {
     await stopIsolatedReplicaSet();
+  });
+
+  it("staff cancellation intent rolls back and commits on the exact caller session", async () => {
+    const { booking, m1 } = twoStaffBooking();
+    const notifier = new StaffBookingNotifier(
+      outbox,
+      staffPort({ [m1]: "u1" }),
+      userPort({ u1: "sam@example.com" }),
+    );
+    const session = await mongoose.startSession();
+    try {
+      await expect(
+        session.withTransaction(async () => {
+          await notifier.enqueueBookingCancelledToStaffInTransaction(
+            booking,
+            "Soho",
+            "CUSTOMER",
+            session,
+          );
+          throw new Error("domain rollback");
+        }),
+      ).rejects.toThrow("domain rollback");
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+      await session.withTransaction(async () => {
+        await notifier.enqueueBookingCancelledToStaffInTransaction(
+          booking,
+          "Soho",
+          "CUSTOMER",
+          session,
+        );
+      });
+      expect(await EmailOutboxModel.countDocuments({})).toBe(1);
+    } finally {
+      await session.endSession();
+    }
   });
 
   it("cancellation: retried dispatch enqueues exactly one PENDING row per DISTINCT assigned staff", async () => {

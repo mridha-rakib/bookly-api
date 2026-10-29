@@ -1,7 +1,11 @@
 import nodemailer from "nodemailer";
 
 import { env } from "../../config/env.js";
-import { classifyEmailProviderError, EmailError } from "./email.errors.js";
+import {
+  classifyEmailProviderError,
+  EMAIL_PROVIDER_REQUEST_TIMEOUT_MS,
+  EmailError,
+} from "./email.errors.js";
 import type {
   EmailAttachment,
   EmailTransportSendInput,
@@ -19,12 +23,23 @@ type SmtpLikeTransporter = {
   sendMail(payload: Record<string, unknown>): Promise<unknown>;
 };
 
+const SMTP_CONNECTION_TIMEOUT_MS = 10_000;
+const SMTP_GREETING_TIMEOUT_MS = 10_000;
+const SMTP_DNS_TIMEOUT_MS = 10_000;
+
 const defaultSmtpTransporterFactory = (): SmtpLikeTransporter =>
   nodemailer.createTransport({
     host: env.SMTP_HOST,
     port: env.SMTP_PORT,
     secure: env.SMTP_SECURE,
     auth: { user: env.SMTP_USER, pass: env.SMTP_PASS },
+    // nodemailer has no per-message abort; these are per-phase limits (connect, greeting,
+    // DNS, socket inactivity), not one wall-clock deadline. Defaults were 120 s / 30 s /
+    // 30 s / 600 s — the 600 s idle limit exceeded the outbox claim timeout.
+    connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+    greetingTimeout: SMTP_GREETING_TIMEOUT_MS,
+    dnsTimeout: SMTP_DNS_TIMEOUT_MS,
+    socketTimeout: EMAIL_PROVIDER_REQUEST_TIMEOUT_MS,
   }) as unknown as SmtpLikeTransporter;
 
 const toNodemailerAttachment = (attachment: EmailAttachment): Record<string, unknown> => ({

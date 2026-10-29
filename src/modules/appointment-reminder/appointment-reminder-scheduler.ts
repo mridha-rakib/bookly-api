@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { AppointmentReminderRepository } from "./appointment-reminder.repository.js";
@@ -14,6 +15,11 @@ import {
  * reschedule or cancellation.
  */
 export type AppointmentReminderSchedulingPort = {
+  onBookingCreatedInTransaction?(booking: BookingDocument, session: ClientSession): Promise<void>;
+  onBookingRescheduledInTransaction?(
+    booking: BookingDocument,
+    session: ClientSession,
+  ): Promise<void>;
   /** Post-commit tail of booking creation — ensure the 24h reminder exists (or is recorded as
    * skipped when the booking is already inside the 24h window). */
   onBookingCreated(booking: BookingDocument): Promise<void>;
@@ -72,6 +78,31 @@ type PlanOutcome = "scheduled" | "skipped_inside_window" | "not_eligible";
  */
 export class AppointmentReminderScheduler implements AppointmentReminderSchedulingPort {
   public constructor(private readonly repository: AppointmentReminderRepository) {}
+  public async onBookingCreatedInTransaction(
+    booking: BookingDocument,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Reminder intent requires the Booking transaction");
+    await this.ensureScheduled(booking, session);
+  }
+  public async onBookingRescheduledInTransaction(
+    booking: BookingDocument,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Reminder intent requires the Booking transaction");
+    const keys = PLANS.map((plan) =>
+      buildAppointmentReminderDedupeKey(plan.kind, String(booking._id), plan.anchorAt(booking)),
+    );
+    await this.repository.retireActiveForBooking(
+      booking._id,
+      "SUPERSEDED_BY_RESCHEDULE",
+      { now: new Date(), exceptDedupeKeys: keys },
+      session,
+    );
+    await this.ensureScheduled(booking, session);
+  }
 
   public async onBookingCreated(booking: BookingDocument): Promise<void> {
     await this.safely("schedule (created)", booking, () => this.ensureScheduled(booking));
@@ -117,6 +148,7 @@ export class AppointmentReminderScheduler implements AppointmentReminderScheduli
 
   private async ensureScheduled(
     booking: BookingDocument,
+    session?: ClientSession,
   ): Promise<Record<AppointmentReminderKind, PlanOutcome>> {
     const results = {} as Record<AppointmentReminderKind, PlanOutcome>;
     const customerUserId = booking.customer.customerUserId;
@@ -132,7 +164,7 @@ export class AppointmentReminderScheduler implements AppointmentReminderScheduli
         continue;
       }
 
-      const { created, record } = await this.repository.schedule({
+      const input = {
         kind: plan.kind,
         bookingId: booking._id,
         businessId: booking.businessId,
@@ -140,7 +172,10 @@ export class AppointmentReminderScheduler implements AppointmentReminderScheduli
         scheduleStartAt: plan.anchorAt(booking),
         offsetMinutes,
         now: new Date(),
-      });
+      };
+      const { created, record } = session
+        ? await this.repository.schedule(input, session)
+        : await this.repository.schedule(input);
 
       const outcome = record.status === "SKIPPED" ? "skipped_inside_window" : "scheduled";
       results[plan.kind] = outcome;

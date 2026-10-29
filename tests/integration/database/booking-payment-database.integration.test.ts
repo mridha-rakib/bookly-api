@@ -1,16 +1,25 @@
-import { Types } from "mongoose";
+import express from "express";
+import mongoose, { Types } from "mongoose";
+import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
+import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import {
+  createBusinessBookingRoute,
+  createCustomerBookingRoute,
+} from "../../../src/modules/booking/booking.route.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
+import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import { BookingRecoveryInbox } from "../../../src/modules/booking/booking-recovery-inbox.js";
 import { NoShowResolutionService } from "../../../src/modules/booking/no-show-resolution.service.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -30,16 +39,19 @@ import { BookingCancelledNotifier } from "../../../src/modules/notification/book
 import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
+import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
@@ -350,6 +362,411 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     idempotencyKey: `key-${new Types.ObjectId().toString()}`,
   });
 
+  // P4A: use the existing real payment fixture and original operation; no new gateway/queue.
+  const recoveryFixture = async () => {
+    const f = await setupBookableBusiness();
+    const customer = await createCustomer("recovery");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+    const input = finalizeInput(f.service._id, f.membership._id);
+    const status = () =>
+      creationService.readCustomerBookingPayment(
+        String(customer._id),
+        String(f.business._id),
+        input.idempotencyKey,
+      );
+    const finalize = () =>
+      creationService.finalizeCustomerBooking(String(customer._id), String(f.business._id), input);
+    return { ...f, customer, input, status, finalize };
+  };
+  it("P4A2 another live device discovers owned 3DS without any browser body or provider call", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    await t.finalize();
+    const tokens = new TokenService(new SessionRepository());
+    const first = await issueTestAccessToken(tokens, { userId: t.customer._id, role: "CUSTOMER" });
+    const second = await issueTestAccessToken(tokens, { userId: t.customer._id, role: "CUSTOMER" });
+    const app = express();
+    app.use("/me", createCustomerBookingRoute());
+    app.use(createErrorHandler());
+    for (const token of [first, second]) {
+      const response = await request(app)
+        .get("/me/bookings/recovery-inbox")
+        .set("Authorization", `Bearer ${token}`)
+        .expect(200);
+      expect(response.body.data.requests).toHaveLength(1);
+      expect(response.body.data.requests[0]).toMatchObject({
+        idempotencyKey: t.input.idempotencyKey,
+        status: { state: "AUTHENTICATION_REQUIRED" },
+        replayAvailable: false,
+        nextAction: "CHECK_STATUS",
+      });
+      expect(JSON.stringify(response.body.data)).not.toMatch(
+        /clientSecret|_secret|financialContract|succeededTransactionId/,
+      );
+      expect(response.headers["cache-control"]).toContain("no-store");
+    }
+    const foreign = await createCustomer("inbox-foreign"),
+      foreignToken = await issueTestAccessToken(tokens, { userId: foreign._id, role: "CUSTOMER" });
+    const empty = await request(app)
+      .get("/me/bookings/recovery-inbox")
+      .set("Authorization", `Bearer ${foreignToken}`)
+      .expect(200);
+    expect(empty.body.data.requests).toEqual([]);
+    expect(empty.body.data.resolved).toEqual([]);
+    await request(app)
+      .get("/me/bookings/recovery-inbox")
+      .query({ customerId: String(t.customer._id) })
+      .set("Authorization", `Bearer ${foreignToken}`)
+      .expect(400);
+    const owner = await issueTestAccessToken(tokens, {
+      userId: t.owner._id,
+      role: "BUSINESS_OWNER",
+    });
+    await request(app)
+      .get("/me/bookings/recovery-inbox")
+      .set("Authorization", `Bearer ${owner}`)
+      .expect(403);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(paymentGateway.refundInputs).toHaveLength(0);
+  });
+  it("P4A2 evidence pages advance without duplicate paid claims and move committed requests into resolved history", async () => {
+    const t = await recoveryFixture();
+    await t.finalize();
+    const input = finalizeInput(t.service._id, t.membership._id, "12:00");
+    await creationService.finalizeCustomerBooking(
+      String(t.customer._id),
+      String(t.business._id),
+      input,
+    );
+    const inbox = new BookingRecoveryInbox(creationService),
+      found: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const result = await inbox.list(String(t.customer._id), 1, cursor);
+      expect(result.scanned).toBeLessThanOrEqual(1);
+      expect(result.requests).toEqual([]);
+      for (const item of result.resolved) {
+        expect(item.status.state).toBe("COMMITTED");
+        expect(item.status.bookingId).toBeTruthy();
+        found.push(item.idempotencyKey);
+      }
+      if (!result.hasMore) break;
+      expect(result.nextCursor).toBeTruthy();
+      expect(result.nextCursor).not.toBe(cursor);
+      cursor = result.nextCursor;
+    }
+    expect(found.sort()).toEqual([t.input.idempotencyKey, input.idempotencyKey].sort());
+    expect(new Set(found).size).toBe(2);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A2 suspended Business and old pending evidence remain inspectable without fabricating replay", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    await t.finalize();
+    t.business.set("status", "SUSPENDED");
+    await t.business.save();
+    // Legacy-age evidence remains discoverable; client privacy expiry is not payment expiry.
+    await PaymentAttemptModel.collection.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { createdAt: new Date("2020-01-01T00:00:00Z") } },
+    );
+    const result = await new BookingRecoveryInbox(creationService).list(String(t.customer._id), 20);
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests[0]?.status).toMatchObject({
+      state: "AUTHENTICATION_REQUIRED",
+      canResume: false,
+      resumeBlockedReason: "BUSINESS_UNAVAILABLE",
+    });
+    expect(result.requests[0]).not.toHaveProperty("input");
+  });
+  it("P4A2 refunded is resolved, pending compensation needs attention, and unsupported Package evidence is rejected", async () => {
+    const t = await recoveryFixture();
+    await t.finalize();
+    const inbox = new BookingRecoveryInbox(creationService);
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { compensationStatus: "REFUND_PENDING" } },
+    );
+    const pending = await inbox.list(String(t.customer._id), 20);
+    expect(pending.requests[0]?.status.state).toBe("REFUND_PENDING");
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { compensationStatus: "REFUNDED" } },
+    );
+    const refunded = await inbox.list(String(t.customer._id), 20);
+    expect(refunded.requests).toEqual([]);
+    expect(refunded.resolved[0]?.status.state).toBe("REFUNDED");
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { productKind: "PACKAGE_PURCHASE" } },
+    );
+    const unsupported = await inbox.list(String(t.customer._id), 20);
+    expect(unsupported.requests).toEqual([]);
+    expect(unsupported.resolved).toEqual([]);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A2 unclassified bare legacy claims are not guessed to be replayable ordinary requests", async () => {
+    const t = await recoveryFixture();
+    await BookingCreationClaimModel.create({
+      idempotencyKey: `legacy-${new Types.ObjectId()}`,
+      businessId: t.business._id,
+      actorUserId: t.customer._id,
+      bookingId: new Types.ObjectId(),
+    });
+    const result = await new BookingRecoveryInbox(creationService).list(String(t.customer._id), 20);
+    expect(result.requests).toEqual([]);
+    expect(result.resolved).toEqual([]);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+  });
+  it("P4A a normal paid Booking is committed only with the exact durable ledger and attempt", async () => {
+    const t = await recoveryFixture();
+    await expect(t.status()).resolves.toMatchObject({ state: "NOT_OBSERVED", canDismiss: false });
+    const result = await t.finalize();
+    if (result.status !== "confirmed") throw Error("expected committed Booking");
+    await expect(t.status()).resolves.toMatchObject({
+      state: "COMMITTED",
+      bookingId: String(result.booking._id),
+      canDismiss: true,
+    });
+    await t.finalize();
+    await t.status();
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(await BookingModel.countDocuments()).toBe(1);
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    await PaymentAttemptModel.updateOne(
+      { _id: attempt._id },
+      { $unset: { succeededTransactionId: "" } },
+    );
+    await expect(t.status()).resolves.toMatchObject({
+      state: "FINALIZATION_PENDING",
+      canDismiss: false,
+    });
+  });
+  it("P4A 3DS status survives a fresh read and never authenticates or resubmits automatically", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    const required = await t.finalize();
+    if (required.status !== "requires_action") throw Error("expected authentication");
+    const before = paymentGateway.paymentIntentInputs.length;
+    await expect(t.status()).resolves.toMatchObject({
+      state: "AUTHENTICATION_REQUIRED",
+      clientSecret: required.clientSecret,
+    });
+    await t.status();
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(before);
+    t.business.set("status", "SUSPENDED");
+    await t.business.save();
+    const suspended = await t.status();
+    expect(suspended.canResume).toBe(false);
+    expect(suspended.resumeBlockedReason).toBe("BUSINESS_UNAVAILABLE");
+    expect(suspended).not.toHaveProperty("clientSecret");
+    t.business.set("status", "APPROVED");
+    await t.business.save();
+    paymentGateway.succeedPaymentIntent(required.paymentIntentId);
+    // GET is a stored observation, not a provider status call or Booking completion.
+    await expect(t.status()).resolves.toMatchObject({ state: "AUTHENTICATION_REQUIRED" });
+    await t.finalize();
+    await expect(t.status()).resolves.toMatchObject({ state: "COMMITTED" });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A a zero-upfront returning Booking requires a durable Booking, not a fake zero payment", async () => {
+    const t = await recoveryFixture();
+    await t.finalize();
+    const next = finalizeInput(t.service._id, t.membership._id, "12:00");
+    await creationService.finalizeCustomerBooking(
+      String(t.customer._id),
+      String(t.business._id),
+      next,
+    );
+    await expect(
+      creationService.readCustomerBookingPayment(
+        String(t.customer._id),
+        String(t.business._id),
+        next.idempotencyKey,
+      ),
+    ).resolves.toMatchObject({ state: "COMMITTED" });
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(await BookingModel.countDocuments()).toBe(2);
+  });
+  it("P4A processing and later provider success remain pending until the original Booking commits", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    const required = await t.finalize();
+    if (required.status !== "requires_action") throw Error("expected authentication");
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    paymentGateway.setPaymentIntentStatus(required.paymentIntentId, "processing");
+    await paymentService.reconcilePaymentAttempt(attempt._id);
+    await expect(t.status()).resolves.toMatchObject({ state: "PAYMENT_PROCESSING" });
+    paymentGateway.succeedPaymentIntent(required.paymentIntentId);
+    await paymentService.reconcilePaymentAttempt(attempt._id);
+    await expect(t.status()).resolves.toMatchObject({ state: "FINALIZATION_PENDING" });
+    expect(await BookingModel.countDocuments()).toBe(0);
+    await t.finalize();
+    await expect(t.status()).resolves.toMatchObject({ state: "COMMITTED" });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A lost payment response remains unresolved and exact-key replay recovers one Booking", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeLostResponse();
+    await expect(t.finalize()).rejects.toThrow();
+    const unresolved = await t.status();
+    expect(unresolved.state).not.toBe("COMMITTED");
+    expect(unresolved).not.toHaveProperty("bookingId");
+    await t.finalize();
+    await expect(t.status()).resolves.toMatchObject({ state: "COMMITTED" });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A a lost Booking commit acknowledgement resolves the exact committed result without compensation", async () => {
+    const t = await recoveryFixture(),
+      start = mongoose.startSession.bind(mongoose);
+    let lost = false;
+    const restoreCommits: Array<() => void> = [];
+    const sessions = vi.spyOn(mongoose, "startSession").mockImplementation(async () => {
+      const session = await start(),
+        commit = session.commitTransaction.bind(session);
+      const spy = vi.spyOn(session, "commitTransaction").mockImplementation(async () => {
+        await commit();
+        if (!lost && (await BookingModel.exists({ businessId: t.business._id }))) {
+          lost = true;
+          throw Error("synthetic lost Booking commit acknowledgement");
+        }
+      });
+      restoreCommits.push(() => spy.mockRestore());
+      return session;
+    });
+    try {
+      const result = await t.finalize();
+      expect(result.status).toBe("confirmed");
+      expect(lost).toBe(true);
+      await expect(t.status()).resolves.toMatchObject({ state: "COMMITTED" });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(paymentGateway.refundInputs).toHaveLength(0);
+      expect(await BookingModel.countDocuments()).toBe(1);
+    } finally {
+      sessions.mockRestore();
+      restoreCommits.forEach((restore): void => {
+        restore();
+      });
+    }
+  });
+  it("P4A foreign Customer/Business and Package attempts cannot leak a payment secret", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    await t.finalize();
+    const foreign = await createCustomer("foreign-recovery");
+    await expect(
+      creationService.readCustomerBookingPayment(
+        String(foreign._id),
+        String(t.business._id),
+        t.input.idempotencyKey,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      creationService.readCustomerBookingPayment(
+        String(t.customer._id),
+        String(new Types.ObjectId()),
+        t.input.idempotencyKey,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { productKind: "PACKAGE_PURCHASE" } },
+    );
+    await expect(t.status()).rejects.toMatchObject({ statusCode: 409 });
+  });
+  it("P4A pending compensation is separate from settled refund and prevents Booking success", async () => {
+    const t = await recoveryFixture();
+    await t.finalize();
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { compensationStatus: "REFUND_PENDING" } },
+    );
+    const pending = await t.status();
+    expect(pending.state).toBe("REFUND_PENDING");
+    expect(pending).not.toHaveProperty("bookingId");
+    expect(pending).not.toHaveProperty("clientSecret");
+    expect(pending.canDismiss).toBe(false);
+    await PaymentAttemptModel.updateOne(
+      { logicalIdempotencyKey: t.input.idempotencyKey },
+      { $set: { compensationStatus: "REFUNDED" } },
+    );
+    await expect(t.status()).resolves.toMatchObject({ state: "REFUNDED", canDismiss: true });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A the real status route permits owned recovery during Business suspension and denies management roles", async () => {
+    const t = await recoveryFixture();
+    await t.finalize();
+    t.business.set("status", "SUSPENDED");
+    await t.business.save();
+    const tokens = new TokenService(new SessionRepository());
+    const customerToken = await issueTestAccessToken(tokens, {
+      userId: t.customer._id,
+      role: "CUSTOMER",
+    });
+    const ownerToken = await issueTestAccessToken(tokens, {
+      userId: t.owner._id,
+      role: "BUSINESS_OWNER",
+    });
+    const app = express();
+    app.use(express.json());
+    app.use("/businesses", createBusinessBookingRoute());
+    app.use(createErrorHandler());
+    const url = `/businesses/${t.business._id}/bookings/operations/payment-status`;
+    const result = await request(app)
+      .get(url)
+      .query({ idempotencyKey: t.input.idempotencyKey })
+      .set("Authorization", `Bearer ${customerToken}`)
+      .expect(200);
+    expect(result.body.data.state).toBe("COMMITTED");
+    expect(result.headers["cache-control"]).toContain("no-store");
+    expect(result.body.data).not.toHaveProperty("clientSecret");
+    await request(app)
+      .get(url)
+      .query({ idempotencyKey: t.input.idempotencyKey })
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .expect(403);
+    for (const role of ["SUPERVISOR", "STAFF"] as const) {
+      const user = await userRepository.create({
+        normalizedEmail: `${role.toLowerCase()}-${new Types.ObjectId()}@example.test`,
+        passwordHash: "hash",
+        role,
+        status: "ACTIVE",
+      });
+      const token = await issueTestAccessToken(tokens, { userId: user._id, role });
+      await request(app)
+        .get(url)
+        .query({ idempotencyKey: t.input.idempotencyKey })
+        .set("Authorization", `Bearer ${token}`)
+        .expect(403);
+    }
+    await request(app)
+      .get(url)
+      .query({ idempotencyKey: t.input.idempotencyKey, customerUserId: String(t.customer._id) })
+      .set("Authorization", `Bearer ${customerToken}`)
+      .expect(400);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("P4A a real paid persistence abort exposes pending compensation without inventing a refund", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextRefundOutcome("pending");
+    const reservation = vi
+      .spyOn(reservationService, "reserveOrJoin")
+      .mockRejectedValueOnce(Error("synthetic transaction abort"));
+    try {
+      await expect(t.finalize()).rejects.toThrow();
+    } finally {
+      reservation.mockRestore();
+    }
+    expect(await BookingModel.countDocuments()).toBe(0);
+    const pending = await t.status();
+    expect(["REFUND_PENDING", "RECONCILIATION_REQUIRED"]).toContain(pending.state);
+    expect(pending).not.toHaveProperty("bookingId");
+    expect(pending.canDismiss).toBe(false);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(paymentGateway.refundInputs).toHaveLength(1);
+  });
+
   // --- First-booking activation charge --------------------------------------------------------
 
   it("returns the VAT-inclusive preview contract while finalization still charges pre-tax", async () => {
@@ -636,6 +1053,19 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       linkedUserId: loserCustomerId,
     }).exec();
     expect(loserClient?.activatedAt).toBeUndefined();
+    // P4A: the same real last-slot race exposes distinct authoritative recovery outcomes.
+    const attempts = await PaymentAttemptModel.find({ businessId: business._id });
+    expect(attempts).toHaveLength(2);
+    for (const attempt of attempts) {
+      const status = await creationService.readCustomerBookingPayment(
+        String(attempt.customerUserId),
+        String(business._id),
+        attempt.logicalIdempotencyKey,
+      );
+      expect(status.state).toBe(
+        String(attempt.customerUserId) === String(loserCustomerId) ? "REFUNDED" : "COMMITTED",
+      );
+    }
   });
 
   it("[race] duplicate finalize with the same idempotencyKey results in exactly one charge and one booking", async () => {
@@ -884,21 +1314,37 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       "Business closed for the day",
     );
 
-    const rows = await EmailOutboxModel.find({
-      eventKey: `BOOKING_CANCELLED:${String(finalizeResult.booking._id)}`,
-    }).exec();
-    expect(rows.length).toBeGreaterThan(0);
-    for (const row of rows) {
-      const payload = row.payload as {
-        financialOutcome: { refundFormatted: string; hasRefund: boolean; settlementStatus: string };
-      };
-      expect(payload.financialOutcome.hasRefund).toBe(true);
-      expect(payload.financialOutcome.settlementStatus).toBe("SUCCEEDED");
-      expect(payload.financialOutcome.refundFormatted).not.toBe("€0.00");
-      expect(payload.financialOutcome.refundFormatted).toBe(
-        `€${(expectedRefundCents / 100).toFixed(2)}`,
-      );
-    }
+    // P4B-1/P4B-1R contract: the cancellation notice commits with the Booking while the refund
+    // is still being arranged; the settled result is its own exact RefundOperation event.
+    const assertRows = async (eventKey: string, settlementStatus: string) => {
+      const rows = await EmailOutboxModel.find({ eventKey }).exec();
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        const payload = row.payload as {
+          financialOutcome: {
+            refundFormatted: string;
+            hasRefund: boolean;
+            settlementStatus: string;
+          };
+        };
+        expect(payload.financialOutcome.hasRefund).toBe(true);
+        expect(payload.financialOutcome.settlementStatus).toBe(settlementStatus);
+        expect(payload.financialOutcome.refundFormatted).not.toBe("€0.00");
+        expect(payload.financialOutcome.refundFormatted).toBe(
+          `€${(expectedRefundCents / 100).toFixed(2)}`,
+        );
+      }
+    };
+    const bookingId = String(finalizeResult.booking._id);
+    const operation = await paymentService.findRefundOperation(
+      `business-cancel-refund:${bookingId}`,
+    );
+    expect(operation?.finalNotificationRecordedAt).toBeInstanceOf(Date);
+    await assertRows(`BOOKING_CANCELLED:${bookingId}`, "PENDING");
+    await assertRows(
+      `BUSINESS_REFUND:${bookingId}:${String(operation?._id)}:SUCCEEDED`,
+      "SUCCEEDED",
+    );
   });
 
   // --- No-show worker ----------------------------------------------------------------------------

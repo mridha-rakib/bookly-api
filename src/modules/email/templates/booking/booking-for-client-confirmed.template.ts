@@ -10,6 +10,12 @@ import {
 } from "../components/email-primitives.js";
 import { renderBookingDetailsHtml, renderBookingDetailsText } from "./booking-details-section.js";
 import type { BookingEmailData } from "./booking-email-data.js";
+import {
+  renderPolicyHtml,
+  renderPolicyText,
+  renderReceiptHtml,
+  renderReceiptText,
+} from "./booking-policy-receipt-section.js";
 
 /**
  * TRIGGERS 3 & 4 (recipient: the client) — a Business Owner or Supervisor created the booking
@@ -19,15 +25,14 @@ import type { BookingEmailData } from "./booking-email-data.js";
 export const BOOKING_FOR_CLIENT_CONFIRMED_SUBJECT =
   "An appointment has been booked for you" as const;
 
-const cancellationReminder = (data: BookingEmailData): string | undefined => {
-  if (!data.cancellationPolicy) {
-    return undefined;
-  }
-  return `If this time doesn't work, let ${data.businessName} know as early as you can. A late cancellation or no-show may be charged up to ${data.cancellationPolicy.noShowPercentage}% of the booking value under their cancellation policy.`;
-};
+// F4A Tier 3: the policy terms come from the Booking's own snapshot (booking-policy-receipt-
+// section.ts). The previous sentence applied the no-show percentage to late cancellations too.
+const letThemKnow = (data: BookingEmailData): string =>
+  `If this time doesn't work, let ${data.businessName} know as early as you can.`;
 
 export const renderBookingForClientConfirmedEmail = (data: BookingEmailData): RenderedEmail => {
-  const reminder = cancellationReminder(data);
+  const reminder = letThemKnow(data);
+  const receiptText = renderReceiptText(data);
   const cta = data.customerBookingUrlPath
     ? emailButton("View this booking", buildFrontendUrl(data.customerBookingUrlPath))
     : "";
@@ -38,7 +43,9 @@ export const renderBookingForClientConfirmedEmail = (data: BookingEmailData): Re
       `Hi ${data.customerName}, ${data.businessName} has booked an appointment for you on Bookly.cy. Here are the details:`,
     ) +
     renderBookingDetailsHtml(data) +
-    (reminder ? emailParagraph(reminder) : "") +
+    renderReceiptHtml(data) +
+    renderPolicyHtml(data) +
+    emailParagraph(reminder) +
     cta +
     emailMutedNote(
       `Didn't expect this? Contact ${data.businessName}, or reach us at ${SUPPORT_EMAIL}.`,
@@ -50,7 +57,11 @@ export const renderBookingForClientConfirmedEmail = (data: BookingEmailData): Re
     `Hi ${data.customerName}, ${data.businessName} has booked an appointment for you on Bookly.cy.`,
     "",
     renderBookingDetailsText(data),
-    ...(reminder ? ["", reminder] : []),
+    ...(receiptText ? ["", receiptText] : []),
+    "",
+    renderPolicyText(data),
+    "",
+    reminder,
     ...(data.customerBookingUrlPath
       ? ["", `View this booking: ${buildFrontendUrl(data.customerBookingUrlPath)}`]
       : []),

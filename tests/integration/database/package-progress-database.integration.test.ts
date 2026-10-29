@@ -28,6 +28,9 @@ import { BusinessHoursService } from "../../../src/modules/business-hours/busine
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { renderBookingCancelledCustomerEmail } from "../../../src/modules/email/templates/booking/booking-cancelled-customer.template.js";
+import { renderBookingCancelledOwnerEmail } from "../../../src/modules/email/templates/booking/booking-cancelled-owner.template.js";
+import type { CancellationEmailData } from "../../../src/modules/email/templates/booking/cancellation-email-data.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
 import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
@@ -50,6 +53,7 @@ import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-of
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
+import { ordinaryCompletionHttp } from "../../helpers/ordinary-completion-http.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -1897,12 +1901,12 @@ describe("database-backed Package Deal integration", () => {
         redeemInput(staff[0]!.membership._id),
       );
 
-      await lifecycleService.completeBooking(
+      const post = await ordinaryCompletionHttp(
+        bookingService,
+        lifecycleService,
         String(owner._id),
-        "BUSINESS_OWNER",
-        String(business._id),
-        String(session2._id),
       );
+      await post(String(business._id), String(session2._id)).expect(200);
 
       const after = await PackageProgressModel.findById(progress._id).orFail().exec();
       expect(after.remainingSessions).toBe(3); // unchanged by completion
@@ -2095,6 +2099,13 @@ describe("database-backed Package Deal integration", () => {
         expect(payload.financialOutcome.hasRefund).toBe(true);
         expect(payload.financialOutcome.refundFormatted).toBe("€35.00");
         expect(payload.financialOutcome.settlementStatus).toBe("SUCCEEDED");
+        const data = row.payload as unknown as CancellationEmailData;
+        const text =
+          row.templateKey === "BOOKING_CANCELLED_CUSTOMER"
+            ? renderBookingCancelledCustomerEmail(data).text
+            : renderBookingCancelledOwnerEmail(data).text;
+        expect(text).toContain("€35.00");
+        expect(text).not.toContain("€450.00");
       }
     });
 
@@ -2126,8 +2137,57 @@ describe("database-backed Package Deal integration", () => {
         const payload = row.payload as { financialOutcome: { settlementStatus: string } };
         expect(payload.financialOutcome.settlementStatus).toBe("FAILED");
       }
-      // The customer-facing text is never "has been processed" for a failed refund.
-      expect(JSON.stringify(rows.map((r) => r.payload))).not.toContain("has been processed");
+      // Check actual rendering, rather than searching presentation-data JSON for prose.
+      for (const row of rows) {
+        const data = row.payload as unknown as CancellationEmailData;
+        expect(data.financialOutcome.refundFormatted).toBe("€35.00");
+        const text =
+          row.templateKey === "BOOKING_CANCELLED_CUSTOMER"
+            ? renderBookingCancelledCustomerEmail(data).text
+            : renderBookingCancelledOwnerEmail(data).text;
+        expect(text).not.toContain("has been processed");
+        expect(text).not.toContain("refunded to the customer");
+        expect(text).toContain(
+          row.templateKey === "BOOKING_CANCELLED_CUSTOMER"
+            ? "could not be completed"
+            : "manual follow-up",
+        );
+      }
+    });
+
+    it("repeated refund-notice delivery deduplicates both recipients independently of void retry eligibility", async () => {
+      const { business, customer, progress, purchase } = await setUpPurchasedPackage();
+      const voided = await lifecycleService.voidUnusedPackage(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        undefined,
+      );
+      const origin = await bookingRepository.findById(business._id, purchase._id);
+      if (!origin || !voided.voidRefundSettlement) throw Error("committed refund fixture required");
+      const settlement = voided.voidRefundSettlement;
+      const before = await financialTransactionService.listForBooking(purchase._id);
+      const notifier = new BookingCancelledNotifier(new EmailOutboxService(), userRepository);
+      for (let i = 0; i < 2; i++)
+        await notifier.notifyBookingCancelled(
+          origin,
+          business,
+          "CUSTOMER",
+          {
+            succeeded: settlement.status === "SUCCEEDED",
+            amountCents: settlement.amountCents,
+            status: settlement.status,
+          },
+          `PACKAGE_REFUND:${purchase._id}`,
+        );
+      const rows = await EmailOutboxModel.find({
+        eventKey: `PACKAGE_REFUND:${purchase._id}`,
+      }).lean();
+      expect(rows.map((row) => row.templateKey).sort()).toEqual([
+        "BOOKING_CANCELLED_CUSTOMER",
+        "BOOKING_CANCELLED_OWNER",
+      ]);
+      expect(await financialTransactionService.listForBooking(purchase._id)).toEqual(before);
     });
 
     it("a retried void after success does not enqueue a duplicate notification (and does not double-refund)", async () => {

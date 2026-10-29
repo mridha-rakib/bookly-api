@@ -9,6 +9,26 @@ export const refundOperationStatuses = [
 ] as const;
 export type RefundOperationStatus = (typeof refundOperationStatuses)[number];
 
+export const refundIncidentCategories = [
+  "REFUND_RECOVERY_FAILED",
+  "FINAL_NOTIFICATION_EVIDENCE_UNRESOLVED",
+  "FINAL_NOTIFICATION_RECONCILIATION_FAILED",
+] as const;
+export type RefundIncidentCategory = (typeof refundIncidentCategories)[number];
+export type RefundRecoveryIncident = {
+  episodeId: Types.ObjectId;
+  state: "OPEN" | "RESOLVED";
+  category: RefundIncidentCategory;
+  openedAt: Date;
+  lastObservedAt: Date;
+  observations: number;
+  lastCheckedAt: Date;
+  alertedAt?: Date;
+  resolvedAt?: Date;
+  notificationMarkerAtObservation?: Date | null;
+  reconciliationAtObservation?: Date | null;
+};
+
 export type RefundOperationDocument = {
   _id: Types.ObjectId;
   logicalIdempotencyKey: string;
@@ -27,6 +47,10 @@ export type RefundOperationDocument = {
   providerRefundId?: string | undefined;
   providerStatus: RefundOperationStatus;
   succeededLedgerTransactionId?: Types.ObjectId | undefined;
+  /** Opt-in only for new ordinary Business cancellations. Historical refunds are not replayed. */
+  finalNotificationProtocolVersion?: 1 | undefined;
+  finalNotificationRecordedAt?: Date | undefined;
+  recoveryIncident?: RefundRecoveryIncident | undefined;
   providerCallStartedAt?: Date | undefined;
   recoveryAttemptCount: number;
   nextRecoveryAt?: Date | undefined;
@@ -67,6 +91,26 @@ const schema = new Schema<RefundOperationDocument>(
       type: Schema.Types.ObjectId,
       ref: "BookingFinancialTransaction",
     },
+    finalNotificationProtocolVersion: { type: Number, enum: [1] },
+    finalNotificationRecordedAt: { type: Date },
+    recoveryIncident: {
+      type: new Schema<RefundRecoveryIncident>(
+        {
+          episodeId: { type: Schema.Types.ObjectId, required: true },
+          state: { type: String, enum: ["OPEN", "RESOLVED"], required: true },
+          category: { type: String, enum: refundIncidentCategories, required: true },
+          openedAt: { type: Date, required: true },
+          lastObservedAt: { type: Date, required: true },
+          observations: { type: Number, required: true, min: 1 },
+          lastCheckedAt: { type: Date, required: true },
+          alertedAt: Date,
+          resolvedAt: Date,
+          notificationMarkerAtObservation: Date,
+          reconciliationAtObservation: Date,
+        },
+        { _id: false },
+      ),
+    },
     providerCallStartedAt: { type: Date },
     recoveryAttemptCount: { type: Number, required: true, min: 0, default: 0 },
     nextRecoveryAt: { type: Date },
@@ -89,5 +133,14 @@ schema.index({ sourcePaymentIntentId: 1, providerStatus: 1 });
 schema.index({ providerStatus: 1, reconciliationNeededAt: 1, updatedAt: 1 });
 schema.index({ providerStatus: 1, providerCallStartedAt: 1, updatedAt: 1 });
 schema.index({ nextRecoveryAt: 1, updatedAt: 1 });
+schema.index({
+  finalNotificationProtocolVersion: 1,
+  reason: 1,
+  providerStatus: 1,
+  finalNotificationRecordedAt: 1,
+  updatedAt: 1,
+});
+// P5-F1: bounded/fair operational sweep; no change to the financial recovery indexes.
+schema.index({ "recoveryIncident.state": 1, "recoveryIncident.lastCheckedAt": 1, _id: 1 });
 
 export const RefundOperationModel = model<RefundOperationDocument>("RefundOperation", schema);

@@ -160,6 +160,14 @@ const lastDecision = (repo: RepoMock, channel: "email" | "sms") =>
     .pop();
 
 describe("AppointmentReminderWorker.processOne — channel matrix", () => {
+  it("P4B shutdown prevents fresh claims without changing completed channel decisions", async () => {
+    const h = build({});
+    const counts = await h.worker.runOnce(() => true);
+    expect(counts.claimed).toBe(0);
+    expect(h.repository.claimNext).not.toHaveBeenCalled();
+    expect(h.emailOutbox.enqueue).not.toHaveBeenCalled();
+    expect(h.smsOutbox.enqueue).not.toHaveBeenCalled();
+  });
   it("A: Email ON, SMS OFF → email ENQUEUED, sms SUPPRESSED_BY_PREFERENCE, COMPLETED", async () => {
     const repo = buildRepo();
     const h = build({ repo, profile: { notifications: { appointmentReminderSms: false } } });

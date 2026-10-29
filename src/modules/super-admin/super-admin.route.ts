@@ -6,7 +6,6 @@ import {
   Router,
 } from "express";
 import multer from "multer";
-
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
@@ -73,6 +72,7 @@ import {
 import { MarketingCampaignService } from "../marketing/marketing-campaign.service.js";
 import { MarketingCampaignRecipientRepository } from "../marketing/marketing-campaign-recipient.repository.js";
 import { MarketingCampaignSourceService } from "../marketing/marketing-campaign-source.service.js";
+import { createRefundRecoveryIncidentReadRoute } from "../payment/refund-recovery-incident.route.js";
 import { PayoutDestinationRepository } from "../payout-destination/payout-destination.repository.js";
 import { superAdminPayoutRevealRateLimit } from "../payout-destination/payout-destination.route.js";
 import { PayoutDestinationService } from "../payout-destination/payout-destination.service.js";
@@ -357,6 +357,7 @@ export const createSuperAdminRoute = (): Router => {
   );
 
   router.use(authenticate, requireActiveUser(), requireRoles(["SUPER_ADMIN"]));
+  router.use("/finance/refund-recovery-incidents", createRefundRecoveryIncidentReadRoute());
 
   // --- Platform Settings ---
   router.get("/settings/platform", asyncHandler(platformSettingsController.get));

@@ -46,9 +46,15 @@ export class SmsOutboxWorker {
     private readonly transport: SmsTransport,
     private readonly options: SmsWorkerOptions,
     private readonly clock: () => Date = () => new Date(),
+    private readonly deliveryEligibility?: {
+      check(record: SmsOutboxDocument, now: Date): Promise<boolean>;
+    },
   ) {}
 
-  public async runOnce(batchSize: number): Promise<SmsWorkerPassCounts> {
+  public async runOnce(
+    batchSize: number,
+    shouldStop: () => boolean = () => false,
+  ): Promise<SmsWorkerPassCounts> {
     const counts: SmsWorkerPassCounts = {
       claimed: 0,
       sent: 0,
@@ -65,7 +71,7 @@ export class SmsOutboxWorker {
     const claimLock = { taken: 0 };
 
     const runner = async (): Promise<void> => {
-      while (claimLock.taken < remaining) {
+      while (claimLock.taken < remaining && !shouldStop()) {
         claimLock.taken += 1;
         const record = await this.repository.claimNext({
           workerId: this.options.workerId,
@@ -83,7 +89,9 @@ export class SmsOutboxWorker {
     };
 
     const poolSize = Math.max(1, Math.min(this.options.concurrency, batchSize));
-    await Promise.all(Array.from({ length: poolSize }, () => runner()));
+    const settled = await Promise.allSettled(Array.from({ length: poolSize }, () => runner()));
+    const rejected = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (rejected) throw rejected.reason;
 
     return counts;
   }
@@ -96,16 +104,44 @@ export class SmsOutboxWorker {
     };
 
     try {
-      const result = await this.transport.send({
-        to: record.recipientE164,
-        body: record.body,
-        ...(record.metadata ? { metadata: record.metadata } : {}),
-      });
-      await this.repository.markSent(record._id, {
+      if (
+        this.deliveryEligibility &&
+        !(await this.deliveryEligibility.check(record, this.clock()))
+      ) {
+        await this.repository.markFailed(record, {
+          category: "BOOKING_DELIVERY_INELIGIBLE",
+          message: "Retired without provider dispatch: Booking is ineligible",
+        });
+        return "failed";
+      }
+      const issued = await this.repository.markProviderStarted(record);
+      if (!issued) throw new Error("SMS claim lost before provider permission");
+      let result: Awaited<ReturnType<SmsTransport["send"]>>;
+      try {
+        result = await this.transport.send({
+          to: record.recipientE164,
+          body: record.body,
+          ...(record.metadata ? { metadata: record.metadata } : {}),
+        });
+      } catch (error) {
+        await this.repository.markUnknown(
+          record,
+          error instanceof SmsError ? error.category : "UNKNOWN",
+        );
+        logSmsFailed({
+          ...logContext,
+          errorCategory: error instanceof SmsError ? error.category : "UNKNOWN",
+          safeMessage: "Provider outcome requires reconciliation",
+          willRetry: false,
+        });
+        return "failed";
+      }
+      const stored = await this.repository.markSent(record, {
         provider: result.provider,
         ...(result.providerMessageId ? { providerMessageId: result.providerMessageId } : {}),
         now: this.clock(),
       });
+      if (!stored) throw new Error("SMS result persistence not confirmed");
       logSmsAccepted({
         ...logContext,
         provider: result.provider,
@@ -113,38 +149,26 @@ export class SmsOutboxWorker {
       });
       return "sent";
     } catch (error) {
+      // A failed acknowledgement write is not evidence that the provider did not accept.
+      // The durable providerStarted barrier prevents an automatic resend after any such error.
+      const existing = await this.repository.markUnknown(
+        record,
+        error instanceof SmsError ? error.category : "UNKNOWN",
+      );
+      if (existing) return "failed";
       const retryable = error instanceof SmsError && error.retryable;
       const hasAttemptsLeft = record.attemptCount < this.options.maxAttempts;
-
       if (retryable && hasAttemptsLeft) {
-        await this.repository.scheduleRetry(record._id, {
+        await this.repository.scheduleRetry(record, {
           category: error.category,
           message: safeErrorMessage(error),
           nextAttemptAt: new Date(this.clock().getTime() + this.backoffMs(record.attemptCount)),
         });
-        logSmsFailed({
-          ...logContext,
-          errorCategory: error.category,
-          ...(error.providerStatus === undefined ? {} : { providerStatus: error.providerStatus }),
-          safeMessage: error.safeProviderMessage,
-          willRetry: true,
-        });
         return "retried";
       }
-
-      const category = error instanceof SmsError ? error.category : "UNKNOWN";
-      await this.repository.markFailed(record._id, {
-        category,
+      await this.repository.markFailed(record, {
+        category: error instanceof SmsError ? error.category : "UNKNOWN",
         message: safeErrorMessage(error),
-      });
-      logSmsFailed({
-        ...logContext,
-        errorCategory: category,
-        ...(error instanceof SmsError && error.providerStatus !== undefined
-          ? { providerStatus: error.providerStatus }
-          : {}),
-        safeMessage: error instanceof SmsError ? error.safeProviderMessage : undefined,
-        willRetry: false,
       });
       return "failed";
     }

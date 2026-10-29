@@ -11,6 +11,17 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import {
+  PackageBatchActivationUnavailableError,
+  verifyPackageBatchActivation,
+} from "../booking/package-batch-authority.js";
+import { PackageLifecycleHttpController } from "../booking/package-lifecycle-http.controller.js";
+import { buildPackageLifecycleHttpServices } from "../booking/package-lifecycle-http.factory.js";
+import {
+  buildPackagePurchaseService,
+  PackagePurchaseHttpController,
+  purchaseHttpBodySchema,
+} from "../booking/package-purchase-http.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { PackageRepository } from "../packages/package.repository.js";
@@ -28,12 +39,22 @@ const detailParams = z.object({ businessId: id, packageId: id }).strict();
 const ownedParams = z.object({ progressId: id }).strict();
 const settlementParams = z.object({ businessId: id, bookingId: id }).strict();
 const noQuery = z.object({}).strict();
+const ownedQuery = z.object({ before: id.optional() }).strict();
 const actor = (request: Request) => {
   if (!request.auth) throw new AppError("Sign in to view packages", 401);
   return request.auth;
 };
+const lifecycleAvailable = async () => {
+  try {
+    await verifyPackageBatchActivation();
+    return true;
+  } catch (error) {
+    if (error instanceof PackageBatchActivationUnavailableError) return false;
+    throw error;
+  }
+};
 
-/** Authenticated read adapter only. No lifecycle kernel, writer or worker is composed here. */
+/** Existing read surface plus activation-gated lifecycle composition. No worker registration. */
 export function createPackageViewRoute(): Router {
   const router = Router();
   const catalogue = new PackageService(
@@ -45,6 +66,8 @@ export function createPackageViewRoute(): Router {
     new BusinessTravelSettingsRepository(),
   );
   const views = new PackageViewService();
+  let lifecycle: PackageLifecycleHttpController | undefined;
+  let purchase: PackagePurchaseHttpController | undefined;
   router.use((_req, res, next) => {
     res.setHeader("Cache-Control", "private, no-store");
     next();
@@ -82,9 +105,18 @@ export function createPackageViewRoute(): Router {
   router.get(
     "/owned",
     requireRoles(["CUSTOMER"]),
-    validateRequest({ query: noQuery }),
+    validateRequest({ query: ownedQuery }),
     asyncHandler(async (req, res) => {
-      sendSuccess(res, 200, "Owned first-class packages", await views.owned(actor(req).userId));
+      const query = req.validated?.query as z.infer<typeof ownedQuery>;
+      const result = await views.owned(actor(req).userId, undefined, query.before),
+        enabled = await lifecycleAvailable();
+      sendSuccess(res, 200, "Owned first-class packages", {
+        ...result,
+        packages: result.packages.map((p) => ({
+          ...p,
+          actionsAvailable: enabled && p.purchaseCompletion === "VERIFIED",
+        })),
+      });
     }),
   );
   router.get(
@@ -93,7 +125,15 @@ export function createPackageViewRoute(): Router {
     validateRequest({ params: ownedParams, query: noQuery }),
     asyncHandler(async (req, res) => {
       const p = req.validated?.params as z.infer<typeof ownedParams>;
-      sendSuccess(res, 200, "Owned package", await views.owned(actor(req).userId, p.progressId));
+      const result = await views.owned(actor(req).userId, p.progressId),
+        enabled = await lifecycleAvailable();
+      sendSuccess(res, 200, "Owned package", {
+        ...result,
+        packages: result.packages.map((entry) => ({
+          ...entry,
+          actionsAvailable: enabled && entry.purchaseCompletion === "VERIFIED",
+        })),
+      });
     }),
   );
   router.get(
@@ -102,39 +142,52 @@ export function createPackageViewRoute(): Router {
     validateRequest({ params: settlementParams, query: noQuery }),
     asyncHandler(async (req, res) => {
       const p = req.validated?.params as z.infer<typeof settlementParams>;
-      sendSuccess(
-        res,
-        200,
-        "Package settlement",
-        await views.settlement(actor(req).userId, actor(req).role, p.businessId, p.bookingId),
+      const result = await views.settlement(
+        actor(req).userId,
+        actor(req).role,
+        p.businessId,
+        p.bookingId,
       );
+      sendSuccess(res, 200, "Package settlement", {
+        ...result,
+        actionsAvailable: (await lifecycleAvailable()) && result.purchaseCompletion === "VERIFIED",
+      });
     }),
   );
   router.post(
     "/actions/:action",
     requireRoles(["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR"]),
-    validateRequest({
-      params: z
-        .object({
-          action: z.enum(["purchase", "consent", "redeem", "reschedule", "cancel", "settlement"]),
-        })
-        .strict(),
-      body: z.object({}).strict(),
-      query: noQuery,
-    }),
-    asyncHandler(async () => {
-      throw new AppError(
-        "First-class Package checkout and lifecycle actions are unavailable",
-        503,
-        {
-          details: [
-            {
-              code: "PACKAGE_BATCH_ACTIVATION_UNAVAILABLE",
-              message: "Genuine purchase consent is not available. No operation was performed.",
-            },
-          ],
-        },
-      );
+    asyncHandler(async (req, res) => {
+      const action = String(req.params["action"]);
+      if (["purchase", "purchase-status"].includes(action)) {
+        // Preserve closed-gate empty-body probes, but reject posted identity/authority.
+        purchaseHttpBodySchema.partial().parse(req.body);
+        noQuery.parse(req.query);
+      }
+      if (action === "consent") {
+        z.object({}).strict().parse(req.body);
+        noQuery.parse(req.query);
+      }
+      // No flag, DTO or alternate registration may open this boundary. In isolated tests
+      // the authority module is mocked; production retains its unconditional denial.
+      try {
+        await verifyPackageBatchActivation();
+      } catch (error) {
+        if (error instanceof PackageBatchActivationUnavailableError)
+          throw new AppError(error.message, 503, {
+            details: [{ code: error.code, message: "No operation was performed" }],
+          });
+        throw error;
+      }
+      if (action === "consent")
+        throw new AppError("Package consent activation is unavailable", 503);
+      if (["purchase", "purchase-status"].includes(action)) {
+        purchase ??= new PackagePurchaseHttpController(buildPackagePurchaseService());
+        await purchase.execute(req, res);
+        return;
+      }
+      lifecycle ??= new PackageLifecycleHttpController(buildPackageLifecycleHttpServices());
+      await lifecycle.execute(req, res);
     }),
   );
   const unavailable: ErrorRequestHandler = (error, _req, _res, next) => {

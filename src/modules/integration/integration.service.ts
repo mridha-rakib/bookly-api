@@ -1,18 +1,49 @@
+import { isDeepStrictEqual } from "node:util";
 import { Types } from "mongoose";
 
 import { logger } from "../../config/logger.js";
+import {
+  consumeOrdinaryCalendarSendPermission,
+  type OrdinaryCalendarBinding,
+  OrdinaryCalendarDispatch,
+  type OrdinaryCalendarPort,
+  type OrdinaryCalendarProvider,
+  sameOrdinaryCalendarDestination,
+} from "../booking/ordinary-calendar-dispatch.js";
+import type { OrdinaryCalendarDestination } from "../booking/ordinary-calendar-journal.model.js";
+import { verifyOrdinaryCalendarDeliveryAuthority } from "../booking/ordinary-calendar-journal-authority.js";
+import { PackageCalendarRepository } from "../booking/package-calendar.repository.js";
+import { verifyPackageCalendarProductionAuthority } from "../booking/package-calendar-authority.js";
+import {
+  type CalendarDestination,
+  type CalendarTaskReference,
+  calendarBookingIntent,
+  calendarDestinationSchema,
+  calendarJournalSchema,
+} from "../booking/package-calendar-contract.js";
+import {
+  type PackageCalendarDeliveryPort,
+  PackageCalendarProviderError,
+  PackageCalendarWriteAuthorityUnavailableError,
+} from "../booking/package-calendar-delivery.js";
+import { PackageCalendarDispatch } from "../booking/package-calendar-dispatch.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { decryptSecret, encryptSecret } from "./integration.crypto.js";
 import { IntegrationError } from "./integration.errors.js";
 import {
+  type BooklyEventMarker,
   buildGoogleAuthUrl,
   createGoogleCalendarEvent,
   deleteGoogleCalendarEvent,
+  deleteGoogleCalendarEventConditionally,
   exchangeGoogleAuthCode,
   type GoogleCalendarEventInput,
   type GoogleCalendarEventScheduleInput,
+  getGoogleCalendarEvent,
+  insertGoogleCalendarEventWithId,
   patchGoogleCalendarEventSchedule,
   refreshGoogleAccessToken,
+  resolveGoogleCalendarDestination,
 } from "./integration.google-client.js";
 import type { GoogleCalendarIntegrationDocument } from "./integration.model.js";
 import type { IntegrationRepository } from "./integration.repository.js";
@@ -69,6 +100,7 @@ export class IntegrationService {
     await this.integrationRepository.upsert({
       businessId: new Types.ObjectId(businessId),
       googleAccountEmail: tokens.googleAccountEmail,
+      ...(tokens.googleAccountId ? { googleAccountId: tokens.googleAccountId } : {}),
       calendarId: "primary",
       encryptedAccessToken: encryptSecret(tokens.accessToken),
       encryptedRefreshToken: encryptSecret(tokens.refreshToken),
@@ -183,6 +215,358 @@ export class IntegrationService {
     }
   }
 
+  /** Complete package delivery implementation, unregistered and gated separately from purchase.
+   * Release is explicit; neither this factory nor a worker scans/releases historical tasks. */
+  public packageCalendarDelivery(): PackageCalendarDispatch {
+    return new PackageCalendarDispatch({
+      resolve: async (businessId) => {
+        await verifyPackageCalendarProductionAuthority();
+        const integration = await this.integrationRepository.findByBusinessId(businessId);
+        if (
+          !integration ||
+          integration.status !== "CONNECTED" ||
+          String(integration.businessId) !== businessId ||
+          !integration.connectionGeneration ||
+          !integration.googleAccountId
+        )
+          throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+        const calendarId = await resolveGoogleCalendarDestination(
+          await this.getValidAccessToken(integration),
+          integration.calendarId,
+        );
+        const destination = calendarDestinationSchema.parse({
+          businessId,
+          integrationId: String(integration._id),
+          generation: integration.connectionGeneration,
+          accountId: integration.googleAccountId,
+          accountEmail: integration.googleAccountEmail,
+          configuredCalendarId: integration.calendarId,
+          calendarId,
+        });
+        await this.assertPackageCalendarDestination(destination);
+        return destination;
+      },
+      assertCurrent: (destination) => this.assertPackageCalendarDestination(destination),
+      bind: (destination, identity) => this.packageCalendarPort(destination, identity),
+    });
+  }
+
+  private async assertPackageCalendarDestination(destination: CalendarDestination) {
+    const integration = await this.integrationRepository.findByBusinessId(destination.businessId);
+    if (
+      !integration ||
+      integration.status !== "CONNECTED" ||
+      String(integration.businessId) !== destination.businessId ||
+      String(integration._id) !== destination.integrationId ||
+      integration.connectionGeneration !== destination.generation ||
+      integration.googleAccountId !== destination.accountId ||
+      integration.googleAccountEmail !== destination.accountEmail ||
+      integration.calendarId !== destination.configuredCalendarId
+    )
+      throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+  }
+
+  /** Unbound raw mutations remain denied. Bound mutations must consume an exact durable
+   * REQUEST_ISSUED intent once, after refreshing credentials and rechecking the connection. */
+  public packageCalendarPort(
+    destination?: CalendarDestination,
+    identity?: { bookingId: string; eventId: string },
+  ): PackageCalendarDeliveryPort {
+    const repository = new PackageCalendarRepository();
+    const withCalendar = async <T>(
+      businessId: string,
+      call: (accessToken: string, calendarId: string) => Promise<T>,
+      mutation?: {
+        kind: "INSERT" | "PATCH" | "DELETE";
+        eventId: string;
+        etag?: string;
+        requestId?: string;
+        event?: GoogleCalendarEventInput;
+        marker?: BooklyEventMarker;
+      },
+    ): Promise<T | "NOT_CONNECTED"> => {
+      if (mutation) {
+        await verifyPackageCalendarProductionAuthority();
+        if (
+          !destination ||
+          !identity ||
+          identity.eventId !== mutation.eventId ||
+          destination.businessId !== businessId
+        )
+          throw new PackageCalendarWriteAuthorityUnavailableError();
+      }
+      if (destination) {
+        calendarDestinationSchema.parse(destination);
+        if (destination.businessId !== businessId)
+          throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+        await this.assertPackageCalendarDestination(destination);
+      }
+      const integration = await this.integrationRepository.findByBusinessId(businessId);
+      if (
+        !integration ||
+        integration.status !== "CONNECTED" ||
+        String(integration.businessId) !== businessId ||
+        !integration.calendarId
+      )
+        return "NOT_CONNECTED";
+      let providerAttempted = false;
+      try {
+        const token = await this.getValidAccessToken(integration);
+        if (destination) await this.assertPackageCalendarDestination(destination);
+        if (mutation && identity && destination) {
+          const booking = await repository.read(identity.bookingId, businessId);
+          if (!booking) throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+          const journal = calendarJournalSchema.parse(booking.packageCalendarDelivery);
+          if (
+            journal.state !== "REQUEST_ISSUED" ||
+            journal.eventId !== identity.eventId ||
+            journal.request?.kind !== mutation.kind ||
+            journal.request.id !== mutation.requestId ||
+            (booking.googleCalendarEventId !== undefined &&
+              booking.googleCalendarEventId !== journal.eventId) ||
+            journal.request.settled ||
+            journal.request.providerStarted ||
+            journal.latest.revision !== journal.request.revision ||
+            calendarBookingIntent(booking).revision !== journal.latest.revision ||
+            !isDeepStrictEqual(calendarBookingIntent(booking).desired, journal.latest.desired) ||
+            !isDeepStrictEqual(journal.destination, destination)
+          )
+            throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+          if (
+            mutation.kind !== "INSERT" &&
+            (!mutation.etag || mutation.etag !== journal.request.etag)
+          )
+            throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+          if (mutation.kind === "DELETE" && journal.latest.desired.kind !== "ABSENT")
+            throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+          if (mutation.kind !== "DELETE") {
+            const desired = journal.latest.desired;
+            if (
+              desired.kind !== "PRESENT" ||
+              !mutation.event ||
+              mutation.event.startAt.getTime() !== desired.startAt.getTime() ||
+              mutation.event.endAt.getTime() !== desired.endAt.getTime() ||
+              mutation.event.timezone !== desired.timezone ||
+              (mutation.kind === "INSERT" &&
+                (mutation.event.summary !== desired.summary ||
+                  mutation.event.description !== desired.description ||
+                  mutation.marker?.booklyBookingId !== journal.bookingId ||
+                  mutation.marker?.booklyBusinessId !== businessId))
+            )
+              throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+          }
+          const started = { ...journal, request: { ...journal.request, providerStarted: true } };
+          if (!(await repository.compareAndSet(booking, journal, started)))
+            throw new PackageCalendarProviderError("RETRYABLE_FAILURE", true);
+          await this.assertPackageCalendarDestination(destination);
+        }
+        providerAttempted = true;
+        return await call(token, destination?.calendarId ?? integration.calendarId);
+      } catch (error) {
+        if (
+          !(error instanceof PackageCalendarProviderError) ||
+          (providerAttempted && error.kind === "BLOCKED_AUTHORITY")
+        ) {
+          if (destination)
+            await this.integrationRepository.markSyncError(
+              businessId,
+              "Package Calendar authorization failed",
+              destination.generation,
+            );
+          else await this.recordSyncFailure(businessId, error);
+        }
+        throw error;
+      }
+    };
+    return {
+      ...(!destination
+        ? {
+            deliver: (reference: CalendarTaskReference) =>
+              this.packageCalendarDelivery().deliver(reference),
+          }
+        : {}),
+      read: async (businessId: string, eventId: string) => {
+        const result = await withCalendar(businessId, (token, calendarId) =>
+          getGoogleCalendarEvent(token, calendarId, eventId),
+        );
+        return result === "NOT_CONNECTED" ? { outcome: "NOT_CONNECTED" as const } : result;
+      },
+      insert: (
+        businessId: string,
+        eventId: string,
+        event: GoogleCalendarEventInput,
+        marker: BooklyEventMarker,
+        requestId?: string,
+      ) =>
+        withCalendar(
+          businessId,
+          (token, calendarId) =>
+            insertGoogleCalendarEventWithId(token, calendarId, eventId, event, marker),
+          { kind: "INSERT", eventId, event, marker, ...(requestId ? { requestId } : {}) },
+        ),
+      patchSchedule: async (
+        businessId: string,
+        eventId: string,
+        schedule: GoogleCalendarEventScheduleInput,
+        ifMatch?: string,
+        requestId?: string,
+      ) => {
+        const result = await withCalendar(
+          businessId,
+          (token, calendarId) =>
+            patchGoogleCalendarEventSchedule(
+              token,
+              calendarId,
+              eventId,
+              schedule,
+              ifMatch ? { etag: ifMatch } : undefined,
+            ),
+          {
+            kind: "PATCH",
+            eventId,
+            event: { ...schedule, summary: "" },
+            ...(ifMatch ? { etag: ifMatch } : {}),
+            ...(requestId ? { requestId } : {}),
+          },
+        );
+        return result === "EVENT_NOT_FOUND" ? ("NOT_FOUND" as const) : result;
+      },
+      remove: async (businessId: string, eventId: string, ifMatch?: string, requestId?: string) => {
+        const result = await withCalendar(
+          businessId,
+          async (token, calendarId) => {
+            if (!ifMatch) throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+            return deleteGoogleCalendarEventConditionally(token, calendarId, eventId, ifMatch);
+          },
+          {
+            kind: "DELETE",
+            eventId,
+            ...(ifMatch ? { etag: ifMatch } : {}),
+            ...(requestId ? { requestId } : {}),
+          },
+        );
+        return result;
+      },
+    };
+  }
+
+  /**
+   * P4B-2B — ordinary Booking Calendar provider. Uses the same Google client helpers, token
+   * refresh and connection-generation fence as P2C, but a separate journal and authority.
+   * Calls go to the destination recorded on the journal row (account id, generation and
+   * configured calendar of that connection); a reconnect or a different account blocks.
+   * Any failure before the send permission is consumed is a definitive no-effect answer;
+   * after it, anything Google did not classify (timeout, network) is UNKNOWN_OUTCOME.
+   * Unregistered: only the default-denied delivery authority lets it run.
+   */
+  public ordinaryCalendarProvider(): OrdinaryCalendarProvider {
+    const currentDestination = async (
+      businessId: string,
+    ): Promise<OrdinaryCalendarDestination | null> => {
+      const integration = await this.integrationRepository.findByBusinessId(businessId);
+      if (
+        !integration ||
+        integration.status !== "CONNECTED" ||
+        String(integration.businessId) !== businessId ||
+        !integration.connectionGeneration ||
+        !integration.googleAccountId ||
+        !integration.calendarId
+      )
+        return null;
+      return {
+        integrationId: integration._id,
+        generation: integration.connectionGeneration,
+        accountId: integration.googleAccountId,
+        accountEmail: integration.googleAccountEmail,
+        configuredCalendarId: integration.calendarId,
+      };
+    };
+    const assertCurrent = async (businessId: string, destination: OrdinaryCalendarDestination) => {
+      if (
+        !sameOrdinaryCalendarDestination(
+          (await currentDestination(businessId)) ?? undefined,
+          destination,
+        )
+      )
+        throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+    };
+    const bind = (binding: OrdinaryCalendarBinding): OrdinaryCalendarPort => {
+      const calendarId = binding.destination.configuredCalendarId;
+      const accessToken = async () => {
+        await verifyOrdinaryCalendarDeliveryAuthority();
+        await assertCurrent(binding.businessId, binding.destination);
+        const integration = await this.integrationRepository.findByBusinessId(binding.businessId);
+        if (!integration) throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+        // Refresh is fenced on the recorded generation; a concurrent reconnect blocks here.
+        const token = await this.getValidAccessToken(integration);
+        await assertCurrent(binding.businessId, binding.destination);
+        return token;
+      };
+      const mutate = async <T>(
+        mutation: Parameters<typeof consumeOrdinaryCalendarSendPermission>[1],
+        call: (token: string) => Promise<T>,
+      ): Promise<T> => {
+        let token: string;
+        try {
+          token = await accessToken();
+          await consumeOrdinaryCalendarSendPermission(binding, mutation);
+        } catch (error) {
+          // Google was never called for this request.
+          throw error instanceof PackageCalendarProviderError
+            ? new PackageCalendarProviderError(error.kind, true)
+            : new PackageCalendarProviderError("RETRYABLE_FAILURE", true);
+        }
+        try {
+          return await call(token);
+        } catch (error) {
+          if (error instanceof PackageCalendarProviderError) throw error;
+          throw new PackageCalendarProviderError("UNKNOWN_OUTCOME");
+        }
+      };
+      return {
+        read: async () => {
+          let token: string;
+          try {
+            token = await accessToken();
+          } catch (error) {
+            if (error instanceof PackageCalendarProviderError && error.kind === "BLOCKED_AUTHORITY")
+              return { outcome: "NOT_CONNECTED" as const };
+            throw error;
+          }
+          return getGoogleCalendarEvent(token, calendarId, binding.eventId);
+        },
+        insert: (event, requestId) =>
+          mutate({ kind: "INSERT", requestId, event }, (token) =>
+            insertGoogleCalendarEventWithId(token, calendarId, binding.eventId, event, {
+              booklyBookingId: binding.bookingId,
+              booklyBusinessId: binding.businessId,
+            }),
+          ),
+        patchSchedule: (schedule, etag, requestId) =>
+          mutate({ kind: "PATCH", requestId, etag, event: schedule }, async (token) => {
+            const result = await patchGoogleCalendarEventSchedule(
+              token,
+              calendarId,
+              binding.eventId,
+              schedule,
+              { etag },
+            );
+            return result === "EVENT_NOT_FOUND" ? ("NOT_FOUND" as const) : result;
+          }),
+        remove: (etag, requestId) =>
+          mutate({ kind: "DELETE", requestId, etag }, (token) =>
+            deleteGoogleCalendarEventConditionally(token, calendarId, binding.eventId, etag),
+          ),
+      };
+    };
+    return { currentDestination, assertCurrent, bind };
+  }
+
+  /** P4B-2B — the ordinary Calendar consumer, unregistered and default-denied. */
+  public ordinaryCalendarDelivery(): OrdinaryCalendarDispatch {
+    return new OrdinaryCalendarDispatch(this.ordinaryCalendarProvider());
+  }
+
   private async getValidAccessToken(
     integration: GoogleCalendarIntegrationDocument,
   ): Promise<string> {
@@ -193,11 +577,16 @@ export class IntegrationService {
     const refreshToken = decryptSecret(integration.encryptedRefreshToken);
     const refreshed = await refreshGoogleAccessToken(refreshToken);
 
-    await this.integrationRepository.updateTokens(integration._id, {
-      encryptedAccessToken: encryptSecret(refreshed.accessToken),
-      encryptedRefreshToken: encryptSecret(refreshed.refreshToken),
-      tokenExpiresAt: refreshed.expiresAt,
-    });
+    const updated = await this.integrationRepository.updateTokens(
+      integration._id,
+      {
+        encryptedAccessToken: encryptSecret(refreshed.accessToken),
+        encryptedRefreshToken: encryptSecret(refreshed.refreshToken),
+        tokenExpiresAt: refreshed.expiresAt,
+      },
+      integration.connectionGeneration,
+    );
+    if (updated === false) throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
 
     return refreshed.accessToken;
   }

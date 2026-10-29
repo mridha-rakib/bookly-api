@@ -244,6 +244,11 @@ export const env = createEnv({
   server: {
     NODE_ENV: nodeEnvSchema,
     PORT: z.coerce.number().int().positive().max(65535).default(3000),
+    // Optional explicit bind address; absent retains Node's existing unspecified-host behavior.
+    HTTP_BIND_HOST: z
+      .string()
+      .refine((value) => isIP(value) !== 0, "HTTP_BIND_HOST must be an IP address")
+      .optional(),
     APP_NAME: z.string().min(1).default("Bookly API"),
     API_VERSION: z
       .string()

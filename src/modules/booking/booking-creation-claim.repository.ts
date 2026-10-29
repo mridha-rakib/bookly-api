@@ -49,7 +49,10 @@ export class BookingCreationClaimRepository {
       idempotencyKey,
       businessId,
       actorUserId: customer.userId,
-    }).exec();
+    })
+      .read("primary")
+      .readConcern("majority")
+      .exec();
     if (!row?.packageCheckoutRetention || row.financialContract || row.packageRequestBinding)
       throw new PackageCheckoutConflictError("Owned retained Package checkout required");
     const retention = packageCheckoutRetentionSchema.parse(row.toObject().packageCheckoutRetention);
@@ -83,7 +86,10 @@ export class BookingCreationClaimRepository {
   }): Promise<PackageCheckoutRetention | null> {
     const existing = await BookingCreationClaimModel.findOne({
       idempotencyKey: input.idempotencyKey,
-    }).exec();
+    })
+      .read("primary")
+      .readConcern("majority")
+      .exec();
     if (!existing) return null;
     if (
       !existing.businessId.equals(input.businessId) ||
@@ -127,7 +133,7 @@ export class BookingCreationClaimRepository {
         actorUserId: scope.actorUserId,
         bookingId: retained.quote.payload.originBookingId,
         packageCheckoutRetention: retained,
-      }).save();
+      }).save({ w: "majority", j: true, wtimeout: 5000 });
       return retained;
     } catch (error) {
       if (!this.isDuplicateKeyError(error)) throw error;

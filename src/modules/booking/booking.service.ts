@@ -119,8 +119,8 @@ export class BookingService {
 
   /**
    * Owner-or-active-Supervisor Business-scoping for future Booking management routes —
-   * mirrors ClientService.requireBusinessAccess exactly (the only existing Supervisor-scoped
-   * precedent in this codebase). BusinessAccess (linked/secondary Business) is deliberately
+   * follows the ClientService Business scope, with the Owner-approved employment-active
+   * requirement for Booking management. BusinessAccess (linked/secondary Business) is deliberately
    * never consulted — a linked Business grants no booking-management rights (confirmed rule
    * V). STAFF and CUSTOMER both fall through to the same 404 as an unrelated user — Staff has
    * no new booking-management permission in this phase (confirmed rule W), and a Customer's
@@ -153,7 +153,15 @@ export class BookingService {
     if (actorRole === "SUPERVISOR") {
       const membership = await this.staffRepository.findActiveByUserId(actorUserId);
 
-      if (membership?.role !== "SUPERVISOR" || !membership.businessId.equals(business._id)) {
+      // Owner-approved revocation: non-removal alone does not retain management rights.
+      // Keep the repository's null-or-absent removedAt contract; never default missing
+      // employmentActive to true or change unrelated membership lookups.
+      if (
+        membership?.role !== "SUPERVISOR" ||
+        membership.employmentActive !== true ||
+        membership.removedAt != null ||
+        !membership.businessId.equals(business._id)
+      ) {
         throw new BookingError("BOOKING_BUSINESS_NOT_FOUND", 404);
       }
       return business;

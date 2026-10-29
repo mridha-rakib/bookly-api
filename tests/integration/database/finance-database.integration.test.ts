@@ -705,6 +705,39 @@ describe("database-backed Business Finance (Batch 7)", () => {
     ).rejects.toThrow(FinanceError);
   });
 
+  it.each([true, false])(
+    "Finance remains Owner/Admin-only for Supervisor employmentActive=%s",
+    async (employmentActive) => {
+      const { owner, business } = await setupBookableBusiness(10_000);
+      const supervisor = await userRepository.create({
+        normalizedEmail: `finance-c-${new Types.ObjectId()}@test.local`,
+        passwordHash: "unused",
+        role: "SUPERVISOR",
+        status: "ACTIVE",
+      });
+      const membership = await staffRepository.create({
+        userId: supervisor._id,
+        businessId: business._id,
+        role: "SUPERVISOR",
+        createdByUserId: owner._id,
+      });
+      await staffRepository.updateActiveById(business._id, String(membership._id), {
+        employmentActive,
+      });
+      await expect(
+        financeService.getSummary(String(supervisor._id), String(business._id), around()),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      const ownerSummary = await financeService.getSummary(
+        String(owner._id),
+        String(business._id),
+        around(),
+      );
+      expect(await financeService.getSummaryForSuperAdmin(String(business._id), around())).toEqual(
+        ownerSummary,
+      );
+    },
+  );
+
   it("denies a Staff member of the business", async () => {
     const { business, membership } = await setupBookableBusiness(10_000);
     await expect(

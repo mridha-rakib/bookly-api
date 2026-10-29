@@ -94,6 +94,8 @@ describe("verification providers", () => {
       expect.objectContaining({
         text: expect.stringContaining("7 minutes"),
       }),
+      // F4A Tier 1: every Resend call is bounded by an abort signal.
+      { signal: expect.any(AbortSignal) },
     );
   });
 
@@ -154,6 +156,7 @@ describe("verification providers", () => {
         subject: "Your Bookly email was changed",
         text: "Your Bookly account email was changed to new@example.com.",
       }),
+      { signal: expect.any(AbortSignal) },
     );
   });
 
@@ -198,6 +201,7 @@ describe("verification providers", () => {
         subject: expect.stringContaining("new Bookly email"),
         text: expect.stringContaining("7 minutes"),
       }),
+      { signal: expect.any(AbortSignal) },
     );
   });
 

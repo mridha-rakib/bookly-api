@@ -36,6 +36,7 @@ import {
 } from "./package-batch-contract.js";
 import type { PackageBatchPersistence } from "./package-batch-persistence.js";
 import { hashCanonicalPackageCheckoutContent as digest } from "./package-checkout-binding.js";
+import { verifyPackagePurchaseConsentCertification } from "./package-purchase-authority.js";
 
 /** Unregistered, activation-denied F2 parent. No provider is invoked in a transaction.
  * Current supported dependency subset remains explicit; rejected offers lose no accepted terms. */
@@ -51,6 +52,9 @@ export class PackageBatchFinancialPersistence {
     await verifyPackageBatchActivation();
     const replay = await readOwnedPackageBatchCompletion(scope);
     if (replay) return replay;
+    // Required for direct F2 callers and recovery too: rollout authority alone cannot
+    // authorize a charge, FIRST admission or fresh entitlement from uncertified consent.
+    const certified = await verifyPackagePurchaseConsentCertification(scope);
     const row = await loadOwnedPackageBatch(scope);
     if (row.packageBatchControl?.phase === "FAILED_FINAL") throw batchConflict();
     if (row.packageBatchControl?.phase === "PERSISTING" || row.packageBatchMaterialization) {
@@ -198,190 +202,223 @@ export class PackageBatchFinancialPersistence {
     const session = await mongoose.startSession();
     let returned = false;
     try {
-      await session.withTransaction(async () => {
-        returned = false;
-        await this.core.materializeInSession(scope, token, session);
-        const current = await loadOwnedPackageBatch(scope, session);
-        if (digest(current.packageBatchFinance) !== digest(finance)) throw batchConflict();
-        const relationship = await BusinessClientModel.findById(p.businessClientId)
-          .session(session)
-          .orFail();
-        if (
-          classification === "RETURNING" &&
-          relationship.financialRelationship?.state !== "CONSUMED"
-        )
-          throw batchConflict();
-        const origin = await BookingModel.findById(p.originBookingId).session(session).orFail();
-        origin.financialContract = c;
-        origin.financials.depositCents = c.requiredUpfrontCents;
-        origin.financials.platformFeeCents =
-          classification === "FIRST" ? c.requiredUpfrontCents : 0;
-        origin.financials.balanceDueCents = origin.financials.totalCents - c.requiredUpfrontCents;
-        await origin.save({ session });
-        let ledgerId: Types.ObjectId | undefined;
-        if (attemptId && paymentToken && providerId) {
-          const ledger = await new BookingFinancialTransactionService(
-            new BookingFinancialTransactionRepository(),
-          ).record(
-            {
-              businessId: p.businessId,
-              bookingId: p.originBookingId,
-              businessClientId: p.businessClientId,
-              customerUserId: p.customerUserId,
-              type: c.upfrontLedgerType,
-              direction: "DEBIT",
-              amountCents: c.onlineChargeCents,
-              currency: "EUR",
-              status: "SUCCEEDED",
-              providerReference: providerId,
-              idempotencyKey: `${p.idempotencyKey}:deposit`,
-            },
-            session,
-          );
-          ledgerId = ledger._id;
-          if (
-            !(await attempts.markCompleted(
-              attemptId,
+      await session.withTransaction(
+        async () => {
+          returned = false;
+          if (certified) {
+            const b = certified.binding;
+            const pinned = await BusinessClientModel.findOneAndUpdate(
               {
-                bookingId: p.originBookingId,
-                packageProgressId: p.packageProgressId,
-                succeededTransactionId: ledgerId,
+                _id: b.businessClientId,
+                businessId: b.businessId,
+                linkedUserId: b.customerUserId,
+                linkState: "LINKED",
+                archivedAt: { $exists: false },
+                ...(b.linkGeneration === 0
+                  ? { $or: [{ linkGeneration: 0 }, { linkGeneration: { $exists: false } }] }
+                  : { linkGeneration: b.linkGeneration }),
               },
-              paymentToken,
+              { $inc: { consentFence: 1 } },
+              { session, returnDocument: "after" },
+            );
+            if (!pinned) throw batchConflict();
+          }
+          await this.core.materializeInSession(scope, token, session);
+          const current = await loadOwnedPackageBatch(scope, session);
+          if (digest(current.packageBatchFinance) !== digest(finance)) throw batchConflict();
+          const relationship = await BusinessClientModel.findById(p.businessClientId)
+            .session(session)
+            .orFail();
+          if (
+            classification === "RETURNING" &&
+            relationship.financialRelationship?.state !== "CONSUMED"
+          )
+            throw batchConflict();
+          const origin = await BookingModel.findById(p.originBookingId).session(session).orFail();
+          origin.financialContract = c;
+          origin.financials.depositCents = c.requiredUpfrontCents;
+          origin.financials.platformFeeCents =
+            classification === "FIRST" ? c.requiredUpfrontCents : 0;
+          origin.financials.balanceDueCents = origin.financials.totalCents - c.requiredUpfrontCents;
+          await origin.save({ session });
+          let ledgerId: Types.ObjectId | undefined;
+          if (attemptId && paymentToken && providerId) {
+            const ledger = await new BookingFinancialTransactionService(
+              new BookingFinancialTransactionRepository(),
+            ).record(
+              {
+                businessId: p.businessId,
+                bookingId: p.originBookingId,
+                businessClientId: p.businessClientId,
+                customerUserId: p.customerUserId,
+                type: c.upfrontLedgerType,
+                direction: "DEBIT",
+                amountCents: c.onlineChargeCents,
+                currency: "EUR",
+                status: "SUCCEEDED",
+                providerReference: providerId,
+                idempotencyKey: `${p.idempotencyKey}:deposit`,
+              },
+              session,
+            );
+            ledgerId = ledger._id;
+            if (
+              !(await attempts.markCompleted(
+                attemptId,
+                {
+                  bookingId: p.originBookingId,
+                  packageProgressId: p.packageProgressId,
+                  succeededTransactionId: ledgerId,
+                },
+                paymentToken,
+                session,
+              ))
+            )
+              throw batchConflict();
+          }
+          if (
+            classification === "FIRST" &&
+            !(await this.relationships.consumeFirst(
+              p.businessClientId,
+              {
+                idempotencyKey: p.idempotencyKey,
+                bookingId: p.originBookingId,
+                productKind: "PACKAGE_PURCHASE",
+                paymentAttemptId: attemptId,
+                financialTransactionId: ledgerId,
+              },
               session,
             ))
           )
             throw batchConflict();
-        }
-        if (
-          classification === "FIRST" &&
-          !(await this.relationships.consumeFirst(
-            p.businessClientId,
-            {
-              idempotencyKey: p.idempotencyKey,
-              bookingId: p.originBookingId,
-              productKind: "PACKAGE_PURCHASE",
-              paymentAttemptId: attemptId,
-              financialTransactionId: ledgerId,
-            },
-            session,
-          ))
-        )
-          throw batchConflict();
-        const business = await BusinessModel.findById(p.businessId).session(session).orFail();
-        const owner = await UserModel.findById(business.ownerUserId).session(session);
-        const emails: BatchCompletion["emails"] = [],
-          reminders: BatchCompletion["reminders"] = [];
-        const tasks: BatchDeliveryTask[] = [];
-        for (const m of p.members) {
-          const booking = await BookingModel.findById(m.bookingId).session(session).orFail();
-          const plans = [
-            {
-              recipient: booking.customer.contact.normalizedEmail,
-              templateKey: "BOOKING_CUSTOMER_CONFIRMED" as const,
-              includeCustomerBookingLink: true,
-            },
-            ...(owner
-              ? [
-                  {
-                    recipient: owner.normalizedEmail,
-                    templateKey: "BOOKING_OWNER_NEW_BOOKING" as const,
-                    includeCustomerBookingLink: false,
-                  },
-                ]
-              : []),
-          ];
-          for (const plan of plans) {
-            const payload = {
-              ...buildBookingEmailData(booking.toObject(), {
-                businessName: business.name,
-                includeCustomerBookingLink: plan.includeCustomerBookingLink,
-              }),
-            };
-            const { record } = await new EmailOutboxRepository().enqueue(
+          const business = await BusinessModel.findById(p.businessId).session(session).orFail();
+          const owner = await UserModel.findById(business.ownerUserId).session(session);
+          const emails: BatchCompletion["emails"] = [],
+            reminders: BatchCompletion["reminders"] = [];
+          const tasks: BatchDeliveryTask[] = [];
+          for (const m of p.members) {
+            const booking = await BookingModel.findById(m.bookingId).session(session).orFail();
+            const plans = [
               {
-                eventKey: `BOOKING_CREATED:${m.bookingId}`,
-                recipient: plan.recipient,
-                templateKey: plan.templateKey,
-                payload,
+                recipient: booking.customer.contact.normalizedEmail,
+                templateKey: "BOOKING_CUSTOMER_CONFIRMED" as const,
+                includeCustomerBookingLink: true,
               },
-              session,
-            );
-            if (digest(record.payload) !== digest(payload)) throw batchConflict();
-            emails.push({
-              id: record._id,
-              dedupeKey: record.dedupeKey,
-              payloadHash: digest(payload),
-            });
-          }
-          const { record } = await new AppointmentReminderRepository().schedule(
-            {
-              kind: "REMINDER_24H",
-              bookingId: m.bookingId,
-              businessId: p.businessId,
-              customerUserId: p.customerUserId,
-              scheduleStartAt: m.startAt,
-              now: this.clock(),
-            },
-            session,
-          );
-          reminders.push({ id: record._id, dedupeKey: record.dedupeKey });
-          const alert = booking.sessionEndReminderSnapshot;
-          if (alert?.enabled && alert.minutesBeforeSessionEnds !== undefined) {
-            const end = await new AppointmentReminderRepository().schedule(
+              ...(owner
+                ? [
+                    {
+                      recipient: owner.normalizedEmail,
+                      templateKey: "BOOKING_OWNER_NEW_BOOKING" as const,
+                      includeCustomerBookingLink: false,
+                    },
+                  ]
+                : []),
+            ];
+            for (const plan of plans) {
+              const payload = {
+                ...buildBookingEmailData(booking.toObject(), {
+                  businessName: business.name,
+                  includeCustomerBookingLink: plan.includeCustomerBookingLink,
+                }),
+              };
+              const { record } = await new EmailOutboxRepository().enqueue(
+                {
+                  eventKey: `BOOKING_CREATED:${m.bookingId}`,
+                  recipient: plan.recipient,
+                  templateKey: plan.templateKey,
+                  payload,
+                },
+                session,
+              );
+              if (digest(record.payload) !== digest(payload)) throw batchConflict();
+              emails.push({
+                id: record._id,
+                dedupeKey: record.dedupeKey,
+                payloadHash: digest(payload),
+              });
+            }
+            const { record } = await new AppointmentReminderRepository().schedule(
               {
-                kind: "SESSION_END_REMINDER",
+                kind: "REMINDER_24H",
                 bookingId: m.bookingId,
                 businessId: p.businessId,
                 customerUserId: p.customerUserId,
-                scheduleStartAt: m.endAt,
-                offsetMinutes: alert.minutesBeforeSessionEnds,
+                scheduleStartAt: m.startAt,
                 now: this.clock(),
               },
               session,
             );
-            reminders.push({ id: end.record._id, dedupeKey: end.record.dedupeKey });
+            reminders.push({ id: record._id, dedupeKey: record.dedupeKey });
+            const alert = booking.sessionEndReminderSnapshot;
+            if (alert?.enabled && alert.minutesBeforeSessionEnds !== undefined) {
+              const end = await new AppointmentReminderRepository().schedule(
+                {
+                  kind: "SESSION_END_REMINDER",
+                  bookingId: m.bookingId,
+                  businessId: p.businessId,
+                  customerUserId: p.customerUserId,
+                  scheduleStartAt: m.endAt,
+                  offsetMinutes: alert.minutesBeforeSessionEnds,
+                  now: this.clock(),
+                },
+                session,
+              );
+              reminders.push({ id: end.record._id, dedupeKey: end.record.dedupeKey });
+            }
+            for (const port of ["CALENDAR", ...(!owner ? ["OWNER_EMAIL" as const] : [])] as const)
+              tasks.push({
+                lifecycleVersion: 0,
+                key: `${p.batchId}:${m.bookingId}:CREATED:v0:${port}`,
+                bookingId: m.bookingId,
+                startAt: m.startAt,
+                endAt: m.endAt,
+                port,
+                state: "BLOCKED_UNVERIFIED",
+                attempts: 0,
+                nextDue: this.clock(),
+              });
           }
-          for (const port of ["CALENDAR", ...(!owner ? ["OWNER_EMAIL" as const] : [])] as const)
-            tasks.push({
-              lifecycleVersion: 0,
-              key: `${p.batchId}:${m.bookingId}:CREATED:v0:${port}`,
-              bookingId: m.bookingId,
-              startAt: m.startAt,
-              endAt: m.endAt,
-              port,
-              state: "BLOCKED_UNVERIFIED",
-              attempts: 0,
-              nextDue: this.clock(),
-            });
-        }
-        await appendBatchCompletion(
-          scope,
-          token,
-          {
-            version: 1,
-            state: "PREPARATION_ONLY_COMPLETE_BATCH",
-            activation: "SYNTHETIC_AUTHORITY_NOT_PRODUCTION_CONSENT",
-            preparationHash: digest(p),
-            financeHash: digest(finance),
-            ...(attemptId ? { paymentAttemptId: new Types.ObjectId(attemptId) } : {}),
-            ...(ledgerId ? { ledgerId } : {}),
-            emails,
-            reminders,
-            tasks: tasks.map(({ key, bookingId, port, startAt, endAt, lifecycleVersion }) => ({
-              lifecycleVersion,
-              key,
-              bookingId,
-              port,
-              startAt,
-              endAt,
-            })),
-          },
-          tasks,
-          session,
-        );
-        returned = true;
-      });
+          await appendBatchCompletion(
+            scope,
+            token,
+            {
+              ...(certified
+                ? {
+                    version: 2 as const,
+                    state: "GENUINE_COMPLETE_BATCH" as const,
+                    activation: "CERTIFIED_ORIGINAL_CONSENT" as const,
+                    consentCertificateId: certified.certificateId,
+                    consentCertificateHash: certified.certificateHash,
+                  }
+                : // Only isolated tests mock certification to return undefined. Shipped
+                  // certification never does; historical v1 data is never promoted.
+                  {
+                    version: 1 as const,
+                    state: "PREPARATION_ONLY_COMPLETE_BATCH" as const,
+                    activation: "SYNTHETIC_AUTHORITY_NOT_PRODUCTION_CONSENT" as const,
+                  }),
+              preparationHash: digest(p),
+              financeHash: digest(finance),
+              ...(attemptId ? { paymentAttemptId: new Types.ObjectId(attemptId) } : {}),
+              ...(ledgerId ? { ledgerId } : {}),
+              emails,
+              reminders,
+              tasks: tasks.map(({ key, bookingId, port, startAt, endAt, lifecycleVersion }) => ({
+                lifecycleVersion,
+                key,
+                bookingId,
+                port,
+                startAt,
+                endAt,
+              })),
+            },
+            tasks,
+            session,
+          );
+          returned = true;
+        },
+        { readConcern: { level: "snapshot" }, writeConcern: { w: "majority", j: true } },
+      );
     } catch (error) {
       const unknown =
         returned ||

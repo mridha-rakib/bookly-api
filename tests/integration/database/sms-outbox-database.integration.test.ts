@@ -112,8 +112,10 @@ describe("database-backed SmsOutbox integration", () => {
 
   it("markSent persists provider + providerMessageId and is terminal", async () => {
     const { record } = await repository.enqueue(enqueueInput());
-    await repository.claimNext(claimOptions());
-    const sent = await repository.markSent(record._id, {
+    const claimed = await repository.claimNext(claimOptions());
+    expect(claimed).not.toBeNull();
+    await repository.markProviderStarted(claimed!);
+    const sent = await repository.markSent(claimed!, {
       provider: "twilio",
       providerMessageId: "SM123",
       now: new Date(),
@@ -126,8 +128,9 @@ describe("database-backed SmsOutbox integration", () => {
 
   it("scheduleRetry returns the row to PENDING with nextAttemptAt; markFailed is terminal", async () => {
     const { record } = await repository.enqueue(enqueueInput());
-    await repository.claimNext(claimOptions());
-    const retried = await repository.scheduleRetry(record._id, {
+    const firstClaim = await repository.claimNext(claimOptions());
+    expect(firstClaim).not.toBeNull();
+    const retried = await repository.scheduleRetry(firstClaim!, {
       category: "NETWORK_TRANSIENT",
       message: "network error contacting provider",
       nextAttemptAt: new Date(Date.now() + 60_000),
@@ -143,7 +146,7 @@ describe("database-backed SmsOutbox integration", () => {
     );
     const reclaimed = await repository.claimNext(claimOptions());
     expect(reclaimed?.status).toBe("PROCESSING");
-    const failed = await repository.markFailed(record._id, {
+    const failed = await repository.markFailed(reclaimed!, {
       category: "PROVIDER_PERMANENT",
       message: "provider returned 422",
     });
@@ -169,5 +172,19 @@ describe("database-backed SmsOutbox integration", () => {
     const recovered = await repository.resetStaleProcessing(new Date(Date.now() - 5 * 60_000));
     expect(recovered).toBe(1);
     expect((await SmsOutboxModel.findById(record._id))?.status).toBe("PENDING");
+  });
+
+  it("never reclaims a stale row once a provider request may have started", async () => {
+    const { record } = await repository.enqueue(enqueueInput());
+    const claimed = await repository.claimNext(claimOptions());
+    expect(claimed).not.toBeNull();
+    await repository.markProviderStarted(claimed!);
+    await SmsOutboxModel.updateOne(
+      { _id: record._id },
+      { $set: { claimedAt: new Date(Date.now() - 10 * 60_000) } },
+    );
+    expect(await repository.resetStaleProcessing(new Date(Date.now() - 5 * 60_000))).toBe(0);
+    expect(await repository.claimNext(claimOptions())).toBeNull();
+    expect((await SmsOutboxModel.findById(record._id))?.status).toBe("PROCESSING");
   });
 });

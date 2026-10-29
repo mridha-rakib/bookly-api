@@ -12,6 +12,7 @@ import type { BookingFinancialTransactionDocument } from "../booking-financial-t
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import { ensureBusinessRefundNotification } from "../payment/business-refund-notification.js";
 import type { PaymentGateway } from "../payment/payment.types.js";
 import type { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import {
@@ -810,6 +811,22 @@ export class StripeWebhookService {
           await this.financialTransactionService.settleStatus(pendingLedger._id, "FAILED");
         }
       }
+      // The financial result above is already durable. A notification problem must not turn
+      // this event retryable or skip the remaining refund handling; the missing marker keeps
+      // the operation in money recovery's exact-event pass.
+      if (
+        storedOperation?.finalNotificationProtocolVersion === 1 &&
+        (effectiveStatus === "SUCCEEDED" || effectiveStatus === "FAILED")
+      )
+        await ensureBusinessRefundNotification(operation._id).catch((error: unknown) =>
+          logger.error(
+            {
+              refundOperationId: String(operation._id),
+              errorCategory: error instanceof Error ? error.name : "UNKNOWN",
+            },
+            "Settled refund notification remains pending exact-event recovery",
+          ),
+        );
     }
     if (bookingId) {
       const entries = await this.financialTransactionService.listForBooking(bookingId);

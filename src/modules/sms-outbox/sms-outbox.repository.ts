@@ -1,5 +1,3 @@
-import type { Types } from "mongoose";
-
 import { type SmsOutboxDocument, SmsOutboxModel } from "./sms-outbox.model.js";
 import {
   buildSmsDedupeKey,
@@ -17,7 +15,7 @@ export type EnqueueSmsResult = {
 export type ClaimSmsOptions = {
   workerId: string;
   now: Date;
-  /** A PROCESSING row older than this is considered abandoned and may be re-claimed. */
+  /** Only a stale pre-dispatch PROCESSING row may be reset for another claim. */
   claimTimeoutMs: number;
   maxAttempts: number;
 };
@@ -68,6 +66,7 @@ export class SmsOutboxRepository {
           ? { metadata: input.metadata }
           : {}),
         status: "PENDING",
+        providerStarted: false,
         attemptCount: 0,
       }).save();
       return { created: true, record };
@@ -85,23 +84,16 @@ export class SmsOutboxRepository {
   }
 
   /**
-   * Atomically move ONE eligible row to PROCESSING and return it (`null` when none). Eligible =
-   * PENDING and due, OR PROCESSING with a stale claim — in both cases only while attempts
-   * remain. `attemptCount` is incremented in the same write.
+   * Atomically claim one due, never-issued row. Stale pre-dispatch rows are reset separately;
+   * a row with a possible provider request cannot be claimed again.
    */
   public claimNext(options: ClaimSmsOptions): Promise<SmsOutboxDocument | null> {
-    const staleBefore = new Date(options.now.getTime() - options.claimTimeoutMs);
-
     return SmsOutboxModel.findOneAndUpdate(
       {
         attemptCount: { $lt: options.maxAttempts },
-        $or: [
-          {
-            status: "PENDING",
-            $or: [{ nextAttemptAt: { $exists: false } }, { nextAttemptAt: { $lte: options.now } }],
-          },
-          { status: "PROCESSING", claimedAt: { $lte: staleBefore } },
-        ],
+        status: "PENDING",
+        providerStarted: false,
+        $or: [{ nextAttemptAt: { $exists: false } }, { nextAttemptAt: { $lte: options.now } }],
       },
       {
         $set: { status: "PROCESSING", claimedAt: options.now, claimedBy: options.workerId },
@@ -111,14 +103,36 @@ export class SmsOutboxRepository {
     ).exec();
   }
 
-  /** SENT is terminal — the `status: "PROCESSING"` guard means a re-delivered row is never
-   * over-written, and a crashed worker whose row was reclaimed+sent elsewhere can't clobber it. */
+  /** Claim-fenced, durable permission consumed before calling the provider. */
+  public markProviderStarted(record: SmsOutboxDocument): Promise<SmsOutboxDocument | null> {
+    if (!record.claimedBy) return Promise.resolve(null);
+    return SmsOutboxModel.findOneAndUpdate(
+      {
+        _id: record._id,
+        status: "PROCESSING",
+        attemptCount: record.attemptCount,
+        claimedBy: record.claimedBy,
+        providerStarted: false,
+      },
+      { $set: { providerStarted: true } },
+      { returnDocument: "after" },
+    ).exec();
+  }
+
+  /** SENT is terminal; exact attempt and claimant fence late acknowledgements. */
   public markSent(
-    id: Types.ObjectId,
+    record: SmsOutboxDocument,
     input: { provider: string; providerMessageId?: string | undefined; now: Date },
   ): Promise<SmsOutboxDocument | null> {
+    if (!record.claimedBy) return Promise.resolve(null);
     return SmsOutboxModel.findOneAndUpdate(
-      { _id: id, status: "PROCESSING" },
+      {
+        _id: record._id,
+        status: "PROCESSING",
+        providerStarted: true,
+        attemptCount: record.attemptCount,
+        claimedBy: record.claimedBy,
+      },
       {
         $set: {
           status: "SENT",
@@ -132,12 +146,45 @@ export class SmsOutboxRepository {
     ).exec();
   }
 
+  /** A provider request may still settle; this state has no automatic resend path. */
+  public markUnknown(
+    record: SmsOutboxDocument,
+    category: string,
+  ): Promise<SmsOutboxDocument | null> {
+    if (!record.claimedBy) return Promise.resolve(null);
+    return SmsOutboxModel.findOneAndUpdate(
+      {
+        _id: record._id,
+        status: "PROCESSING",
+        providerStarted: true,
+        attemptCount: record.attemptCount,
+        claimedBy: record.claimedBy,
+      },
+      {
+        $set: {
+          status: "UNKNOWN_OUTCOME",
+          lastErrorCategory: category,
+          lastErrorMessage: "Provider outcome requires reconciliation",
+        },
+        $unset: { claimedAt: "", claimedBy: "", nextAttemptAt: "" },
+      },
+      { returnDocument: "after" },
+    ).exec();
+  }
+
   public scheduleRetry(
-    id: Types.ObjectId,
+    record: SmsOutboxDocument,
     input: { category: string; message: string; nextAttemptAt: Date },
   ): Promise<SmsOutboxDocument | null> {
+    if (!record.claimedBy) return Promise.resolve(null);
     return SmsOutboxModel.findOneAndUpdate(
-      { _id: id, status: "PROCESSING" },
+      {
+        _id: record._id,
+        status: "PROCESSING",
+        providerStarted: false,
+        attemptCount: record.attemptCount,
+        claimedBy: record.claimedBy,
+      },
       {
         $set: {
           status: "PENDING",
@@ -152,11 +199,18 @@ export class SmsOutboxRepository {
   }
 
   public markFailed(
-    id: Types.ObjectId,
+    record: SmsOutboxDocument,
     input: { category: string; message: string },
   ): Promise<SmsOutboxDocument | null> {
+    if (!record.claimedBy) return Promise.resolve(null);
     return SmsOutboxModel.findOneAndUpdate(
-      { _id: id, status: "PROCESSING" },
+      {
+        _id: record._id,
+        status: "PROCESSING",
+        providerStarted: false,
+        attemptCount: record.attemptCount,
+        claimedBy: record.claimedBy,
+      },
       {
         $set: {
           status: "FAILED",
@@ -169,10 +223,10 @@ export class SmsOutboxRepository {
     ).exec();
   }
 
-  /** Explicit sweep so a run can start from a clean state (claimNext also self-reclaims). */
+  /** Only a proven pre-dispatch stale claim is reset. Unknown issued work stays quarantined. */
   public async resetStaleProcessing(staleBefore: Date): Promise<number> {
     const result = await SmsOutboxModel.updateMany(
-      { status: "PROCESSING", claimedAt: { $lte: staleBefore } },
+      { status: "PROCESSING", providerStarted: false, claimedAt: { $lte: staleBefore } },
       { $set: { status: "PENDING" }, $unset: { claimedAt: "", claimedBy: "" } },
     ).exec();
     return result.modifiedCount ?? 0;

@@ -25,6 +25,7 @@ export type ProviderReversalBusinessEmailData = {
 };
 
 export type FinanceSupportAlertKind =
+  | "REFUND_RECOVERY_CONFLICT"
   | "DISPUTE_NEW"
   | "DISPUTE_INVESTIGATION"
   | "DISPUTE_RECONCILIATION_REQUIRED"
@@ -93,13 +94,16 @@ const businessCopy = (
 
 const supportCopy = (data: FinanceSupportAlertEmailData): { title: string; lines: string[] } => {
   const facts = [
-    `Provider reference: ${data.providerReference}`,
+    data.kind === "REFUND_RECOVERY_CONFLICT"
+      ? `Internal refund operation reference: ${data.providerReference}`
+      : `Provider reference: ${data.providerReference}`,
     ...(data.amountFormatted ? [`Amount: ${data.amountFormatted}`] : []),
     ...(data.businessId ? [`Business: ${data.businessId}`] : []),
     ...(data.bookingId ? [`Booking: ${data.bookingId}`] : []),
     ...(data.detail ? [`Detail: ${data.detail}`] : []),
   ];
   const titles: Record<FinanceSupportAlertKind, string> = {
+    REFUND_RECOVERY_CONFLICT: "Refund recovery requires investigation",
     DISPUTE_NEW: "New payment dispute",
     DISPUTE_INVESTIGATION: "Payment dispute needs investigation",
     DISPUTE_RECONCILIATION_REQUIRED: "Payment dispute needs reconciliation",
@@ -134,6 +138,8 @@ export const renderFinanceSupportAlertEmail = (
   return render(
     copy,
     `[Finance] ${copy.title} — ${data.providerReference}`,
-    "Evidence and responses are handled in the Stripe Dashboard.",
+    data.kind === "REFUND_RECOVERY_CONFLICT"
+      ? "Review the current internal incident state. This alert does not authorize a refund or financial change."
+      : "Evidence and responses are handled in the Stripe Dashboard.",
   );
 };

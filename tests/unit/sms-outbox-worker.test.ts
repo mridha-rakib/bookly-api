@@ -18,6 +18,7 @@ const makeRow = (overrides: Partial<SmsOutboxDocument> = {}): SmsOutboxDocument 
     body: "Bookly reminder: ...",
     status: "PROCESSING",
     attemptCount: 1,
+    claimedBy: "t",
     ...overrides,
   }) as unknown as SmsOutboxDocument;
 
@@ -25,7 +26,9 @@ const build = (transportImpl: Partial<SmsTransport>) => {
   const repository = {
     resetStaleProcessing: vi.fn().mockResolvedValue(0),
     claimNext: vi.fn(),
-    markSent: vi.fn().mockResolvedValue(null),
+    markProviderStarted: vi.fn().mockImplementation(async (row: SmsOutboxDocument) => row),
+    markUnknown: vi.fn().mockImplementation(async (row: SmsOutboxDocument) => row),
+    markSent: vi.fn().mockImplementation(async () => makeRow({ status: "SENT" })),
     scheduleRetry: vi.fn().mockResolvedValue(null),
     markFailed: vi.fn().mockResolvedValue(null),
   } as unknown as SmsOutboxRepository & Record<string, ReturnType<typeof vi.fn>>;
@@ -65,33 +68,41 @@ describe("SmsOutboxWorker.processOne", () => {
     );
   });
 
-  it("retryable failure → scheduleRetry with an exponential-backoff nextAttemptAt", async () => {
+  it("network ambiguity after provider permission is quarantined without another send", async () => {
     const h = build({ send: vi.fn().mockRejectedValue(new SmsError("NETWORK_TRANSIENT")) });
-    expect(await h.worker.processOne(makeRow({ attemptCount: 1 }))).toBe("retried");
-    expect(h.repository.scheduleRetry).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        category: "NETWORK_TRANSIENT",
-        nextAttemptAt: new Date(NOW.getTime() + 60_000), // base * 2^(1-1)
-      }),
-    );
-    expect(h.repository.markFailed).not.toHaveBeenCalled();
+    expect(await h.worker.processOne(makeRow({ attemptCount: 1 }))).toBe("failed");
+    expect(h.repository.markUnknown).toHaveBeenCalledWith(expect.anything(), "NETWORK_TRANSIENT");
+    expect(h.repository.scheduleRetry).not.toHaveBeenCalled();
   });
 
   it("permanent failure → markFailed immediately", async () => {
     const h = build({ send: vi.fn().mockRejectedValue(new SmsError("INVALID_DESTINATION")) });
     expect(await h.worker.processOne(makeRow({ attemptCount: 1 }))).toBe("failed");
-    expect(h.repository.markFailed).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ category: "INVALID_DESTINATION" }),
-    );
+    expect(h.repository.markUnknown).toHaveBeenCalledWith(expect.anything(), "INVALID_DESTINATION");
     expect(h.repository.scheduleRetry).not.toHaveBeenCalled();
   });
 
   it("retryable but attempts exhausted → markFailed", async () => {
     const h = build({ send: vi.fn().mockRejectedValue(new SmsError("PROVIDER_TRANSIENT")) });
     expect(await h.worker.processOne(makeRow({ attemptCount: 5 }))).toBe("failed");
-    expect(h.repository.markFailed).toHaveBeenCalled();
+    expect(h.repository.markUnknown).toHaveBeenCalled();
+    expect(h.repository.scheduleRetry).not.toHaveBeenCalled();
+  });
+
+  it("does not call provider without a durable exact-claim send permission", async () => {
+    const h = build({ send: vi.fn() });
+    vi.mocked(h.repository.markProviderStarted).mockResolvedValue(null);
+    expect(await h.worker.processOne(makeRow())).toBe("failed");
+    expect(h.transport.send).not.toHaveBeenCalled();
+  });
+
+  it("does not retry an accepted SMS if result persistence fails", async () => {
+    const h = build({
+      send: vi.fn().mockResolvedValue({ provider: "twilio", status: "PROVIDER_ACCEPTED" }),
+    });
+    vi.mocked(h.repository.markSent).mockRejectedValue(new Error("write acknowledgement lost"));
+    expect(await h.worker.processOne(makeRow())).toBe("failed");
+    expect(h.repository.markUnknown).toHaveBeenCalled();
     expect(h.repository.scheduleRetry).not.toHaveBeenCalled();
   });
 

@@ -27,6 +27,7 @@ describe("MoneyRecoveryService", () => {
     } as unknown as PaymentAttemptRepository;
     const refundOperationRepository = {
       listRecoverable: vi.fn(async () => []),
+      listFinalNotificationPending: vi.fn(async () => []),
     } as unknown as RefundOperationRepository;
     const webhookService = {
       recoverDue: vi.fn(async () => ({ processed: 0, failed: 0 })),

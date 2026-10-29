@@ -21,6 +21,12 @@ export type BookingRefundOutcome = {
 
 /** Optional observer port — see `BookingLifecycleService`. */
 export type BookingCancelledNotificationPort = {
+  enqueueBookingCancelledInTransaction?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session: ClientSession,
+  ): Promise<void>;
   notifyBookingCancelled(
     booking: BookingDocument,
     business: BusinessDocument,
@@ -35,20 +41,18 @@ export type BookingCancelledNotificationPort = {
 };
 
 /**
- * TRIGGERS 1 & 2 — after `cancelByCustomer` / `cancelByBusiness` returns its final booking
- * (status + `cancellationOutcome.settlementStatus` already settled to NOT_APPLICABLE / SUCCEEDED
- * / FAILED). Recipients: customer (booking contact snapshot) + Business Owner (User). Never
- * throws — a notification problem can't undo the cancellation.
+ * TRIGGERS 1 & 2 — customer and owner cancellation intents. The transactional entry uses the
+ * committed cancellation snapshot (refund may still be PENDING) and propagates persistence
+ * failure to roll back the transition. The legacy post-commit observer logs failures.
  *
  * `refundOutcome` (Phase 4B close-out fix): when the caller has just executed a real refund and
  * wants that exact, authoritative, just-happened result reflected in the email (rather than
  * whatever the booking's own persisted `cancellationOutcome` says — see
  * cancellation-email-data.ts's own module doc comment for why that field can be stale or simply
  * describe a different event), it is passed here and forwarded into
- * buildCancellationEmailData's own `refundOverride`. `cancelByBusiness` passes this today; the
- * eventKey/dedupe behavior below is UNCHANGED for it (still `BOOKING_CANCELLED:${bookingId}`,
- * exactly as before this fix) since it is the only notification ever dispatched for that
- * booking's cancellation.
+ * buildCancellationEmailData's own `refundOverride`. A later confirmed refund outcome uses a
+ * separate exact RefundOperation event key so it cannot be swallowed by the initial pending
+ * cancellation notice.
  *
  * `eventKeyOverride` exists ONLY for a caller that must dispatch a SECOND, genuinely distinct
  * notification about the SAME booking that an earlier, separate call in the same flow may
@@ -66,6 +70,24 @@ export class BookingCancelledNotifier implements BookingCancelledNotificationPor
     private readonly emailOutbox: OutboxEnqueue,
     private readonly users: Pick<BookingNotificationUserPort, "findManyByIds">,
   ) {}
+
+  public async enqueueBookingCancelledInTransaction(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Cancellation notification requires an active transaction");
+    await this.notifyBookingCancelled(
+      booking,
+      business,
+      cancelledBy,
+      undefined,
+      undefined,
+      session,
+    );
+  }
 
   public async notifyPackageTerminated(
     booking: BookingDocument,

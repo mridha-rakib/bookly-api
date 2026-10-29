@@ -20,6 +20,7 @@ export type CreateRefundOperationInput = {
   expectedRefundAmountCents: number;
   currency: string;
   reason: string;
+  finalNotificationProtocolVersion?: 1 | undefined;
 };
 
 export class RefundOperationRepository {
@@ -63,6 +64,11 @@ export class RefundOperationRepository {
     ) {
       throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
     }
+    if (
+      input.finalNotificationProtocolVersion &&
+      row.finalNotificationProtocolVersion !== input.finalNotificationProtocolVersion
+    )
+      throw new PaymentError("PAYMENT_REFUND_IDEMPOTENCY_CONFLICT", 409);
     if (input.packageProgressId && !row.packageProgressId) {
       row.packageProgressId = new Types.ObjectId(input.packageProgressId);
       await row.save({ session });
@@ -293,6 +299,22 @@ export class RefundOperationRepository {
       ],
     })
       .sort({ updatedAt: 1 })
+      .limit(limit)
+      .exec();
+  }
+
+  /** Bounded exact-event reconciliation. No provider call and no historical opt-in. */
+  public listFinalNotificationPending(limit: number): Promise<RefundOperationDocument[]> {
+    return RefundOperationModel.find({
+      finalNotificationProtocolVersion: 1,
+      finalNotificationRecordedAt: { $exists: false },
+      reason: "BUSINESS_CANCELLATION",
+      packageProgressId: { $exists: false },
+      providerRefundId: { $exists: true },
+      providerStatus: { $in: ["SUCCEEDED", "FAILED"] },
+      $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }],
+    })
+      .sort({ updatedAt: 1, _id: 1 })
       .limit(limit)
       .exec();
   }

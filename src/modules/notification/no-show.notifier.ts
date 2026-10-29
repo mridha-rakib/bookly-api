@@ -22,6 +22,16 @@ const TEMPLATE_BY_OUTCOME: Record<
 
 /** Optional observer port used by both the no-show worker and the lifecycle service. */
 export type NoShowNotificationPort = {
+  enqueueNoShowWaivedInTransaction?(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void>;
+  enqueueNoShowCancelledInTransaction?(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void>;
   notifyNoShowCharged(
     booking: BookingDocument,
     context: { businessName: string; amounts: NoShowChargedAmounts },
@@ -42,6 +52,26 @@ export type NoShowNotificationPort = {
  */
 export class NoShowNotifier implements NoShowNotificationPort {
   public constructor(private readonly emailOutbox: OutboxEnqueue) {}
+
+  public enqueueNoShowWaivedInTransaction(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("No-show waiver notification requires a transaction");
+    return this.enqueue(booking, "WAIVED", context.businessName, undefined, session);
+  }
+
+  public enqueueNoShowCancelledInTransaction(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("No-show cancellation notification requires a transaction");
+    return this.enqueue(booking, "CANCELLED", context.businessName, undefined, session);
+  }
 
   public notifyNoShowCharged(
     booking: BookingDocument,

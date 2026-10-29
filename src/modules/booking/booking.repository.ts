@@ -7,6 +7,7 @@ import {
   type BookingRescheduleEntry,
 } from "./booking.model.js";
 import { type BookingSource, type BookingStatus, bookingStatuses } from "./booking.types.js";
+import { withSupervisorBookingWrite } from "./booking-management-write.js";
 
 /**
  * `_id` is optional-but-honored: BookingCreationService pre-generates it (`new Types.ObjectId()`)
@@ -46,6 +47,23 @@ export type BookingListResult = {
  * `findScheduleForBusinessOnDate`'s own comment. */
 const MAX_DASHBOARD_SCHEDULE_ROWS = 200;
 
+/** P4C-1 — fields a Staff appointment read never needs (least privilege at the query). */
+const STAFF_APPOINTMENT_PROJECTION = {
+  eventHistory: 0,
+  rescheduleHistory: 0,
+  notes: 0,
+  financials: 0,
+  financialContract: 0,
+  cancellationOutcome: 0,
+  cancellationPolicySnapshot: 0,
+  completionPayment: 0,
+  "customer.contact.normalizedEmail": 0,
+  "customer.contact.phone": 0,
+  "fulfilment.travelAddress": 0,
+  googleCalendarEventId: 0,
+  packageCalendarDelivery: 0,
+} as const;
+
 /**
  * Deliberately minimal in this phase: create + the read paths needed to prove the schema and
  * its indexes behave correctly (see the corresponding integration test). List/filter/pagination
@@ -58,7 +76,9 @@ export class BookingRepository {
     input: CreateBookingInput,
     session?: ClientSession,
   ): Promise<BookingDocument> {
-    return new BookingModel(input).save(session ? { session } : undefined);
+    return withSupervisorBookingWrite(input.businessId, input.createdBy, session, (transaction) =>
+      new BookingModel(input).save(transaction ? { session: transaction } : undefined),
+    );
   }
 
   public async findById(
@@ -313,21 +333,27 @@ export class BookingRepository {
     const inc: Record<string, unknown> = {};
     if (update.incrementCustomerRescheduleCount) inc["customerRescheduleCount"] = 1;
 
-    return BookingModel.findOneAndUpdate(
-      {
-        _id: bookingId,
-        businessId,
-        status: { $in: expectedStatuses },
-        ...(update.extraFilter ?? {}),
-      },
-      {
-        ...(update.set && Object.keys(update.set).length > 0 ? { $set: update.set } : {}),
-        ...(update.unset && Object.keys(update.unset).length > 0 ? { $unset: update.unset } : {}),
-        ...(Object.keys(push).length > 0 ? { $push: push } : {}),
-        ...(Object.keys(inc).length > 0 ? { $inc: inc } : {}),
-      },
-      { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) },
-    ).exec();
+    return withSupervisorBookingWrite(businessId, update.pushEvent, session, (transaction) =>
+      BookingModel.findOneAndUpdate(
+        {
+          _id: bookingId,
+          businessId,
+          status: { $in: expectedStatuses },
+          ...(update.extraFilter ?? {}),
+        },
+        {
+          ...(update.set && Object.keys(update.set).length > 0 ? { $set: update.set } : {}),
+          ...(update.unset && Object.keys(update.unset).length > 0 ? { $unset: update.unset } : {}),
+          ...(Object.keys(push).length > 0 ? { $push: push } : {}),
+          ...(Object.keys(inc).length > 0 ? { $inc: inc } : {}),
+        },
+        {
+          returnDocument: "after",
+          runValidators: true,
+          ...(transaction ? { session: transaction } : {}),
+        },
+      ).exec(),
+    );
   }
 
   /** Same as `casUpdate`, scoped by `customer.customerUserId` instead of `businessId` — for the
@@ -473,6 +499,7 @@ export class BookingRepository {
         "serviceLines.serviceSnapshot.name": 1,
         "serviceLines.serviceSnapshot.pricingMode": 1,
         "serviceLines.pricingInput.packageProgressId": 1,
+        "serviceLines.pricingInput.packageItemId": 1,
         "serviceLines.pricingInput.sessionIndex": 1,
         "serviceLines.pricingInput.sessionsInPackage": 1,
         "serviceLines.staffSnapshot": 1,
@@ -923,6 +950,89 @@ export class BookingRepository {
     ]).exec();
 
     return rows.map((row) => ({ mongoDayOfWeek: row._id, count: row.count }));
+  }
+
+  /**
+   * P4C-1 (Owner decision D-S1) — read-only Staff appointments. The membership and Business
+   * are server-derived by the caller; the query itself is always restricted to both, so a
+   * reassigned line (different `responsibleStaffMembershipId`) or a foreign Business can never
+   * match. Served by `{serviceLines.responsibleStaffMembershipId, schedule.startAt}`. Fetches
+   * `limit + 1` rows to report `hasMore` without a count; stable order (startAt, _id).
+   * Private Customer contact fields, notes, financials and history are not even read.
+   */
+  public async listAssignedToStaffMembership(
+    businessId: Types.ObjectId | string,
+    staffMembershipId: Types.ObjectId | string,
+    filter: { status?: BookingStatus[] | undefined; fromDate: Date; toDate: Date },
+    pagination: { page: number; limit: number },
+  ): Promise<{ bookings: BookingDocument[]; hasMore: boolean }> {
+    const rows = await BookingModel.find(
+      {
+        businessId,
+        "serviceLines.responsibleStaffMembershipId": staffMembershipId,
+        "schedule.startAt": { $gte: filter.fromDate, $lte: filter.toDate },
+        ...(filter.status && filter.status.length > 0 ? { status: { $in: filter.status } } : {}),
+      },
+      STAFF_APPOINTMENT_PROJECTION,
+    )
+      .sort({ "schedule.startAt": 1, _id: 1 })
+      .skip((pagination.page - 1) * pagination.limit)
+      .limit(pagination.limit + 1)
+      .lean<BookingDocument[]>()
+      .exec();
+    return { bookings: rows.slice(0, pagination.limit), hasMore: rows.length > pagination.limit };
+  }
+
+  /** P4C-1 — one Booking only if it is in this Business AND currently assigned to this
+   * membership; anything else is indistinguishable from "not found". */
+  public async findAssignedToStaffMembership(
+    businessId: Types.ObjectId | string,
+    staffMembershipId: Types.ObjectId | string,
+    bookingId: Types.ObjectId | string,
+  ): Promise<BookingDocument | null> {
+    return BookingModel.findOne(
+      {
+        _id: bookingId,
+        businessId,
+        "serviceLines.responsibleStaffMembershipId": staffMembershipId,
+      },
+      STAFF_APPOINTMENT_PROJECTION,
+    )
+      .lean<BookingDocument>()
+      .exec();
+  }
+
+  /** D-S2: fetch only destination fields, after the normal detail authorization/proof check.
+   * All lines share the canonical Booking fulfilment mode (rule L); no per-line mode exists.
+   * Repeat assignment, tenant, mode and operational-state checks in this sensitive read.
+   */
+  public async findStaffTravelDestination(
+    businessId: Types.ObjectId,
+    staffMembershipId: Types.ObjectId,
+    bookingId: Types.ObjectId,
+  ): Promise<Pick<BookingDocument, "fulfilment"> | null> {
+    return BookingModel.findOne(
+      {
+        _id: bookingId,
+        businessId,
+        "serviceLines.responsibleStaffMembershipId": staffMembershipId,
+        "fulfilment.mode": "TRAVEL_TO_CUSTOMER",
+        "fulfilment.businessLocation": { $exists: false },
+        status: "UPCOMING",
+        "schedule.endAt": { $gt: new Date() },
+      },
+      {
+        _id: 0,
+        "fulfilment.travelAddress.city": 1,
+        "fulfilment.travelAddress.area": 1,
+        "fulfilment.travelAddress.streetName": 1,
+        "fulfilment.travelAddress.streetNumber": 1,
+        "fulfilment.travelAddress.floorUnit": 1,
+        "fulfilment.travelAddress.aptRoom": 1,
+      },
+    )
+      .lean<Pick<BookingDocument, "fulfilment">>()
+      .exec();
   }
 
   private buildListQuery(

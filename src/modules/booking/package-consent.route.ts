@@ -5,16 +5,26 @@ import { AppError } from "../../common/errors/app-error.js";
 import { sendSuccess } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { env } from "../../config/env.js";
+import { AddonModel } from "../addons/addon.model.js";
+import { AddonServiceAssignmentModel } from "../addons/addon-service-assignment.model.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
   requireRoles,
 } from "../auth/auth.middleware.js";
+import { BusinessTravelSettingsModel } from "../business-travel-settings/business-travel-settings.model.js";
 import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { packageCheckoutAffirmativeActionSchema } from "./package-checkout-acceptance.js";
+import { readPackageCheckoutAvailability } from "./package-checkout-availability.js";
 import { packageCheckoutIntentSchema } from "./package-checkout-contract.js";
 import { readPackageCheckoutCustomer } from "./package-checkout-customer-authority.js";
+import { packageCheckoutHttpView } from "./package-checkout-http-view.js";
 import { buildPackageConsentServices } from "./package-consent.factory.js";
+import { readPackageConsentPublicState } from "./package-consent-certification.js";
+import {
+  readPackageConsentHttpReadiness,
+  shippedPackageConsentHttpActivation,
+} from "./package-consent-http-activation.js";
 
 const objectId = z
   .string()
@@ -53,22 +63,25 @@ export const packageConsentOperationKey = (customerId: Types.ObjectId, operation
   `package-consent:${customerId.toHexString()}:${operationId}`;
 
 /** All routes are consent-only and gated before auth, composition, reads or writes. */
-export const createPackageConsentRoute = (options: Options = {}): Router => {
+export const createPackageConsentRoute = (
+  options: Options = shippedPackageConsentHttpActivation,
+): Router => {
   const router = Router();
   let services: PackageConsentServices | undefined;
   router.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
-    // Shipped composition passes no options. A runtime flag cannot grant B1c authority.
-    // Explicit options remain an isolated engineering-test composition seam only.
-    if (options.enabled !== true)
+    // Shipped composition passes no options (= shippedPackageConsentHttpActivation, disabled).
+    // A runtime flag cannot grant B1c authority. Explicit options remain an isolated
+    // engineering-test composition seam only. Catalogue availability reads the same gate.
+    const readiness = readPackageConsentHttpReadiness(options);
+    if (readiness.state === "DISABLED")
       return next(
         consentError("Package terms review is unavailable", 404, "PACKAGE_CONSENT_DISABLED"),
       );
     const origin = req.headers.origin;
     if (origin && !(options.origins ?? env.CORS_ORIGINS).includes(origin))
       return next(consentError("Origin is not allowed", 403, "PACKAGE_CONSENT_ORIGIN_REJECTED"));
-    const lifetime = options.lifetimeMs ?? env.PACKAGE_CONSENT_QUOTE_LIFETIME_MS;
-    if (!lifetime)
+    if (readiness.state === "NOT_CONFIGURED")
       return next(
         consentError(
           "Package quote lifetime requires server configuration",
@@ -76,6 +89,15 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
           "PACKAGE_CONSENT_NOT_CONFIGURED",
         ),
       );
+    if (readiness.state === "LIFETIME_UNAPPROVED")
+      return next(
+        consentError(
+          "The approved quote lifetime is 30 minutes",
+          503,
+          "PACKAGE_CONSENT_LIFETIME_UNAPPROVED",
+        ),
+      );
+    const lifetime = readiness.lifetimeMs;
     services ??= (options.build ?? buildPackageConsentServices)(lifetime);
     next();
   });
@@ -137,13 +159,6 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         !definition.contractTerms
       )
         throw consentError("Package offer not found", 404, "PACKAGE_CONSENT_OFFER_NOT_FOUND");
-      // First UI slice supports at-Business selections. Travel consent remains API-supported via canonical intent.
-      if (business.visitType !== "AT_BUSINESS_LOCATION")
-        throw consentError(
-          "This terms review currently supports appointments at the Business",
-          409,
-          "PACKAGE_CONSENT_VISIT_UNSUPPORTED",
-        );
       const staff = (await s.staff.listActiveByBusinessId(businessId)).filter(
         (p) => p.employmentActive,
       );
@@ -152,17 +167,47 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         businessId,
         definition.items.map((i) => i.serviceId),
       );
+      const travel = await BusinessTravelSettingsModel.findOne({ businessId }).maxTimeMS(2000);
+      const assignments = await AddonServiceAssignmentModel.find({
+        businessId,
+        serviceId: { $in: services.map((s) => s._id) },
+      }).maxTimeMS(2000);
+      const addons = await AddonModel.find({
+        businessId,
+        _id: { $in: assignments.map((a) => a.addonId) },
+        status: "ACTIVE",
+        archivedAt: { $exists: false },
+      }).maxTimeMS(2000);
       sendSuccess(res, 200, "Package terms selection", {
         businessId,
         packageId,
         name: definition.name,
         revision: definition.revision,
         timezone: business.timezone,
+        fulfilmentMode: business.visitType,
+        bundlePriceCents: definition.bundlePriceCents,
+        // Same display hint as the catalogue; acceptance and purchase still re-check authority.
+        checkoutAvailable: await readPackageCheckoutAvailability(options),
         items: definition.items.map((i) => ({
           definitionItemId: i.itemId,
           serviceId: i.serviceId,
           name: services.find((s) => s._id.equals(i.serviceId))?.name,
           quantity: i.includedSessions,
+          travelCities:
+            travel?.cities
+              .filter(
+                (c) =>
+                  c.active &&
+                  services.find((s) => s._id.equals(i.serviceId))?.servedCities.includes(c.city),
+              )
+              .map((c) => c.city) ?? [],
+          addons: addons
+            .filter((a) =>
+              assignments.some(
+                (link) => link.serviceId.equals(i.serviceId) && link.addonId.equals(a._id),
+              ),
+            )
+            .map((a) => ({ id: a._id, name: a.name, priceCents: a.priceCents })),
           providers: staff
             .filter((p) =>
               services
@@ -188,7 +233,7 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
       const proof = await s.authority.authenticate(req.headers.authorization),
         customer = readPackageCheckoutCustomer(proof);
       const key = packageConsentOperationKey(customer.userId, body.operationId);
-      await s.retention.prepareAndRetain(
+      const retained = await s.retention.prepareAndRetain(
         {
           businessId,
           customerUserId: customer.userId,
@@ -198,7 +243,10 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         key,
         body.intent,
       );
-      sendSuccess(res, 200, "Package quote retained", { operationId: body.operationId });
+      sendSuccess(res, 200, "Package quote retained", {
+        operationId: body.operationId,
+        quote: packageCheckoutHttpView(retained),
+      });
     }),
   );
   router.post(
@@ -221,6 +269,9 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         packageConsentOperationKey(customer.userId, params.operationId),
       );
       const accepted = stored.accepted;
+      const consentState = await readPackageConsentPublicState(
+        packageConsentOperationKey(customer.userId, params.operationId),
+      );
       // Explicit DTO: never serialize the private session-family id or retained seed.
       sendSuccess(res, 200, "Package terms ready", {
         version: p.version,
@@ -230,6 +281,8 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         quoteHash: p.disclosure.content.quoteHash,
         disclosureHash: p.disclosure.contentHash,
         text: p.disclosure.content.renderedTermsSnapshot,
+        quote: { ...packageCheckoutHttpView(stored.retention), ...consentState },
+        ...consentState,
         ...(accepted
           ? {
               accepted: {
@@ -261,7 +314,10 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         packageConsentOperationKey(customer.userId, params.operationId),
         action,
       );
-      sendSuccess(res, 200, "Terms accepted", {
+      const consentState = await readPackageConsentPublicState(
+        packageConsentOperationKey(customer.userId, params.operationId),
+      );
+      sendSuccess(res, 200, "Acceptance recorded; certification status follows", {
         state: accepted.state,
         acceptanceId: accepted.evidence.acceptanceId,
         acceptedAt: accepted.evidence.acceptedAt,
@@ -269,6 +325,7 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         quoteHash: accepted.event.quoteHash,
         disclosureHash: accepted.disclosureHash,
         eventId: accepted.event.eventId,
+        ...consentState,
       });
     }),
   );
@@ -285,6 +342,9 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
         packageConsentOperationKey(owner.userId, params.operationId),
       );
       const accepted = row.accepted;
+      const consentState = await readPackageConsentPublicState(
+        packageConsentOperationKey(owner.userId, params.operationId),
+      );
       sendSuccess(
         res,
         200,
@@ -298,9 +358,33 @@ export const createPackageConsentRoute = (options: Options = {}): Router => {
               quoteHash: accepted.event.quoteHash,
               disclosureHash: accepted.disclosureHash,
               eventId: accepted.event.eventId,
+              ...consentState,
             }
           : { state: "NOT_ACCEPTED" },
       );
+    }),
+  );
+  router.get(
+    "/:businessId/operations/:operationId/quote",
+    handle(async (req, res) => {
+      const s = get(),
+        params = paramsSchema.parse(req.params);
+      z.object({}).strict().parse(req.query);
+      const proof = await s.authority.authenticate(req.headers.authorization),
+        customer = readPackageCheckoutCustomer(proof);
+      const stored = await s.claims.findPackageCheckoutForCustomer(
+        proof,
+        params.businessId,
+        packageConsentOperationKey(customer.userId, params.operationId),
+      );
+      const consentState = await readPackageConsentPublicState(
+        packageConsentOperationKey(customer.userId, params.operationId),
+      );
+      sendSuccess(res, 200, "Original retained Package quote", {
+        operationId: params.operationId,
+        quote: { ...packageCheckoutHttpView(stored.retention), ...consentState },
+        acceptanceRecorded: Boolean(stored.accepted),
+      });
     }),
   );
   return router;

@@ -57,7 +57,10 @@ const fixture = () => {
   const service = new MoneyRecoveryService(
     payment as unknown as PaymentService,
     attempts as unknown as PaymentAttemptRepository,
-    { listRecoverable: vi.fn(async () => []) } as unknown as RefundOperationRepository,
+    {
+      listRecoverable: vi.fn(async () => []),
+      listFinalNotificationPending: vi.fn(async () => []),
+    } as unknown as RefundOperationRepository,
     bookings as unknown as BookingRepository,
     financials as unknown as BookingFinancialTransactionService,
     {

@@ -112,6 +112,12 @@ const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
 );
 
 bookingCreationClaimSchema.index({ idempotencyKey: 1 }, { unique: true });
+bookingCreationClaimSchema.index({
+  actorUserId: 1,
+  "financialContract.productKind": 1,
+  createdAt: -1,
+  _id: -1,
+});
 const checkoutTransitions = new WeakSet<object>();
 const batchTransitions = new WeakSet<object>();
 const freshBatchMaterializations = new WeakMap<
@@ -601,6 +607,7 @@ export async function readOwnedPackageBatchMaterialization(scope: PackageBatchSc
  */
 export const commitPackageCheckoutClaimGrant = async (
   grant: PackageCheckoutClaimGrant,
+  session?: ClientSession,
 ): Promise<boolean> => {
   const authorized = readPackageCheckoutClaimGrant(grant);
   const { retention, presentation } = authorized;
@@ -634,7 +641,12 @@ export const commitPackageCheckoutClaimGrant = async (
           ? { packageCheckoutPresentation: presentation }
           : { packageCheckoutAcceptance: authorized.accepted },
     },
-    { runValidators: true },
+    // Majority/journal acknowledgement strengthens durability. It does NOT prove the
+    // acknowledgement or actual commit happened before the original consent deadline.
+    {
+      runValidators: true,
+      ...(session ? { session } : { writeConcern: { w: "majority", j: true, wtimeout: 5000 } }),
+    },
   );
   checkoutTransitions.add(query);
   return (await query).matchedCount === 1;
@@ -728,9 +740,15 @@ export async function appendBatchCompletion(
   freshBatchMaterializations.get(session)?.claims.delete(String(row._id));
 }
 
-/** Exact-array CAS preserves independent sibling tasks. Calendar processing reconciles a
- * deterministic existing provider event only; elapsed task time never reopens a purchase. */
-export async function claimBatchDeliveryTask(scope: PackageBatchScope, key: string, now: Date) {
+/** Exact-array CAS preserves independent sibling tasks. The legacy read-only reconciler may
+ * inspect blocked tasks. P2C delivery passes reconcileBlocked=false; it cannot release them.
+ * Elapsed task time never reopens a purchase. The activation gate denies either mode. */
+export async function claimBatchDeliveryTask(
+  scope: PackageBatchScope,
+  key: string,
+  now: Date,
+  reconcileBlocked = true,
+) {
   await verifyPackageBatchActivation();
   const row = await loadOwnedPackageBatch(scope);
   if (!row.packageBatchCompletion || !row.packageBatchDelivery) throw batchConflict();
@@ -738,6 +756,7 @@ export async function claimBatchDeliveryTask(scope: PackageBatchScope, key: stri
   const task = old.find((t) => t.key === key && t.port === "CALENDAR");
   if (
     !task ||
+    (!reconcileBlocked && task.state === "BLOCKED_UNVERIFIED") ||
     !["PENDING", "RETRY", "BLOCKED_UNVERIFIED", "PROCESSING"].includes(task.state) ||
     task.nextDue > now
   )
@@ -781,6 +800,31 @@ export async function settleBatchDeliveryTask(
   );
   batchTransitions.add(query);
   return (await query).modifiedCount === 1;
+}
+
+/** Called only by the explicit owner-decision Calendar release transaction. No scan, default,
+ * historical migration or environment flag invokes this transition. */
+export async function releaseBatchCalendarTask(
+  claimId: Types.ObjectId,
+  key: string,
+  now: Date,
+  session: ClientSession,
+) {
+  await verifyPackageBatchActivation();
+  if (!session.inTransaction()) throw batchConflict();
+  const row = await BookingCreationClaimModel.findById(claimId).session(session).orFail();
+  const old = row.packageBatchDelivery;
+  const task = old?.find((entry) => entry.key === key && entry.port === "CALENDAR");
+  if (!old || !task || !["BLOCKED_UNVERIFIED", "PENDING", "RETRY"].includes(task.state))
+    throw batchConflict();
+  const next = batchDeliveryTaskSchema.parse({ ...task, state: "PENDING", nextDue: now });
+  const query = BookingCreationClaimModel.updateOne(
+    { _id: row._id, packageBatchDelivery: old },
+    { $set: { packageBatchDelivery: old.map((entry) => (entry.key === key ? next : entry)) } },
+    { session },
+  );
+  batchTransitions.add(query);
+  if ((await query).matchedCount !== 1) throw batchConflict();
 }
 
 /** Terminal failure only from exact full, durably confirmed compensation. Never from missing

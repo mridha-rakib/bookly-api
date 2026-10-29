@@ -285,6 +285,34 @@ describe("resolveAssignedStaffRecipients", () => {
 });
 
 describe("StaffBookingNotifier", () => {
+  it("binds cancellation to the caller transaction and propagates enqueue failure", async () => {
+    const outbox = outboxStub();
+    const notifier = new StaffBookingNotifier(
+      outbox,
+      staffPort(() => "u1"),
+      userPort({ u1: "sam@example.com" }),
+    );
+    const session = { inTransaction: () => true } as never;
+    await notifier.enqueueBookingCancelledToStaffInTransaction(
+      buildBooking(),
+      "Soho",
+      "CUSTOMER",
+      session,
+    );
+    expect(outbox.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ templateKey: "STAFF_BOOKING_CANCELLED" }),
+      session,
+    );
+    outbox.enqueue.mockRejectedValueOnce(new Error("outbox unavailable"));
+    await expect(
+      notifier.enqueueBookingCancelledToStaffInTransaction(
+        buildBooking(),
+        "Soho",
+        "CUSTOMER",
+        session,
+      ),
+    ).rejects.toThrow("outbox unavailable");
+  });
   it("cancellation enqueues one STAFF_BOOKING_CANCELLED row per assigned staff, terminal eventKey", async () => {
     const booking = buildBooking();
     const membershipId = String(booking.serviceLines[0]?.responsibleStaffMembershipId);

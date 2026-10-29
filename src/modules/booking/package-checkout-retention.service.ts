@@ -9,12 +9,14 @@ import {
   normalizePackageCheckoutIntent,
   packageCheckoutRetentionSchema,
 } from "./package-checkout-retention.js";
+import type { PackageConsentProtocol } from "./package-consent-protocol.js";
 
 type Context = Parameters<PackageCheckoutQuotePreparer["prepare"]>[0];
 
 /** INTERNAL / UNWIRED. The caller supplies authenticated context, never a posted actor.
  * Lifetime is an explicit server composition decision; no production lifetime is invented.
- * No acceptance, relationship, provider or Booking write is reachable here.
+ * Optional P3B protocol pins the pre-issuance BusinessClient and trusted original anchor.
+ * No acceptance, payment or Booking write is reachable here.
  */
 export class PackageCheckoutRetentionService {
   public constructor(
@@ -26,6 +28,7 @@ export class PackageCheckoutRetentionService {
     private readonly preparer: Pick<PackageCheckoutQuotePreparer, "prepare">,
     private readonly quoteLifetimeMs: number,
     private readonly clock: () => Date = () => new Date(),
+    private readonly consent?: PackageConsentProtocol,
   ) {
     if (!Number.isSafeInteger(quoteLifetimeMs) || quoteLifetimeMs <= 0)
       throw new Error("Explicit server quote lifetime required");
@@ -45,7 +48,10 @@ export class PackageCheckoutRetentionService {
       intent,
     };
     const existing = await this.claims.findRetainedPackageCheckout(scope);
-    if (existing) return this.verifyCurrent(context, existing);
+    if (existing) {
+      if (this.consent) await this.consent.assertRetentionWindow(existing.seed);
+      return this.verifyCurrent(context, existing);
+    }
     const definition = await this.packages.findById(
       context.businessId,
       intent.packageId.toHexString(),
@@ -57,7 +63,7 @@ export class PackageCheckoutRetentionService {
     )
       throw new PackageCheckoutConflictError("Package offer unavailable or stale");
     const issuedAt = new Date(this.clock().getTime());
-    const seed = packageCheckoutSeedSchema.parse({
+    let seed = packageCheckoutSeedSchema.parse({
       version: 1,
       quoteId: new Types.ObjectId(),
       batchId: new Types.ObjectId(),
@@ -79,6 +85,7 @@ export class PackageCheckoutRetentionService {
         bookingId: new Types.ObjectId(),
       })),
     });
+    if (this.consent) seed = await this.consent.issue(seed, intent);
     const quote = await this.preparer.prepare(context, intent, seed);
     const retained = await this.claims.retainPackageCheckout({
       version: 1,
@@ -87,6 +94,7 @@ export class PackageCheckoutRetentionService {
       intent,
       quote,
     });
+    if (this.consent) await this.consent.assertRetentionWindow(retained.seed);
     // Also verify a concurrent winner. Never return a losing proposal as the stored quote.
     return this.verifyCurrent(context, retained);
   }

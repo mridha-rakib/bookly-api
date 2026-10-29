@@ -25,7 +25,10 @@ declare const customerBrand: unique symbol;
 export type PackageCheckoutCustomer = { readonly [customerBrand]: true };
 declare const grantBrand: unique symbol;
 export type PackageCheckoutClaimGrant = { readonly [grantBrand]: true };
-const customers = new WeakMap<object, { userId: Types.ObjectId; sessionFamilyId: string }>();
+const customers = new WeakMap<
+  object,
+  { userId: Types.ObjectId; sessionFamilyId: string; jwtExpiresAtMs?: number }
+>();
 const grants = new WeakMap<
   object,
   { retention: PackageCheckoutRetention } & (
@@ -84,7 +87,11 @@ export class PackageCheckoutCustomerAuthority {
     )
       throw new PackageCheckoutConflictError("Active Customer session required");
     const proof = Object.freeze({}) as PackageCheckoutCustomer;
-    customers.set(proof, { userId: new Types.ObjectId(claims.sub), sessionFamilyId: claims.sid });
+    customers.set(proof, {
+      userId: new Types.ObjectId(claims.sub),
+      sessionFamilyId: claims.sid,
+      ...(claims.exp !== undefined ? { jwtExpiresAtMs: claims.exp * 1000 } : {}),
+    });
     return proof;
   }
 

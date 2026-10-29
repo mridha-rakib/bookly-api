@@ -1,3 +1,4 @@
+import type { ClientSession } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import {
@@ -18,11 +19,21 @@ type OutboxEnqueue = Pick<EmailOutboxService, "enqueue">;
 
 /**
  * Optional observer port on `BookingLifecycleService` — the assigned-staff half of the booking
- * cancellation / reschedule notifications. Kept separate from the existing customer/owner
- * `BookingCancelledNotifier` so that well-tested path is untouched. Never throws: a notification
- * problem can never undo a cancelled or rescheduled booking.
+ * cancellation / reschedule notifications. Transactional methods propagate enqueue errors so
+ * an uncommitted domain transition rolls back with its intent. Legacy observers log failures.
  */
 export type StaffBookingNotificationPort = {
+  enqueueBookingCancelledToStaffInTransaction?(
+    booking: BookingDocument,
+    businessName: string,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session: ClientSession,
+  ): Promise<void>;
+  enqueueBookingRescheduledToStaffInTransaction?(
+    booking: BookingDocument,
+    businessName: string,
+    session: ClientSession,
+  ): Promise<void>;
   notifyBookingCancelledToStaff(
     booking: BookingDocument,
     businessName: string,
@@ -41,42 +52,75 @@ export class StaffBookingNotifier implements StaffBookingNotificationPort {
     private readonly users: StaffRecipientUserPort,
   ) {}
 
+  public async enqueueBookingCancelledToStaffInTransaction(
+    booking: BookingDocument,
+    businessName: string,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Staff cancellation notification requires an active transaction");
+    await this.enqueueCancelled(booking, businessName, cancelledBy, session);
+  }
+
+  public async enqueueBookingRescheduledToStaffInTransaction(
+    booking: BookingDocument,
+    businessName: string,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!session.inTransaction())
+      throw new Error("Staff reschedule notification requires an active transaction");
+    await this.enqueueRescheduled(booking, businessName, session);
+  }
+
   public async notifyBookingCancelledToStaff(
     booking: BookingDocument,
     businessName: string,
     cancelledBy: "CUSTOMER" | "BUSINESS",
   ): Promise<void> {
     try {
-      const recipients = await this.resolveRecipients(booking);
-      if (recipients.length === 0) {
-        return;
-      }
+      await this.enqueueCancelled(booking, businessName, cancelledBy);
+    } catch (error) {
+      logger.error(
+        { err: error, bookingId: String(booking._id) },
+        "Failed to enqueue staff booking-cancelled notifications",
+      );
+    }
+  }
 
-      const tz = booking.schedule.timezone;
-      const eventKey = `BOOKING_CANCELLED:${String(booking._id)}`;
+  private async enqueueCancelled(
+    booking: BookingDocument,
+    businessName: string,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session?: ClientSession,
+  ): Promise<void> {
+    const recipients = await this.resolveRecipients(booking);
+    if (recipients.length === 0) {
+      return;
+    }
 
-      for (const recipient of recipients) {
-        const payload: StaffBookingCancelledPayload = {
-          staffFirstName: recipient.firstName,
-          bookingReference: booking.reference,
-          businessName,
-          customerName: customerDisplayName(booking),
-          appointmentDate: formatDateInTimezone(booking.schedule.startAt, tz),
-          appointmentTime: formatTimeInTimezone(booking.schedule.startAt, tz),
-          services: recipient.services,
-          cancelledBy,
-        };
-        await this.emailOutbox.enqueue({
+    const tz = booking.schedule.timezone;
+    const eventKey = `BOOKING_CANCELLED:${String(booking._id)}`;
+
+    for (const recipient of recipients) {
+      const payload: StaffBookingCancelledPayload = {
+        staffFirstName: recipient.firstName,
+        bookingReference: booking.reference,
+        businessName,
+        customerName: customerDisplayName(booking),
+        appointmentDate: formatDateInTimezone(booking.schedule.startAt, tz),
+        appointmentTime: formatTimeInTimezone(booking.schedule.startAt, tz),
+        services: recipient.services,
+        cancelledBy,
+      };
+      await this.emailOutbox.enqueue(
+        {
           eventKey,
           templateKey: "STAFF_BOOKING_CANCELLED",
           recipient: recipient.email,
           payload: payload as unknown as Record<string, unknown>,
-        });
-      }
-    } catch (error) {
-      logger.error(
-        { err: error, bookingId: String(booking._id) },
-        "Failed to enqueue staff booking-cancelled notifications (the cancellation is unaffected)",
+        },
+        session,
       );
     }
   }
@@ -86,52 +130,63 @@ export class StaffBookingNotifier implements StaffBookingNotificationPort {
     businessName: string,
   ): Promise<void> {
     try {
-      // Authoritative previous/new appointment comes from the reschedule entry the reschedule
-      // transaction just appended. Its 1-based index in the persisted history is a stable,
-      // monotonic, never-reused identifier for THIS reschedule — no new domain field.
-      const historyLength = booking.rescheduleHistory.length;
-      const entry = booking.rescheduleHistory[historyLength - 1];
-      if (!entry) {
-        return;
-      }
-      const previousStart = new Date(entry.previousStart);
-      const newStart = new Date(entry.newStart);
-      if (previousStart.getTime() === newStart.getTime()) {
-        // Not a material date/time move — nothing to tell staff about.
-        return;
-      }
+      await this.enqueueRescheduled(booking, businessName);
+    } catch (error) {
+      logger.error(
+        { err: error, bookingId: String(booking._id) },
+        "Failed to enqueue staff booking-reschedule notifications",
+      );
+    }
+  }
 
-      const recipients = await this.resolveRecipients(booking);
-      if (recipients.length === 0) {
-        return;
-      }
+  private async enqueueRescheduled(
+    booking: BookingDocument,
+    businessName: string,
+    session?: ClientSession,
+  ): Promise<void> {
+    // Authoritative previous/new appointment comes from the reschedule entry the reschedule
+    // transaction just appended. Its 1-based index in the persisted history is a stable,
+    // monotonic, never-reused identifier for THIS reschedule — no new domain field.
+    const historyLength = booking.rescheduleHistory.length;
+    const entry = booking.rescheduleHistory[historyLength - 1];
+    if (!entry) {
+      return;
+    }
+    const previousStart = new Date(entry.previousStart);
+    const newStart = new Date(entry.newStart);
+    if (previousStart.getTime() === newStart.getTime()) {
+      // Not a material date/time move — nothing to tell staff about.
+      return;
+    }
 
-      const tz = booking.schedule.timezone;
-      const eventKey = `BOOKING_SCHEDULE_CHANGED:${String(booking._id)}:${historyLength}`;
+    const recipients = await this.resolveRecipients(booking);
+    if (recipients.length === 0) {
+      return;
+    }
 
-      for (const recipient of recipients) {
-        const payload: StaffBookingScheduleChangedPayload = {
-          staffFirstName: recipient.firstName,
-          bookingReference: booking.reference,
-          businessName,
-          customerName: customerDisplayName(booking),
-          previousDate: formatDateInTimezone(previousStart, tz),
-          previousTime: formatTimeInTimezone(previousStart, tz),
-          newDate: formatDateInTimezone(newStart, tz),
-          newTime: formatTimeInTimezone(newStart, tz),
-          services: recipient.services,
-        };
-        await this.emailOutbox.enqueue({
+    const tz = booking.schedule.timezone;
+    const eventKey = `BOOKING_SCHEDULE_CHANGED:${String(booking._id)}:${historyLength}`;
+
+    for (const recipient of recipients) {
+      const payload: StaffBookingScheduleChangedPayload = {
+        staffFirstName: recipient.firstName,
+        bookingReference: booking.reference,
+        businessName,
+        customerName: customerDisplayName(booking),
+        previousDate: formatDateInTimezone(previousStart, tz),
+        previousTime: formatTimeInTimezone(previousStart, tz),
+        newDate: formatDateInTimezone(newStart, tz),
+        newTime: formatTimeInTimezone(newStart, tz),
+        services: recipient.services,
+      };
+      await this.emailOutbox.enqueue(
+        {
           eventKey,
           templateKey: "STAFF_BOOKING_SCHEDULE_CHANGED",
           recipient: recipient.email,
           payload: payload as unknown as Record<string, unknown>,
-        });
-      }
-    } catch (error) {
-      logger.error(
-        { err: error, bookingId: String(booking._id) },
-        "Failed to enqueue staff booking-reschedule notifications (the reschedule is unaffected)",
+        },
+        session,
       );
     }
   }

@@ -1,23 +1,46 @@
 import { appendFileSync } from "node:fs";
+import express from "express";
 import mongoose, { Types } from "mongoose";
 import type Stripe from "stripe";
+import httpRequest from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
+import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
+import { validateRequest } from "../../../src/common/middleware/validate-request.js";
 import { AddonModel } from "../../../src/modules/addons/addon.model.js";
 import { AddonServiceAssignmentModel } from "../../../src/modules/addons/addon-service-assignment.model.js";
 import { AppointmentReminderModel } from "../../../src/modules/appointment-reminder/appointment-reminder.model.js";
 import { AppointmentReminderRepository } from "../../../src/modules/appointment-reminder/appointment-reminder.repository.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+} from "../../../src/modules/auth/auth.middleware.js";
+import { BookingController } from "../../../src/modules/booking/booking.controller.js";
+import { toBookingCalendarEntryDto } from "../../../src/modules/booking/booking.dto.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import {
+  bookingIdParamsSchema,
+  completeBookingBodySchema,
+} from "../../../src/modules/booking/booking.schema.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
-import { readOwnedPackageBatchCompletion } from "../../../src/modules/booking/package-batch-completion.js";
+import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
+import {
+  readOwnedPackageBatchCompletion,
+  verifyBatchCompletion,
+} from "../../../src/modules/booking/package-batch-completion.js";
 import { PackageBatchFinancialPersistence } from "../../../src/modules/booking/package-batch-financial-persistence.js";
 import { PackageLifecycleService } from "../../../src/modules/booking/package-lifecycle.service.js";
 import { PackageLifecycleDeliveryRecovery } from "../../../src/modules/booking/package-lifecycle-delivery-recovery.js";
+import { PackageLifecycleHttpController } from "../../../src/modules/booking/package-lifecycle-http.controller.js";
+import type { PackageLifecycleHttpServices } from "../../../src/modules/booking/package-lifecycle-http.factory.js";
 import type { LifecycleIntent } from "../../../src/modules/booking/package-lifecycle-operation.js";
 import {
+  lifecycleOperationId,
   PackageLifecycleOperationModel,
   PackageLifecycleOperations,
 } from "../../../src/modules/booking/package-lifecycle-operation.js";
+import * as purchaseAuthority from "../../../src/modules/booking/package-purchase-authority.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -32,6 +55,7 @@ import { FinancialRelationshipService } from "../../../src/modules/client/financ
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
 import * as eligibility from "../../../src/modules/package-progress/package-eligibility.js";
+import { withPackageEligibility } from "../../../src/modules/package-progress/package-eligibility.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { PackageProgressV2Repository } from "../../../src/modules/package-progress/package-progress-v2.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
@@ -47,6 +71,7 @@ import { RefundOperationModel } from "../../../src/modules/payment/refund-operat
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
+import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
@@ -62,6 +87,12 @@ import {
 
 vi.mock("../../../src/modules/booking/package-batch-authority.js", () => ({
   verifyPackageBatchActivation: vi.fn(async () => undefined),
+}));
+// Existing S5 fixtures are deliberately synthetic and retain v1 proof. This explicit
+// engineering seam does not qualify consent; genuine P3B protocol tests use the real verifier.
+vi.mock("../../../src/modules/booking/package-purchase-authority.js", async (original) => ({
+  ...(await original<object>()),
+  verifyPackagePurchaseConsentCertification: vi.fn(async () => undefined),
 }));
 async function fixture(options: Parameters<typeof packageBatchFixture>[0] = {}) {
   const t = await packageBatchFixture({ bundlePriceCents: 0, ...options });
@@ -2522,5 +2553,1000 @@ describe("S5 internal first-class lifecycle", () => {
     ).toEqual(t.first.schedule.startAt);
     expect(t.gateway.refundInputs).toHaveLength(1);
     expect(await readOwnedPackageBatchCompletion(t.scope)).toBeTruthy();
+  });
+});
+
+// P2D reuses the S5 fixtures, real domain, session-bound Customer authority, C1, payment
+// fake and replica-set helper. The file's existing authority mock is the only gate opening.
+describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
+  beforeAll(connectIsolatedDatabase, 120000);
+  beforeEach(clearIsolatedDatabase);
+  afterEach(() => vi.restoreAllMocks());
+  afterAll(stopIsolatedReplicaSet);
+  async function surface(t: Awaited<ReturnType<typeof fixture>>) {
+    // Engineering transport fixtures deliberately substitute ONLY the public ownership
+    // boundary, retaining full internal F2 verification. This does not certify production
+    // consent. The P2A/P3B suites separately exercise the real rejecting boundary.
+    vi.spyOn(purchaseAuthority, "verifyPackagePurchaseClaimCompletion").mockImplementation(
+      async (claim, session) => {
+        return verifyBatchCompletion(claim, session);
+      },
+    );
+    const services = {
+      authority: t.authority,
+      tokens: t.tokens,
+      users: new UserRepository(),
+      staff: new StaffRepository(),
+      management: t.booking,
+      lifecycle: t.moneyLifecycle,
+      operations: new PackageLifecycleOperations(),
+      availability: t.availability,
+    } as unknown as PackageLifecycleHttpServices;
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createAuthenticateAccessTokenMiddleware(t.tokens, new UserRepository()),
+      requireActiveUser(),
+    );
+    app.post(
+      "/package-views/actions/:action",
+      asyncHandler(new PackageLifecycleHttpController(services, t.clock).execute),
+    );
+    app.use(createErrorHandler({ isProduction: true }));
+    const post = (action: string, body: object, authorization = t.authorization) =>
+      httpRequest(app)
+        .post(`/package-views/actions/${action}`)
+        .set("Authorization", authorization)
+        .send(body);
+    const body = (input: ReturnType<typeof t.intent>) => {
+      const { action: _action, businessClientId: _client, ...wire } = input;
+      return wire;
+    };
+    const owner = `Bearer ${await issueTestAccessToken(t.tokens, { userId: t.f.business.ownerUserId, role: "BUSINESS_OWNER" })}`;
+    return { post, body, owner };
+  }
+  it("redeems, replays, reschedules and cancels through the real service with one credit effect", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = h.body(t.redeem());
+    const first = await h.post("redeem", redeem).expect(200);
+    const replay = await h.post("redeem", redeem).expect(200);
+    expect(replay.body.data.bookingId).toBe(first.body.data.bookingId);
+    const bookingId = new Types.ObjectId(first.body.data.bookingId);
+    await h
+      .post(
+        "reschedule",
+        h.body(
+          t.intent("RESCHEDULE", {
+            bookingId,
+            startAt: new Date(t.first.schedule.startAt.getTime() + 3 * 86400000),
+          }),
+        ),
+      )
+      .expect(200);
+    const cancel = h.body(t.intent("CANCEL", { bookingId }));
+    await h.post("cancel", cancel).expect(200);
+    await h.post("cancel", cancel).expect(200);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.items[0]?.remainingSessions,
+    ).toBe(t.progress.items[0]?.remainingSessions);
+    expect(await BookingModel.countDocuments()).toBe(t.full.bookings.length + 1);
+  });
+  it("ordinary HTTP completion rejects a First-Class member with authority open and no effects", async () => {
+    // This suite explicitly mocks activation open above. Shipped 503 coverage stays separate.
+    const t = await fixture({ bundlePriceCents: 1000 }),
+      h = await surface(t);
+    // Exercise the real narrow Calendar projection, not only the DTO on a full Booking.
+    const summaries = await new BookingRepository().findManyForCalendar(
+      t.scope.businessId,
+      new Date(t.first.schedule.startAt.getTime() - 1),
+      new Date(t.first.schedule.startAt.getTime() + 1),
+    );
+    expect(
+      summaries.map(toBookingCalendarEntryDto).find((row) => row.id === String(t.first._id))
+        ?.firstClassPackage,
+    ).toBe(true);
+    const effects = async () => ({
+      bookings: await BookingModel.find().sort({ _id: 1 }).lean(),
+      progress: await PackageProgressV2Model.findById(t.progress._id).lean(),
+      operations: await PackageLifecycleOperationModel.find().sort({ _id: 1 }).lean(),
+      ledger: await BookingFinancialTransactionModel.find().sort({ _id: 1 }).lean(),
+      emails: await EmailOutboxModel.find().sort({ _id: 1 }).lean(),
+      reminders: await AppointmentReminderModel.find().sort({ _id: 1 }).lean(),
+      reservations: await BookingSlotReservationModel.find().sort({ _id: 1 }).lean(),
+      payments: await PaymentAttemptModel.find().sort({ _id: 1 }).lean(),
+      refunds: await RefundOperationModel.find().sort({ _id: 1 }).lean(),
+    });
+    const before = await effects();
+    const cas = vi.fn(() => {
+      throw Error("ordinary status writer reached");
+    });
+    const ordinary: BookingLifecycleService = Object.assign(
+      Object.create(BookingLifecycleService.prototype),
+      {
+        bookingService: t.booking,
+        bookingRepository: {
+          findById: new BookingRepository().findById.bind(new BookingRepository()),
+          casUpdate: cas,
+        },
+      },
+    );
+    const controller = new BookingController(t.booking, {} as never, ordinary);
+    const app = express();
+    app.use(
+      express.json(),
+      createAuthenticateAccessTokenMiddleware(t.tokens, new UserRepository()),
+      requireActiveUser(),
+    );
+    app.post(
+      "/businesses/:businessId/bookings/:bookingId/complete",
+      validateRequest({ params: bookingIdParamsSchema, body: completeBookingBodySchema }),
+      asyncHandler(controller.completeBooking),
+    );
+    app.use(createErrorHandler({ isProduction: true }));
+    const transaction = vi.spyOn(mongoose, "startSession");
+    for (let i = 0; i < 2; i++) {
+      const response = await httpRequest(app)
+        .post(`/businesses/${t.scope.businessId}/bookings/${t.first._id}/complete`)
+        .set("Authorization", h.owner)
+        .send({ venuePayment: { settlement: "FULL" } })
+        .expect(409);
+      expect(JSON.stringify(response.body)).toContain("BOOKING_PACKAGE_LIFECYCLE_REQUIRED");
+      expect(response.body.success).toBe(false);
+    }
+    await expect(
+      ordinary.completeBooking(
+        String(t.f.business.ownerUserId),
+        "BUSINESS_OWNER",
+        String(t.scope.businessId),
+        String(t.first._id),
+        { settlement: "FULL" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(transaction).not.toHaveBeenCalled();
+    expect(cas).not.toHaveBeenCalled();
+    expect(await effects()).toEqual(before);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.sessions.find((attempt) =>
+        attempt.bookingId.equals(t.first._id),
+      )?.status,
+    ).toBe("SCHEDULED");
+  });
+
+  it("Owner completion and venue settlement preserve the original purchase authority", async () => {
+    const t = await fixture(),
+      h = await surface(t);
+    await h
+      .post(
+        "settlement",
+        h.body(
+          t.intent("VENUE_SETTLEMENT", {
+            bookingId: t.first._id,
+            venuePayment: { settlement: "NOT_PAID" },
+          }),
+        ),
+        h.owner,
+      )
+      .expect(200);
+    const body = h.body(t.intent("COMPLETE", { bookingId: t.first._id }));
+    await h.post("complete", body, h.owner).expect(200);
+    await h.post("complete", body, h.owner).expect(200);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.items[0]?.completedSessions,
+    ).toBe(1);
+    expect(await readOwnedPackageBatchCompletion(t.scope)).toBeTruthy();
+  });
+  it.each(["no-show", "reverse-no-show"])(
+    "Owner %s uses real no-show state and deadline authority",
+    async (action) => {
+      const t = await fixture({ categoryWindow: true }),
+        h = await surface(t),
+        window = must(t.first.noShowEligibilitySnapshot);
+      t.advance(new Date(t.first.schedule.startAt.getTime() + window.opensAfterMinutes * 60000));
+      await h
+        .post("mark-no-show", h.body(t.intent("MARK_NO_SHOW", { bookingId: t.first._id })), h.owner)
+        .expect(200);
+      if (action === "no-show") {
+        const booking = await BookingModel.findById(t.first._id).orFail();
+        t.advance(must(booking.noShowDeadlineAt));
+      }
+      const input = h.body(
+        t.intent(action === "no-show" ? "NO_SHOW" : "REVERSE_NO_SHOW", { bookingId: t.first._id }),
+      );
+      await h.post(action, input, h.owner).expect(200);
+      await h.post(action, input, h.owner).expect(200);
+      expect((await BookingModel.findById(t.first._id))?.status).toBe(
+        action === "no-show" ? "NO_SHOW_WAIVED" : "NO_SHOW_CANCELLED",
+      );
+    },
+  );
+  it("expiry processing is exact-package, authenticated and idempotent; expired redemption fails", async () => {
+    const t = await fixture({ mode: "FINITE" }),
+      h = await surface(t);
+    if (t.progress.purchasedContract?.validity.mode !== "FINITE") throw Error("finite");
+    t.advance(t.progress.purchasedContract.validity.expiresAt);
+    await h.post("redeem", h.body(t.redeem())).expect(409);
+    const input = h.body(t.intent("EXPIRE"));
+    await h.post("expire", input).expect(200);
+    await h.post("expire", input).expect(200);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.items.every(
+        (i) => i.remainingSessions === 0,
+      ),
+    ).toBe(true);
+  });
+  it("invalid service entitlement, foreign tenant and foreign session cannot consume credit", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      before = await BookingModel.countDocuments();
+    await h
+      .post("redeem", h.body({ ...t.redeem(), packageItemId: new Types.ObjectId() }))
+      .expect(409);
+    await h
+      .post("redeem", { ...h.body(t.redeem()), businessId: String(new Types.ObjectId()) })
+      .expect(404);
+    await h
+      .post("cancel", h.body(t.intent("CANCEL", { bookingId: new Types.ObjectId() })))
+      .expect(404);
+    expect(await BookingModel.countDocuments()).toBe(before);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.items[0]?.remainingSessions,
+    ).toBe(t.progress.items[0]?.remainingSessions);
+  });
+  it("failure after the real reservation rolls back Booking and credit through HTTP", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      reserve = t.reservations.reserveOrJoin.bind(t.reservations);
+    vi.spyOn(t.reservations, "reserveOrJoin").mockImplementationOnce(async (...args) => {
+      await reserve(...args);
+      throw Error("synthetic post-reservation failure");
+    });
+    await h.post("redeem", h.body(t.redeem())).expect(500);
+    expect(await BookingModel.countDocuments()).toBe(t.full.bookings.length);
+    expect(
+      (await PackageProgressV2Model.findById(t.progress._id))?.items[0]?.remainingSessions,
+    ).toBe(t.progress.items[0]?.remainingSessions);
+  });
+  it("concurrent last-credit HTTP redemptions admit at most one Booking", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      remaining = must(t.progress.items[0]).remainingSessions;
+    for (let i = 1; i < remaining; i++)
+      await t.customer({
+        ...t.redeem(),
+        startAt: new Date(t.first.schedule.startAt.getTime() + i * 86400000),
+      });
+    const before = await BookingModel.countDocuments();
+    const results = await Promise.all(
+      [8, 9].map((day) =>
+        h.post(
+          "redeem",
+          h.body({
+            ...t.redeem(),
+            startAt: new Date(t.first.schedule.startAt.getTime() + day * 86400000),
+          }),
+        ),
+      ),
+    );
+    expect(results.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(await BookingModel.countDocuments()).toBe(before + 1);
+  });
+  it("positive Add-on quote, exact acceptance and venue dues use existing financial authority", async () => {
+    const t = await fixture({ addon: true }),
+      h = await surface(t);
+    await t.business(
+      t.intent("VENUE_SETTLEMENT", {
+        bookingId: t.first._id,
+        venuePayment: { settlement: "FULL" },
+      }),
+    );
+    const addon = await AddonModel.findOne({ businessId: t.scope.businessId }).orFail();
+    const input = h.body({
+      ...t.redeem(),
+      dues: { addonIds: [addon._id], paymentMethod: "VENUE" },
+    });
+    const q = (await h.post("session-quote", input).expect(200)).body.data;
+    expect(q.totalCents).toBeGreaterThan(0);
+    expect(q).not.toHaveProperty("sessionFamilyId");
+    await h.post("redeem", input).expect(409);
+    const acceptance = {
+      quoteId: q.quoteId,
+      termsHash: q.termsHash,
+      disclosureHash: q.disclosureHash,
+      challenge: q.challenge,
+      action: "ACCEPT_SESSION_DUES",
+    };
+    await h
+      .post("session-acceptance", {
+        ...input,
+        acceptance: { ...acceptance, challenge: "wrong-challenge-at-least-32-characters" },
+      })
+      .expect(409);
+    await h.post("session-acceptance", { ...input, acceptance }).expect(200);
+    const result = await h.post("redeem", input).expect(200);
+    expect(
+      (await BookingModel.findById(result.body.data.bookingId))?.financials.addonsSubtotalCents,
+    ).toBe(q.addonsCents);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+  });
+  it("actual pending online dues resume the accepted PaymentAttempt through HTTP", async () => {
+    const t = await fixture({ first: true, addon: true, bundlePriceCents: 0 }),
+      h = await surface(t);
+    await t.business(
+      t.intent("VENUE_SETTLEMENT", {
+        bookingId: t.first._id,
+        venuePayment: { settlement: "FULL" },
+      }),
+    );
+    const input = h.body({
+      ...t.redeem(),
+      dues: {
+        addonIds: [must(t.first.serviceLines[0]?.addons[0]).addonId],
+        paymentMethod: "ONLINE",
+      },
+    });
+    const q = (await h.post("session-quote", input).expect(200)).body.data;
+    await h
+      .post("session-acceptance", {
+        ...input,
+        acceptance: {
+          quoteId: q.quoteId,
+          termsHash: q.termsHash,
+          disclosureHash: q.disclosureHash,
+          challenge: q.challenge,
+          action: "ACCEPT_SESSION_DUES",
+        },
+      })
+      .expect(200);
+    t.gateway.queueNextChargeOutcome("requires_action");
+    const pending = await h.post("redeem", input).expect(202);
+    expect(pending.body.data.state).toBe("PAYMENT_PENDING");
+    expect(pending.body.data.clientSecret).toBeTruthy();
+    expect(await BookingModel.countDocuments()).toBe(t.full.bookings.length);
+    const attempt = await PaymentAttemptModel.findById(pending.body.data.paymentAttemptId).orFail();
+    t.gateway.succeedPaymentIntent(must(attempt.providerPaymentIntentId));
+    await h.post("redeem", input).expect(200);
+    await h.post("redeem", input).expect(200);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+    expect(await BookingModel.countDocuments()).toBe(t.full.bookings.length + 1);
+  });
+  it("selection reuses C1 and returns staff/slots only for an owned included service", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = t.redeem();
+    const day = must(redeem.startAt).toISOString().slice(0, 10);
+    const res = await h
+      .post("selection", {
+        businessId: String(t.scope.businessId),
+        packageProgressId: String(t.progress._id),
+        packageItemId: String(redeem.packageItemId),
+        fromDate: day,
+        toDate: day,
+      })
+      .expect(200);
+    expect(res.body.data.timezone).toBe(t.first.schedule.timezone);
+    expect(res.body.data.providers.length).toBeGreaterThan(0);
+    expect(res.body.data.days.flatMap((d: { slots: unknown[] }) => d.slots).length).toBeGreaterThan(
+      0,
+    );
+    expect(await BookingModel.countDocuments()).toBe(t.full.bookings.length);
+  });
+  // P4K-3: read-only recovery of an exact Customer redemption (reload / lost response).
+  const effects = async (progressId: Types.ObjectId) => ({
+    bookings: await BookingModel.countDocuments(),
+    operations: await PackageLifecycleOperationModel.countDocuments(),
+    attempts: await PaymentAttemptModel.countDocuments(),
+    reservations: await BookingSlotReservationModel.countDocuments(),
+    remaining: (await PackageProgressV2Model.findById(progressId).orFail()).items.map(
+      (i) => i.remainingSessions,
+    ),
+  });
+  it("P4K-3 session-status recovers the committed redemption read-only and identically", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = h.body(t.redeem());
+    const committed = (await h.post("redeem", redeem).expect(200)).body.data;
+    const after = await effects(t.progress._id);
+    for (let i = 0; i < 2; i++) {
+      const status = (await h.post("session-status", redeem).expect(200)).body.data;
+      expect(status).toMatchObject({
+        state: "COMMITTED",
+        bookingId: committed.bookingId,
+        status: committed.status,
+      });
+      expect(status).not.toHaveProperty("tasks");
+      expect(status).not.toHaveProperty("money");
+    }
+    expect(await effects(t.progress._id)).toEqual(after);
+    expect(after.remaining[0]).toBe(must(t.progress.items[0]).remainingSessions - 1);
+    expect(after.bookings).toBe(t.full.bookings.length + 1);
+  });
+  it("P4K-3 lost response after commit: status returns the same Booking without replaying", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      request = t.redeem();
+    // The HTTP response is lost: the service committed but the Client never saw the result.
+    const committed = await t.moneyLifecycle.customer(t.scope.customer, request);
+    const before = await effects(t.progress._id);
+    const status = (await h.post("session-status", h.body(request)).expect(200)).body.data;
+    expect(status.bookingId).toBe(String(must(committed?.booking)._id));
+    expect(await effects(t.progress._id)).toEqual(before);
+    // An explicit identical retry converges on the same Booking and credit effect.
+    expect((await h.post("redeem", h.body(request)).expect(200)).body.data.bookingId).toBe(
+      status.bookingId,
+    );
+    expect(await effects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-3 uncertain commit stays UNRESOLVED and status never advances or cleans it up", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      request = t.redeem();
+    vi.spyOn(PackageLifecycleOperations.prototype, "complete").mockRejectedValueOnce(
+      Object.assign(Error("unknown"), { errorLabels: ["UnknownTransactionCommitResult"] }),
+    );
+    await expect(t.moneyLifecycle.customer(t.scope.customer, request)).rejects.toThrow();
+    const before = await effects(t.progress._id);
+    expect((await h.post("session-status", h.body(request)).expect(202)).body.data).toEqual({
+      state: "UNRESOLVED",
+    });
+    expect((await PackageLifecycleOperationModel.findOne().orFail()).phase).toBe("PERSISTING");
+    expect(await effects(t.progress._id)).toEqual(before);
+    expect(before.bookings).toBe(t.full.bookings.length);
+  });
+  it("P4K-3 status creates no operation and binds the exact Customer, key and fields", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = h.body(t.redeem());
+    await h.post("session-status", redeem).expect(404);
+    expect(await PackageLifecycleOperationModel.countDocuments()).toBe(0);
+    await h.post("redeem", redeem).expect(200);
+    const after = await effects(t.progress._id);
+    // Same key with a changed time is not this operation (no disclosure of the original).
+    await h
+      .post("session-status", {
+        ...redeem,
+        startAt: new Date(t.first.schedule.startAt.getTime() + 5 * 86400000),
+      })
+      .expect(404);
+    await h.post("session-status", { ...redeem, key: `s5:${new Types.ObjectId()}` }).expect(404);
+    await h.post("session-status", redeem, h.owner).expect(403);
+    const foreign = await UserModel.create({
+      normalizedEmail: "p4k3-foreign@s5.test",
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: INTERNAL_TIME },
+    });
+    const other = `Bearer ${await issueTestAccessToken(t.tokens, { userId: foreign._id, role: "CUSTOMER" })}`;
+    expect((await h.post("session-status", redeem, other)).status).toBeGreaterThanOrEqual(400);
+    expect(await effects(t.progress._id)).toEqual(after);
+  });
+  it("P4K-3 simultaneous identical submissions commit one Booking and one credit", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = h.body(t.redeem());
+    const replies = await Promise.all([h.post("redeem", redeem), h.post("redeem", redeem)]);
+    for (const reply of replies) expect([200, 202]).toContain(reply.status);
+    const status = (await h.post("session-status", redeem).expect(200)).body.data;
+    for (const reply of replies)
+      if (reply.status === 200) expect(reply.body.data.bookingId).toBe(status.bookingId);
+    const after = await effects(t.progress._id);
+    expect(after.bookings).toBe(t.full.bookings.length + 1);
+    expect(after.remaining[0]).toBe(must(t.progress.items[0]).remainingSessions - 1);
+    expect(after.operations).toBe(1);
+  });
+  it("P4K-3 different keys competing for the last credit commit exactly one", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      n = must(t.progress.items[0]).remainingSessions;
+    const at = (days: number) => new Date(t.first.schedule.startAt.getTime() + days * 86400000);
+    for (let i = 1; i < n; i++)
+      await h.post("redeem", h.body({ ...t.redeem(), startAt: at(i) })).expect(200);
+    const replies = await Promise.all(
+      [n + 1, n + 2].map((d) => h.post("redeem", h.body({ ...t.redeem(), startAt: at(d) }))),
+    );
+    expect(replies.filter((r) => r.status === 200)).toHaveLength(1);
+    const after = await effects(t.progress._id);
+    expect(after.remaining[0]).toBe(0);
+    expect(after.bookings).toBe(t.full.bookings.length + n);
+  });
+  // P4K-4: read-only recovery of exact Customer cancellation and reschedule operations.
+  const redeemed = async (
+    t: Awaited<ReturnType<typeof fixture>>,
+    h: Awaited<ReturnType<typeof surface>>,
+    days = 1,
+  ) => {
+    const r = await h
+      .post(
+        "redeem",
+        h.body({
+          ...t.redeem(),
+          startAt: new Date(t.first.schedule.startAt.getTime() + days * 86400000),
+        }),
+      )
+      .expect(200);
+    return new Types.ObjectId(r.body.data.bookingId);
+  };
+  const moved = (t: Awaited<ReturnType<typeof fixture>>, days: number) =>
+    new Date(t.first.schedule.startAt.getTime() + days * 86400000);
+  it("P4K-4 cancel-status returns the committed cancellation read-only and credit restores once", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h);
+    const cancel = h.body(t.intent("CANCEL", { bookingId }));
+    const committed = (await h.post("cancel", cancel).expect(200)).body.data;
+    const after = await effects(t.progress._id);
+    expect(after.remaining[0]).toBe(must(t.progress.items[0]).remainingSessions);
+    for (let i = 0; i < 2; i++)
+      expect((await h.post("cancel-status", cancel).expect(200)).body.data).toMatchObject({
+        state: "COMMITTED",
+        status: committed.status,
+      });
+    expect(await effects(t.progress._id)).toEqual(after);
+    expect((await BookingModel.findById(bookingId).orFail()).status).toBe(committed.status);
+  });
+  it("P4K-4 lost cancellation response: status recovers it and the explicit retry converges", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h),
+      request = t.intent("CANCEL", { bookingId });
+    const committed = await t.moneyLifecycle.customer(t.scope.customer, request);
+    const before = await effects(t.progress._id);
+    const status = (await h.post("cancel-status", h.body(request)).expect(200)).body.data;
+    expect(status.status).toBe(committed?.result.status);
+    expect(await effects(t.progress._id)).toEqual(before);
+    expect((await h.post("cancel", h.body(request)).expect(200)).body.data.status).toBe(
+      status.status,
+    );
+    expect(await effects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-4 reschedule-status returns the same canonical Booking and new time without another reservation", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h);
+    const move = h.body(t.intent("RESCHEDULE", { bookingId, startAt: moved(t, 3) }));
+    const committed = (await h.post("reschedule", move).expect(200)).body.data;
+    const after = await effects(t.progress._id);
+    const status = (await h.post("reschedule-status", move).expect(200)).body.data;
+    expect(status).toMatchObject({
+      state: "COMMITTED",
+      bookingId: String(bookingId),
+      startAt: committed.startAt,
+    });
+    expect(await effects(t.progress._id)).toEqual(after);
+    expect((await BookingModel.findById(bookingId).orFail()).schedule.startAt.toISOString()).toBe(
+      moved(t, 3).toISOString(),
+    );
+  });
+  it("P4K-4 lost reschedule response: status recovers the original move without duplicating it", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h);
+    const request = t.intent("RESCHEDULE", { bookingId, startAt: moved(t, 4) });
+    await t.moneyLifecycle.customer(t.scope.customer, request);
+    const before = await effects(t.progress._id);
+    expect(
+      (await h.post("reschedule-status", h.body(request)).expect(200)).body.data.bookingId,
+    ).toBe(String(bookingId));
+    expect(await effects(t.progress._id)).toEqual(before);
+    await h.post("reschedule", h.body(request)).expect(200);
+    expect(await effects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-4 uncertain cancellation stays UNRESOLVED and the Booking stays upcoming", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h),
+      request = t.intent("CANCEL", { bookingId });
+    vi.spyOn(PackageLifecycleOperations.prototype, "complete").mockRejectedValueOnce(
+      Object.assign(Error("unknown"), { errorLabels: ["UnknownTransactionCommitResult"] }),
+    );
+    await expect(t.moneyLifecycle.customer(t.scope.customer, request)).rejects.toThrow();
+    const before = await effects(t.progress._id);
+    expect((await h.post("cancel-status", h.body(request)).expect(202)).body.data).toEqual({
+      state: "UNRESOLVED",
+    });
+    expect(
+      (await PackageLifecycleOperationModel.findById(lifecycleOperationId(request.key)).orFail())
+        .phase,
+    ).toBe("PERSISTING");
+    expect((await BookingModel.findById(bookingId).orFail()).status).toBe("UPCOMING");
+    expect(await effects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-4 one action's key never reveals another action's result", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      redeem = h.body(t.redeem());
+    const bookingId = new Types.ObjectId(
+      (await h.post("redeem", redeem).expect(200)).body.data.bookingId,
+    );
+    const cancel = h.body(t.intent("CANCEL", { bookingId }));
+    await h.post("cancel", cancel).expect(200);
+    const after = await effects(t.progress._id);
+    // Same key with another action or other fields: indistinguishable from a missing operation.
+    await h
+      .post("cancel-status", {
+        businessId: redeem.businessId,
+        packageProgressId: redeem.packageProgressId,
+        key: redeem.key,
+        bookingId,
+      })
+      .expect(404);
+    await h.post("reschedule-status", { ...cancel, startAt: moved(t, 3) }).expect(404);
+    await h
+      .post("expire-status", {
+        businessId: cancel.businessId,
+        packageProgressId: cancel.packageProgressId,
+        key: cancel.key,
+      })
+      .expect(404);
+    await h.post("session-status", { ...redeem, key: cancel.key }).expect(404);
+    await h.post("cancel-status", { ...cancel, bookingId: t.first._id }).expect(404);
+    await h.post("cancel-status", { ...cancel, key: `s5:${new Types.ObjectId()}` }).expect(404);
+    expect(await effects(t.progress._id)).toEqual(after);
+  });
+  it("P4K-4 simultaneous identical cancellations restore one credit and release once", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h);
+    const cancel = h.body(t.intent("CANCEL", { bookingId }));
+    const replies = await Promise.all([h.post("cancel", cancel), h.post("cancel", cancel)]);
+    for (const reply of replies) expect([200, 202]).toContain(reply.status);
+    expect((await h.post("cancel-status", cancel).expect(200)).body.data.state).toBe("COMMITTED");
+    const after = await effects(t.progress._id);
+    expect(after.remaining[0]).toBe(must(t.progress.items[0]).remainingSessions);
+    expect(after.bookings).toBe(t.full.bookings.length + 1);
+  });
+  it("P4K-4 different keys moving two Bookings into one slot admit exactly one", async () => {
+    const t = await fixture(),
+      h = await surface(t);
+    const a = await redeemed(t, h, 1),
+      b = await redeemed(t, h, 2);
+    const target = moved(t, 5);
+    const replies = await Promise.all(
+      [a, b].map((bookingId) =>
+        h.post("reschedule", h.body(t.intent("RESCHEDULE", { bookingId, startAt: target }))),
+      ),
+    );
+    expect(replies.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(
+      await BookingModel.countDocuments({ _id: { $in: [a, b] }, "schedule.startAt": target }),
+    ).toBe(1);
+  });
+  it("P4K-4 Owner, foreign Customer and an unlinked relationship cannot read Customer status", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      bookingId = await redeemed(t, h);
+    const cancel = h.body(t.intent("CANCEL", { bookingId }));
+    await h.post("cancel", cancel).expect(200);
+    const after = await effects(t.progress._id);
+    // P4K-5: the Owner may use status actions, but only for the Owner's own operations.
+    await h.post("cancel-status", cancel, h.owner).expect(404);
+    const foreign = await UserModel.create({
+      normalizedEmail: "p4k4-foreign@s5.test",
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: INTERNAL_TIME },
+    });
+    const other = `Bearer ${await issueTestAccessToken(t.tokens, { userId: foreign._id, role: "CUSTOMER" })}`;
+    const denied = await h.post("cancel-status", cancel, other);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(denied.body)).not.toContain(String(bookingId));
+    await new ClientRepository().setLinkState(t.scope.businessClientId, { linkState: "UNLINKED" });
+    expect((await h.post("cancel-status", cancel)).status).toBe(409);
+    expect(await effects(t.progress._id)).toEqual(after);
+  });
+  // P4K-5: read-only recovery of exact Owner/Supervisor management operations.
+  const managementEffects = async (progressId: Types.ObjectId) => ({
+    ...(await effects(progressId)),
+    ledger: await BookingFinancialTransactionModel.countDocuments(),
+    emails: await EmailOutboxModel.countDocuments(),
+    reminders: await AppointmentReminderModel.countDocuments(),
+    refunds: await RefundOperationModel.countDocuments(),
+    completed: (await PackageProgressV2Model.findById(progressId).orFail()).items.map(
+      (i) => i.completedSessions,
+    ),
+    bookingStates: (await BookingModel.find().sort({ _id: 1 }).lean()).map((b) => [
+      String(b._id),
+      b.status,
+      b.completionPayment?.amountCents ?? 0,
+    ]),
+  });
+  const managementSupervisor = async (t: Awaited<ReturnType<typeof fixture>>) => {
+    const user = await UserModel.create({
+      normalizedEmail: `approved-c-${new Types.ObjectId()}@s5.test`,
+      passwordHash: "unused",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: INTERNAL_TIME },
+    });
+    const membership = await StaffMembershipModel.create({
+      userId: user._id,
+      businessId: t.scope.businessId,
+      role: "SUPERVISOR",
+      employmentActive: true,
+      createdByUserId: t.f.business.ownerUserId,
+    });
+    const authorization = `Bearer ${await issueTestAccessToken(t.tokens, { userId: user._id, role: "SUPERVISOR" })}`;
+    return { user, membership, authorization };
+  };
+
+  it("approved Fix C denies inactive Supervisor mutation and own/Owner status while preserving committed evidence", async () => {
+    const t = await fixture({ bundlePriceCents: 1000 }),
+      h = await surface(t),
+      s = await managementSupervisor(t);
+    // null is explicitly non-removed under the shared repository/index contract.
+    await StaffMembershipModel.updateOne({ _id: s.membership._id }, { $set: { removedAt: null } });
+    const own = t.intent("VENUE_SETTLEMENT", {
+      bookingId: t.first._id,
+      venuePayment: { settlement: "PARTIAL", amountCents: 200 },
+    });
+    await h.post("settlement", h.body(own), s.authorization).expect(200);
+    const owner = t.intent("VENUE_SETTLEMENT", {
+      bookingId: t.first._id,
+      venuePayment: { settlement: "PARTIAL", amountCents: 100 },
+    });
+    await h.post("settlement", h.body(owner), h.owner).expect(200);
+    await h.post("settlement-status", h.body(own), s.authorization).expect(200);
+    await h.post("settlement-status", h.body(owner), s.authorization).expect(404);
+    const evidence = await PackageLifecycleOperationModel.find().sort({ _id: 1 }).lean();
+    const after = await managementEffects(t.progress._id);
+    await StaffMembershipModel.updateOne(
+      { _id: s.membership._id },
+      { $set: { employmentActive: false } },
+    );
+    await h.post("settlement-status", h.body(own), s.authorization).expect(404);
+    await h.post("settlement-status", h.body(owner), s.authorization).expect(404);
+    await h
+      .post("complete", h.body(t.intent("COMPLETE", { bookingId: t.first._id })), s.authorization)
+      .expect(404);
+    await h.post("settlement", h.body(own), s.authorization).expect(404); // even committed replay must be authorized
+    await expect(
+      t.moneyLifecycle.businessOperationStatus(
+        s.user._id,
+        "SUPERVISOR",
+        t.f.context.customerUserId,
+        own,
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    await expect(
+      t.moneyLifecycle.business(s.user._id, "SUPERVISOR", t.f.context.customerUserId, own),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    await h.post("settlement-status", h.body(owner), h.owner).expect(200);
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+    expect(await PackageLifecycleOperationModel.find().sort({ _id: 1 }).lean()).toEqual(evidence);
+    // Evidence survives deactivation. Reauthorization recovers only this exact actor's result.
+    await StaffMembershipModel.updateOne(
+      { _id: s.membership._id },
+      { $set: { employmentActive: true } },
+    );
+    await h.post("settlement-status", h.body(own), s.authorization).expect(200);
+    await h.post("settlement-status", h.body(owner), s.authorization).expect(404);
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+  });
+
+  it.each(["removed", "foreign", "wrong-role", "suspended", "revoked"] as const)(
+    "approved Fix C preserves %s denial on management mutation and status",
+    async (denial) => {
+      const t = await fixture(),
+        h = await surface(t),
+        s = await managementSupervisor(t);
+      const request = t.intent("COMPLETE", { bookingId: t.first._id });
+      await h.post("complete", h.body(request), s.authorization).expect(200);
+      const after = await managementEffects(t.progress._id);
+      if (denial === "revoked") await t.tokens.revokeAllSessionsForUser(s.user._id);
+      else if (denial === "suspended")
+        await UserModel.updateOne({ _id: s.user._id }, { $set: { status: "SUSPENDED" } });
+      else
+        await StaffMembershipModel.updateOne(
+          { _id: s.membership._id },
+          {
+            $set:
+              denial === "removed"
+                ? { removedAt: new Date() }
+                : denial === "foreign"
+                  ? { businessId: new Types.ObjectId() }
+                  : { role: "STAFF" },
+          },
+        );
+      for (const action of ["complete", "complete-status"] as const) {
+        const response = await h.post(action, h.body(request), s.authorization);
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(JSON.stringify(response.body)).not.toContain('"state":"COMMITTED"');
+      }
+      // Direct domain methods have no token parameter; sid revocation is the HTTP boundary.
+      if (denial !== "revoked")
+        await expect(
+          t.lifecycle.businessOperationStatus(
+            s.user._id,
+            "SUPERVISOR",
+            t.f.context.customerUserId,
+            request,
+          ),
+        ).rejects.toThrow();
+      expect(await managementEffects(t.progress._id)).toEqual(after);
+    },
+  );
+
+  it("package transaction rechecks deactivation that commits after shared entry authorization", async () => {
+    const t = await fixture(),
+      s = await managementSupervisor(t);
+    const request = t.intent("COMPLETE", { bookingId: t.first._id });
+    const before = (await PackageProgressV2Model.findById(t.progress._id).orFail()).toObject();
+    const original = PackageLifecycleOperations.prototype.claim;
+    vi.spyOn(PackageLifecycleOperations.prototype, "claim").mockImplementationOnce(async function (
+      this: PackageLifecycleOperations,
+      id,
+    ) {
+      const claimed = await original.call(this, id);
+      await withPackageEligibility(t.scope.businessId, undefined, async (session) => {
+        await StaffMembershipModel.updateOne(
+          { _id: s.membership._id },
+          { $set: { employmentActive: false } },
+        ).session(session);
+      });
+      return claimed;
+    });
+    await expect(
+      t.lifecycle.business(s.user._id, "SUPERVISOR", t.f.context.customerUserId, request),
+    ).rejects.toThrow();
+    expect((await BookingModel.findById(t.first._id))?.status).toBe("UPCOMING");
+    expect((await PackageProgressV2Model.findById(t.progress._id).orFail()).toObject()).toEqual(
+      before,
+    );
+    expect(
+      (await PackageLifecycleOperationModel.findById(lifecycleOperationId(request.key)))?.phase,
+    ).not.toBe("COMPLETE");
+  });
+
+  it("P4K-5 Owner completion: complete-status returns the committed result read-only", async () => {
+    const t = await fixture(),
+      h = await surface(t);
+    const body = h.body(t.intent("COMPLETE", { bookingId: t.first._id }));
+    const committed = (await h.post("complete", body, h.owner).expect(200)).body.data;
+    const after = await managementEffects(t.progress._id);
+    for (let i = 0; i < 2; i++)
+      expect((await h.post("complete-status", body, h.owner).expect(200)).body.data).toMatchObject({
+        state: "COMMITTED",
+        status: committed.status,
+      });
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+    expect(after.completed[0]).toBe(1);
+  });
+  it("P4K-5 lost completion response: status recovers it and the identical retry converges", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      request = t.intent("COMPLETE", { bookingId: t.first._id });
+    const committed = await t.business(request);
+    const before = await managementEffects(t.progress._id);
+    expect(
+      (await h.post("complete-status", h.body(request), h.owner).expect(200)).body.data.status,
+    ).toBe(committed?.result.status);
+    await h.post("complete", h.body(request), h.owner).expect(200);
+    expect(await managementEffects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-5 venue settlement status is COMMITTED only with ledger proof and never settles again", async () => {
+    const t = await fixture(),
+      h = await surface(t);
+    const body = h.body(
+      t.intent("VENUE_SETTLEMENT", {
+        bookingId: t.first._id,
+        venuePayment: { settlement: "FULL" },
+      }),
+    );
+    await h.post("settlement", body, h.owner).expect(200);
+    const after = await managementEffects(t.progress._id);
+    for (let i = 0; i < 2; i++)
+      expect((await h.post("settlement-status", body, h.owner).expect(200)).body.data.state).toBe(
+        "COMMITTED",
+      );
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+    // Removing the ledger proof makes the same operation unprovable: UNRESOLVED, never success.
+    const operation = await PackageLifecycleOperationModel.findById(
+      lifecycleOperationId(body.key),
+    ).orFail();
+    if (operation.result?.venue?.ledgerId) {
+      await BookingFinancialTransactionModel.deleteOne({ _id: operation.result.venue.ledgerId });
+      expect((await h.post("settlement-status", body, h.owner).expect(202)).body.data).toEqual({
+        state: "UNRESOLVED",
+      });
+    }
+  });
+  it("P4K-5 mark-no-show and no-show statuses recover deterministic-time transitions", async () => {
+    const t = await fixture({ policy: true, categoryWindow: true }),
+      h = await surface(t),
+      w = must(t.first.noShowEligibilitySnapshot);
+    t.advance(new Date(t.first.schedule.startAt.getTime() + w.opensAfterMinutes * 60000));
+    const mark = h.body(t.intent("MARK_NO_SHOW", { bookingId: t.first._id }));
+    await h.post("mark-no-show", mark, h.owner).expect(200);
+    expect((await h.post("mark-no-show-status", mark, h.owner).expect(200)).body.data.state).toBe(
+      "COMMITTED",
+    );
+    t.advance(must((await BookingModel.findById(t.first._id).orFail()).noShowDeadlineAt));
+    const resolve = h.body(t.intent("NO_SHOW", { bookingId: t.first._id }));
+    await h.post("no-show", resolve, h.owner).expect(200);
+    const after = await managementEffects(t.progress._id);
+    expect((await h.post("no-show-status", resolve, h.owner).expect(200)).body.data.state).toBe(
+      "COMMITTED",
+    );
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+  });
+  it("P4K-5 uncertain completion stays UNRESOLVED and is not advanced", async () => {
+    const t = await fixture(),
+      h = await surface(t),
+      request = t.intent("COMPLETE", { bookingId: t.first._id });
+    vi.spyOn(PackageLifecycleOperations.prototype, "complete").mockRejectedValueOnce(
+      Object.assign(Error("unknown"), { errorLabels: ["UnknownTransactionCommitResult"] }),
+    );
+    await expect(t.business(request)).rejects.toThrow();
+    const before = await managementEffects(t.progress._id);
+    expect(
+      (await h.post("complete-status", h.body(request), h.owner).expect(202)).body.data,
+    ).toEqual({ state: "UNRESOLVED" });
+    expect(
+      (await PackageLifecycleOperationModel.findById(lifecycleOperationId(request.key)).orFail())
+        .phase,
+    ).toBe("PERSISTING");
+    expect(await managementEffects(t.progress._id)).toEqual(before);
+  });
+  it("P4K-5 management status binds actor, action and Booking; Customers, foreign owners and inactive owners are denied", async () => {
+    const t = await fixture(),
+      h = await surface(t);
+    const cancel = h.body(t.intent("CANCEL", { bookingId: t.first._id }));
+    await h.post("cancel", cancel, h.owner).expect(200);
+    const after = await managementEffects(t.progress._id);
+    expect((await h.post("cancel-status", cancel, h.owner).expect(200)).body.data.state).toBe(
+      "COMMITTED",
+    );
+    await h.post("cancel-status", cancel).expect(404); // the Customer cannot read the Owner's operation
+    await h.post("complete-status", { ...cancel }, h.owner).expect(404); // another action, same key
+    await h.post("complete-status", cancel).expect(403); // management-only status
+    const foreign = await UserModel.create({
+      normalizedEmail: "p4k5-owner@s5.test",
+      passwordHash: "unused",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: INTERNAL_TIME },
+    });
+    const foreignOwner = `Bearer ${await issueTestAccessToken(t.tokens, { userId: foreign._id, role: "BUSINESS_OWNER" })}`;
+    const denied = await h.post("cancel-status", cancel, foreignOwner);
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(denied.body)).not.toContain("COMMITTED");
+    await UserModel.updateOne({ _id: t.f.business.ownerUserId }, { $set: { status: "SUSPENDED" } });
+    expect((await h.post("cancel-status", cancel, h.owner)).status).toBeGreaterThanOrEqual(400);
+    expect(await managementEffects(t.progress._id)).toEqual(after);
+  });
+  // P4K-5 deterministic time boundaries (fixture clock only; no host clock is touched).
+  it.each([6, 12] as const)(
+    "P4K-5 FINITE%s expiry reconciliation is refused 1 ms before expiresAt and applies exactly at it",
+    async (months) => {
+      const t = await fixture({ mode: "FINITE", months });
+      if (t.progress.purchasedContract?.validity.mode !== "FINITE") throw Error("finite fixture");
+      const expiresAt = t.progress.purchasedContract.validity.expiresAt;
+      t.advance(new Date(expiresAt.getTime() - 1));
+      const early = t.intent("EXPIRE");
+      await expect(t.customer(early)).rejects.toThrow();
+      const unchanged = await PackageProgressV2Model.findById(t.progress._id).orFail();
+      expect(unchanged.expiryReconciledAt).toBeUndefined();
+      expect(unchanged.items.map((i) => i.remainingSessions)).toEqual(
+        t.progress.items.map((i) => i.remainingSessions),
+      );
+      t.advance(expiresAt);
+      const r = await t.customer(t.intent("EXPIRE"));
+      expect(r?.progress.items.every((i) => i.remainingSessions === 0)).toBe(true);
+    },
+  );
+  it("P4K-5 mark-no-show is refused 1 ms before the window opens and allowed exactly at it", async () => {
+    const t = await fixture({ policy: true, categoryWindow: true }),
+      w = must(t.first.noShowEligibilitySnapshot);
+    const opens = t.first.schedule.startAt.getTime() + w.opensAfterMinutes * 60000;
+    t.advance(new Date(opens - 1));
+    await expect(
+      t.business(t.intent("MARK_NO_SHOW", { bookingId: t.first._id })),
+    ).rejects.toThrow();
+    expect((await BookingModel.findById(t.first._id).orFail()).status).toBe("UPCOMING");
+    t.advance(new Date(opens));
+    const marked = await t.business(t.intent("MARK_NO_SHOW", { bookingId: t.first._id }));
+    expect(marked?.booking?.status).toBe("PENDING");
   });
 });

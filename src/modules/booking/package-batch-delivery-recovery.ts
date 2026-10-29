@@ -7,6 +7,12 @@ import {
 import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import { readOwnedPackageBatchCompletion } from "./package-batch-completion.js";
 import { batchConflict } from "./package-batch-contract.js";
+import {
+  type PackageCalendarDeliveryPort,
+  PackageCalendarWriteAuthorityUnavailableError,
+  packageCalendarEventFor,
+  reconcilePackageCalendarEvent,
+} from "./package-calendar-delivery.js";
 
 export type ExistingCalendarReconciliationPort = {
   /** Read/reconcile only. No create POST is authorized by this preparation infrastructure. */
@@ -29,12 +35,16 @@ export type ExistingCalendarReconciliationPort = {
   >;
 };
 
-/** Callable offline infrastructure only: no route/worker/container registration or Google
- * adapter. A missing existing event remains durably BLOCKED, never blindly recreated. */
+/** Callable offline infrastructure only: no route/worker/container registration. Without a
+ * delivery port a missing existing event remains durably BLOCKED, never blindly recreated.
+ * P2C: with an explicitly injected `delivery` port (e.g. IntegrationService.packageCalendarPort)
+ * the consumer reconciles the desired event with a deterministic id and read-back verification
+ * (package-calendar-delivery.ts). Still activation-gated and never auto-registered. */
 export class PackageBatchDeliveryRecovery {
   public constructor(
     private readonly calendar: ExistingCalendarReconciliationPort,
     private readonly clock: () => Date = () => new Date(),
+    private readonly delivery?: PackageCalendarDeliveryPort,
   ) {}
 
   public async runOnce(scope: PackageBatchScope, limit = 20) {
@@ -45,7 +55,9 @@ export class PackageBatchDeliveryRecovery {
     let processed = 0;
     for (const expected of complete.completion.tasks.filter((t) => t.port === "CALENDAR")) {
       if (processed >= limit) break;
-      const task = await claimBatchDeliveryTask(scope, expected.key, this.clock());
+      // A delivery port is not task-release authority. Preserve the older read-only
+      // recovery contract, but never dispatch a blocked task through the P2C port.
+      const task = await claimBatchDeliveryTask(scope, expected.key, this.clock(), !this.delivery);
       if (!task?.token) continue;
       const current = async () =>
         BookingModel.findOne({
@@ -63,8 +75,25 @@ export class PackageBatchDeliveryRecovery {
         booking.schedule.endAt.getTime() === task.endAt.getTime();
       let state: "DONE" | "SKIPPED" | "RETRY" | "BLOCKED_UNVERIFIED" = "RETRY";
       try {
-        if (!matches(await current())) state = "SKIPPED";
-        else {
+        const booking = await current();
+        if (!matches(booking)) state = "SKIPPED";
+        else if (this.delivery?.deliver) {
+          state = await this.delivery.deliver({
+            kind: "BATCH",
+            claimId: String(complete.preparation.claimId),
+            key: task.key,
+          });
+        } else if (this.delivery && booking) {
+          state = await reconcilePackageCalendarEvent(this.delivery, {
+            businessId: String(scope.businessId),
+            bookingId: task.bookingId,
+            recordedEventId: booking.googleCalendarEventId ?? undefined,
+            allowInsert: task.attempts === 1,
+            desired: { kind: "PRESENT", ...packageCalendarEventFor(booking) },
+          });
+          // Changed while delivering: the newer lifecycle task owns the final state.
+          if (!matches(await current())) state = "SKIPPED";
+        } else {
           const eventId = `b${task.bookingId.toHexString()}`;
           const result = await this.calendar.reconcileExisting({
             lifecycleVersion: task.lifecycleVersion,
@@ -85,7 +114,9 @@ export class PackageBatchDeliveryRecovery {
           )
             state = "DONE";
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof PackageCalendarWriteAuthorityUnavailableError)
+          state = "BLOCKED_UNVERIFIED";
         /* Failed/lost reconciliation response is retriable, never proof of a send. */
       }
       await settleBatchDeliveryTask(scope, task.key, task.token, state, this.clock());

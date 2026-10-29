@@ -17,6 +17,7 @@ import { PackageBatchPersistence } from "../../src/modules/booking/package-batch
 import { PackageCheckoutAcceptanceService } from "../../src/modules/booking/package-checkout-acceptance.service.js";
 import { PackageCheckoutCustomerAuthority } from "../../src/modules/booking/package-checkout-customer-authority.js";
 import { PackageCheckoutQuotePreparer } from "../../src/modules/booking/package-checkout-quote.service.js";
+import { PackageConsentProtocol } from "../../src/modules/booking/package-consent-protocol.js";
 import { BookingFinancialTransactionRepository } from "../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationRepository } from "../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
@@ -60,6 +61,11 @@ export async function packageBatchFixture(
     latePercentage?: number;
     penaltyBasisCents?: number;
     endReminder?: boolean;
+    /** P3A HTTP integration needs the existing Customer-scoped operation namespace. */
+    operationId?: string;
+    /** Uses the actual P3B protocol; only the importing suite may supply a synthetic host. */
+    certifiedConsent?: boolean;
+    beforeConsentCommit?: () => Promise<void>;
   } = {},
 ) {
   const f = checkoutFixture(options.mode ?? "FOREVER", 4);
@@ -266,8 +272,11 @@ export async function packageBatchFixture(
     }),
   };
   if (intent.selections.some((s) => !s.staffMembershipId)) throw new Error("Missing provider");
-  const seed = {
+  let seed = {
     ...f.seed,
+    ...(options.operationId
+      ? { idempotencyKey: `package-consent:${f.context.customerUserId}:${options.operationId}` }
+      : {}),
     issuedAt: new Date("2030-08-19T08:00:00Z"),
     expiresAt: new Date("2030-08-19T08:30:00Z"),
     appointments: indices.map((index) => {
@@ -276,6 +285,8 @@ export async function packageBatchFixture(
       return row;
     }),
   };
+  const consent = options.certifiedConsent ? new PackageConsentProtocol() : undefined;
+  if (consent) seed = await consent.issue(seed, intent);
   const deps = {
     ...f.dependencies,
     availability,
@@ -317,9 +328,11 @@ export async function packageBatchFixture(
     staff,
     users,
     () => now,
+    consent,
   );
   const authorization = `Bearer ${await issueTestAccessToken(tokens, { userId: f.context.customerUserId, role: "CUSTOMER" })}`;
   const presentation = await acceptance.present(authorization, f.business._id, seed.idempotencyKey);
+  await options.beforeConsentCommit?.();
   await acceptance.accept(authorization, f.business._id, seed.idempotencyKey, {
     version: 1,
     action: "ACCEPT_PACKAGE_CHECKOUT_TERMS",
@@ -337,7 +350,7 @@ export async function packageBatchFixture(
     idempotencyKey: seed.idempotencyKey,
   };
   const writer = new PackageBatchPersistence(availability, reservations, () => now);
-  const another = async (shiftAll = false, staggerFixed = false) => {
+  const another = async (shiftAll = false, staggerFixed = false, operationId?: string) => {
     const nextIntent = {
       ...intent,
       selections: intent.selections.map((s) => ({
@@ -352,9 +365,11 @@ export async function packageBatchFixture(
         ),
       })),
     };
-    const nextSeed = {
+    let nextSeed = {
       ...seed,
-      idempotencyKey: `f1:${new Types.ObjectId()}`,
+      idempotencyKey: operationId
+        ? `package-consent:${f.context.customerUserId}:${operationId}`
+        : `f1:${new Types.ObjectId()}`,
       quoteId: new Types.ObjectId(),
       batchId: new Types.ObjectId(),
       packageProgressId: new Types.ObjectId(),
@@ -362,6 +377,7 @@ export async function packageBatchFixture(
       items: seed.items.map((i) => ({ ...i, packageItemId: new Types.ObjectId() })),
       appointments: seed.appointments.map((a) => ({ ...a, bookingId: new Types.ObjectId() })),
     };
+    if (consent) nextSeed = await consent.issue(nextSeed, nextIntent);
     const nextQuote = await preparer.prepare(f.context, nextIntent, nextSeed);
     await claims.retainPackageCheckout({
       version: 1,
@@ -412,6 +428,7 @@ export async function packageBatchFixture(
     scope,
     writer,
     authority,
+    checkoutAcceptance: acceptance,
     tokens,
     authorization,
     schedules,

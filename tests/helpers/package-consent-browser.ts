@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,9 +15,20 @@ export const openPackageConsentBrowser = async (url: string, artifactDirectory: 
     )
   )
     throw new Error("Disposable local browser URL required");
+  // Match the existing CDP helper's runner setting; never launch a Windows-only
+  // path on an independent Linux runner or silently choose another browser.
+  const executable =
+    process.env["BOOKLY_TEST_BROWSER"] ??
+    (process.platform === "win32"
+      ? "C:/Program Files/Google/Chrome/Application/chrome.exe"
+      : undefined);
+  if (!executable || !existsSync(executable))
+    throw new Error(
+      "An approved test browser is required; set BOOKLY_TEST_BROWSER to its executable path",
+    );
   const profile = await mkdtemp(join(tmpdir(), "bookly-consent-browser-"));
   const child = spawn(
-    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    executable,
     [
       "--headless=new",
       "--remote-debugging-port=0",

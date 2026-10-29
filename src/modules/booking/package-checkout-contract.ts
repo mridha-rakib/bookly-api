@@ -107,6 +107,7 @@ export const packageCheckoutSeedSchema = z
     items: z.array(z.object({ definitionItemId: id, packageItemId: id }).strict()).min(1),
     appointments: z.array(z.object({ selectionId: id, bookingId: id }).strict()).min(1),
     temporalProofRef: id.optional(),
+    consentEvidenceId: id.optional(),
   })
   .strict()
   .refine(

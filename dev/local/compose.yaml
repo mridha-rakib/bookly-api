@@ -1,0 +1,36 @@
+# Dependencies only. Never merge with the October temporary Compose project.
+# Explicit image digests must be selected/provisioned on the approved runner first.
+services:
+  mongo:
+    image: ${BOOKLY_DEV_MONGO_IMAGE:?set approved Mongo image with digest}
+    command: ["mongod", "--replSet", "bookly-local", "--bind_ip_all", "--port", "27117"]
+    ports: ["127.0.0.1:27117:27117"]
+    volumes: ["mongo-data:/data/db"]
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--port", "27117", "--eval", "quit(db.adminCommand({ping:1}).ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  mongo-init:
+    image: ${BOOKLY_DEV_MONGO_IMAGE:?set approved Mongo image with digest}
+    profiles: ["setup"]
+    depends_on:
+      mongo: {condition: service_healthy}
+    entrypoint: ["mongosh", "--quiet", "mongodb://mongo:27117/admin?directConnection=true", "/setup/init-replica.js"]
+    volumes: ["./init-replica.js:/setup/init-replica.js:ro"]
+    networks: [isolated]
+    restart: "no"
+  mail:
+    image: ${BOOKLY_DEV_MAIL_IMAGE:?set approved Mailpit image with digest}
+    ports: ["127.0.0.1:11025:1025", "127.0.0.1:18025:8025"]
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_DISABLE_VERSION_CHECK: "true"
+      MP_BLOCK_REMOTE_CSS_AND_FONTS: "true"
+    networks: [isolated]
+networks:
+  isolated: {internal: true}
+volumes:
+  mongo-data:

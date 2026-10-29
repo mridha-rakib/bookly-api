@@ -30,6 +30,7 @@ import {
   readPackageCheckoutNoShowWindows,
 } from "./package-checkout-quote.service.js";
 import { PackageCheckoutRetentionService } from "./package-checkout-retention.service.js";
+import { PackageConsentProtocol } from "./package-consent-protocol.js";
 
 /** Read-only quote dependencies and canonical claim writes. No provider client or activation service. */
 export const buildPackageConsentServices = (lifetimeMs: number) => {
@@ -90,6 +91,7 @@ export const buildPackageConsentServices = (lifetimeMs: number) => {
       }),
     },
   });
+  const consent = new PackageConsentProtocol();
   return {
     tokens,
     users,
@@ -100,7 +102,22 @@ export const buildPackageConsentServices = (lifetimeMs: number) => {
     services,
     staff,
     availability,
-    retention: new PackageCheckoutRetentionService(claims, packages, preparer, lifetimeMs),
-    acceptance: new PackageCheckoutAcceptanceService(claims, authority, preparer, staff, users),
+    retention: new PackageCheckoutRetentionService(
+      claims,
+      packages,
+      preparer,
+      lifetimeMs,
+      undefined,
+      consent,
+    ),
+    acceptance: new PackageCheckoutAcceptanceService(
+      claims,
+      authority,
+      preparer,
+      staff,
+      users,
+      undefined,
+      consent,
+    ),
   };
 };

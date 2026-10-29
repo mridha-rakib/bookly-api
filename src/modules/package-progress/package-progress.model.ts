@@ -208,6 +208,8 @@ packageProgressSchema.index({ originBookingId: 1 }, { unique: true });
 // "My Packages" cross-business list (newest first) — mirrors Booking's own customer-scoped
 // list index shape.
 packageProgressSchema.index({ customerUserId: 1, createdAt: -1 });
+// P4E: bounded v2 owned-history cursor reads. V2 copies this shared collection's declarations.
+packageProgressSchema.index({ customerUserId: 1, schemaVersion: 1, _id: -1 });
 // Business-scoped lookup — "does this customer have an active package for this service" and
 // the redemption endpoint's own ownership-scoped find.
 packageProgressSchema.index({ businessId: 1, customerUserId: 1, serviceId: 1 });

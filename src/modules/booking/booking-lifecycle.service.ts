@@ -21,7 +21,9 @@ import {
   packageSessionOutcomeForBookingStatus,
 } from "../package-progress/package-progress.rules.js";
 import { PackageProgressService } from "../package-progress/package-progress.service.js";
+import { ensureBusinessRefundNotification } from "../payment/business-refund-notification.js";
 import type { PaymentService } from "../payment/payment.service.js";
+import { PaymentAttemptModel } from "../payment/payment-attempt.model.js";
 import { ensureRefundAccounting } from "../payment/refund-accounting.js";
 import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import { PromoRedemptionRepository } from "../promo/promo-redemption.repository.js";
@@ -46,11 +48,13 @@ import {
 } from "./booking.types.js";
 import { buildCancellationOutcome } from "./booking-cancellation-classification.js";
 import { packageReservationPartySize } from "./booking-package-foundation.js";
+import { bookingPaymentSummary } from "./booking-payment-summary.js";
 import {
   acquireSchedulingAdmission,
   validateSchedulingLine,
   verifiedOccupiedMilliseconds,
 } from "./booking-scheduling-admission.js";
+import type { OrdinaryCalendarJournalPort } from "./ordinary-calendar-journal.js";
 import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import {
   cancellationObligationKey,
@@ -69,11 +73,22 @@ import {
  * implementation swallows its own errors, exactly like the Google Calendar side effects).
  */
 export type BookingCompletedNotificationPort = {
+  enqueueBookingCompletedInTransaction?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    session: ClientSession,
+  ): Promise<void>;
   notifyBookingCompleted(booking: BookingDocument, business: BusinessDocument): Promise<void>;
 };
 
 /** Stage D mailing observer ports (optional + trailing, never throw). */
 export type BookingCancelledNotificationPort = {
+  enqueueBookingCancelledInTransaction?(
+    booking: BookingDocument,
+    business: BusinessDocument,
+    cancelledBy: "CUSTOMER" | "BUSINESS",
+    session: ClientSession,
+  ): Promise<void>;
   notifyPackageTerminated?(
     booking: BookingDocument,
     business: BusinessDocument,
@@ -99,6 +114,16 @@ export type BookingCancelledNotificationPort = {
   ): Promise<void>;
 };
 export type NoShowNotificationPort = {
+  enqueueNoShowWaivedInTransaction?(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void>;
+  enqueueNoShowCancelledInTransaction?(
+    booking: BookingDocument,
+    context: { businessName: string },
+    session: ClientSession,
+  ): Promise<void>;
   notifyNoShowWaived(booking: BookingDocument, context: { businessName: string }): Promise<void>;
   notifyNoShowCancelled(booking: BookingDocument, context: { businessName: string }): Promise<void>;
 };
@@ -183,7 +208,10 @@ export class BookingLifecycleService {
     private readonly bookingCancelledNotifier?: BookingCancelledNotificationPort,
     private readonly noShowNotifier?: Pick<
       NoShowNotificationPort,
-      "notifyNoShowWaived" | "notifyNoShowCancelled"
+      | "notifyNoShowWaived"
+      | "notifyNoShowCancelled"
+      | "enqueueNoShowWaivedInTransaction"
+      | "enqueueNoShowCancelledInTransaction"
     >,
     // Important-staff-notification observer (optional + trailing, never throws). Emails the
     // staff actually assigned to a booking when it is cancelled or its appointment time moves.
@@ -229,6 +257,9 @@ export class BookingLifecycleService {
       businessRepository,
       packageProgressRepository,
     }),
+    // P4B-2A — durable ordinary Calendar desired state, recorded inside the reschedule and
+    // cancellation transactions. Optional trailing dep; absent in directly constructed suites.
+    private readonly ordinaryCalendarJournal?: OrdinaryCalendarJournalPort,
   ) {}
 
   /** Best-effort — no-op for a Booking with no Package-linked line (every normal booking).
@@ -295,6 +326,12 @@ export class BookingLifecycleService {
     if (!booking.googleCalendarEventId || !this.integrationService) {
       return;
     }
+    // P4B-2A — an AUTHORITATIVE journal owns this Booking's event; never add a second writer.
+    if (
+      this.ordinaryCalendarJournal &&
+      !(await this.ordinaryCalendarJournal.legacySyncPermitted(booking))
+    )
+      return;
 
     await this.integrationService.deleteEventForBooking(
       booking.businessId,
@@ -325,6 +362,8 @@ export class BookingLifecycleService {
     businessId: string,
     bookingId: string,
     venuePayment?: CompleteVenuePaymentInput,
+    expectedBalanceDueCents?: number,
+    expectedOutstandingVenueBalanceCents?: number,
   ): Promise<BookingDocument> {
     const business = await this.bookingService.requireBookingManagementAccess(
       actorUserId,
@@ -332,6 +371,36 @@ export class BookingLifecycleService {
       businessId,
     );
     const booking = await this.requireBookingForBusiness(business._id, bookingId, ["UPCOMING"]);
+    // packageItemId identifies a First-Class member; packageProgressId alone also occurs on
+    // legacy packages, whose completion hook below must remain supported. The loader retains
+    // the shipped activation denial; even with authority open this ordinary writer must not
+    // bypass the accounting-v2 attempt and lifecycle-operation transaction.
+    if (booking.serviceLines.some((line) => line.pricingInput.packageItemId)) {
+      throw new BookingError("BOOKING_PACKAGE_LIFECYCLE_REQUIRED", 409);
+    }
+    if (
+      expectedBalanceDueCents !== undefined &&
+      (!Number.isSafeInteger(expectedBalanceDueCents) ||
+        expectedBalanceDueCents < 0 ||
+        expectedBalanceDueCents !== booking.financials.balanceDueCents)
+    ) {
+      throw new BookingError("BOOKING_COMPLETION_BALANCE_CHANGED", 409);
+    }
+    if (
+      expectedOutstandingVenueBalanceCents !== undefined &&
+      (!Number.isSafeInteger(expectedOutstandingVenueBalanceCents) ||
+        expectedOutstandingVenueBalanceCents < 0 ||
+        expectedOutstandingVenueBalanceCents !==
+          bookingPaymentSummary(booking).outstandingVenueBalanceCents)
+    ) {
+      throw new BookingError("BOOKING_COMPLETION_BALANCE_CHANGED", 409);
+    }
+    // Ordinary completion writes this record ONCE. Unlike First-Class settlement, it is not
+    // an incremental payment recorder. Do not overwrite an anomalous UPCOMING record or
+    // book the original balance again when payment was already attested.
+    if (booking.completionPayment != null) {
+      throw new BookingError("BOOKING_COMPLETION_PAYMENT_ALREADY_RECORDED", 409);
+    }
     const now = new Date();
 
     const event: BookingEventHistoryEntry = {
@@ -405,6 +474,13 @@ export class BookingLifecycleService {
               ...(completionPayment ? { completionPayment } : {}),
             },
             pushEvent: event,
+            extraFilter: {
+              // Protect every persisted input to the displayed outstanding balance. In this
+              // writer's eligible state, venue payment must remain absent (null also means
+              // no record). A racing record insertion loses CAS before any ledger write.
+              completionPayment: null,
+              "financials.balanceDueCents": booking.financials.balanceDueCents,
+            },
           },
           dbSession,
         );
@@ -433,6 +509,11 @@ export class BookingLifecycleService {
             dbSession,
           );
         }
+        await this.bookingCompletedNotifier?.enqueueBookingCompletedInTransaction?.(
+          updated,
+          business,
+          dbSession,
+        );
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
@@ -450,7 +531,8 @@ export class BookingLifecycleService {
     // Stage C mailing — enqueue the customer's BOOKING_COMPLETED email strictly AFTER the
     // completion transaction has committed. Best-effort, never throws: a notification / PDF /
     // provider problem can never undo the completed booking.
-    await this.dispatchBookingCompletedNotification(updated, business);
+    if (!this.bookingCompletedNotifier?.enqueueBookingCompletedInTransaction)
+      await this.dispatchBookingCompletedNotification(updated, business);
     await this.retireAppointmentReminder(updated, "BOOKING_COMPLETED");
 
     return updated;
@@ -567,6 +649,11 @@ export class BookingLifecycleService {
       nextStatus,
       cancellationOutcome: outcome,
       event,
+      notificationBusiness:
+        penalty?.business ??
+        (await this.businessRepository.findById(booking.businessId)) ??
+        undefined,
+      cancelledBy: "CUSTOMER",
       scopedToCustomerUserId: customerUserId,
       ...(penalty ? { penalty: { ...penalty, result: penaltyResult } } : {}),
     });
@@ -576,8 +663,10 @@ export class BookingLifecycleService {
 
     const prepared = penaltyResult.prepared;
     if (!prepared) {
-      await this.dispatchCancellationNotifications(cancelled, "CUSTOMER");
-      await this.dispatchStaffCancellationNotification(cancelled, "CUSTOMER");
+      if (!this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction)
+        await this.dispatchCancellationNotifications(cancelled, "CUSTOMER");
+      if (!this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction)
+        await this.dispatchStaffCancellationNotification(cancelled, "CUSTOMER");
       return cancelled;
     }
 
@@ -588,7 +677,8 @@ export class BookingLifecycleService {
       await this.penaltyCollection.collect(prepared.obligation._id);
     }
     const settled = (await this.bookingRepository.findByIdOnly(cancelled._id)) ?? cancelled;
-    await this.dispatchStaffCancellationNotification(settled, "CUSTOMER");
+    if (!this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction)
+      await this.dispatchStaffCancellationNotification(settled, "CUSTOMER");
     return settled;
   }
 
@@ -627,11 +717,14 @@ export class BookingLifecycleService {
     if (booking.status === "CANCELLED_BY_BUSINESS") {
       if (!upfrontPayment) return booking;
       const result = await this.executeBusinessCancellationRefund(booking, upfrontPayment);
-      await this.dispatchCancellationNotifications(result.booking, "BUSINESS", business, {
-        succeeded: result.refundSucceeded,
-        amountCents: result.refundedAmountCents,
-        status: result.settlementStatus,
-      });
+      // Production commits the notice with the cancellation and the settled follow-up through
+      // the exact refund event. A legacy injected port keeps its earlier post-refund seam.
+      if (!this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction)
+        await this.dispatchCancellationNotifications(result.booking, "BUSINESS", business, {
+          succeeded: result.refundSucceeded,
+          amountCents: result.refundedAmountCents,
+          status: result.settlementStatus,
+        });
       return result.booking;
     }
     const refundOwedCents = upfrontPayment?.amountCents ?? 0;
@@ -665,14 +758,18 @@ export class BookingLifecycleService {
       nextStatus: "CANCELLED_BY_BUSINESS",
       cancellationOutcome: outcome,
       event,
+      notificationBusiness: business,
+      cancelledBy: "BUSINESS",
     });
 
     await this.syncBookingCancelledToGoogleCalendar(cancelled);
     await this.retireAppointmentReminder(cancelled, "BOOKING_CANCELLED_BY_BUSINESS");
 
     if (!upfrontPayment || refundOwedCents <= 0) {
-      await this.dispatchCancellationNotifications(cancelled, "BUSINESS", business);
-      await this.dispatchStaffCancellationNotification(cancelled, "BUSINESS", business);
+      if (!this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction)
+        await this.dispatchCancellationNotifications(cancelled, "BUSINESS", business);
+      if (!this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction)
+        await this.dispatchStaffCancellationNotification(cancelled, "BUSINESS", business);
       return cancelled;
     }
 
@@ -682,12 +779,14 @@ export class BookingLifecycleService {
       refundedAmountCents,
       settlementStatus,
     } = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment);
-    await this.dispatchCancellationNotifications(refunded, "BUSINESS", business, {
-      succeeded: refundSucceeded,
-      amountCents: refundedAmountCents,
-      status: settlementStatus,
-    });
-    await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
+    if (!this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction)
+      await this.dispatchCancellationNotifications(refunded, "BUSINESS", business, {
+        succeeded: refundSucceeded,
+        amountCents: refundedAmountCents,
+        status: settlementStatus,
+      });
+    if (!this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction)
+      await this.dispatchStaffCancellationNotification(refunded, "BUSINESS", business);
     return refunded;
   }
 
@@ -708,23 +807,32 @@ export class BookingLifecycleService {
       true,
     );
     const progress = result.packageProgress;
-    if (progress.voidRefundSettlement) {
-      const origin = await this.bookingRepository.findById(
-        progress.businessId,
-        progress.originBookingId,
-      );
-      if (origin)
-        await this.dispatchCancellationNotifications(
-          origin,
-          "CUSTOMER",
-          undefined,
-          {
-            succeeded: progress.voidRefundSettlement.status === "SUCCEEDED",
-            amountCents: progress.voidRefundSettlement.amountCents,
-            status: progress.voidRefundSettlement.status,
-          },
-          `PACKAGE_REFUND:${String(origin._id)}`,
+    // The workflow has already committed its void/refund outcome. Observer lookups and
+    // injected notification ports must not turn that committed result into a failed void.
+    try {
+      if (progress.voidRefundSettlement) {
+        const origin = await this.bookingRepository.findById(
+          progress.businessId,
+          progress.originBookingId,
         );
+        if (origin)
+          await this.dispatchCancellationNotifications(
+            origin,
+            "CUSTOMER",
+            undefined,
+            {
+              succeeded: progress.voidRefundSettlement.status === "SUCCEEDED",
+              amountCents: progress.voidRefundSettlement.amountCents,
+              status: progress.voidRefundSettlement.status,
+            },
+            `PACKAGE_REFUND:${String(origin._id)}`,
+          );
+      }
+    } catch (error) {
+      logger.error(
+        { err: error, packageProgressId: String(progress._id) },
+        "Failed to dispatch package refund notification (the refund and void are unaffected)",
+      );
     }
     return progress;
   }
@@ -1109,6 +1217,11 @@ export class BookingLifecycleService {
     if (!booking.googleCalendarEventId || !this.integrationService) {
       return;
     }
+    if (
+      this.ordinaryCalendarJournal &&
+      !(await this.ordinaryCalendarJournal.legacySyncPermitted(booking))
+    )
+      return;
 
     try {
       const latest = await this.bookingRepository.findById(booking.businessId, booking._id);
@@ -1307,6 +1420,14 @@ export class BookingLifecycleService {
       settlementStatus,
       refundId,
     );
+    const notificationProtocolEnabled = operation?.finalNotificationProtocolVersion === 1;
+    if (notificationProtocolEnabled && refundOperationId && settlementStatus !== "PENDING")
+      await ensureBusinessRefundNotification(refundOperationId).catch((error: unknown) =>
+        logger.error(
+          { refundOperationId, errorCategory: error instanceof Error ? error.name : "UNKNOWN" },
+          "Settled refund notification remains pending exact-event recovery",
+        ),
+      );
     if (
       operation?.packageProgressId &&
       this.packageProgressRepository &&
@@ -1345,6 +1466,24 @@ export class BookingLifecycleService {
     if (!source || source.amountCents <= 0) return undefined;
     if (!source.providerReference)
       throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    const supportedAttempt =
+      reason === "BUSINESS_CANCELLATION" && !packageId && !isPackageLinkedBooking(booking)
+        ? await PaymentAttemptModel.findOne({
+            providerPaymentIntentId: source.providerReference,
+            bookingId: booking._id,
+            businessId: booking.businessId,
+            customerUserId: booking.customer.customerUserId,
+            businessClientId: booking.customer.businessClientId,
+            purpose: "BOOKING_DEPOSIT",
+            productKind: "NORMAL_BOOKING",
+            providerStatus: "SUCCEEDED",
+            persistenceStatus: "COMPLETED",
+            compensationStatus: "NOT_REQUIRED",
+            succeededTransactionId: source._id,
+          })
+            .session(session)
+            .exec()
+        : null;
     return this.paymentService.prepareRefund(
       {
         logicalIdempotencyKey: `business-cancel-refund:${String(booking._id)}`,
@@ -1357,6 +1496,7 @@ export class BookingLifecycleService {
         businessClientId: booking.customer.businessClientId,
         customerUserId: booking.customer.customerUserId,
         reason,
+        ...(supportedAttempt ? { finalNotificationProtocolVersion: 1 as const } : {}),
         ...(packageId ? { packageProgressId: packageId } : {}),
       },
       session,
@@ -1371,6 +1511,8 @@ export class BookingLifecycleService {
       event: BookingEventHistoryEntry;
       scopedToCustomerUserId?: string;
       penalty?: CancellationPenaltyPlan;
+      notificationBusiness?: BusinessDocument;
+      cancelledBy?: "CUSTOMER" | "BUSINESS";
     },
     session: ClientSession,
   ): Promise<BookingDocument> {
@@ -1416,10 +1558,28 @@ export class BookingLifecycleService {
           );
       }
     }
-    if (params.penalty) {
-      return this.prepareCancellationPenalty(updated, params.penalty, session);
+    const current = params.penalty
+      ? await this.prepareCancellationPenalty(updated, params.penalty, session)
+      : updated;
+    if (params.notificationBusiness && params.cancelledBy) {
+      if (!params.penalty)
+        await this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction?.(
+          current,
+          params.notificationBusiness,
+          params.cancelledBy,
+          session,
+        );
+      await this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction?.(
+        current,
+        params.notificationBusiness.name,
+        params.cancelledBy,
+        session,
+      );
     }
-    return updated;
+    // P4B-2A — every cancellation (customer, Business, Package action) records ABSENT with the
+    // same session. A Booking without a journal (historical, First-Class) is left untouched.
+    await this.ordinaryCalendarJournal?.recordMutationInTransaction(current, session);
+    return current;
   }
 
   /** P5 — inside the cancellation transaction: the canonical PENDING CANCELLATION_FEE
@@ -1465,6 +1625,8 @@ export class BookingLifecycleService {
     event: BookingEventHistoryEntry;
     scopedToCustomerUserId?: string;
     penalty?: CancellationPenaltyPlan;
+    notificationBusiness?: BusinessDocument;
+    cancelledBy?: "CUSTOMER" | "BUSINESS";
   }): Promise<BookingDocument> {
     const dbSession = await mongoose.startSession();
     let updated: BookingDocument | null = null;
@@ -1645,6 +1807,13 @@ export class BookingLifecycleService {
     };
 
     if (plan.amountCents <= 0 && !booking.noShowChargeClaimedAt) {
+      if (plan.type === "NO_SHOW_FEE" && this.noShowNotifier?.enqueueNoShowWaivedInTransaction) {
+        return this.runWaiverTransaction((dbSession) =>
+          this.applyWaiverBookingTransition(business, booking, plan, event, dbSession, {
+            noShowChargeClaimedAt: { $exists: false },
+          }),
+        );
+      }
       const updated = await this.bookingRepository.casUpdate(
         business._id,
         booking._id,
@@ -1666,7 +1835,8 @@ export class BookingLifecycleService {
     }
 
     const result = await this.applyGatedWaiver(business, booking, plan, event);
-    await this.dispatchNoShowWaivedNotification(result, business.name);
+    if (!this.noShowNotifier?.enqueueNoShowWaivedInTransaction)
+      await this.dispatchNoShowWaivedNotification(result, business.name);
     return result;
   }
 
@@ -1866,6 +2036,12 @@ export class BookingLifecycleService {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
     await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
+    if (plan.type === "NO_SHOW_FEE" && updated.status === "NO_SHOW_WAIVED")
+      await this.noShowNotifier?.enqueueNoShowWaivedInTransaction?.(
+        updated,
+        { businessName: business.name },
+        dbSession,
+      );
     if (plan.type === "CANCELLATION_FEE") {
       // P5 Rule 5 — the truthful "fee waived" follow-up, committed with the waiver itself.
       await this.penaltyCollection.notifySettlement(
@@ -1944,7 +2120,7 @@ export class BookingLifecycleService {
     for (let attempt = 0; attempt < 2 && !updated; attempt += 1) {
       const gate = await this.penaltyCollection.inspectGate("NO_SHOW_FEE", booking._id);
       this.assertNoShowReversible(gate);
-      updated = await this.bookingRepository.casUpdate(business._id, booking._id, ["PENDING"], {
+      const update: Parameters<BookingRepository["casUpdate"]>[3] = {
         set: { status: nextStatus },
         pushEvent: {
           type: "STATUS_CHANGED",
@@ -1957,7 +2133,48 @@ export class BookingLifecycleService {
         ...(gate.state === "NONE"
           ? { extraFilter: { noShowChargeClaimedAt: { $exists: false } } }
           : {}),
-      });
+      };
+      const transactional =
+        nextStatus === "NO_SHOW_CANCELLED"
+          ? this.noShowNotifier?.enqueueNoShowCancelledInTransaction
+          : this.noShowNotifier?.enqueueNoShowWaivedInTransaction;
+      if (transactional) {
+        const dbSession = await mongoose.startSession();
+        try {
+          await dbSession.withTransaction(async () => {
+            updated = await this.bookingRepository.casUpdate(
+              business._id,
+              booking._id,
+              ["PENDING"],
+              update,
+              dbSession,
+            );
+            if (!updated) return;
+            await this.syncPackageSessionOnTerminalStatus(updated, dbSession);
+            if (nextStatus === "NO_SHOW_CANCELLED")
+              await this.noShowNotifier?.enqueueNoShowCancelledInTransaction?.(
+                updated,
+                { businessName: business.name },
+                dbSession,
+              );
+            else
+              await this.noShowNotifier?.enqueueNoShowWaivedInTransaction?.(
+                updated,
+                { businessName: business.name },
+                dbSession,
+              );
+          });
+        } finally {
+          await dbSession.endSession();
+        }
+      } else {
+        updated = await this.bookingRepository.casUpdate(
+          business._id,
+          booking._id,
+          ["PENDING"],
+          update,
+        );
+      }
       // A CAS lost to a claim that committed after the gate read re-reads the gate once.
       if (!updated && gate.state !== "NONE") break;
     }
@@ -1966,10 +2183,14 @@ export class BookingLifecycleService {
       throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     }
 
-    await this.syncPackageSessionOnTerminalStatus(updated);
+    const transactional =
+      nextStatus === "NO_SHOW_CANCELLED"
+        ? this.noShowNotifier?.enqueueNoShowCancelledInTransaction
+        : this.noShowNotifier?.enqueueNoShowWaivedInTransaction;
+    if (!transactional) await this.syncPackageSessionOnTerminalStatus(updated);
 
     // Stage D — customer notification for the terminal no-show outcome. Best-effort.
-    if (this.noShowNotifier) {
+    if (this.noShowNotifier && !transactional) {
       if (nextStatus === "NO_SHOW_CANCELLED") {
         await this.noShowNotifier.notifyNoShowCancelled(updated, { businessName: business.name });
       } else if (nextStatus === "NO_SHOW_WAIVED") {
@@ -2231,6 +2452,22 @@ export class BookingLifecycleService {
         if (!updated) {
           throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
         }
+        await this.bookingRescheduledCustomerNotifier?.enqueueBookingRescheduledInTransaction?.(
+          updated,
+          params.business,
+          dbSession,
+        );
+        await this.staffBookingNotifier?.enqueueBookingRescheduledToStaffInTransaction?.(
+          updated,
+          params.business.name,
+          dbSession,
+        );
+        await this.appointmentReminderScheduler?.onBookingRescheduledInTransaction?.(
+          updated,
+          dbSession,
+        );
+        // P4B-2A — the new schedule revision supersedes the previous desired state atomically.
+        await this.ordinaryCalendarJournal?.recordMutationInTransaction(updated, dbSession);
       });
     } catch (error) {
       if (this.isTransactionUnsupported(error)) {
@@ -2252,19 +2489,24 @@ export class BookingLifecycleService {
     await this.syncBookingRescheduledToGoogleCalendar(updated);
 
     // Important-staff notification — strictly AFTER the reschedule transaction committed.
-    await this.dispatchStaffRescheduleNotification(updated);
+    if (!this.staffBookingNotifier?.enqueueBookingRescheduledToStaffInTransaction)
+      await this.dispatchStaffRescheduleNotification(updated);
 
     // Retire the reminder for the OLD schedule version and schedule one for the new
     // `schedule.startAt` (or record it skipped if the new time is inside the 24h window).
     // Best-effort, never throws — a reminder problem can never roll back the reschedule.
     if (this.appointmentReminderScheduler) {
-      await this.appointmentReminderScheduler.onBookingRescheduled(updated);
+      if (!this.appointmentReminderScheduler.onBookingRescheduledInTransaction)
+        await this.appointmentReminderScheduler.onBookingRescheduled(updated);
     }
 
     // MANDATORY customer transactional email — the reschedule confirmation. Strictly after
     // commit, best-effort, reuses the already-loaded Business (no extra query), and is
     // deliberately NOT gated by any reminder preference.
-    await this.dispatchRescheduledCustomerNotification(updated, params.business);
+    // Production notifier has already committed the intent with the schedule. Retain the
+    // older observer seam for existing integrations that do not implement transactional enqueue.
+    if (!this.bookingRescheduledCustomerNotifier?.enqueueBookingRescheduledInTransaction)
+      await this.dispatchRescheduledCustomerNotification(updated, params.business);
 
     return updated;
   }

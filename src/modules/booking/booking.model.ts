@@ -42,6 +42,7 @@ import {
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
 import { verifyPackageBatchActivation } from "./package-batch-authority.js";
+import { isCalendarJournalWrite } from "./package-calendar-contract.js";
 
 // --- Actor / customer -------------------------------------------------------------------
 //
@@ -467,6 +468,8 @@ export type BookingDocument = {
    * Present only while a synced event exists — cleared once the event is deleted (booking
    * cancelled) so idempotent re-sync attempts don't leak/duplicate events. */
   googleCalendarEventId?: string | undefined;
+  /** Internal durable delivery journal; excluded from ordinary reads/API serialization. */
+  packageCalendarDelivery?: unknown;
   customer: BookingCustomer;
   createdBy: BookingActor;
   fulfilment: BookingFulfilment;
@@ -985,6 +988,7 @@ const bookingSchema = new Schema<BookingDocument>(
     source: { type: String, enum: bookingSources, required: true, default: "BOOKLY_MANAGED" },
     status: { type: String, enum: bookingStatuses, required: true, default: "UPCOMING" },
     googleCalendarEventId: { type: String },
+    packageCalendarDelivery: { type: Schema.Types.Mixed, select: false },
     customer: { type: bookingCustomerSchema, required: true },
     createdBy: { type: bookingActorSchema, required: true },
     fulfilment: { type: bookingFulfilmentSchema, required: true },
@@ -1102,6 +1106,8 @@ bookingSchema.index({ createdAt: -1 });
 // Booking writers/routes. This denial is independent of flags and also covers validation-off
 // saves. Raw privileged collection writes remain outside application enforcement.
 bookingSchema.pre("save", async function () {
+  if (this.isModified("packageCalendarDelivery"))
+    throw new Error("Package Calendar journal requires its repository CAS");
   if (
     this.serviceLines.some((line) => line.pricingInput.packageItemId) ||
     (!this.isNew &&
@@ -1134,6 +1140,8 @@ for (const hook of [
 ] as const) {
   bookingSchema.pre(hook, async function () {
     const update = JSON.stringify(this.getUpdate() ?? {});
+    if (update.includes("packageCalendarDelivery") && !isCalendarJournalWrite(this))
+      throw new Error("Package Calendar journal requires its repository CAS");
     if (
       update.includes("packageItemId") ||
       (await this.model
@@ -1160,6 +1168,8 @@ bookingSchema.pre("insertMany", async (docs) => {
 // target and proposed document, rather than trusting a caller-supplied bypass option.
 bookingSchema.pre("bulkWrite", async function (operations) {
   for (const operation of operations) {
+    if (JSON.stringify(operation).includes("packageCalendarDelivery"))
+      throw new Error("Package Calendar journal requires its repository CAS");
     if (JSON.stringify(operation).includes("packageItemId")) await verifyPackageBatchActivation();
     for (const key of [
       "updateOne",

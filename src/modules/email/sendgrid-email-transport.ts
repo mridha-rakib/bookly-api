@@ -1,7 +1,11 @@
 import sgMail from "@sendgrid/mail";
 
 import { env } from "../../config/env.js";
-import { classifyEmailProviderError, EmailError } from "./email.errors.js";
+import {
+  classifyEmailProviderError,
+  EMAIL_PROVIDER_REQUEST_TIMEOUT_MS,
+  EmailError,
+} from "./email.errors.js";
 import type {
   EmailAttachment,
   EmailTransportSendInput,
@@ -21,6 +25,10 @@ type SendGridLikeClient = {
 
 const defaultSendGridClientFactory = (apiKey: string): SendGridLikeClient => {
   sgMail.setApiKey(apiKey);
+  // axios `timeout` via @sendgrid/client's default request. Through follow-redirects it is a
+  // wall-clock timer from socket assignment to response headers; on expiry the request is
+  // aborted and destroyed (ECONNABORTED → PROVIDER_OUTCOME_UNKNOWN).
+  sgMail.setTimeout(EMAIL_PROVIDER_REQUEST_TIMEOUT_MS);
   return sgMail as unknown as SendGridLikeClient;
 };
 

@@ -117,8 +117,8 @@ export class DashboardOverviewService {
   // --- Authorization -------------------------------------------------------------------------
 
   /**
-   * OWNER/SUPERVISOR branches mirror BookingService.requireBookingManagementAccess exactly
-   * (never duplicated formula, re-derived scoping only). STAFF is new: an active STAFF
+   * OWNER/SUPERVISOR branches apply Booking management's Business/employment scope.
+   * STAFF is new: an active STAFF
    * membership of THIS business, re-derived from the actor's own identity — never a
    * client-supplied id, matching AuthService.resolveMeBusiness's own "resolve business from the
    * actor's own StaffMembership" convention.
@@ -146,7 +146,13 @@ export class DashboardOverviewService {
 
     if (actorRole === "SUPERVISOR") {
       const membership = await this.staffRepository.findActiveByUserId(actorUserId);
-      if (membership?.role !== "SUPERVISOR" || !membership.businessId.equals(business._id)) {
+      // This FULL scope includes Booking and ledger-derived financial figures.
+      if (
+        membership?.role !== "SUPERVISOR" ||
+        membership.employmentActive !== true ||
+        membership.removedAt != null ||
+        !membership.businessId.equals(business._id)
+      ) {
         throw new DashboardOverviewError("DASHBOARD_OVERVIEW_BUSINESS_NOT_FOUND", 404);
       }
       return { kind: "FULL", business };

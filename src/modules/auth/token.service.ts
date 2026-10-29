@@ -16,6 +16,7 @@ export type AccessTokenClaims = {
   sid?: string | undefined;
   /** Issued-at, seconds since epoch. */
   iat?: number | undefined;
+  exp?: number | undefined;
 };
 
 export type RefreshTokenResult = {
@@ -85,7 +86,13 @@ export class TokenService {
       throw new Error("Invalid token claims");
     }
 
-    return { sub: subject, role: role as UserRole, sid, iat: result.payload.iat };
+    return {
+      sub: subject,
+      role: role as UserRole,
+      sid,
+      iat: result.payload.iat,
+      exp: result.payload.exp,
+    };
   }
 
   /**

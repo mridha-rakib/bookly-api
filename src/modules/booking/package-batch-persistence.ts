@@ -95,6 +95,10 @@ export class PackageBatchPersistence {
     await this.#writeInTransaction(scope, p, token, business, session);
   }
 
+  /** ENGINEERING-ONLY. Commits INTERNAL materialization (UPCOMING member Bookings, occupancy,
+   * Progress) WITHOUT commercial completion. Production must use the F2 parent
+   * (PackageBatchFinancialPersistence.complete), which materializes and completes in ONE
+   * transaction. Guarded by tests/unit/package-batch-materialization-guard.test.ts. */
   public async materialize(scope: PackageBatchScope) {
     await verifyPackageBatchActivation();
     const existing = await readOwnedPackageBatchMaterialization(scope).catch((error: unknown) => {

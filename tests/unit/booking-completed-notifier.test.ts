@@ -13,6 +13,22 @@ const makeOutbox = () => {
 };
 
 describe("BookingCompletedNotifier", () => {
+  it("P4B completion intent shares the caller transaction and propagates pre-commit failure", async () => {
+    const outbox = makeOutbox(),
+      notifier = new BookingCompletedNotifier(outbox.service);
+    const booking = buildCompletedBooking(),
+      business = buildBusiness(),
+      session = { inTransaction: () => true } as never;
+    await notifier.enqueueBookingCompletedInTransaction(booking, business, session);
+    expect(outbox.spy).toHaveBeenCalledWith(
+      expect.objectContaining({ eventKey: `BOOKING_COMPLETED:${booking._id}` }),
+      session,
+    );
+    outbox.spy.mockRejectedValueOnce(Error("completion intent unavailable"));
+    await expect(
+      notifier.enqueueBookingCompletedInTransaction(booking, business, session),
+    ).rejects.toThrow("completion intent unavailable");
+  });
   beforeEach(() => vi.clearAllMocks());
 
   it("3/4 enqueues exactly one BOOKING_COMPLETED to the customer snapshot email", async () => {

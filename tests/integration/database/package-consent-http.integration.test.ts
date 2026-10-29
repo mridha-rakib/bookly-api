@@ -21,6 +21,7 @@ import {
   packageConsentOperationKey,
 } from "../../../src/modules/booking/package-consent.route.js";
 import { BusinessOpeningHoursModel } from "../../../src/modules/business-hours/business-hours.model.js";
+import { createCatalogRoute } from "../../../src/modules/catalog/catalog.route.js";
 import { ServiceCategoryModel } from "../../../src/modules/services/service-category.model.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -408,6 +409,16 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
     const preserved = await BookingCreationClaimModel.findOne().orFail();
     expect(preserved.packageCheckoutRetention?.seed.expiresAt).toEqual(expiry);
     expect(preserved.packageCheckoutAcceptance).toBeUndefined();
+    const original = await request(s.app)
+      .get(`${s.path}/quote`)
+      .set("Authorization", s.auth)
+      .expect(200);
+    expect(original.body.data.quote.expiresAt).toBe(expiry.toISOString());
+    expect(original.body.data.quote.issuedAt).toBe(
+      row.packageCheckoutRetention?.seed.issuedAt.toISOString(),
+    );
+    expect(original.body.data.quote.certification).toBe("UNRESOLVED");
+    expect(original.body.data.quote.purchaseAvailable).toBe(false);
   });
   it("committed acceptance replays after expiry without fresh policy or new evidence", async () => {
     const s = await setup();
@@ -551,6 +562,7 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
           build: () => production,
         }),
       );
+      browserApp.use("/catalog", createCatalogRoute());
       browserApp.get("/consent-browser.js", (_req, res) => res.type("js").send(bundle));
       browserApp.get("/consent-browser.css", (_req, res) => res.type("css").send(css));
       browserApp.get("/browser-fixture", (_req, res) =>
@@ -577,7 +589,16 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
         );
         await browser.waitFor(`!!document.querySelector('select')`);
         await browser.evaluate(
-          `(()=>{const s=document.querySelector('select'); s.value=s.options[1].value; s.dispatchEvent(new Event('change',{bubbles:true}));const d=new Date(${JSON.stringify(slot?.startAt)});const value=[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-')+'T'+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');const input=document.querySelector('input[type="datetime-local"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));})()`,
+          `(()=>{const s=document.querySelector('select'); s.value=s.options[1].value; s.dispatchEvent(new Event('change',{bubbles:true}));const input=document.querySelector('input[type="date"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(slot?.startAt.slice(0, 10))});input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));})()`,
+        );
+        await browser.evaluate(
+          `Array.from(document.querySelectorAll('button')).find(b=>b.textContent.includes('Find available times')).click()`,
+        );
+        await browser.waitFor(
+          `document.querySelector('[aria-label="Package appointment time"]').options.length > 1`,
+        );
+        await browser.evaluate(
+          `(()=>{const s=document.querySelector('[aria-label="Package appointment time"]');s.value=${JSON.stringify(slot?.startAt)};s.dispatchEvent(new Event('change',{bubbles:true}));})()`,
         );
         await browser.evaluate(
           `Array.from(document.querySelectorAll('button')).find(b=>b.textContent.includes('Review selected terms')).click()`,

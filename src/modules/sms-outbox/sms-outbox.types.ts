@@ -1,6 +1,12 @@
 import type { SmsProviderName } from "../sms/sms.types.js";
 
-export const smsOutboxStatuses = ["PENDING", "PROCESSING", "SENT", "FAILED"] as const;
+export const smsOutboxStatuses = [
+  "PENDING",
+  "PROCESSING",
+  "SENT",
+  "FAILED",
+  "UNKNOWN_OUTCOME",
+] as const;
 export type SmsOutboxStatus = (typeof smsOutboxStatuses)[number];
 
 /**

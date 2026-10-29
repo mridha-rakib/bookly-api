@@ -1,10 +1,20 @@
+import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import express from "express";
 import mongoose, { type ClientSession, Types } from "mongoose";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppError } from "../../../src/common/errors/app-error.js";
+import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
+import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { AddonModel } from "../../../src/modules/addons/addon.model.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AppointmentReminderModel } from "../../../src/modules/appointment-reminder/appointment-reminder.model.js";
 import { AppointmentReminderRepository } from "../../../src/modules/appointment-reminder/appointment-reminder.repository.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+} from "../../../src/modules/auth/auth.middleware.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import * as claims from "../../../src/modules/booking/booking-creation-claim.model.js";
@@ -17,6 +27,9 @@ import { PackageBatchFinancialPersistence } from "../../../src/modules/booking/p
 import { inspectBatchPaymentAuthority } from "../../../src/modules/booking/package-batch-payment-recovery.js";
 import { PackageCheckoutConflictError } from "../../../src/modules/booking/package-checkout.errors.js";
 import { hashCanonicalPackageCheckoutContent as digest } from "../../../src/modules/booking/package-checkout-binding.js";
+import { PackagePurchaseService } from "../../../src/modules/booking/package-purchase.service.js";
+import { verifyPackagePurchaseConsentCertification } from "../../../src/modules/booking/package-purchase-authority.js";
+import { PackagePurchaseHttpController } from "../../../src/modules/booking/package-purchase-http.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -58,6 +71,12 @@ import {
 
 vi.mock("../../../src/modules/booking/package-batch-authority.js", () => ({
   verifyPackageBatchActivation: vi.fn(async () => undefined),
+}));
+// New HTTP tests compose synthetic authority around the existing real F2 test domain.
+// This does not qualify original consent, change the production registry or promote evidence.
+vi.mock("../../../src/modules/booking/package-purchase-authority.js", () => ({
+  verifyPackagePurchaseConsentCertification: vi.fn(async () => undefined),
+  verifyPackagePurchaseProductionCompletion: vi.fn(async () => undefined),
 }));
 
 async function fixture(
@@ -1295,5 +1314,143 @@ describe("F2 preparation-only same-parent financial/delivery integration", () =>
     expect(await PaymentAttemptModel.countDocuments()).toBe(1);
     expect(t.gateway.paymentIntentInputs).toHaveLength(1);
     expect(await readOwnedPackageBatchCompletion(t.scope)).toBeTruthy();
+  });
+});
+
+describe("P3A purchase HTTP over the existing F2 parent (synthetic authorities only)", () => {
+  beforeAll(connectIsolatedDatabase, 120000);
+  beforeEach(clearIsolatedDatabase);
+  afterEach(() => vi.restoreAllMocks());
+  afterAll(stopIsolatedReplicaSet);
+  async function surface(first = false) {
+    const operationId = randomUUID(),
+      t = await fixture(first, false, { operationId });
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createAuthenticateAccessTokenMiddleware(t.tokens, new UserRepository()),
+      requireActiveUser(),
+    );
+    const service = new PackagePurchaseService(t.authority, t.writer);
+    app.post("/actions/:action", asyncHandler(new PackagePurchaseHttpController(service).execute));
+    app.use(createErrorHandler({ isProduction: true }));
+    const post = (
+      action = "purchase",
+      body: object = { businessId: String(t.scope.businessId), operationId },
+      authorization = t.authorization,
+    ) => request(app).post(`/actions/${action}`).set("Authorization", authorization).send(body);
+    return { ...t, operationId, post };
+  }
+  it.each([false, true])(
+    "paid=%s real parent completes and replays one Progress with exact intents",
+    async (first) => {
+      const t = await surface(first);
+      const a = await t.post().expect(200),
+        b = await t.post().expect(200);
+      expect(a.body.data.purchaseCompletion).toBe("VERIFIED");
+      expect(b.body.data.packageProgressId).toBe(a.body.data.packageProgressId);
+      expect(await PackageProgressV2Model.countDocuments()).toBe(1);
+      expect(await BookingModel.countDocuments()).toBe(2);
+      expect(await PaymentAttemptModel.countDocuments()).toBe(first ? 1 : 0);
+      expect(await BookingFinancialTransactionModel.countDocuments()).toBe(first ? 1 : 0);
+      expect(await EmailOutboxModel.countDocuments()).toBeGreaterThan(0);
+      const claim = await BookingCreationClaimModel.findOne().orFail();
+      expect(claim.packageBatchCompletion?.activation).toBe(
+        "SYNTHETIC_AUTHORITY_NOT_PRODUCTION_CONSENT",
+      );
+    },
+  );
+  it("3DS status/reload exposes only the exact Customer's original attempt; no credits before persistence", async () => {
+    const t = await surface(true);
+    t.gateway.queueNextChargeOutcome("requires_action");
+    const a = await t.post().expect(202);
+    expect(a.body.data).toMatchObject({
+      state: "PAYMENT_PENDING",
+      providerStatus: "REQUIRES_ACTION",
+    });
+    expect(a.body.data.clientSecret).toBeTruthy();
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+    const reread = await t.post("purchase-status").expect(202);
+    expect(reread.body.data.quoteId).toBe(a.body.data.quoteId);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    if (!attempt.providerPaymentIntentId) throw Error("Expected exact fake PI");
+    t.gateway.succeedPaymentIntent(attempt.providerPaymentIntentId);
+    await t.post().expect(200);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("lost provider response remains unconfirmed and recovers the same logical payment", async () => {
+    const t = await surface(true);
+    t.gateway.queueNextChargeLostResponse();
+    const initial = await t.post();
+    expect(initial.status).not.toBe(200);
+    const status = await t.post("purchase-status").expect(202);
+    expect(status.body.data.state).not.toBe("COMPLETE");
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+    await t.post().expect(200);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+  });
+  it("a failed payment never grants a purchased package", async () => {
+    const t = await surface(true);
+    t.gateway.queueNextChargeOutcome("failed");
+    const initial = await t.post();
+    expect(initial.status).not.toBe(200);
+    const status = await t.post("purchase-status").expect(202);
+    expect(status.body.data.providerStatus).toBe("FAILED");
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+  });
+  it("actual parent rollback and pending compensation do not report reimbursement complete", async () => {
+    const t = await surface(true);
+    t.gateway.queueNextRefundOutcome("pending");
+    vi.spyOn(EmailOutboxRepository.prototype, "enqueue").mockRejectedValueOnce(
+      Error("synthetic transactional failure"),
+    );
+    const initial = await t.post();
+    expect(initial.status).not.toBe(200);
+    const status = await t.post("purchase-status").expect(202);
+    expect(status.body.data.state).toBe("COMPENSATION");
+    expect(status.body.data.compensationStatus).not.toBe("REFUNDED");
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+    expect(await BookingModel.countDocuments()).toBe(0);
+  });
+  it("foreign Business, posted authority and unknown operation cannot dispatch a charge", async () => {
+    const t = await surface(true);
+    await t
+      .post("purchase", { businessId: String(new Types.ObjectId()), operationId: t.operationId })
+      .expect(404);
+    await t
+      .post("purchase", {
+        businessId: String(t.scope.businessId),
+        operationId: t.operationId,
+        certified: true,
+      })
+      .expect(400);
+    await t
+      .post("purchase", { businessId: String(t.scope.businessId), operationId: randomUUID() })
+      .expect(404);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(0);
+  });
+  it("acceptance without certification cannot prepare, charge or create entitlement even behind synthetic rollout", async () => {
+    const t = await surface(true);
+    vi.mocked(verifyPackagePurchaseConsentCertification).mockRejectedValueOnce(
+      new AppError("Uncertified", 503),
+    );
+    await t.post().expect(503);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(0);
+    expect(await BookingModel.countDocuments()).toBe(0);
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+    expect((await BookingCreationClaimModel.findOne())?.packageBatchPreparation).toBeUndefined();
+  });
+  it("competing initial-slot purchases through HTTP cannot materialize two exclusive members", async () => {
+    const t = await surface(false),
+      otherOperation = randomUUID();
+    await t.another(false, false, otherOperation);
+    const results = await Promise.all([
+      t.post(),
+      t.post("purchase", { businessId: String(t.scope.businessId), operationId: otherOperation }),
+    ]);
+    expect(results.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(await PackageProgressV2Model.countDocuments()).toBe(1);
+    expect(await BookingModel.countDocuments()).toBe(2);
   });
 });

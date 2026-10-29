@@ -70,6 +70,8 @@ import {
   bookingBusinessParamsSchema,
   bookingIdOnlyParamsSchema,
   bookingIdParamsSchema,
+  bookingPaymentStatusQuerySchema,
+  bookingRecoveryInboxQuerySchema,
   bookingServiceParamsSchema,
   calendarQuerySchema,
   cancelBookingBodySchema,
@@ -91,8 +93,10 @@ import { BookingService } from "./booking.service.js";
 import { BookingCreationService } from "./booking-creation.service.js";
 import { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "./booking-lifecycle.service.js";
+import { BookingRecoveryInbox } from "./booking-recovery-inbox.js";
 import { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
 import { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
+import { OrdinaryCalendarJournal } from "./ordinary-calendar-journal.js";
 import { createPenaltyCollectionService } from "./penalty-collection.factory.js";
 
 const buildController = (): BookingController => {
@@ -182,6 +186,8 @@ const buildController = (): BookingController => {
     new AppointmentReminderRepository(),
   );
 
+  // P4B-2A — SHADOW-only while the cutover authority is default-denied (no provider writes).
+  const ordinaryCalendarJournal = new OrdinaryCalendarJournal();
   const creationService = new BookingCreationService(
     businessRepository,
     bookingService,
@@ -203,6 +209,7 @@ const buildController = (): BookingController => {
     packageProgressRepository,
     taxService,
     financialRelationshipService,
+    ordinaryCalendarJournal,
   );
 
   const lifecycleService = new BookingLifecycleService(
@@ -233,6 +240,7 @@ const buildController = (): BookingController => {
       packageProgressRepository,
       userRepository,
     }),
+    ordinaryCalendarJournal,
   );
 
   return new BookingController(
@@ -241,6 +249,7 @@ const buildController = (): BookingController => {
     lifecycleService,
     new BookingRescheduleAvailabilityService(bookingService, availabilityService),
     new CustomerFinancialOutcomeRead(),
+    new BookingRecoveryInbox(creationService),
   );
 };
 
@@ -398,6 +407,19 @@ export const createBusinessBookingRoute = (): Router => {
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
     validateRequest({ params: bookingIdParamsSchema, body: rescheduleBookingBodySchema }),
     asyncHandler(controller.rescheduleByOwner),
+  );
+
+  // Read-only original-operation recovery remains available if new admission is suspended.
+  router.get(
+    "/:businessId/bookings/operations/payment-status",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({
+      params: bookingBusinessParamsSchema,
+      query: bookingPaymentStatusQuerySchema,
+    }),
+    asyncHandler(controller.readCustomerBookingPayment),
   );
 
   // Batch 11 — a PENDING or SUSPENDED Business cannot be previewed/booked by a Customer either
@@ -560,6 +582,15 @@ export const createCustomerBookingRoute = (): Router => {
     requireRoles(["CUSTOMER"]),
     validateRequest({ query: listCustomerBookingsQuerySchema }),
     asyncHandler(controller.listForCustomer),
+  );
+
+  router.get(
+    "/bookings/recovery-inbox",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ query: bookingRecoveryInboxQuerySchema }),
+    asyncHandler(controller.listCustomerRecoveryInbox),
   );
 
   // Batch 16 — Book Again. Registered BEFORE "/bookings/:bookingId" so the literal path segment

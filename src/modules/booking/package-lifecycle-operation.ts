@@ -184,13 +184,17 @@ operationSchema.pre("bulkWrite", () => {
 /** This record owns operation identity/results only. V2 remains the only credit authority.
  * No scan/TTL/index declaration; hashed built-in _id elects one globally scoped key winner. */
 export const PackageLifecycleOperationModel = model("PackageLifecycleOperation", operationSchema);
+/** Deterministic operation identity for one Customer/Business request key (the only key). */
+export const lifecycleOperationId = (key: string) =>
+  new Types.ObjectId(
+    createHash("sha256").update(`bookly:lifecycle:v1:${key}`).digest("hex").slice(0, 24),
+  );
+
 export class PackageLifecycleOperations {
   public async prepare(input: LifecycleIntent) {
     await verifyPackageBatchActivation();
     const intent = lifecycleIntentSchema.parse(input);
-    const _id = new Types.ObjectId(
-      createHash("sha256").update(`bookly:lifecycle:v1:${intent.key}`).digest("hex").slice(0, 24),
-    );
+    const _id = lifecycleOperationId(intent.key);
     const query = PackageLifecycleOperationModel.findOneAndUpdate(
       { _id },
       {
@@ -705,6 +709,40 @@ export class PackageLifecycleOperations {
     );
     grants.add(query);
     return (await query) ? { token, task: result.tasks[index] } : null;
+  }
+  public async releaseCalendarDelivery(
+    id: Types.ObjectId,
+    index: number,
+    now: Date,
+    session: ClientSession,
+  ) {
+    await verifyPackageBatchActivation();
+    if (!session.inTransaction()) throw batchConflict();
+    const row = await PackageLifecycleOperationModel.findOne({ _id: id, phase: "COMPLETE" })
+      .session(session)
+      .orFail();
+    const result = readLifecycleResult(row.result);
+    const delivery = row.delivery;
+    const entry = delivery?.find((value) => value.index === index);
+    if (
+      result.tasks[index]?.port !== "CALENDAR" ||
+      !entry ||
+      !["BLOCKED_UNVERIFIED", "PENDING", "RETRY"].includes(entry.state)
+    )
+      throw batchConflict();
+    const query = PackageLifecycleOperationModel.updateOne(
+      { _id: id, phase: "COMPLETE", delivery },
+      {
+        $set: {
+          delivery: delivery?.map((value) =>
+            value.index === index ? { ...value, state: "PENDING", nextDue: now } : value,
+          ),
+        },
+      },
+      { session },
+    );
+    grants.add(query);
+    if ((await query).matchedCount !== 1) throw batchConflict();
   }
   public async settleDelivery(
     id: Types.ObjectId,

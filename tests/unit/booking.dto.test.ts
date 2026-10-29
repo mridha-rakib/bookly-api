@@ -1,12 +1,12 @@
 import { Types } from "mongoose";
 import { describe, expect, it } from "vitest";
-
 import {
   toBookingCalendarEntryDto,
   toBookingDetailDto,
   toBookingListItemDto,
 } from "../../src/modules/booking/booking.dto.js";
 import type { BookingDocument } from "../../src/modules/booking/booking.model.js";
+import { bookingPaymentSummary } from "../../src/modules/booking/booking-payment-summary.js";
 import type { PackageProgressDocument } from "../../src/modules/package-progress/package-progress.model.js";
 
 /**
@@ -172,6 +172,15 @@ describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
     expect(dto.currency).toBe("EUR");
   });
 
+  it("calendar distinguishes First-Class members from ordinary and legacy package linkage", () => {
+    const booking = buildBooking();
+    expect(toBookingCalendarEntryDto(booking).firstClassPackage).toBe(false);
+    booking.serviceLines[0]!.pricingInput.packageProgressId = new Types.ObjectId();
+    expect(toBookingCalendarEntryDto(booking).firstClassPackage).toBe(false);
+    booking.serviceLines[0]!.pricingInput.packageItemId = new Types.ObjectId();
+    expect(toBookingCalendarEntryDto(booking).firstClassPackage).toBe(true);
+  });
+
   it("toBookingDetailDto exposes noShowStartedAt/noShowDeadlineAt only when both are set", () => {
     const withoutNoShow = toBookingDetailDto(buildBooking());
     expect(withoutNoShow.noShowStartedAt).toBeUndefined();
@@ -270,6 +279,13 @@ describe("booking.dto mappers (Batch 6 frontend-facing fields)", () => {
     );
     expect(partial.paymentSummary.venueSettlementStatus).toBe("PARTIALLY_PAID");
     expect(partial.paymentSummary.outstandingVenueBalanceCents).toBe(2500);
+    const persisted = buildBooking({
+      completionPayment: { paid: true, amountCents: 1500, recordedAt, recordedBy },
+    });
+    expect(bookingPaymentSummary(persisted)).toEqual(toBookingDetailDto(persisted).paymentSummary);
+    expect(bookingPaymentSummary(persisted).outstandingVenueBalanceCents).not.toBe(
+      persisted.financials.balanceDueCents,
+    );
 
     const full = toBookingDetailDto(
       buildBooking({

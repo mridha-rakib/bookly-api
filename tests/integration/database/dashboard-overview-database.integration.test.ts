@@ -16,6 +16,7 @@ import { DashboardOverviewError } from "../../../src/modules/dashboard-overview/
 import { DashboardOverviewService } from "../../../src/modules/dashboard-overview/dashboard-overview.service.js";
 import { BusinessPayoutRepository } from "../../../src/modules/finance/business-payout.repository.js";
 import { FinanceService } from "../../../src/modules/finance/finance.service.js";
+import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import {
@@ -320,6 +321,21 @@ describe("database-backed Dashboard Overview", () => {
     expect(overview.scope).toBe("FULL");
     expect(overview.todayBookingsCount).toBe(1);
     expect(overview.financials).not.toBeNull();
+  });
+
+  it("inactive Supervisor cannot retain the FULL financial Overview; Owner scope survives", async () => {
+    const { owner, business } = await createBusiness();
+    const { staffUser, membership } = await createStaffMember(business._id, "SUPERVISOR");
+    await StaffMembershipModel.updateOne(
+      { _id: membership._id },
+      { $set: { employmentActive: false } },
+    );
+    await expect(
+      service.getOverview(String(staffUser._id), "SUPERVISOR", String(business._id)),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(
+      (await service.getOverview(String(owner._id), "BUSINESS_OWNER", String(business._id))).scope,
+    ).toBe("FULL");
   });
 
   it("exposes compact package identity in both overview schedule presentations", async () => {

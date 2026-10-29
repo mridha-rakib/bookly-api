@@ -3,9 +3,11 @@ import { pathToFileURL } from "node:url";
 import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
+import { BookingReminderSmsDeliveryEligibility } from "../modules/booking/booking-email-delivery-eligibility.js";
 import { createSmsTransport } from "../modules/sms/sms-transport.factory.js";
 import { SmsOutboxRepository } from "../modules/sms-outbox/sms-outbox.repository.js";
 import { SmsOutboxWorker } from "../modules/sms-outbox/sms-outbox-worker.js";
+import { withMoneyRecoveryLifecycle as withWorkerLifecycle } from "./money-recovery-runtime.js";
 
 /**
  * The transactional-SMS outbox worker entry point. Same design as run-email-worker.ts /
@@ -19,16 +21,25 @@ import { SmsOutboxWorker } from "../modules/sms-outbox/sms-outbox-worker.js";
  *   node dist/scripts/run-sms-worker.js
  */
 const buildWorker = (): SmsOutboxWorker =>
-  new SmsOutboxWorker(new SmsOutboxRepository(), createSmsTransport(), {
-    workerId: `sms-worker-${process.pid}`,
-    maxAttempts: env.SMS_WORKER_MAX_ATTEMPTS,
-    claimTimeoutMs: env.SMS_OUTBOX_CLAIM_TIMEOUT_MS,
-    retryBaseMs: env.SMS_WORKER_RETRY_BASE_MS,
-    concurrency: env.SMS_WORKER_CONCURRENCY,
-  });
+  new SmsOutboxWorker(
+    new SmsOutboxRepository(),
+    createSmsTransport(),
+    {
+      workerId: `sms-worker-${process.pid}`,
+      maxAttempts: env.SMS_WORKER_MAX_ATTEMPTS,
+      claimTimeoutMs: env.SMS_OUTBOX_CLAIM_TIMEOUT_MS,
+      retryBaseMs: env.SMS_WORKER_RETRY_BASE_MS,
+      concurrency: env.SMS_WORKER_CONCURRENCY,
+    },
+    () => new Date(),
+    new BookingReminderSmsDeliveryEligibility(),
+  );
 
-const runOnce = async (worker: SmsOutboxWorker): Promise<void> => {
-  const counts = await worker.runOnce(env.SMS_WORKER_BATCH_SIZE);
+const runOnce = async (
+  worker: SmsOutboxWorker,
+  shouldStop: () => boolean = () => false,
+): Promise<void> => {
+  const counts = await worker.runOnce(env.SMS_WORKER_BATCH_SIZE, shouldStop);
   logger.info({ counts }, "SMS worker pass complete");
 };
 
@@ -37,51 +48,34 @@ const runCli = async (): Promise<void> => {
   const worker = buildWorker();
   const runForever = !process.argv.includes("--once");
 
-  try {
-    await databaseManager.connect();
-
-    if (!runForever) {
-      await runOnce(worker);
-      return;
-    }
-
-    logger.info(
-      { intervalMs: env.SMS_WORKER_POLL_INTERVAL_MS },
-      "SMS worker starting continuous polling",
-    );
-
-    let stopping = false;
-    const shutdown = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      clearInterval(interval);
-      await databaseManager.disconnect();
-      logger.info("SMS worker stopped");
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
-
-    const interval = setInterval(() => {
-      runOnce(worker).catch((error: unknown) => {
-        logger.error({ err: error }, "SMS worker pass failed");
-      });
-    }, env.SMS_WORKER_POLL_INTERVAL_MS);
-
-    await runOnce(worker);
-    return;
-  } catch (error) {
-    logger.error({ err: error }, "SMS worker failed to start");
-    throw error;
-  } finally {
-    if (!runForever) {
-      await databaseManager.disconnect();
-    }
-  }
+  await withWorkerLifecycle({
+    signals: process,
+    connect: () => databaseManager.connect(),
+    disconnect: () => databaseManager.disconnect(),
+    onStopping: () => logger.info("SMS worker stopping: no new claims; draining in-flight work"),
+    execute: async (shouldStop, wait) => {
+      do {
+        if (shouldStop()) break;
+        try {
+          await runOnce(worker, shouldStop);
+        } catch {
+          logger.error({ event: "SMS_WORKER_PASS_FAILED" }, "SMS worker pass failed");
+          if (!runForever) throw new Error("SMS worker pass failed");
+        }
+        if (!runForever || shouldStop()) break;
+        await wait(env.SMS_WORKER_POLL_INTERVAL_MS);
+      } while (!shouldStop());
+    },
+  });
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await runCli();
+  try {
+    await runCli();
+  } catch {
+    logger.error({ event: "SMS_WORKER_FAILED" }, "SMS worker stopped with failure");
+    process.exitCode = 1;
+  }
 }
 
 export { buildWorker, runOnce };

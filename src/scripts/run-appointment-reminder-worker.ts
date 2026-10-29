@@ -12,6 +12,7 @@ import { CustomerNotificationPolicy } from "../modules/notification/customer-not
 import { createSmsTransport } from "../modules/sms/sms-transport.factory.js";
 import { SmsOutboxService } from "../modules/sms-outbox/sms-outbox.service.js";
 import { UserRepository } from "../modules/user/user.repository.js";
+import { withMoneyRecoveryLifecycle as withWorkerLifecycle } from "./money-recovery-runtime.js";
 
 /**
  * The 24h appointment-reminder worker entry point. Same design as run-no-show-worker.ts /
@@ -44,8 +45,11 @@ const buildWorker = (): AppointmentReminderWorker =>
     },
   );
 
-const runOnce = async (worker: AppointmentReminderWorker): Promise<void> => {
-  const counts = await worker.runOnce();
+const runOnce = async (
+  worker: AppointmentReminderWorker,
+  shouldStop: () => boolean = () => false,
+): Promise<void> => {
+  const counts = await worker.runOnce(shouldStop);
   logger.info({ counts }, "Appointment reminder worker pass complete");
 };
 
@@ -54,51 +58,41 @@ const runCli = async (): Promise<void> => {
   const worker = buildWorker();
   const runForever = !process.argv.includes("--once");
 
-  try {
-    await databaseManager.connect();
-
-    if (!runForever) {
-      await runOnce(worker);
-      return;
-    }
-
-    logger.info(
-      { intervalMs: env.APPOINTMENT_REMINDER_WORKER_POLL_INTERVAL_MS },
-      "Appointment reminder worker starting continuous polling",
-    );
-
-    let stopping = false;
-    const shutdown = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      clearInterval(interval);
-      await databaseManager.disconnect();
-      logger.info("Appointment reminder worker stopped");
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
-
-    const interval = setInterval(() => {
-      runOnce(worker).catch((error: unknown) => {
-        logger.error({ err: error }, "Appointment reminder worker pass failed");
-      });
-    }, env.APPOINTMENT_REMINDER_WORKER_POLL_INTERVAL_MS);
-
-    await runOnce(worker);
-    return;
-  } catch (error) {
-    logger.error({ err: error }, "Appointment reminder worker failed to start");
-    throw error;
-  } finally {
-    if (!runForever) {
-      await databaseManager.disconnect();
-    }
-  }
+  await withWorkerLifecycle({
+    signals: process,
+    connect: () => databaseManager.connect(),
+    disconnect: () => databaseManager.disconnect(),
+    onStopping: () =>
+      logger.info("Reminder worker stopping: no new claims; draining in-flight work"),
+    execute: async (shouldStop, wait) => {
+      do {
+        if (shouldStop()) break;
+        try {
+          await runOnce(worker, shouldStop);
+        } catch {
+          logger.error(
+            { event: "REMINDER_WORKER_PASS_FAILED" },
+            "Appointment reminder worker pass failed",
+          );
+          if (!runForever) throw new Error("Appointment reminder worker pass failed");
+        }
+        if (!runForever || shouldStop()) break;
+        await wait(env.APPOINTMENT_REMINDER_WORKER_POLL_INTERVAL_MS);
+      } while (!shouldStop());
+    },
+  });
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await runCli();
+  try {
+    await runCli();
+  } catch {
+    logger.error(
+      { event: "REMINDER_WORKER_FAILED" },
+      "Appointment reminder worker stopped with failure",
+    );
+    process.exitCode = 1;
+  }
 }
 
 export { buildWorker, runOnce };

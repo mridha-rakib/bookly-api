@@ -10,6 +10,12 @@ import {
 } from "../components/email-primitives.js";
 import { renderBookingDetailsHtml, renderBookingDetailsText } from "./booking-details-section.js";
 import type { BookingEmailData } from "./booking-email-data.js";
+import {
+  renderPolicyHtml,
+  renderPolicyText,
+  renderReceiptHtml,
+  renderReceiptText,
+} from "./booking-policy-receipt-section.js";
 
 /**
  * TRIGGER 2 (recipient A) — the customer who booked it themselves. Wording assumes the customer
@@ -18,15 +24,12 @@ import type { BookingEmailData } from "./booking-email-data.js";
  */
 export const BOOKING_CUSTOMER_CONFIRMED_SUBJECT = "Your Bookly booking is confirmed" as const;
 
-const cancellationReminder = (data: BookingEmailData): string | undefined => {
-  if (!data.cancellationPolicy) {
-    return undefined;
-  }
-  return `If you need to cancel, do it as early as you can. A late cancellation or no-show may be charged up to ${data.cancellationPolicy.noShowPercentage}% of the booking value under ${data.businessName}'s cancellation policy.`;
-};
+// F4A Tier 3: the policy terms come from the Booking's own snapshot (booking-policy-receipt-
+// section.ts). The previous sentence applied the no-show percentage to late cancellations too.
+const CANCEL_EARLY = "If you need to cancel, do it as early as you can.";
 
 export const renderBookingCustomerConfirmedEmail = (data: BookingEmailData): RenderedEmail => {
-  const reminder = cancellationReminder(data);
+  const receiptText = renderReceiptText(data);
 
   const cta = data.customerBookingUrlPath
     ? emailButton("View your booking", buildFrontendUrl(data.customerBookingUrlPath))
@@ -38,7 +41,9 @@ export const renderBookingCustomerConfirmedEmail = (data: BookingEmailData): Ren
       `Hi ${data.customerName}, your booking with ${data.businessName} is confirmed. Here are the details:`,
     ) +
     renderBookingDetailsHtml(data) +
-    (reminder ? emailParagraph(reminder) : "") +
+    renderReceiptHtml(data) +
+    renderPolicyHtml(data) +
+    emailParagraph(CANCEL_EARLY) +
     cta +
     emailMutedNote(`Questions about this appointment? Contact us at ${SUPPORT_EMAIL}.`);
 
@@ -48,7 +53,11 @@ export const renderBookingCustomerConfirmedEmail = (data: BookingEmailData): Ren
     `Hi ${data.customerName}, your booking with ${data.businessName} is confirmed.`,
     "",
     renderBookingDetailsText(data),
-    ...(reminder ? ["", reminder] : []),
+    ...(receiptText ? ["", receiptText] : []),
+    "",
+    renderPolicyText(data),
+    "",
+    CANCEL_EARLY,
     ...(data.customerBookingUrlPath
       ? ["", `View your booking: ${buildFrontendUrl(data.customerBookingUrlPath)}`]
       : []),

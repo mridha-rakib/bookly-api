@@ -107,6 +107,9 @@ export type BusinessClientFinancialRelationship = {
 };
 
 export type BusinessClientDocument = {
+  /** P3B: absent legacy generation is zero; every link/archive mutation advances it. */
+  linkGeneration?: number;
+  consentFence?: number;
   _id: Types.ObjectId;
   businessId: Types.ObjectId;
   createdByUserId: Types.ObjectId;
@@ -266,6 +269,8 @@ const financialRelationshipSchema = new Schema<BusinessClientFinancialRelationsh
 
 const businessClientSchema = new Schema<BusinessClientDocument>(
   {
+    linkGeneration: { type: Number, min: 0, validate: Number.isSafeInteger, default: 0 },
+    consentFence: { type: Number, min: 0, validate: Number.isSafeInteger, default: 0 },
     businessId: { type: Schema.Types.ObjectId, ref: "Business", required: true },
     createdByUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
 
@@ -333,6 +338,69 @@ businessClientSchema.index(
     partialFilterExpression: { "financialRelationship.pending.idempotencyKey": { $exists: true } },
   },
 );
+
+const linkRoots = ["linkedUserId", "linkState", "archivedAt", "businessId"];
+businessClientSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"], function () {
+  const update = this.getUpdate();
+  if (!update) return;
+  if (Array.isArray(update))
+    throw new Error("BusinessClient pipeline updates cannot preserve link continuity");
+  const touches = (fields: object) =>
+    Object.keys(fields).some((key) =>
+      linkRoots.some((root) => key === root || key.startsWith(`${root}.`)),
+    ) ||
+    Object.values(fields).some((value) => typeof value === "string" && linkRoots.includes(value));
+  const fields = Object.values(update).filter(
+    (v): v is object => Boolean(v) && typeof v === "object",
+  );
+  if (
+    Object.hasOwn(update, "linkGeneration") ||
+    fields.some(
+      (v) =>
+        Object.keys(v).some(
+          (key) => key === "linkGeneration" || key.startsWith("linkGeneration."),
+        ) ||
+        Object.values(v).some(
+          (value) =>
+            typeof value === "string" &&
+            (value === "linkGeneration" || value.startsWith("linkGeneration.")),
+        ),
+    )
+  )
+    throw new Error("BusinessClient link generation is model-owned");
+  if (touches(update) || fields.some(touches)) {
+    this.and([
+      {
+        $or: [
+          { linkGeneration: { $exists: false } },
+          { linkGeneration: { $lt: Number.MAX_SAFE_INTEGER } },
+        ],
+      },
+    ]);
+    // Even repeated writes conservatively invalidate pending consent. Missing legacy = 0.
+    const increment = (update.$inc ?? {}) as Record<string, number>;
+    update.$inc = { ...increment, linkGeneration: 1 };
+    this.setUpdate(update);
+  }
+});
+businessClientSchema.pre("save", function () {
+  if (this.isNew) {
+    if ((this.linkGeneration ?? 0) !== 0)
+      throw new Error("New BusinessClient generation must be zero");
+    return;
+  }
+  if (this.isModified("linkGeneration") || linkRoots.some((key) => this.isModified(key)))
+    throw new Error("Use canonical BusinessClient query writers for link/archive changes");
+});
+businessClientSchema.pre(
+  ["replaceOne", "findOneAndReplace", "bulkWrite", "deleteOne", "deleteMany", "findOneAndDelete"],
+  () => {
+    throw new Error("BusinessClient replacement/bulk writes cannot preserve link continuity");
+  },
+);
+businessClientSchema.pre("deleteOne", { document: true, query: false }, () => {
+  throw new Error("Archive BusinessClient rows; link identity cannot be erased");
+});
 
 export const BusinessClientModel = model<BusinessClientDocument>(
   "BusinessClient",

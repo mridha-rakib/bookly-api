@@ -8,6 +8,10 @@ import type { FinancialRelationshipService } from "../client/financial-relations
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import type { ProviderReversalService } from "../provider-reversal/provider-reversal.service.js";
 import type { StripeWebhookService } from "../stripe-webhook/stripe-webhook.service.js";
+import {
+  convergeBusinessRefundSettlementProjection,
+  ensureBusinessRefundNotification,
+} from "./business-refund-notification.js";
 import type { PaymentService } from "./payment.service.js";
 import type {
   PaymentAttemptDocument,
@@ -19,6 +23,7 @@ import { isPenaltyPurpose } from "./penalty-attempt.js";
 import { ensureRefundAccounting } from "./refund-accounting.js";
 import type { RefundOperationDocument } from "./refund-operation.model.js";
 import type { RefundOperationRepository } from "./refund-operation.repository.js";
+import type { RefundRecoveryIncidentService } from "./refund-recovery-incident.js";
 
 const ORPHAN_GRACE_MS = 5 * 60_000;
 /** P1.1 — a bound FIRST charge still awaiting 3DS this long is re-read from Stripe. Reading is
@@ -58,6 +63,7 @@ export class MoneyRecoveryService {
     // P6 — provider-originated reversal backstop (open-dispute resync, bounded provider sweep of
     // disputes / external refunds, missing processing fees). Accounting only; optional trailing dep.
     private readonly providerReversals?: Pick<ProviderReversalService, "runBackstop">,
+    private readonly refundIncidents?: Pick<RefundRecoveryIncidentService, "observe" | "poll">,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
@@ -397,8 +403,44 @@ export class MoneyRecoveryService {
           },
           "Money recovery item failed",
         );
+        errors += await this.monitorRefundIncident(() =>
+          this.refundIncidents?.observe(operation._id, "REFUND_RECOVERY_FAILED"),
+        );
       }
     }
+
+    // Settled refund rows remain discoverable even after their ledger reconciliation marker
+    // was cleared. This pass never calls the provider; the outbox row and marker commit together.
+    // A definitive result whose Booking projection was interrupted by a crash is projected first.
+    for (const operation of await this.refundOperationRepository.listFinalNotificationPending(
+      limit,
+    )) {
+      try {
+        await convergeBusinessRefundSettlementProjection(operation._id);
+        const disposition = await ensureBusinessRefundNotification(operation._id);
+        if (disposition === "NOT_READY") {
+          errors += await this.monitorRefundIncident(() =>
+            this.refundIncidents?.observe(operation._id, "FINAL_NOTIFICATION_EVIDENCE_UNRESOLVED"),
+          );
+          await this.refundOperationRepository.scheduleRecoveryRetry(
+            operation._id,
+            "Final refund notification evidence not yet converged",
+          );
+        }
+      } catch (error) {
+        errors += 1;
+        errors += await this.monitorRefundIncident(() =>
+          this.refundIncidents?.observe(operation._id, "FINAL_NOTIFICATION_RECONCILIATION_FAILED"),
+        );
+        await this.refundOperationRepository.scheduleRecoveryRetry(
+          operation._id,
+          error instanceof Error ? error.name : "Final notification unavailable",
+        );
+      }
+    }
+    // No provider calls: pending incidents remain visible independently of the normal retry
+    // queues, including after the final-notification marker removes a row from those queues.
+    errors += await this.monitorRefundIncident(() => this.refundIncidents?.poll(limit));
 
     // Runs AFTER the payment/refund passes so a compensation refund confirmed in this same pass
     // can restore eligibility immediately. Never a timeout unlock — see
@@ -444,6 +486,19 @@ export class MoneyRecoveryService {
       ...reversals,
       errors,
     };
+  }
+
+  private async monitorRefundIncident(action: () => Promise<void> | undefined): Promise<number> {
+    try {
+      await action();
+      return 0;
+    } catch {
+      logger.error(
+        { event: "REFUND_RECOVERY_INCIDENT_MONITORING_FAILED" },
+        "Refund incident monitoring failed; financial state was not changed by monitoring",
+      );
+      return 1;
+    }
   }
 
   /**

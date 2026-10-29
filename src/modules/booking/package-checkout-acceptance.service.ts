@@ -14,6 +14,7 @@ import {
 import { buildPackageCheckoutDisclosure } from "./package-checkout-disclosure.js";
 import type { PackageCheckoutQuotePreparer } from "./package-checkout-quote.service.js";
 import type { PackageCheckoutRetention } from "./package-checkout-retention.js";
+import type { PackageConsentProtocol } from "./package-consent-protocol.js";
 
 /** INTERNAL / NOT REGISTERED. A future authenticated UI must deliver the returned exact
  * disclosure as text with an unchecked acceptance control, then post its explicit action.
@@ -31,6 +32,7 @@ export class PackageCheckoutAcceptanceService {
     private readonly staff: Pick<StaffRepository, "findManyByIdsForBusiness">,
     private readonly users: Pick<UserRepository, "findProfilesByUserIds">,
     private readonly clock: () => Date = () => new Date(),
+    private readonly consent?: PackageConsentProtocol,
   ) {}
 
   private async names(retained: PackageCheckoutRetention) {
@@ -144,6 +146,10 @@ export class PackageCheckoutAcceptanceService {
     if (row.accepted) {
       if (!isDeepStrictEqual(row.accepted.event, action))
         throw new PackageCheckoutConflictError("Conflicting acceptance event");
+      if (row.retention.seed.consentEvidenceId) {
+        if (!this.consent) throw new PackageCheckoutConflictError("Consent protocol required");
+        await this.consent.certify(operationKey);
+      }
       return row.accepted;
     }
     if (
@@ -168,7 +174,10 @@ export class PackageCheckoutAcceptanceService {
       fresh,
       action,
     );
-    await this.claims.commitPackageCheckoutGrant(grant);
+    if (row.retention.seed.consentEvidenceId) {
+      if (!this.consent) throw new PackageCheckoutConflictError("Consent protocol required");
+      await this.consent.commit(grant, customer, businessId, operationKey);
+    } else await this.claims.commitPackageCheckoutGrant(grant);
     const winner = await this.claims.findPackageCheckoutForCustomer(
       customer,
       businessId,

@@ -60,6 +60,7 @@ import {
   type LifecycleResult,
   lifecycleAssessmentSchema,
   lifecycleIntentSchema,
+  lifecycleOperationId,
   PackageLifecycleOperationModel,
   PackageLifecycleOperations,
   readLifecycleResult,
@@ -108,6 +109,82 @@ export class PackageLifecycleService {
         customerUserId: actor.userId,
       }),
     );
+  }
+  /** Read-only recovery of one exact Customer redemption after a lost response or reload. */
+  public async customerRedemptionStatus(customer: PackageCheckoutCustomer, request: Request) {
+    if (request.action !== "REDEEM") throw batchConflict();
+    return this.customerOperationStatus(customer, request);
+  }
+  /** Read-only recovery of one exact Customer lifecycle operation (REDEEM, RESCHEDULE, CANCEL,
+   * EXPIRE) after a lost response or reload. It never prepares, claims, charges, refunds,
+   * reserves, releases or writes. The stored operation must carry the identical intent (same
+   * action, key, Business, BusinessClient, Progress, Customer actor and action fields); an
+   * absent or differently bound operation, including another action's key, returns null, so it
+   * is indistinguishable from a missing one. COMPLETE is reported only after the same
+   * committed-result verifier the replay path uses; anything else stays UNRESOLVED. */
+  public async customerOperationStatus(customer: PackageCheckoutCustomer, request: Request) {
+    await verifyPackageBatchActivation();
+    const actor = readPackageCheckoutCustomer(customer);
+    if (!["REDEEM", "RESCHEDULE", "CANCEL", "EXPIRE"].includes(request.action))
+      throw batchConflict();
+    const intent = lifecycleIntentSchema.parse({
+      ...request,
+      version: 1,
+      actorUserId: actor.userId,
+      actorRole: "CUSTOMER",
+      customerUserId: actor.userId,
+    });
+    return this.#operationStatus(intent);
+  }
+  /** Read-only recovery of one exact Owner/Supervisor lifecycle operation (every management
+   * action: RESCHEDULE, CANCEL, COMPLETE, MARK_NO_SHOW, NO_SHOW, REVERSE_NO_SHOW, EXPIRE,
+   * VENUE_SETTLEMENT). The caller must still be the ACTIVE user in that role with current
+   * management access to the Business (same checks as business()), and the stored intent must
+   * name this exact actor: a Supervisor cannot read the Owner's operation or vice versa, and a
+   * Customer operation never matches. No write, notification, payment, settlement or ledger
+   * effect; settlement is COMMITTED only with the verifier's exact venue-ledger proof. */
+  public async businessOperationStatus(
+    actorUserId: Types.ObjectId,
+    actorRole: "BUSINESS_OWNER" | "SUPERVISOR",
+    customerUserId: Types.ObjectId,
+    request: Request,
+  ) {
+    await verifyPackageBatchActivation();
+    if (request.action === "REDEEM") throw batchConflict();
+    const user = await UserModel.findById(actorUserId);
+    if (!user || user.role !== actorRole || user.status !== "ACTIVE") throw batchConflict();
+    await this.management.requireBookingManagementAccess(
+      String(actorUserId),
+      actorRole,
+      String(request.businessId),
+    );
+    return this.#operationStatus(
+      lifecycleIntentSchema.parse({
+        ...request,
+        version: 1,
+        actorUserId,
+        actorRole,
+        customerUserId,
+      }),
+    );
+  }
+  async #operationStatus(intent: LifecycleIntent) {
+    const row = await PackageLifecycleOperationModel.findById(lifecycleOperationId(intent.key))
+      .read("primary")
+      .readConcern("majority")
+      .maxTimeMS(2000);
+    if (!row || digest(row.intent) !== digest(intent)) return null;
+    if (row.phase === "FAILED_FINAL") throw batchConflict();
+    if (row.phase !== "COMPLETE") return { state: "UNRESOLVED" as const };
+    try {
+      const committed = await verifyCommittedLifecycleResult(row._id, intent);
+      return committed
+        ? { state: "COMMITTED" as const, result: committed.result }
+        : { state: "UNRESOLVED" as const };
+    } catch {
+      // Contradictory or unavailable proof is never reported as success.
+      return { state: "UNRESOLVED" as const };
+    }
   }
   public async business(
     actorUserId: Types.ObjectId,
@@ -262,7 +339,8 @@ export class PackageLifecycleService {
                   userId: intent.actorUserId,
                   role: "SUPERVISOR",
                   employmentActive: true,
-                  removedAt: { $exists: false },
+                  // Same non-removed contract as the shared scope guard/partial unique index.
+                  removedAt: null,
                 }).session(session));
           if (!user || !allowed) throw batchConflict();
         }
@@ -1212,192 +1290,14 @@ export class PackageLifecycleService {
         endAt: booking.schedule.endAt,
       });
   }
+  /** Reuses the complete committed-result verifier for Calendar membership, including paid
+   * redemption evidence. It has no scheduling, payment or delivery side effects. */
+  public static async verifyCalendarResult(id: Types.ObjectId, intent: LifecycleIntent) {
+    await verifyPackageBatchActivation();
+    return verifyCommittedLifecycleResult(id, intent);
+  }
   async #read(id: Types.ObjectId, intent: LifecycleIntent) {
-    const row = await PackageLifecycleOperationModel.findById(id).read("primary").maxTimeMS(2000);
-    if (row?.phase !== "COMPLETE") return null;
-    if (digest(row.intent) !== digest(intent)) throw batchConflict();
-    const result = readLifecycleResult(row.result);
-    const progress = await PackageProgressV2Model.findOne({
-      _id: intent.packageProgressId,
-      businessId: intent.businessId,
-      customerUserId: intent.customerUserId,
-      businessClientId: intent.businessClientId,
-    })
-      .read("primary")
-      .maxTimeMS(2000);
-    if (!progress) throw batchConflict();
-    const plain = progress.toObject();
-    for (const key of ["createdAt", "updatedAt", "__v"]) Reflect.deleteProperty(plain, key);
-    packageProgressV2InputSchema.parse(plain);
-    if (intent.action === "EXPIRE") {
-      if (progress.creditAccountingVersion !== 2) throw batchConflict();
-      if (result.status === "FOREVER") {
-        if (progress.purchasedContract.validity.mode !== "FOREVER") throw batchConflict();
-      } else if (
-        !progress.expiryReconciledAt ||
-        progress.items.some((item) => !item.expiryEvent || item.remainingSessions !== 0)
-      )
-        throw batchConflict();
-    }
-    let booking = null;
-    const resultBookingId = result.bookingId;
-    if (resultBookingId) {
-      booking = await BookingModel.findOne({
-        _id: resultBookingId,
-        businessId: intent.businessId,
-        "customer.customerUserId": intent.customerUserId,
-        "customer.businessClientId": intent.businessClientId,
-      })
-        .read("primary")
-        .maxTimeMS(2000);
-      const line = booking?.serviceLines[0],
-        attempt = progress.sessions.find((a) => a.bookingId.equals(resultBookingId));
-      if (
-        !booking ||
-        !line ||
-        !attempt ||
-        !line.pricingInput.packageProgressId?.equals(progress._id) ||
-        !attempt.packageItemId.equals(line.pricingInput.packageItemId ?? new Types.ObjectId()) ||
-        !attempt.serviceId.equals(line.serviceId)
-      )
-        throw batchConflict();
-      const expected =
-        booking.status === "UPCOMING" || booking.status === "PENDING"
-          ? "SCHEDULED"
-          : booking.status === "COMPLETED"
-            ? "COMPLETED"
-            : ["CANCELLED_BY_CUSTOMER", "CANCELLED_BY_BUSINESS", "NO_SHOW_CANCELLED"].includes(
-                  booking.status,
-                )
-              ? "CANCELLED"
-              : "FORFEITED";
-      if (attempt.status !== expected) throw batchConflict();
-      if (result.reservationKey) {
-        if (!result.staffMembershipId) throw batchConflict();
-        const effect = await BookingSlotReservationClaimModel.findOne({
-          idempotencyKey: result.reservationKey,
-          businessId: intent.businessId,
-          serviceId: line.serviceId,
-          staffMembershipId: result.staffMembershipId,
-          partySize: 1,
-        })
-          .read("primary")
-          .maxTimeMS(2000);
-        if (
-          !effect?.effect ||
-          !result.reservationId ||
-          !effect.effect.actualReservationId.equals(result.reservationId) ||
-          effect.originalIntent?.startAt.getTime() !==
-            (result.startAt ?? intent.startAt)?.getTime() ||
-          effect.originalIntent?.endAt.getTime() !== result.endAt?.getTime() ||
-          effect.originalIntent?.capacityMax !==
-            (line.schedulingSnapshot?.group?.capacityMax ?? 1) ||
-          (effect.effect.state !== "APPLIED" && effect.effect.state !== "RELEASED") ||
-          (intent.action === "CANCEL" && effect.effect.state !== "RELEASED")
-        )
-          throw batchConflict();
-      }
-    }
-    if (intent.dues) {
-      const q = lifecycleSessionQuoteSchema.parse(row.sessionQuote),
-        a = lifecycleSessionAcceptanceSchema.parse(row.sessionAcceptance);
-      if (
-        !booking ||
-        !result.bookingId ||
-        !q.terms.bookingId.equals(result.bookingId) ||
-        q.terms.intentHash !== digest(intent) ||
-        q.termsHash !== digest(q.terms) ||
-        q.disclosureHash !== digest(q.disclosure) ||
-        !a.quoteId.equals(q.quoteId) ||
-        !a.customerUserId.equals(intent.customerUserId) ||
-        a.termsHash !== q.termsHash ||
-        a.disclosureHash !== q.disclosureHash ||
-        a.sessionFamilyId !== q.sessionFamilyId ||
-        digest(booking.toObject().fulfilment) !== digest(q.terms.fulfilment) ||
-        booking.financials.servicesSubtotalCents !== 0 ||
-        booking.financials.addonsSubtotalCents !== q.terms.addonsCents ||
-        booking.financials.travelFeeCents !== q.terms.travelCents ||
-        booking.financials.totalCents !== q.terms.totalCents ||
-        booking.financials.depositCents !==
-          (q.terms.paymentMethod === "ONLINE" ? q.terms.totalCents : 0)
-      )
-        throw batchConflict();
-      const item = progress.items.find((i) =>
-        i.packageItemId.equals(intent.packageItemId ?? new Types.ObjectId()),
-      );
-      if (
-        !item ||
-        digest(
-          plain.items.find((i) => i.packageItemId.equals(item.packageItemId))?.travelCities ?? [],
-        ) !== q.terms.travelRightsHash
-      )
-        throw batchConflict();
-    }
-    if (result.money) {
-      const attempt = await PaymentAttemptModel.findById(result.money.attemptId)
-        .read("primary")
-        .maxTimeMS(2000)
-        .orFail();
-      const authority = await inspectLifecyclePaymentAuthority(attempt);
-      if (
-        authority?.kind !== "COMPLETE" ||
-        attempt.persistenceStatus !== "COMPLETED" ||
-        !authority.row._id.equals(id)
-      )
-        throw batchConflict();
-    }
-    if (result.venue) {
-      if (
-        !intent.venuePayment ||
-        !booking ||
-        (booking.completionPayment?.amountCents ?? 0) < result.venue.cumulativeCents
-      )
-        throw batchConflict();
-      if (result.venue.amountCents > 0) {
-        if (
-          !result.venue.ledgerId ||
-          !(await BookingFinancialTransactionModel.exists({
-            _id: result.venue.ledgerId,
-            businessId: intent.businessId,
-            bookingId: booking._id,
-            customerUserId: intent.customerUserId,
-            businessClientId: intent.businessClientId,
-            type: "PAYMENT",
-            direction: "DEBIT",
-            status: "SUCCEEDED",
-            amountCents: result.venue.amountCents,
-            idempotencyKey: `package-venue:${id}`,
-            "metadata.collectedAtVenue": true,
-            "metadata.lifecycleOperationId": String(id),
-          })
-            .read("primary")
-            .maxTimeMS(2000))
-        )
-          throw batchConflict();
-      } else if (result.venue.ledgerId) throw batchConflict();
-    }
-    for (const email of result.emails)
-      if (
-        !(await EmailOutboxModel.exists({ _id: email, eventKey: `PACKAGE_LIFECYCLE:${intent.key}` })
-          .read("primary")
-          .maxTimeMS(2000))
-      )
-        throw batchConflict();
-    for (const reminder of result.reminders) {
-      if (!result.bookingId) throw batchConflict();
-      if (
-        !(await AppointmentReminderModel.exists({
-          _id: reminder,
-          bookingId: result.bookingId,
-          businessId: intent.businessId,
-          customerUserId: intent.customerUserId,
-        })
-          .read("primary")
-          .maxTimeMS(2000))
-      )
-        throw batchConflict();
-    }
-    return { result, booking, progress };
+    return verifyCommittedLifecycleResult(id, intent);
   }
   async #resolve(id: Types.ObjectId, intent: LifecycleIntent) {
     for (let i = 0; i < 6; i++) {
@@ -1410,4 +1310,191 @@ export class PackageLifecycleService {
     }
     throw new PackageBatchUnresolvedError();
   }
+}
+
+async function verifyCommittedLifecycleResult(id: Types.ObjectId, intent: LifecycleIntent) {
+  const row = await PackageLifecycleOperationModel.findById(id).read("primary").maxTimeMS(2000);
+  if (row?.phase !== "COMPLETE") return null;
+  if (digest(row.intent) !== digest(intent)) throw batchConflict();
+  const result = readLifecycleResult(row.result);
+  const progress = await PackageProgressV2Model.findOne({
+    _id: intent.packageProgressId,
+    businessId: intent.businessId,
+    customerUserId: intent.customerUserId,
+    businessClientId: intent.businessClientId,
+  })
+    .read("primary")
+    .maxTimeMS(2000);
+  if (!progress) throw batchConflict();
+  const plain = progress.toObject();
+  for (const key of ["createdAt", "updatedAt", "__v"]) Reflect.deleteProperty(plain, key);
+  packageProgressV2InputSchema.parse(plain);
+  if (intent.action === "EXPIRE") {
+    if (progress.creditAccountingVersion !== 2) throw batchConflict();
+    if (result.status === "FOREVER") {
+      if (progress.purchasedContract.validity.mode !== "FOREVER") throw batchConflict();
+    } else if (
+      !progress.expiryReconciledAt ||
+      progress.items.some((item) => !item.expiryEvent || item.remainingSessions !== 0)
+    )
+      throw batchConflict();
+  }
+  let booking = null;
+  const resultBookingId = result.bookingId;
+  if (resultBookingId) {
+    booking = await BookingModel.findOne({
+      _id: resultBookingId,
+      businessId: intent.businessId,
+      "customer.customerUserId": intent.customerUserId,
+      "customer.businessClientId": intent.businessClientId,
+    })
+      .read("primary")
+      .maxTimeMS(2000);
+    const line = booking?.serviceLines[0],
+      attempt = progress.sessions.find((a) => a.bookingId.equals(resultBookingId));
+    if (
+      !booking ||
+      !line ||
+      !attempt ||
+      !line.pricingInput.packageProgressId?.equals(progress._id) ||
+      !attempt.packageItemId.equals(line.pricingInput.packageItemId ?? new Types.ObjectId()) ||
+      !attempt.serviceId.equals(line.serviceId)
+    )
+      throw batchConflict();
+    const expected =
+      booking.status === "UPCOMING" || booking.status === "PENDING"
+        ? "SCHEDULED"
+        : booking.status === "COMPLETED"
+          ? "COMPLETED"
+          : ["CANCELLED_BY_CUSTOMER", "CANCELLED_BY_BUSINESS", "NO_SHOW_CANCELLED"].includes(
+                booking.status,
+              )
+            ? "CANCELLED"
+            : "FORFEITED";
+    if (attempt.status !== expected) throw batchConflict();
+    if (result.reservationKey) {
+      if (!result.staffMembershipId) throw batchConflict();
+      const effect = await BookingSlotReservationClaimModel.findOne({
+        idempotencyKey: result.reservationKey,
+        businessId: intent.businessId,
+        serviceId: line.serviceId,
+        staffMembershipId: result.staffMembershipId,
+        partySize: 1,
+      })
+        .read("primary")
+        .maxTimeMS(2000);
+      if (
+        !effect?.effect ||
+        !result.reservationId ||
+        !effect.effect.actualReservationId.equals(result.reservationId) ||
+        effect.originalIntent?.startAt.getTime() !==
+          (result.startAt ?? intent.startAt)?.getTime() ||
+        effect.originalIntent?.endAt.getTime() !== result.endAt?.getTime() ||
+        effect.originalIntent?.capacityMax !== (line.schedulingSnapshot?.group?.capacityMax ?? 1) ||
+        (effect.effect.state !== "APPLIED" && effect.effect.state !== "RELEASED") ||
+        (intent.action === "CANCEL" && effect.effect.state !== "RELEASED")
+      )
+        throw batchConflict();
+    }
+  }
+  if (intent.dues) {
+    const q = lifecycleSessionQuoteSchema.parse(row.sessionQuote),
+      a = lifecycleSessionAcceptanceSchema.parse(row.sessionAcceptance);
+    if (
+      !booking ||
+      !result.bookingId ||
+      !q.terms.bookingId.equals(result.bookingId) ||
+      q.terms.intentHash !== digest(intent) ||
+      q.termsHash !== digest(q.terms) ||
+      q.disclosureHash !== digest(q.disclosure) ||
+      !a.quoteId.equals(q.quoteId) ||
+      !a.customerUserId.equals(intent.customerUserId) ||
+      a.termsHash !== q.termsHash ||
+      a.disclosureHash !== q.disclosureHash ||
+      a.sessionFamilyId !== q.sessionFamilyId ||
+      digest(booking.toObject().fulfilment) !== digest(q.terms.fulfilment) ||
+      booking.financials.servicesSubtotalCents !== 0 ||
+      booking.financials.addonsSubtotalCents !== q.terms.addonsCents ||
+      booking.financials.travelFeeCents !== q.terms.travelCents ||
+      booking.financials.totalCents !== q.terms.totalCents ||
+      booking.financials.depositCents !==
+        (q.terms.paymentMethod === "ONLINE" ? q.terms.totalCents : 0)
+    )
+      throw batchConflict();
+    const item = progress.items.find((i) =>
+      i.packageItemId.equals(intent.packageItemId ?? new Types.ObjectId()),
+    );
+    if (
+      !item ||
+      digest(
+        plain.items.find((i) => i.packageItemId.equals(item.packageItemId))?.travelCities ?? [],
+      ) !== q.terms.travelRightsHash
+    )
+      throw batchConflict();
+  }
+  if (result.money) {
+    const attempt = await PaymentAttemptModel.findById(result.money.attemptId)
+      .read("primary")
+      .maxTimeMS(2000)
+      .orFail();
+    const authority = await inspectLifecyclePaymentAuthority(attempt);
+    if (
+      authority?.kind !== "COMPLETE" ||
+      attempt.persistenceStatus !== "COMPLETED" ||
+      !authority.row._id.equals(id)
+    )
+      throw batchConflict();
+  }
+  if (result.venue) {
+    if (
+      !intent.venuePayment ||
+      !booking ||
+      (booking.completionPayment?.amountCents ?? 0) < result.venue.cumulativeCents
+    )
+      throw batchConflict();
+    if (result.venue.amountCents > 0) {
+      if (
+        !result.venue.ledgerId ||
+        !(await BookingFinancialTransactionModel.exists({
+          _id: result.venue.ledgerId,
+          businessId: intent.businessId,
+          bookingId: booking._id,
+          customerUserId: intent.customerUserId,
+          businessClientId: intent.businessClientId,
+          type: "PAYMENT",
+          direction: "DEBIT",
+          status: "SUCCEEDED",
+          amountCents: result.venue.amountCents,
+          idempotencyKey: `package-venue:${id}`,
+          "metadata.collectedAtVenue": true,
+          "metadata.lifecycleOperationId": String(id),
+        })
+          .read("primary")
+          .maxTimeMS(2000))
+      )
+        throw batchConflict();
+    } else if (result.venue.ledgerId) throw batchConflict();
+  }
+  for (const email of result.emails)
+    if (
+      !(await EmailOutboxModel.exists({ _id: email, eventKey: `PACKAGE_LIFECYCLE:${intent.key}` })
+        .read("primary")
+        .maxTimeMS(2000))
+    )
+      throw batchConflict();
+  for (const reminder of result.reminders) {
+    if (!result.bookingId) throw batchConflict();
+    if (
+      !(await AppointmentReminderModel.exists({
+        _id: reminder,
+        bookingId: result.bookingId,
+        businessId: intent.businessId,
+        customerUserId: intent.customerUserId,
+      })
+        .read("primary")
+        .maxTimeMS(2000))
+    )
+      throw batchConflict();
+  }
+  return { result, booking, progress };
 }

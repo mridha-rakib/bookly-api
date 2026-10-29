@@ -12,12 +12,14 @@ import { BusinessBookingSettingsRepository } from "../../../src/modules/business
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { ReviewRepository } from "../../../src/modules/review/review.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
+import { UserModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
@@ -266,6 +268,82 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
   ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Cross-role authorization: every /super-admin route is SUPER_ADMIN-only ------------------
+
+  it("P5-F1 incident reads require live ACTIVE Super Admin access and expose only the operational allowlist", async () => {
+    const admin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+    const path = "/super-admin/finance/refund-recovery-incidents";
+    const row = await RefundOperationModel.create({
+      logicalIdempotencyKey: "private-idempotency",
+      sourcePaymentIntentId: "pi_private",
+      expectedRefundAmountCents: 700,
+      currency: "EUR",
+      reason: "BUSINESS_CANCELLATION",
+      businessId: new Types.ObjectId(),
+      lastErrorMessage: "private provider payload",
+      recoveryIncident: {
+        episodeId: new Types.ObjectId(),
+        state: "OPEN",
+        category: "FINAL_NOTIFICATION_EVIDENCE_UNRESOLVED",
+        openedAt: new Date(),
+        lastObservedAt: new Date(),
+        lastCheckedAt: new Date(0),
+        observations: 1,
+      },
+    });
+    expect((await request(app).get(path)).status).toBe(401);
+    for (const role of ["CUSTOMER", "BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const) {
+      const account = await userRepository.create({
+        normalizedEmail: `${role}-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role,
+        status: "ACTIVE",
+      });
+      expect(
+        (
+          await request(app)
+            .get(path)
+            .set("Authorization", await bearerFor(account._id, role))
+        ).status,
+      ).toBe(403);
+    }
+    const bearer = await bearerFor(admin._id, "SUPER_ADMIN");
+    const response = await request(app).get(path).set("Authorization", bearer);
+    expect(response.status).toBe(200);
+    expect(response.headers["cache-control"]).toBe("private, no-store");
+    expect(response.body.data.incidents).toHaveLength(1);
+    expect(response.body.data.incidents[0]).toMatchObject({
+      refundOperationId: String(row._id),
+      businessId: String(row.businessId),
+      state: "OPEN",
+    });
+    for (const secret of [
+      "pi_private",
+      "private-idempotency",
+      "private provider payload",
+      "expectedRefundAmountCents",
+    ])
+      expect(JSON.stringify(response.body)).not.toContain(secret);
+    expect(
+      (
+        await request(app)
+          .get(`${path}?businessId=${new Types.ObjectId()}`)
+          .set("Authorization", bearer)
+      ).body.data.incidents,
+    ).toEqual([]);
+    expect((await request(app).get(`${path}?limit=51`).set("Authorization", bearer)).status).toBe(
+      400,
+    );
+    expect(
+      (await request(app).post(path).set("Authorization", bearer).send({ state: "RESOLVED" }))
+        .status,
+    ).toBe(404);
+    await UserModel.updateOne({ _id: admin._id }, { $set: { status: "SUSPENDED" } });
+    expect((await request(app).get(path).set("Authorization", bearer)).status).toBe(403);
+    await UserModel.updateOne({ _id: admin._id }, { $set: { status: "ACTIVE" } });
+    await tokenService.revokeAllSessionsForUser(admin._id);
+    expect((await request(app).get(path).set("Authorization", bearer)).status).toBe(401);
+  });
 
   it("rejects a BUSINESS_OWNER token on GET /super-admin/businesses (403)", async () => {
     const { owner } = await createPendingBusiness("Salon A");

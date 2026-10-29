@@ -1,6 +1,12 @@
 import { AppError, type ErrorDetail } from "../../common/errors/app-error.js";
 
 const defaultMessages: Record<string, string> = {
+  BOOKING_PACKAGE_LIFECYCLE_REQUIRED:
+    "Complete this First-Class Package appointment through its Package management controls",
+  BOOKING_COMPLETION_BALANCE_CHANGED:
+    "The Booking balance changed; reload the Booking and confirm the payment again",
+  BOOKING_COMPLETION_PAYMENT_ALREADY_RECORDED:
+    "This appointment already has a venue-payment record; review the Booking before completing it",
   BOOKING_SCHEDULING_CHANGED: "Scheduling facts changed; please review the appointment again",
   BOOKING_BUSINESS_NOT_FOUND: "Business not found",
   BOOKING_NOT_FOUND: "Booking not found",
