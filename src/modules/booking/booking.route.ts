@@ -78,6 +78,7 @@ import {
   completeBookingBodySchema,
   createCustomerBookingPreviewBodySchema,
   createManualBookingBodySchema,
+  legacyPackageStatusQuerySchema,
   listBusinessBookingsQuerySchema,
   listCustomerBookingsQuerySchema,
   markNoShowBodySchema,
@@ -407,6 +408,15 @@ export const createBusinessBookingRoute = (): Router => {
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
     validateRequest({ params: bookingIdParamsSchema, body: rescheduleBookingBodySchema }),
     asyncHandler(controller.rescheduleByOwner),
+  );
+
+  router.get(
+    "/:businessId/bookings/packages/operations/status",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ params: bookingBusinessParamsSchema, query: legacyPackageStatusQuerySchema }),
+    asyncHandler(controller.readLegacyPackageOperation),
   );
 
   // Read-only original-operation recovery remains available if new admission is suspended.

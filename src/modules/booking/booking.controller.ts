@@ -35,6 +35,7 @@ import {
   bookingBusinessParamsSchema,
   bookingPaymentStatusQuerySchema,
   bookingRecoveryInboxQuerySchema,
+  legacyPackageStatusQuerySchema,
 } from "./booking.schema.js";
 import type { BookingService } from "./booking.service.js";
 import type { BookingCreationService } from "./booking-creation.service.js";
@@ -44,6 +45,25 @@ import type { BookingRescheduleAvailabilityService } from "./booking-reschedule-
 import type { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
 
 export class BookingController {
+  public readLegacyPackageOperation = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const userId = this.requireCustomerId(request);
+    const { businessId } = bookingBusinessParamsSchema.parse(request.validated?.params);
+    const { kind, packageId, idempotencyKey } = legacyPackageStatusQuerySchema.parse(
+      request.validated?.query,
+    );
+    const result = await this.creationService.readLegacyPackageOperation(
+      userId,
+      businessId,
+      kind,
+      packageId,
+      idempotencyKey,
+    );
+    response.setHeader("Cache-Control", "private, no-store");
+    sendSuccess(response, 200, "Original legacy package operation", result);
+  };
   public listCustomerRecoveryInbox = async (
     request: Request,
     response: Response,

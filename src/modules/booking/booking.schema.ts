@@ -12,6 +12,13 @@ export const bookingBusinessParamsSchema = z.object({ businessId: objectIdSchema
 export const bookingPaymentStatusQuerySchema = z
   .object({ idempotencyKey: z.string().trim().min(1).max(200) })
   .strict();
+export const legacyPackageStatusQuerySchema = z
+  .object({
+    kind: z.enum(["PACKAGE_PURCHASE", "PACKAGE_REDEMPTION"]),
+    packageId: objectIdSchema,
+    idempotencyKey: z.string().trim().min(1).max(200),
+  })
+  .strict();
 export const bookingRecoveryInboxQuerySchema = z
   .object({
     limit: z.coerce.number().int().min(1).max(20).default(10),

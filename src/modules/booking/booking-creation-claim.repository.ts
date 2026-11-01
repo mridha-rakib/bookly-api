@@ -8,6 +8,7 @@ import {
   commitPackageCheckoutClaimGrant,
 } from "./booking-creation-claim.model.js";
 import { type FinancialContract, findFinancialContractMismatch } from "./financial-contract.js";
+import type { LegacyRecoveryBinding } from "./legacy-package-operation.js";
 import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { assertPackageAccepted, assertPackagePresentation } from "./package-checkout-acceptance.js";
 import {
@@ -26,6 +27,7 @@ import {
 } from "./package-request-binding.js";
 
 export type ClaimBookingCreationInput = {
+  legacyRecovery?: LegacyRecoveryBinding | undefined;
   packageRequestBinding?: PackageRequestBinding | undefined;
   idempotencyKey: string;
   businessId: Types.ObjectId;
@@ -163,6 +165,8 @@ export class BookingCreationClaimRepository {
         throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       }
       const storedBinding = existing.toObject().packageRequestBinding;
+      if (!isDeepStrictEqual(existing.toObject().legacyRecovery, input.legacyRecovery))
+        throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       if (existing.packageCheckoutRetention)
         throw new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
       if (

@@ -5,6 +5,7 @@ import { BusinessClientModel } from "../client/client.model.js";
 import { generateBookingReference } from "./booking.utils.js";
 import type { FinancialContract } from "./financial-contract.js";
 import { financialContractSchema } from "./financial-contract.model.js";
+import type { LegacyRecoveryBinding } from "./legacy-package-operation.js";
 import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import {
   type BatchCompletion,
@@ -66,6 +67,7 @@ import {
  * second provider operation.
  */
 export type BookingCreationClaimDocument = {
+  legacyRecovery?: LegacyRecoveryBinding | undefined;
   packageBatchFinance?: BatchFinance | undefined;
   packageBatchCompletion?: BatchCompletion | undefined;
   packageBatchDelivery?: BatchDeliveryTask[] | undefined;
@@ -91,6 +93,17 @@ export type BookingCreationClaimDocument = {
 
 const bookingCreationClaimSchema = new Schema<BookingCreationClaimDocument>(
   {
+    legacyRecovery: {
+      type: new Schema(
+        {
+          version: { type: Number, enum: [1], required: true },
+          kind: { type: String, enum: ["PACKAGE_PURCHASE", "PACKAGE_REDEMPTION"], required: true },
+          packageId: { type: String, match: /^[a-f\d]{24}$/i, required: true },
+          requestHash: { type: String, match: /^[a-f\d]{64}$/, required: true },
+        },
+        { _id: false },
+      ),
+    },
     packageBatchFinance: { type: Schema.Types.Mixed },
     packageBatchCompletion: { type: Schema.Types.Mixed },
     packageBatchDelivery: { type: Schema.Types.Mixed },

@@ -1,5 +1,6 @@
-import { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createServer } from "node:http";
+import mongoose, { Types } from "mongoose";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
@@ -34,6 +35,7 @@ import type { CancellationEmailData } from "../../../src/modules/email/templates
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
 import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
+import { BookingCreatedNotifier } from "../../../src/modules/notification/booking-created.notifier.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { PackageProgressService } from "../../../src/modules/package-progress/package-progress.service.js";
@@ -53,6 +55,7 @@ import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-of
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
+import { legacyPackageHttp } from "../../helpers/legacy-package-http.js";
 import { ordinaryCompletionHttp } from "../../helpers/ordinary-completion-http.js";
 import {
   clearIsolatedDatabase,
@@ -181,7 +184,7 @@ describe("database-backed Package Deal integration", () => {
       promoApplicationService,
       undefined, // integrationService
       undefined, // platformSettingsService
-      undefined, // bookingCreatedNotifier
+      new BookingCreatedNotifier(new EmailOutboxService(), userRepository),
       undefined, // appointmentReminderScheduler
       packageProgressRepository,
       new CyprusTaxService(taxGateway),
@@ -213,6 +216,450 @@ describe("database-backed Package Deal integration", () => {
   });
 
   // --- Fixtures ------------------------------------------------------------------------------
+
+  it("BC-I1 HTTP: active Customer only, strict scoped read, private response and no domain writes", async () => {
+    const f = await setUpSettledPackage();
+    const input = redeemInput(f.staff[0]!.membership._id);
+    const redeemed = await creationService.redeemPackageSession(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      input,
+    );
+    if (redeemed.status !== "confirmed") throw Error("Expected session");
+    const http = await legacyPackageHttp(creationService, String(f.customer._id));
+    const query = {
+      kind: "PACKAGE_REDEMPTION",
+      packageId: String(f.progress._id),
+      idempotencyKey: input.idempotencyKey,
+    };
+    const before = JSON.stringify({
+      progress: await PackageProgressModel.findById(f.progress._id).lean(),
+      reservations: await BookingSlotReservationModel.find().lean(),
+      payments: await PaymentAttemptModel.find().lean(),
+      ledger: await BookingFinancialTransactionModel.find().lean(),
+      intents: await EmailOutboxModel.find().lean(),
+    });
+    const result = await http(String(f.business._id), query);
+    expect(result.status).toBe(200);
+    expect(result.headers["cache-control"]).toBe("private, no-store");
+    expect(result.body.data).toMatchObject({
+      state: "COMMITTED",
+      bookingId: String(redeemed.booking._id),
+      packageProgressId: String(f.progress._id),
+    });
+    expect(JSON.stringify(result.body)).not.toMatch(
+      /clientSecret|paymentIntentId|providerCustomerId/,
+    );
+    expect((await http(String(f.business._id), query, false)).status).toBe(401);
+    expect(
+      (await http(String(f.business._id), { ...query, clientSecret: "forbidden" })).status,
+    ).toBe(400);
+    const ownerHttp = await legacyPackageHttp(
+      creationService,
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+    );
+    expect((await ownerHttp(String(f.business._id), query)).status).toBe(403);
+    const stranger = await createCustomer("stranger");
+    const foreignHttp = await legacyPackageHttp(creationService, String(stranger._id));
+    expect((await foreignHttp(String(f.business._id), query)).status).toBe(409);
+    expect(
+      JSON.stringify({
+        progress: await PackageProgressModel.findById(f.progress._id).lean(),
+        reservations: await BookingSlotReservationModel.find().lean(),
+        payments: await PaymentAttemptModel.find().lean(),
+        ledger: await BookingFinancialTransactionModel.find().lean(),
+        intents: await EmailOutboxModel.find().lean(),
+      }),
+    ).toBe(before);
+  });
+
+  it("BC-I1 authority: parallel same-key purchase resolves one booking/progress/payment/notification identity", async () => {
+    const f = await setupPackageBusiness();
+    const customer = await createCustomer("parallel-purchase");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+    const input = purchaseInput(f.service._id, f.staff[0]!.membership._id);
+    const results = await Promise.all(
+      [0, 1].map(() =>
+        creationService.finalizePackagePurchase(
+          String(customer._id),
+          String(f.business._id),
+          input,
+        ),
+      ),
+    );
+    if (results[0]?.status !== "confirmed" || results[1]?.status !== "confirmed")
+      throw Error("Expected canonical purchase");
+    expect(String(results[0].booking._id)).toBe(String(results[1].booking._id));
+    const status = await creationService.readLegacyPackageOperation(
+      String(customer._id),
+      String(f.business._id),
+      "PACKAGE_PURCHASE",
+      String(f.service._id),
+      input.idempotencyKey,
+    );
+    expect(status.state).toBe("COMMITTED");
+    expect(await BookingModel.countDocuments()).toBe(1);
+    expect(await PackageProgressModel.countDocuments()).toBe(1);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(1);
+    const intents = await EmailOutboxModel.find({
+      eventKey: `BOOKING_CREATED:${status.bookingId}`,
+    });
+    expect(intents.length).toBeGreaterThan(0);
+    expect(new Set(intents.map((r) => r.dedupeKey)).size).toBe(intents.length);
+  });
+
+  it("BC-I1 authority: parallel free redemption, last-session exhaustion and status reads preserve one allocation", async () => {
+    const f = await setUpSettledPackage();
+    let lastInput = redeemInput(f.staff[0]!.membership._id);
+    for (const time of ["10:00", "12:00", "14:00", "16:00"]) {
+      lastInput = redeemInput(f.staff[0]!.membership._id, DATE_2, time);
+      const results = await Promise.all(
+        [0, 1].map(() =>
+          creationService.redeemPackageSession(
+            String(f.customer._id),
+            String(f.business._id),
+            String(f.progress._id),
+            lastInput,
+          ),
+        ),
+      );
+      if (results[0]?.status !== "confirmed" || results[1]?.status !== "confirmed")
+        throw Error("Expected canonical session");
+      expect(String(results[0].booking._id)).toBe(String(results[1].booking._id));
+    }
+    expect((await PackageProgressModel.findById(f.progress._id).orFail()).remainingSessions).toBe(
+      0,
+    );
+    const before = {
+      bookings: await BookingModel.countDocuments(),
+      attempts: await PaymentAttemptModel.countDocuments(),
+      ledger: await BookingFinancialTransactionModel.countDocuments(),
+      intents: await EmailOutboxModel.countDocuments(),
+    };
+    const replay = await creationService.redeemPackageSession(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      lastInput,
+    );
+    const status = await creationService.readLegacyPackageOperation(
+      String(f.customer._id),
+      String(f.business._id),
+      "PACKAGE_REDEMPTION",
+      String(f.progress._id),
+      lastInput.idempotencyKey,
+    );
+    expect(replay.status).toBe("confirmed");
+    expect(status.state).toBe("COMMITTED");
+    expect(before).toMatchObject({ bookings: 5, attempts: 1, ledger: 2 });
+    expect(await BookingModel.countDocuments()).toBe(before.bookings);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(before.attempts);
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(before.ledger);
+    expect(await EmailOutboxModel.countDocuments()).toBe(before.intents);
+    expect(
+      await creationService.readLegacyPackageOperation(
+        String(f.customer._id),
+        String(f.business._id),
+        "PACKAGE_REDEMPTION",
+        String(f.progress._id),
+        "not-observed",
+      ),
+    ).toMatchObject({ state: "NOT_OBSERVED", canDismiss: false });
+  });
+
+  it("BC-I1 authority: wrong customer/business/type/progress and changed original request fail closed", async () => {
+    const f = await setUpSettledPackage();
+    const input = redeemInput(f.staff[0]!.membership._id);
+    await creationService.redeemPackageSession(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      input,
+    );
+    const read = (
+      customer = String(f.customer._id),
+      business = String(f.business._id),
+      kind: "PACKAGE_PURCHASE" | "PACKAGE_REDEMPTION" = "PACKAGE_REDEMPTION",
+      progress = String(f.progress._id),
+    ) =>
+      creationService.readLegacyPackageOperation(
+        customer,
+        business,
+        kind,
+        progress,
+        input.idempotencyKey,
+      );
+    await expect(read(String(new Types.ObjectId()))).rejects.toMatchObject({ statusCode: 409 });
+    await expect(read(undefined, String(new Types.ObjectId()))).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(read(undefined, undefined, "PACKAGE_PURCHASE")).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(
+      read(undefined, undefined, undefined, String(new Types.ObjectId())),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      creationService.redeemPackageSession(
+        String(f.customer._id),
+        String(f.business._id),
+        String(f.progress._id),
+        { ...input, startAt: startAtFor(DATE_2, "15:00") },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    const status = await read();
+    expect(Object.keys(status).sort()).toEqual(
+      [
+        "bookingId",
+        "businessId",
+        "canDismiss",
+        "canResume",
+        "idempotencyKey",
+        "kind",
+        "packageId",
+        "packageProgressId",
+        "state",
+      ].sort(),
+    );
+  });
+
+  /** Actual loopback HTTP response loss AFTER the domain transaction commits. */
+  const loseCommittedResponse = async (work: () => Promise<unknown>) => {
+    let failure: unknown;
+    const server = createServer((_request, response) => {
+      void work().then(
+        () => response.destroy(),
+        (error: unknown) => {
+          failure = error;
+          response.writeHead(500).end();
+        },
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw Error("Expected owned loopback server");
+      await expect(
+        fetch(`http://127.0.0.1:${address.port}/legacy-operation`, {
+          method: "POST",
+          signal: AbortSignal.timeout(10_000),
+        }),
+      ).rejects.toThrow();
+      if (failure) throw failure;
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+
+  it("BC-I1 reproduction: lost purchase response retains one canonical purchase on same-key retry", async () => {
+    expect(mongoose.connection.host).toBe("127.0.0.1");
+    expect(mongoose.connection.name).toMatch(/^bookly_auth_/);
+    const f = await setupPackageBusiness();
+    const customer = await createCustomer("bc-i1-purchase");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+    const input = {
+      ...purchaseInput(f.service._id, f.staff[0]!.membership._id),
+      idempotencyKey: "bc-i1-purchase-lost",
+    };
+    const submit = () =>
+      creationService.finalizePackagePurchase(String(customer._id), String(f.business._id), input);
+    await loseCommittedResponse(submit);
+    const retry = await submit();
+    expect(retry.status).toBe("confirmed");
+    expect(await BookingModel.countDocuments()).toBe(1);
+    expect(await PackageProgressModel.countDocuments()).toBe(1);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(1);
+    const booking = await BookingModel.findOne().orFail();
+    const progress = await PackageProgressModel.findOne().orFail();
+    expect(progress.originBookingId).toEqual(booking._id);
+    expect(progress.remainingSessions).toBe(4);
+    expect(progress.sessions).toHaveLength(1);
+    const observed = await creationService.readLegacyPackageOperation(
+      String(customer._id),
+      String(f.business._id),
+      "PACKAGE_PURCHASE",
+      String(f.service._id),
+      input.idempotencyKey,
+    );
+    expect(observed).toMatchObject({
+      state: "COMMITTED",
+      bookingId: booking.id,
+      packageProgressId: progress.id,
+      canDismiss: true,
+      canResume: false,
+    });
+    expect(
+      await EmailOutboxModel.countDocuments({ eventKey: `BOOKING_CREATED:${booking.id}` }),
+    ).toBeGreaterThan(0);
+    expect(booking.serviceLines[0]?.reservationOperationKey).toBe(`${input.idempotencyKey}:0`);
+  });
+
+  it.each(["free", "travel", "extras"] as const)(
+    "BC-I1 reproduction: lost %s redemption and later fresh-key Confirm cannot recover the committed result",
+    async (mode) => {
+      const f = mode === "travel" ? await setUpSettledTravelPackage() : await setUpSettledPackage();
+      const addon =
+        mode === "extras"
+          ? await addonRepository.create({
+              businessId: f.business._id,
+              status: "ACTIVE",
+              name: "Recovery towel",
+              priceCents: 1000,
+            })
+          : undefined;
+      if (addon)
+        await addonServiceAssignmentRepository.insertMany([
+          { businessId: f.business._id, addonId: addon._id, serviceId: f.service._id },
+        ]);
+      const input = {
+        ...redeemInput(f.staff[0]!.membership._id),
+        idempotencyKey: `bc-i1-${mode}-lost`,
+        ...(addon ? { addonIds: [String(addon._id)] } : {}),
+        ...(mode === "travel"
+          ? {
+              customerCity: "Larnaca" as const,
+              travelAddress: {
+                city: "Larnaca" as const,
+                propertyType: "House" as const,
+                area: "Center",
+                streetName: "Main",
+                streetNumber: "1",
+              },
+            }
+          : {}),
+      };
+      const submit = (value = input) =>
+        creationService.redeemPackageSession(
+          String(f.customer._id),
+          String(f.business._id),
+          String(f.progress._id),
+          value,
+        );
+      await loseCommittedResponse(() => submit());
+      const retry = await submit();
+      expect(retry.status).toBe("confirmed");
+      // Current UI creates this replacement key after its original successful response is lost.
+      await expect(
+        submit({ ...input, idempotencyKey: `${input.idempotencyKey}-fresh-confirm` }),
+      ).rejects.toThrow();
+      const progress = await PackageProgressModel.findById(f.progress._id).orFail();
+      expect(progress.remainingSessions).toBe(3);
+      expect(progress.sessions).toHaveLength(2);
+      const observed = await creationService.readLegacyPackageOperation(
+        String(f.customer._id),
+        String(f.business._id),
+        "PACKAGE_REDEMPTION",
+        String(f.progress._id),
+        input.idempotencyKey,
+      );
+      expect(observed).toMatchObject({
+        state: "COMMITTED",
+        packageProgressId: progress.id,
+        canDismiss: true,
+        canResume: false,
+      });
+      expect(
+        await EmailOutboxModel.countDocuments({
+          eventKey: `BOOKING_CREATED:${observed.bookingId}`,
+        }),
+      ).toBeGreaterThan(0);
+      expect(await BookingModel.countDocuments()).toBe(2);
+      // Baseline travel retry under a NEW key creates a separate attempt which is compensated
+      // after admission fails. Same-key replay above created no extra attempt.
+      expect(await PaymentAttemptModel.countDocuments()).toBe(mode === "free" ? 1 : 3);
+    },
+  );
+
+  it.each(["authentication", "unknown", "tax-failure", "persistence-failure"] as const)(
+    "BC-I1 reproduction: %s retains original legacy redemption identity",
+    async (mode) => {
+      const f = await setUpSettledTravelPackage();
+      const input = {
+        ...redeemInput(f.staff[0]!.membership._id),
+        idempotencyKey: `bc-i1-${mode}`,
+        customerCity: "Larnaca" as const,
+        travelAddress: {
+          city: "Larnaca" as const,
+          propertyType: "House" as const,
+          area: "Center",
+          streetName: "Main",
+          streetNumber: "1",
+        },
+      };
+      const submit = () =>
+        creationService.redeemPackageSession(
+          String(f.customer._id),
+          String(f.business._id),
+          String(f.progress._id),
+          input,
+        );
+      if (mode === "authentication") {
+        paymentGateway.queueNextChargeOutcome("requires_action");
+        const pending = await submit();
+        if (pending.status !== "requires_action") throw Error("Expected authentication");
+        expect(await BookingModel.countDocuments()).toBe(1);
+        const observed = await creationService.readLegacyPackageOperation(
+          String(f.customer._id),
+          String(f.business._id),
+          "PACKAGE_REDEMPTION",
+          String(f.progress._id),
+          input.idempotencyKey,
+        );
+        expect(observed).toMatchObject({
+          state: "AUTHENTICATION_REQUIRED",
+          canResume: true,
+          canDismiss: false,
+        });
+        expect(observed).not.toHaveProperty("clientSecret");
+        paymentGateway.succeedPaymentIntent(pending.paymentIntentId);
+        await loseCommittedResponse(submit);
+        expect((await submit()).status).toBe("confirmed");
+        expect(await PaymentAttemptModel.countDocuments()).toBe(2);
+      } else if (mode === "unknown") {
+        paymentGateway.queueNextChargeLostResponse();
+        await expect(submit()).rejects.toThrow();
+        expect(await BookingModel.countDocuments()).toBe(1);
+        expect((await submit()).status).toBe("confirmed");
+        expect(await PaymentAttemptModel.countDocuments()).toBe(2);
+      } else if (mode === "tax-failure") {
+        taxGateway.queueNextFailure(Error("BC-I1 synthetic pre-provider failure"));
+        await expect(submit()).rejects.toThrow();
+        expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+        expect((await submit()).status).toBe("confirmed");
+      } else {
+        const spy = vi
+          .spyOn(financialTransactionService, "record")
+          .mockRejectedValueOnce(Error("BC-I1 synthetic persistence failure"));
+        await expect(submit()).rejects.toThrow("BC-I1 synthetic persistence failure");
+        spy.mockRestore();
+        expect(await BookingModel.countDocuments()).toBe(1);
+        expect(
+          (await PackageProgressModel.findById(f.progress._id).orFail()).remainingSessions,
+        ).toBe(4);
+        const attempt = await PaymentAttemptModel.findOne({
+          logicalIdempotencyKey: input.idempotencyKey,
+        }).orFail();
+        expect(attempt.compensationStatus).toBe("REFUNDED");
+        expect(
+          await creationService.readLegacyPackageOperation(
+            String(f.customer._id),
+            String(f.business._id),
+            "PACKAGE_REDEMPTION",
+            String(f.progress._id),
+            input.idempotencyKey,
+          ),
+        ).toMatchObject({ state: "REFUNDED", canDismiss: true, canResume: false });
+        await expect(submit()).rejects.toThrow();
+      }
+    },
+  );
 
   const createBusiness = async (
     email: string,

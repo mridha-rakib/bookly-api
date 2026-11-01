@@ -93,6 +93,11 @@ import {
   findFinancialContractMismatch,
   type RelationshipClassification,
 } from "./financial-contract.js";
+import {
+  type LegacyPackageKind,
+  type LegacyRecoveryBinding,
+  legacyRecoveryBinding,
+} from "./legacy-package-operation.js";
 import type { OrdinaryCalendarJournalPort } from "./ordinary-calendar-journal.js";
 
 type CustomerReplayScope = {
@@ -101,6 +106,7 @@ type CustomerReplayScope = {
   idempotencyKey: string;
   kind: FinancialContractProductKind | "PACKAGE_REDEMPTION";
   packageProgressId?: Types.ObjectId;
+  legacyRecovery?: LegacyRecoveryBinding;
 };
 
 class BookingPersistenceUnresolvedError extends BookingError {
@@ -630,6 +636,8 @@ export class BookingCreationService {
     // rest of this preview: no PaymentIntent, no persistence, and (per this checkpoint's own
     // scope) the ACTUAL PaymentIntent amount in finalize remains this same pre-tax value.
     const customerChargeNowCents = financials.depositCents;
+
+    // The claim inserted above carries the immutable legacy recovery identity.
     const computedTax = await this.computeCyprusTax(
       customerChargeNowCents,
       `preview-${new Types.ObjectId().toHexString()}`,
@@ -1248,6 +1256,180 @@ export class BookingCreationService {
    * (for FIRST) relationship consumption are written in the SAME Mongo transaction so none can
    * become durably visible without the others.
    */
+  /** Pure owned observation: no pricing, admission, provider dispatch or credit mutation. */
+  public async readLegacyPackageOperation(
+    customerUserId: string,
+    businessId: string,
+    kind: LegacyPackageKind,
+    packageId: string,
+    key: string,
+  ) {
+    this.requireIdempotencyKey(key);
+    const scope: CustomerReplayScope = {
+      businessId: new Types.ObjectId(businessId),
+      customerUserId,
+      idempotencyKey: key,
+      kind,
+      ...(kind === "PACKAGE_REDEMPTION"
+        ? { packageProgressId: new Types.ObjectId(packageId) }
+        : {}),
+    };
+    const conflict = () => new BookingError("BOOKING_IDEMPOTENCY_CONFLICT", 409);
+    const { claim, booking } = await this.readCustomerReplay(scope, undefined, false);
+    const binding = claim?.legacyRecovery;
+    if (binding && (binding.kind !== kind || binding.packageId !== packageId)) throw conflict();
+    const attempt = await PaymentAttemptModel.findOne({ logicalIdempotencyKey: key })
+      .read("primary")
+      .readConcern("majority")
+      .maxTimeMS(2000);
+    if (
+      attempt &&
+      (String(attempt.customerUserId) !== customerUserId ||
+        String(attempt.businessId) !== businessId ||
+        attempt.packageBatchBinding ||
+        attempt.packageLifecycleBinding ||
+        attempt.purpose !==
+          (kind === "PACKAGE_PURCHASE" ? "PACKAGE_PURCHASE" : "PACKAGE_SESSION_EXTRAS") ||
+        (kind === "PACKAGE_PURCHASE"
+          ? attempt.productKind !== kind
+          : Boolean(attempt.productKind)) ||
+        (claim && String(attempt.bookingId) !== String(claim.bookingId)))
+    )
+      throw conflict();
+    if (claim && !booking && !binding)
+      return {
+        state: "UNRESOLVED" as const,
+        businessId,
+        kind,
+        packageId,
+        idempotencyKey: key,
+        canDismiss: false,
+        canResume: false,
+      };
+    if (
+      claim &&
+      kind === "PACKAGE_REDEMPTION" &&
+      !(await this.requirePackageProgressRepository().findByIdForCustomerAndBusiness(
+        packageId,
+        scope.businessId,
+        customerUserId,
+      ))
+    )
+      throw conflict();
+    let state: BookingPaymentState =
+      !claim && !attempt ? "NOT_OBSERVED" : bookingPaymentState(attempt);
+    let committed = false;
+    let progressId: string | undefined;
+    if (booking) {
+      const line = booking.serviceLines[0];
+      if (!line || (kind === "PACKAGE_PURCHASE" && String(line.serviceId) !== packageId))
+        throw conflict();
+      progressId = String(line.pricingInput.packageProgressId);
+      const progress = await this.requirePackageProgressRepository().findByIdForCustomerAndBusiness(
+        progressId,
+        scope.businessId,
+        customerUserId,
+      );
+      if (
+        !progress?.sessions.some((entry) => String(entry.bookingId) === String(booking._id)) ||
+        (kind === "PACKAGE_PURCHASE" && String(progress.originBookingId) !== String(booking._id))
+      )
+        throw conflict();
+      if (!claim) throw conflict();
+      const durable = await BookingModel.findOne({
+        _id: claim.bookingId,
+        businessId: scope.businessId,
+        "customer.customerUserId": customerUserId,
+      })
+        .read("primary")
+        .readConcern("majority")
+        .maxTimeMS(2000);
+      const contract = claim?.financialContract;
+      const amount =
+        kind === "PACKAGE_PURCHASE"
+          ? contract?.onlineChargeCents
+          : durable?.financials.depositCents;
+      if (
+        kind === "PACKAGE_PURCHASE" &&
+        (!contract ||
+          !durable?.financialContract ||
+          findFinancialContractMismatch(contract, durable.financialContract))
+      )
+        throw conflict();
+      if (durable && amount === 0) committed = !attempt;
+      else if (
+        durable &&
+        amount !== undefined &&
+        amount > 0 &&
+        attempt?.providerStatus === "SUCCEEDED" &&
+        attempt.persistenceStatus === "COMPLETED" &&
+        attempt.compensationStatus === "NOT_REQUIRED" &&
+        attempt.expectedAmountCents === amount &&
+        attempt.currency === durable.financials.currency &&
+        (kind === "PACKAGE_PURCHASE"
+          ? String(attempt.businessClientId) === String(durable.customer.businessClientId) &&
+            attempt.financialContractVersion === contract?.version &&
+            attempt.relationshipClassification === contract?.classification
+          : !attempt.businessClientId ||
+            String(attempt.businessClientId) === String(durable.customer.businessClientId)) &&
+        String(attempt.packageProgressId) === progressId &&
+        attempt.providerPaymentIntentId &&
+        attempt.succeededTransactionId
+      ) {
+        committed = Boolean(
+          await BookingFinancialTransactionModel.findOne({
+            _id: attempt.succeededTransactionId,
+            bookingId: durable._id,
+            businessId: scope.businessId,
+            businessClientId: durable.customer.businessClientId,
+            customerUserId,
+            type:
+              kind === "PACKAGE_PURCHASE" ? (contract?.upfrontLedgerType ?? "DEPOSIT") : "DEPOSIT",
+            direction: "DEBIT",
+            status: "SUCCEEDED",
+            amountCents: amount,
+            currency: durable.financials.currency,
+            providerReference: attempt.providerPaymentIntentId,
+            idempotencyKey: `${key}:deposit`,
+          })
+            .read("primary")
+            .readConcern("majority")
+            .maxTimeMS(2000),
+        );
+      }
+    }
+    if (committed) state = "COMMITTED";
+    const canDismiss =
+      committed ||
+      state === "REFUNDED" ||
+      Boolean(
+        attempt &&
+          state === "PAYMENT_FAILED" &&
+          (attempt.providerStatus === "CANCELED" || isProviderCreationClosed(attempt)),
+      );
+    const business = await this.businessRepository.findById(scope.businessId);
+    const canResume = Boolean(
+      business &&
+        ["APPROVED", "WARNING"].includes(business.status) &&
+        !canDismiss &&
+        !["REFUND_PENDING", "RECONCILIATION_REQUIRED"].includes(state) &&
+        // Unbound historical pending claims cannot establish original progress/type ownership.
+        (!claim ? !attempt : binding),
+    );
+    return {
+      state,
+      businessId,
+      kind,
+      packageId,
+      idempotencyKey: key,
+      canDismiss,
+      canResume,
+      ...(committed && booking
+        ? { bookingId: String(booking._id), packageProgressId: progressId }
+        : {}),
+    };
+  }
+
   public async finalizePackagePurchase(
     customerUserId: string,
     businessId: string,
@@ -1257,12 +1439,20 @@ export class BookingCreationService {
     this.requirePackagePurchaseShape(input);
     this.requireIdempotencyKey(input.idempotencyKey);
     const business = await this.requireBusiness(businessId);
+    const purchaseService = input.serviceLines[0];
+    if (!purchaseService) throw new BookingError("BOOKING_INVALID_INPUT", 400);
+    const legacyRecovery = legacyRecoveryBinding(
+      "PACKAGE_PURCHASE",
+      purchaseService.serviceId,
+      input,
+    );
 
     const customerReplay: CustomerReplayScope = {
       businessId: business._id,
       customerUserId,
       idempotencyKey: input.idempotencyKey,
       kind: "PACKAGE_PURCHASE",
+      legacyRecovery,
     };
     const replay = await this.readCustomerReplay(customerReplay);
     const existingClaim = replay.claim;
@@ -1324,6 +1514,7 @@ export class BookingCreationService {
       businessId: business._id,
       actorUserId: new Types.ObjectId(customerUserId),
       bookingId,
+      legacyRecovery,
     });
 
     if (!claimResult.isNew && !existingClaim) {
@@ -1491,6 +1682,19 @@ export class BookingCreationService {
   ): Promise<FinalizeBookingResult> {
     this.requirePackageProgressRepository();
     this.requireIdempotencyKey(input.idempotencyKey);
+    // Resolve the original committed operation before live eligibility/exhaustion checks.
+    // A completed last session remains recoverable after it exhausts the package.
+    const legacyRecovery = legacyRecoveryBinding("PACKAGE_REDEMPTION", packageProgressId, input);
+    const customerReplay: CustomerReplayScope = {
+      businessId: new Types.ObjectId(businessId),
+      customerUserId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "PACKAGE_REDEMPTION",
+      packageProgressId: new Types.ObjectId(packageProgressId),
+      legacyRecovery,
+    };
+    const replay = await this.readCustomerReplay(customerReplay);
+    if (replay.booking) return { status: "confirmed", booking: replay.booking };
     const pricing = await this.computePackageRedemptionPricing(
       customerUserId,
       businessId,
@@ -1499,17 +1703,8 @@ export class BookingCreationService {
     );
     const { business, progress, service, fulfilment, addons, financials } = pricing;
 
-    const customerReplay: CustomerReplayScope = {
-      businessId: business._id,
-      customerUserId,
-      idempotencyKey: input.idempotencyKey,
-      kind: "PACKAGE_REDEMPTION",
-      packageProgressId: progress._id,
-    };
-    const replay = await this.readCustomerReplay(customerReplay);
     const existingClaim = replay.claim;
     if (existingClaim) {
-      if (replay.booking) return { status: "confirmed", booking: replay.booking };
       if (!replay.attempt || this.persistenceLeaseActive(replay.attempt)) {
         const pendingBooking = await this.awaitIdempotentBooking(
           { business, idempotencyKey: input.idempotencyKey, customerReplay },
@@ -1632,6 +1827,7 @@ export class BookingCreationService {
       businessId: business._id,
       actorUserId: new Types.ObjectId(customerUserId),
       bookingId,
+      legacyRecovery,
     });
     if (!claimResult.isNew && !existingClaim) {
       const booking = await this.awaitIdempotentBooking(
@@ -3603,6 +3799,16 @@ export class BookingCreationService {
       scope.customerUserId,
     );
     if (!claim) return { claim: null, booking: null, attempt: null };
+    const bound = claim.legacyRecovery;
+    if (
+      bound &&
+      (bound.kind !== scope.kind ||
+        (scope.packageProgressId && bound.packageId !== String(scope.packageProgressId)) ||
+        (scope.legacyRecovery &&
+          (bound.packageId !== scope.legacyRecovery.packageId ||
+            bound.requestHash !== scope.legacyRecovery.requestHash)))
+    )
+      throw conflict();
     if (expectedBookingId && String(claim.bookingId) !== String(expectedBookingId))
       throw conflict();
     const contract = claim.financialContract;
