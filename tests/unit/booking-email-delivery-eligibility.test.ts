@@ -57,7 +57,11 @@ const row = (templateKey = "BOOKING_CUSTOMER_CONFIRMED"): EmailOutboxDocument =>
   createdAt: now,
   updatedAt: now,
 });
-const query = (value: unknown) => ({ read: () => ({ maxTimeMS: async () => value }) }) as never;
+const query = (value: unknown) =>
+  ({
+    where: () => ({ equals: () => query(value) }),
+    read: () => ({ maxTimeMS: async () => value }),
+  }) as never;
 afterEach(() => vi.restoreAllMocks());
 it.each(["CANCELLED_BY_CUSTOMER", "COMPLETED", "PENDING", "NO_SHOW_CHARGED"])(
   "queued confirmation is retired before send for %s",
@@ -70,7 +74,7 @@ it("current confirmation uses exact business-local schedule, while an old resche
   vi.spyOn(BookingModel, "findById").mockReturnValue(query(booking()));
   expect(await new BookingEmailDeliveryEligibility().check(row(), now)).toBe(true);
   const stale = row();
-  stale.payload.appointmentTime = "wrong";
+  stale.payload["appointmentTime"] = "wrong";
   expect(await new BookingEmailDeliveryEligibility().check(stale, now)).toBe(false);
 });
 it.each(["CANCELLED", "SKIPPED"])(
@@ -153,7 +157,7 @@ it("a queued receipt's PAID text is not payment authority when the durable attem
   vi.spyOn(BookingModel, "findById").mockReturnValue(query(booking()));
   vi.spyOn(PaymentAttemptModel, "findOne").mockReturnValue(query(null));
   const email = row();
-  email.payload.onlinePayment = {
+  email.payload["onlinePayment"] = {
     kind: "PAID",
     paymentFor: "BOOKING",
     paymentReference: "pi_forged",

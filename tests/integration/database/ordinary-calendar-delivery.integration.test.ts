@@ -223,7 +223,7 @@ describe("P4B-2B ordinary Calendar delivery", () => {
   };
 
   const destinationFor = (
-    businessId: Types.ObjectId,
+    _businessId: Types.ObjectId,
     row: { _id: Types.ObjectId },
     overrides = {},
   ) => ({
@@ -237,28 +237,41 @@ describe("P4B-2B ordinary Calendar delivery", () => {
 
   /** A committed, connected, journal-owned ordinary Booking. */
   const seed = async (overrides: Partial<BookingDocument> = {}) => {
-    const booking = buildBooking(overrides);
-    await BusinessModel.collection.insertOne({
-      _id: booking.businessId,
-      ownerUserId: ownerId,
-      name: "Salon",
-    } as never);
-    const integrationId = new Types.ObjectId();
-    await GoogleCalendarIntegrationModel.collection.insertOne({
-      _id: integrationId,
+    // Multiple appointments for this owner share one Business and Calendar connection.
+    const existingBusiness = await BusinessModel.findOne({ ownerUserId: ownerId }).lean();
+    const booking = buildBooking({
+      reference: `BK-${new Types.ObjectId().toHexString()}`,
+      ...(existingBusiness ? { businessId: existingBusiness._id } : {}),
+      ...overrides,
+    });
+    if (!existingBusiness) {
+      await BusinessModel.collection.insertOne({
+        _id: booking.businessId,
+        ownerUserId: ownerId,
+        name: "Salon",
+      } as never);
+    }
+    const existingIntegration = await GoogleCalendarIntegrationModel.findOne({
       businessId: booking.businessId,
-      googleAccountEmail: "owner@example.com",
-      googleAccountId: "acct-1",
-      calendarId: "primary",
-      connectionGeneration: "11111111-1111-4111-8111-111111111111",
-      encryptedAccessToken: "x",
-      encryptedRefreshToken: "y",
-      tokenExpiresAt: new Date(),
-      status: "CONNECTED",
-      connectedAt: new Date(),
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    } as never);
+    }).lean();
+    const integrationId = existingIntegration?._id ?? new Types.ObjectId();
+    if (!existingIntegration) {
+      await GoogleCalendarIntegrationModel.collection.insertOne({
+        _id: integrationId,
+        businessId: booking.businessId,
+        googleAccountEmail: "owner@example.com",
+        googleAccountId: "acct-1",
+        calendarId: "primary",
+        connectionGeneration: "11111111-1111-4111-8111-111111111111",
+        encryptedAccessToken: "x",
+        encryptedRefreshToken: "y",
+        tokenExpiresAt: new Date(),
+        status: "CONNECTED",
+        connectedAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as never);
+    }
     google.current = destinationFor(booking.businessId, { _id: integrationId });
     const row = await inTxn(async (session) => {
       await BookingModel.collection.insertOne(booking as never, { session });
@@ -551,7 +564,7 @@ describe("P4B-2B ordinary Calendar delivery", () => {
     await commit(reschedule(booking, 30));
     // An Owner edit lands between our read and our PATCH, so the observed ETag is stale.
     google.afterRead = () => {
-      google.afterRead = undefined;
+      delete google.afterRead;
       google.events.get(ordinaryCalendarEventId(booking._id))!.etag = '"owner-edit"';
     };
     // 412 → definitive no effect → fresh read → PATCH with the new ETag; read-back next pass.
@@ -646,7 +659,7 @@ describe("P4B-2B ordinary Calendar delivery", () => {
     const { booking, row } = await seed();
     const moved = reschedule(booking, 120);
     google.onRead = async () => {
-      google.onRead = undefined;
+      delete google.onRead;
       await commit(moved);
     };
     expect(await dispatch.deliver(row._id)).toBe("RETRY");
@@ -1006,8 +1019,11 @@ describe("P4B-2B ordinary Calendar delivery", () => {
   it("a worker stopped mid-batch reports the remaining due rows and logs an incident summary", async () => {
     const first = await seed();
     await clearIsolatedDatabase();
-    await seed();
-    await seed();
+    const appointmentA = await seed();
+    const appointmentB = await seed();
+    expect(appointmentA.booking.businessId.equals(appointmentB.booking.businessId)).toBe(true);
+    expect(appointmentA.booking._id.equals(appointmentB.booking._id)).toBe(false);
+    expect(appointmentA.integrationId.equals(appointmentB.integrationId)).toBe(true);
     void first;
     const warn = vi.spyOn(logger, "warn");
     let delivered = 0;

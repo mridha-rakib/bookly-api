@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Types } from "mongoose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import {
+  type ClaimOptions,
+  EMAIL_OUTBOX_CLAIM_ABANDONED,
+  type EmailOutboxClaimFence,
+} from "../../src/modules/email-outbox/email-outbox.repository.js";
 import { buildBooking, buildBusiness } from "./stage-b-fixtures.js";
 
 /**
@@ -305,35 +309,85 @@ describe("worker and consumers", () => {
     status: "PENDING" as string,
     attemptCount: 0,
     claimedBy: undefined as string | undefined,
+    claimedAt: undefined as Date | undefined,
+    nextAttemptAt: undefined as Date | undefined,
     lastErrorCategory: undefined as string | undefined,
     createdAt: new Date(),
     updatedAt: new Date(),
   });
 
-  const repoFor = (row: ReturnType<typeof bookingRow>) => ({
-    resetStaleProcessing: vi.fn(async () => 0),
-    claimNext: vi.fn(async () => {
-      if (row.status !== "PENDING") return null;
-      row.status = "PROCESSING";
-      row.attemptCount += 1;
-      row.claimedBy = "w";
-      return { ...row };
-    }),
-    markSent: vi.fn(async () => {
-      row.status = "SENT";
-      return row;
-    }),
-    scheduleRetry: vi.fn(async (_id: unknown, i: { category: string }) => {
-      row.status = "PENDING";
-      row.lastErrorCategory = i.category;
-      return row;
-    }),
-    markFailed: vi.fn(async (_id: unknown, i: { category: string }) => {
-      row.status = "FAILED";
-      row.lastErrorCategory = i.category;
-      return row;
-    }),
-  });
+  const repoFor = (row: ReturnType<typeof bookingRow>) => {
+    const owned = (id: unknown, claim?: EmailOutboxClaimFence) =>
+      String(id) === String(row._id) &&
+      row.status === "PROCESSING" &&
+      (!claim ||
+        (claim.attemptCount === row.attemptCount &&
+          (claim.claimedBy === undefined || claim.claimedBy === row.claimedBy)));
+    const release = () => {
+      row.claimedAt = undefined;
+      row.claimedBy = undefined;
+    };
+    return {
+      resetStaleProcessing: vi.fn(async (staleBefore: Date, maxAttempts: number) => {
+        const stale = row.status === "PROCESSING" && row.claimedAt && row.claimedAt <= staleBefore;
+        if (row.attemptCount >= maxAttempts && (stale || row.status === "PENDING")) {
+          row.status = "FAILED";
+          row.lastErrorCategory = EMAIL_OUTBOX_CLAIM_ABANDONED;
+          row.nextAttemptAt = undefined;
+          release();
+          return 1;
+        }
+        if (!stale) return 0;
+        row.status = "PENDING";
+        release();
+        return 1;
+      }),
+      claimNext: vi.fn(async (input: ClaimOptions) => {
+        const due =
+          row.status === "PENDING" && (!row.nextAttemptAt || row.nextAttemptAt <= input.now);
+        const stale =
+          row.status === "PROCESSING" &&
+          row.claimedAt &&
+          row.claimedAt.getTime() <= input.now.getTime() - input.claimTimeoutMs;
+        if ((!due && !stale) || row.attemptCount >= input.maxAttempts) return null;
+        row.status = "PROCESSING";
+        row.attemptCount += 1;
+        row.claimedBy = input.workerId;
+        row.claimedAt = input.now;
+        return { ...row };
+      }),
+      markSent: vi.fn(async (id: unknown) => {
+        if (String(id) !== String(row._id) || !["PENDING", "PROCESSING"].includes(row.status))
+          return null;
+        row.status = "SENT";
+        release();
+        row.nextAttemptAt = undefined;
+        return row;
+      }),
+      scheduleRetry: vi.fn(
+        async (
+          id: unknown,
+          i: { category: string; nextAttemptAt: Date; claim?: EmailOutboxClaimFence },
+        ) => {
+          if (!owned(id, i.claim)) return null;
+          row.status = "PENDING";
+          row.nextAttemptAt = i.nextAttemptAt;
+          release();
+          row.lastErrorCategory = i.category;
+          return row;
+        },
+      ),
+      markFailed: vi.fn(
+        async (id: unknown, i: { category: string; claim?: EmailOutboxClaimFence }) => {
+          if (!owned(id, i.claim)) return null;
+          row.status = "FAILED";
+          release();
+          row.lastErrorCategory = i.category;
+          return row;
+        },
+      ),
+    };
+  };
 
   const options = {
     workerId: "w",
@@ -342,6 +396,45 @@ describe("worker and consumers", () => {
     retryBaseMs: 60_000,
     concurrency: 1,
   };
+  const workerNow = new Date("2030-08-19T08:00:00Z");
+  const workerClock = () => new Date(workerNow);
+  const nextRetryAt = (row: ReturnType<typeof bookingRow>) => {
+    if (!row.nextAttemptAt) throw new Error("Expected a scheduled retry");
+    return row.nextAttemptAt;
+  };
+
+  it("the worker fake preserves retry timing, claim ownership and maximum attempts", async () => {
+    const row = bookingRow({});
+    const repo = repoFor(row);
+    const claimOptions = { ...options, now: workerClock() };
+    const first = await repo.claimNext(claimOptions);
+    expect(first?.attemptCount).toBe(1);
+    expect(await repo.claimNext(claimOptions)).toBeNull();
+    const claim = { claimedBy: "w", attemptCount: 1 };
+    expect(
+      await repo.scheduleRetry(row._id, {
+        category: "PROVIDER_TRANSIENT",
+        nextAttemptAt: workerClock(),
+        claim: { ...claim, claimedBy: "another-worker" },
+      }),
+    ).toBeNull();
+    const retryAt = new Date(workerNow.getTime() + 60_000);
+    await repo.scheduleRetry(row._id, {
+      category: "PROVIDER_TRANSIENT",
+      nextAttemptAt: retryAt,
+      claim,
+    });
+    expect(
+      await repo.claimNext({ ...claimOptions, now: new Date(retryAt.getTime() - 1) }),
+    ).toBeNull();
+    expect((await repo.claimNext({ ...claimOptions, now: retryAt }))?.attemptCount).toBe(2);
+    expect(await repo.markFailed(row._id, { category: "UNKNOWN", claim })).toBeNull();
+    await repo.markFailed(row._id, { category: "UNKNOWN", claim: { ...claim, attemptCount: 2 } });
+    expect(await repo.claimNext({ ...claimOptions, now: retryAt })).toBeNull();
+    const exhausted = bookingRow({});
+    exhausted.attemptCount = options.maxAttempts;
+    expect(await repoFor(exhausted).claimNext(claimOptions)).toBeNull();
+  });
 
   it("8/9/13/15 a returned Resend 500 on a Booking confirmation is retried under the same event, never SENT", async () => {
     const stack = await loadWorkerStack();
@@ -356,12 +449,16 @@ describe("worker and consumers", () => {
       repo as never,
       new stack.EmailService(new stack.ResendEmailTransport(factory)),
       options,
+      workerClock,
     );
 
     const counts = await worker.runOnce(5);
 
     expect(counts).toMatchObject({ sent: 0, retried: 1 });
     expect(repo.markSent).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(row.attemptCount).toBe(1);
+    expect(nextRetryAt(row).getTime()).toBeGreaterThan(workerNow.getTime());
     expect(row).toMatchObject({
       status: "PENDING",
       lastErrorCategory: "PROVIDER_TRANSIENT",
@@ -376,12 +473,43 @@ describe("worker and consumers", () => {
     const repo = repoFor(row);
     const { factory } = resendClient({ data: null, error: { name: "x", statusCode: null } });
     const service = new stack.EmailService(new stack.ResendEmailTransport(factory));
-    vi.spyOn(service, "render").mockReturnValue({ subject: "s", text: "t" });
+    vi.spyOn(service, "render").mockReturnValue({ subject: "s", text: "t", html: "<p>t</p>" });
 
-    await new stack.EmailOutboxWorker(repo as never, service, options).runOnce(5);
+    await new stack.EmailOutboxWorker(repo as never, service, options, workerClock).runOnce(5);
 
     expect(repo.markFailed).not.toHaveBeenCalled();
+    expect(row.attemptCount).toBe(1);
+    expect(nextRetryAt(row).getTime()).toBeGreaterThan(workerNow.getTime());
     expect(row).toMatchObject({ status: "PENDING", lastErrorCategory: "PROVIDER_OUTCOME_UNKNOWN" });
+  });
+
+  it("a retryable provider failure reaches the real worker limit only after eligible retries", async () => {
+    const stack = await loadWorkerStack();
+    const row = bookingRow({});
+    const repo = repoFor(row);
+    const { send, factory } = resendClient({ data: null, error: { name: "x", statusCode: 500 } });
+    const service = new stack.EmailService(new stack.ResendEmailTransport(factory));
+    vi.spyOn(service, "render").mockReturnValue({ subject: "s", text: "t", html: "<p>t</p>" });
+    let now = workerClock();
+    const worker = new stack.EmailOutboxWorker(repo as never, service, options, () => now);
+    for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
+      const counts = await worker.runOnce(5);
+      expect(row.attemptCount).toBe(attempt);
+      expect(row.eventKey).toBe("BOOKING_CREATED:b1");
+      expect(counts).toMatchObject(
+        attempt < options.maxAttempts
+          ? { sent: 0, retried: 1, failed: 0 }
+          : { sent: 0, retried: 0, failed: 1 },
+      );
+      if (attempt < options.maxAttempts) {
+        expect(row.nextAttemptAt).toBeDefined();
+        now = new Date(nextRetryAt(row).getTime());
+      }
+    }
+    expect(send).toHaveBeenCalledTimes(options.maxAttempts);
+    expect(repo.markFailed).toHaveBeenCalledOnce();
+    expect(repo.markSent).not.toHaveBeenCalled();
+    expect(row.status).toBe("FAILED");
   });
 
   it("14 OTP via Resend: a returned provider error is an OTP delivery failure, not a silent success", async () => {

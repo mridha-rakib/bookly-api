@@ -10,7 +10,7 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
-import express from "express";
+import express, { type Express } from "express";
 import mongoose from "mongoose";
 import { ExpressApplication } from "../../src/app/app.js";
 import { PaymentAttemptModel } from "../../src/modules/payment/payment-attempt.model.js";
@@ -97,7 +97,7 @@ export function controlApp(input: {
   apiOrigin: string;
   controlOrigin: string;
   token: string;
-}) {
+}): Express {
   const { uiOrigin, seed, apiOrigin, controlOrigin, token } = input;
   const expected = Buffer.from(`Bearer ${token}`);
   const app = express();
@@ -179,10 +179,10 @@ export function controlApp(input: {
       return void res.json(
         simulateAuthentication(
           {
-            clientSecret: req.body?.clientSecret ? String(req.body.clientSecret) : undefined,
-            paymentIntentId: req.body?.paymentIntentId
-              ? String(req.body.paymentIntentId)
-              : undefined,
+            ...(req.body?.clientSecret ? { clientSecret: String(req.body.clientSecret) } : {}),
+            ...(req.body?.paymentIntentId
+              ? { paymentIntentId: String(req.body.paymentIntentId) }
+              : {}),
           },
           String(req.body?.result ?? ""),
         ),

@@ -52,7 +52,7 @@ export async function ensureBusinessRefundNotification(
           operation.logicalIdempotencyKey !==
             `business-cancel-refund:${String(operation.bookingId)}` ||
           !operation.providerRefundId ||
-          !["SUCCEEDED", "FAILED"].includes(operation.providerStatus)
+          (operation.providerStatus !== "SUCCEEDED" && operation.providerStatus !== "FAILED")
         ) {
           result = "NOT_READY";
           return;
@@ -92,9 +92,10 @@ export async function ensureBusinessRefundNotification(
           type: { $in: ["PLATFORM_FEE", "DEPOSIT"] },
           status: "SUCCEEDED",
           amountCents: operation.expectedRefundAmountCents,
-          currency: operation.currency,
           providerReference: operation.sourcePaymentIntentId,
         })
+          .where("currency")
+          .equals(operation.currency)
           .session(session)
           .exec();
         const attempt = await PaymentAttemptModel.findOne({
@@ -108,8 +109,9 @@ export async function ensureBusinessRefundNotification(
           providerStatus: "SUCCEEDED",
           persistenceStatus: "COMPLETED",
           compensationStatus: "NOT_REQUIRED",
-          succeededTransactionId: source?._id,
         })
+          .where("succeededTransactionId")
+          .equals(source?._id)
           .session(session)
           .exec();
         if (!business || !source || !attempt) {
@@ -131,12 +133,13 @@ export async function ensureBusinessRefundNotification(
             direction: "CREDIT",
             status: "SUCCEEDED",
             amountCents: operation.expectedRefundAmountCents,
-            currency: operation.currency,
             providerReference: operation.providerRefundId,
             idempotencyKey: `refund-operation:${String(operation._id)}:ledger`,
             "metadata.sourceTransactionId": String(source._id),
             "metadata.sourceType": source.type,
           })
+            .where("currency")
+            .equals(operation.currency)
             .session(session)
             .exec();
           if (!refundLedger) {

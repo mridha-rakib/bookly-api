@@ -276,7 +276,7 @@ describe("P4K-3 read-only redemption recovery (session-status)", () => {
   };
   async function withStatus(outcome: unknown) {
     const server = await app(),
-      status = vi.fn(async () => outcome);
+      status = vi.fn(async (_context: unknown, _intent: unknown) => outcome);
     (services.lifecycle as unknown as Record<string, unknown>)["customerRedemptionStatus"] = status;
     return { server, status };
   }
@@ -361,7 +361,7 @@ describe("P4K-4 read-only cancel/reschedule/expiry recovery", () => {
   } as const;
   async function withStatus(outcome: unknown) {
     const server = await app(),
-      status = vi.fn(async () => outcome),
+      status = vi.fn(async (_context: unknown, _intent: unknown) => outcome),
       redemption = vi.fn(async () => outcome);
     Object.assign(services.lifecycle as object, {
       customerOperationStatus: status,

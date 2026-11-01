@@ -225,7 +225,6 @@ export class RefundRecoveryIncidentService {
                 type: "REFUND",
                 direction: "CREDIT",
                 status: "SUCCEEDED",
-                currency: operation.currency,
                 amountCents: operation.expectedRefundAmountCents,
                 providerReference: operation.providerRefundId,
                 idempotencyKey: `refund-operation:${String(operation._id)}:ledger`,
@@ -236,12 +235,15 @@ export class RefundRecoveryIncidentService {
                       ),
                     }
                   : {}),
-              }).session(session),
+              })
+                .where("currency")
+                .equals(operation.currency)
+                .session(session),
             );
           }
           const filter = {
             _id: operation._id,
-            "recoveryIncident.state": "OPEN",
+            "recoveryIncident.state": "OPEN" as const,
             "recoveryIncident.episodeId": incident.episodeId,
           };
           if (resolved) {

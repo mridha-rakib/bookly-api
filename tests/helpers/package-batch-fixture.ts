@@ -15,6 +15,7 @@ import { BookingCreationClaimRepository } from "../../src/modules/booking/bookin
 import { BookingLifecycleService } from "../../src/modules/booking/booking-lifecycle.service.js";
 import { PackageBatchPersistence } from "../../src/modules/booking/package-batch-persistence.js";
 import { PackageCheckoutAcceptanceService } from "../../src/modules/booking/package-checkout-acceptance.service.js";
+import type { PackageCheckoutSeed } from "../../src/modules/booking/package-checkout-contract.js";
 import { PackageCheckoutCustomerAuthority } from "../../src/modules/booking/package-checkout-customer-authority.js";
 import { PackageCheckoutQuotePreparer } from "../../src/modules/booking/package-checkout-quote.service.js";
 import { PackageConsentProtocol } from "../../src/modules/booking/package-consent-protocol.js";
@@ -249,6 +250,9 @@ export async function packageBatchFixture(
     selections: indices.map((index, n) => {
       const selection = original[index];
       if (!selection) throw new Error("Missing synthetic selection");
+      const staffMembershipId =
+        options.tie && n === 1 ? f.providers[1]?._id : selection.staffMembershipId;
+      if (!staffMembershipId) throw new Error("Missing provider");
       return {
         ...selection,
         addonIds: options.addon ? [addonId] : [],
@@ -266,13 +270,12 @@ export async function packageBatchFixture(
         startAt: new Date(
           `2030-08-20T${options.manual ? (n === 0 ? "19" : "21") : options.tie ? "09" : String(9 + (options.reverse ? indices.length - 1 - n : n) * 2).padStart(2, "0")}:00:00Z`,
         ),
-        staffMembershipId:
-          options.tie && n === 1 ? f.providers[1]?._id : selection.staffMembershipId,
+        staffMembershipId,
       };
     }),
   };
   if (intent.selections.some((s) => !s.staffMembershipId)) throw new Error("Missing provider");
-  let seed = {
+  let seed: PackageCheckoutSeed = {
     ...f.seed,
     ...(options.operationId
       ? { idempotencyKey: `package-consent:${f.context.customerUserId}:${options.operationId}` }
@@ -365,7 +368,7 @@ export async function packageBatchFixture(
         ),
       })),
     };
-    let nextSeed = {
+    let nextSeed: typeof seed = {
       ...seed,
       idempotencyKey: operationId
         ? `package-consent:${f.context.customerUserId}:${operationId}`

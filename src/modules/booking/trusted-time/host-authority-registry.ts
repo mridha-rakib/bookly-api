@@ -47,7 +47,7 @@ export function createConsentHostAuthorityRegistry(
       !["CURRENT", "VERIFY_ONLY", "REVOKED"].includes(input.disposition) ||
       records.has(input.profile.authorityId)
     )
-      denied();
+      return denied();
     const profile = parsed.data;
     records.set(profile.authorityId, {
       ...input,

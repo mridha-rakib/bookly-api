@@ -543,7 +543,7 @@ describe("database-backed Package Deal integration", () => {
   // --- Purchase --------------------------------------------------------------------------------
 
   describe("Package purchase", () => {
-    it("previews the actual online package deposit with Stripe VAT and keeps venue balance pre-tax", async () => {
+    it("previews the actual online package upfront with separate informational VAT", async () => {
       const { owner, business, staff, service } = await setupPackageBusiness();
       const customer = await createCustomer("preview-buyer");
       await saveCard(customer._id);
@@ -558,12 +558,69 @@ describe("database-backed Package Deal integration", () => {
 
       expect(taxGateway.calls.at(-1)?.amountCents).toBe(3_500);
       expect(preview).toMatchObject({
+        taxMode: "PRE_ACTIVATION",
         preTaxChargeCents: 3_500,
         taxCents: 665,
-        dueNowCents: 4_165,
+        dueNowCents: 3_500,
         balanceDueCents: 41_500,
       });
       expect(preview.financials.balanceDueCents).toBe(41_500);
+    });
+
+    it("discloses a €160 FIRST package then a zero-upfront RETURNING package at the same Business", async () => {
+      const f = await setupPackageBusiness();
+      const serviceUpdate = await ServiceModel.updateOne(
+        { _id: f.service._id, businessId: f.business._id },
+        { $set: { "packagePricing.bundlePriceCents": 16000 } },
+        { runValidators: true },
+      ).exec();
+      expect(serviceUpdate.matchedCount).toBe(1);
+      const customer = await createCustomer("disclosure-buyer");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+      const input = purchaseInput(f.service._id, f.staff[0]!.membership._id);
+      const first = await creationService.previewPackagePurchase(
+        String(customer._id),
+        String(f.business._id),
+        input,
+      );
+      expect(first).toMatchObject({
+        taxMode: "PRE_ACTIVATION",
+        dueNowCents: 3200,
+        taxCents: 608,
+        balanceDueCents: 12800,
+        financials: { totalCents: 16000 },
+      });
+      const purchase = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(f.business._id),
+        input,
+      );
+      expect(purchase.status).toBe("confirmed");
+      const nextInput = purchaseInput(f.service._id, f.staff[0]!.membership._id, DATE_2);
+      const returning = await creationService.previewPackagePurchase(
+        String(customer._id),
+        String(f.business._id),
+        nextInput,
+      );
+      expect(returning).toMatchObject({
+        taxMode: "PRE_ACTIVATION",
+        dueNowCents: 0,
+        taxCents: 0,
+        balanceDueCents: 16000,
+        financials: { totalCents: 16000, depositCents: 0 },
+      });
+      expect(
+        (
+          await creationService.finalizePackagePurchase(
+            String(customer._id),
+            String(f.business._id),
+            nextInput,
+          )
+        ).status,
+      ).toBe("confirmed");
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(first.dueNowCents);
     });
 
     it("charges the full bundle price as a normal deposit, creates session 1, and creates the entitlement", async () => {

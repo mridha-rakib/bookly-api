@@ -504,7 +504,8 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     expect(preview.financials.platformFeeCents).toBeGreaterThan(0);
     expect(preview.preTaxChargeCents).toBe(preview.financials.depositCents);
     expect(preview.taxCents).toBe(Math.round(preview.preTaxChargeCents * 0.19));
-    expect(preview.dueNowCents).toBe(preview.preTaxChargeCents + preview.taxCents);
+    expect(preview.dueNowCents).toBe(preview.preTaxChargeCents);
+    expect(preview.taxMode).toBe("PRE_ACTIVATION");
     expect(preview.balanceDueCents).toBe(preview.financials.balanceDueCents);
     expect(preview.requiresSavedCard).toBe(true);
     expect(preview.hasSavedCard).toBe(false);
@@ -971,7 +972,8 @@ describe("database-backed Booking creation + lifecycle integration", () => {
           (hours * 60 + 15) * 60_000,
         );
         expect(moved.serviceLines[0]!.pricingInput.hours).toBe(hours);
-        expect(moved.financials).toEqual(f.booking.financials);
+        // Compare persisted values, not Mongoose parent-document bookkeeping.
+        expect(JSON.stringify(moved.financials)).toBe(JSON.stringify(f.booking.financials));
         expect(moved.customerRescheduleCount).toBe(0);
       },
     );
@@ -1235,7 +1237,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
         String(f.booking._id),
         result.days[0]!.slots[0]!.startAt,
       );
-      expect(moved.financials).toEqual(f.booking.financials);
+      expect(JSON.stringify(moved.financials)).toBe(JSON.stringify(f.booking.financials));
     });
     it("all-line availability preserves distinct ends and excludes secondary-line failures", async () => {
       const f = await setupBookableBusiness();
@@ -1285,7 +1287,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       );
       expect(moved.schedule.endAt.toISOString()).toBe(offered.endAt);
       expect(moved.serviceLines.map((line) => line.serviceSnapshot.durationMin)).toEqual([60, 255]);
-      expect(moved.financials).toEqual(booking.financials);
+      expect(JSON.stringify(moved.financials)).toBe(JSON.stringify(booking.financials));
     });
     it("read snapshots do not mutate the business fence, operations, booking or financials; failed moves roll back", async () => {
       const f = await newBooking();
@@ -1311,8 +1313,8 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       ).rejects.toThrow("F1C-A injected release failure");
       failure.mockRestore();
       const original = await bookingRepository.findById(f.business._id, f.booking._id);
-      expect(original?.schedule).toEqual(f.booking.schedule);
-      expect(original?.financials).toEqual(f.booking.financials);
+      expect(JSON.stringify(original?.schedule)).toBe(JSON.stringify(f.booking.schedule));
+      expect(JSON.stringify(original?.financials)).toBe(JSON.stringify(f.booking.financials));
       expect(original?.rescheduleHistory).toHaveLength(0);
       expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(claimsBefore);
       expect(await read(f)).toEqual(first);
@@ -1412,7 +1414,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       );
       expect(moved.serviceLines[0]!.serviceSnapshot.pricingMode).toBe("HOURLY");
       expect(moved.serviceLines[0]!.pricingInput.hours).toBe(4);
-      expect(moved.financials).toEqual(f.booking.financials);
+      expect(JSON.stringify(moved.financials)).toBe(JSON.stringify(f.booking.financials));
     });
   });
 
@@ -1705,8 +1707,27 @@ describe("database-backed Booking creation + lifecycle integration", () => {
       void business;
     });
 
-    it("a failing outbox enqueue never rolls back the committed reschedule", async () => {
+    it("a transactional outbox failure rolls back the reschedule, reservations and partial intent", async () => {
       const { owner, business, booking } = await createUpcomingBooking("10:00");
+      const originalBooking = await BookingModel.findById(booking._id).lean().orFail();
+      const originalReservations = await BookingSlotReservationModel.find({
+        businessId: business._id,
+      })
+        .sort({ _id: 1 })
+        .lean();
+      const originalClaims = await BookingSlotReservationClaimModel.find({
+        businessId: business._id,
+      })
+        .sort({ _id: 1 })
+        .lean();
+      const originalOutbox = await EmailOutboxModel.find({}).sort({ _id: 1 }).lean();
+      const outbox = new EmailOutboxService(new EmailOutboxRepository());
+      const enqueue = vi.fn<EmailOutboxService["enqueue"]>(async (input, session) => {
+        expect(session?.inTransaction()).toBe(true);
+        // Write a genuine intent first: rollback must remove partial outbox state too.
+        await outbox.enqueue(input, session);
+        throw new Error("outbox unavailable");
+      });
 
       const brokenLifecycle = new BookingLifecycleService(
         bookingService,
@@ -1724,26 +1745,36 @@ describe("database-backed Booking creation + lifecycle integration", () => {
         undefined,
         undefined,
         undefined,
-        new BookingRescheduledCustomerNotifier({
-          enqueue: async () => {
-            throw new Error("outbox unavailable");
-          },
-        } as never),
+        new BookingRescheduledCustomerNotifier({ enqueue }),
       );
 
-      const rescheduled = await brokenLifecycle.rescheduleByOwner(
-        String(owner._id),
-        "BUSINESS_OWNER",
-        String(business._id),
-        String(booking._id),
-        startAtFor("15:00"),
-      );
-
-      expect(rescheduled.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
-      expect(rescheduled.rescheduleHistory).toHaveLength(1);
-      const persisted = await bookingRepository.findById(business._id, booking._id);
-      expect(persisted?.schedule.startAt.toISOString()).toBe(startAtFor("15:00"));
-      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+      await expect(
+        brokenLifecycle.rescheduleByOwner(
+          String(owner._id),
+          "BUSINESS_OWNER",
+          String(business._id),
+          String(booking._id),
+          startAtFor("15:00"),
+        ),
+      ).rejects.toThrow("outbox unavailable");
+      expect(enqueue).toHaveBeenCalledOnce();
+      const persisted = await BookingModel.findById(booking._id).lean().orFail();
+      expect(persisted.schedule).toEqual(originalBooking.schedule);
+      expect(persisted.serviceLines).toEqual(originalBooking.serviceLines);
+      expect(persisted.financials).toEqual(originalBooking.financials);
+      expect(persisted.rescheduleHistory).toEqual(originalBooking.rescheduleHistory);
+      expect(persisted.customerRescheduleCount).toBe(originalBooking.customerRescheduleCount);
+      expect(
+        await BookingSlotReservationModel.find({ businessId: business._id })
+          .sort({ _id: 1 })
+          .lean(),
+      ).toEqual(originalReservations);
+      expect(
+        await BookingSlotReservationClaimModel.find({ businessId: business._id })
+          .sort({ _id: 1 })
+          .lean(),
+      ).toEqual(originalClaims);
+      expect(await EmailOutboxModel.find({}).sort({ _id: 1 }).lean()).toEqual(originalOutbox);
     });
   });
 
@@ -1807,7 +1838,7 @@ describe("database-backed Booking creation + lifecycle integration", () => {
     });
 
     it("customer reschedule PATCHes the same event", async () => {
-      const { business, booking, client } = await createUpcomingBooking("10:00");
+      const { booking, client } = await createUpcomingBooking("10:00");
       await linkEvent(booking._id);
       const customer = await linkCustomer(client._id, booking._id);
 

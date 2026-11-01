@@ -110,13 +110,18 @@ schema.pre(
     "deleteOne",
     "deleteMany",
     "findOneAndDelete",
-    "bulkWrite",
-    "insertMany",
   ],
   () => {
     throw Error("Consent evidence cannot be changed or erased");
   },
 );
+// Model middleware has distinct overloads; keep the same prohibitions registered.
+schema.pre("bulkWrite", () => {
+  throw Error("Consent evidence cannot be changed or erased");
+});
+schema.pre("insertMany", () => {
+  throw Error("Consent evidence cannot be changed or erased");
+});
 schema.pre("deleteOne", { document: true, query: false }, () => {
   throw Error("Consent evidence cannot be erased");
 });

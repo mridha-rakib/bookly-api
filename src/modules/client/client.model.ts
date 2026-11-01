@@ -393,11 +393,14 @@ businessClientSchema.pre("save", function () {
     throw new Error("Use canonical BusinessClient query writers for link/archive changes");
 });
 businessClientSchema.pre(
-  ["replaceOne", "findOneAndReplace", "bulkWrite", "deleteOne", "deleteMany", "findOneAndDelete"],
+  ["replaceOne", "findOneAndReplace", "deleteOne", "deleteMany", "findOneAndDelete"],
   () => {
     throw new Error("BusinessClient replacement/bulk writes cannot preserve link continuity");
   },
 );
+businessClientSchema.pre("bulkWrite", () => {
+  throw new Error("BusinessClient replacement/bulk writes cannot preserve link continuity");
+});
 businessClientSchema.pre("deleteOne", { document: true, query: false }, () => {
   throw new Error("Archive BusinessClient rows; link identity cannot be erased");
 });

@@ -37,9 +37,10 @@ export async function bookingDeliveryPurchaseVerified(booking: BookingDocument):
     const progress = await PackageProgressV2Model.findOne({
       _id: id,
       businessId: booking.businessId,
-      customerUserId: booking.customer.customerUserId,
       businessClientId: booking.customer.businessClientId,
     })
+      .where("customerUserId")
+      .equals(booking.customer.customerUserId)
       .read("primary")
       .maxTimeMS(2000);
     if (!progress || (await readPackagePurchaseCompletion(progress)) !== "VERIFIED") return false;
@@ -134,15 +135,19 @@ export class BookingEmailDeliveryEligibility {
         record.eventKey,
       );
       if (!match?.[1] || !match[2] || !match[3]) return false;
+      const refundStatus = match[3];
+      if (refundStatus !== "SUCCEEDED" && refundStatus !== "FAILED") return false;
       bookingId = new Types.ObjectId(match[1]);
       const refund = await RefundOperationModel.findOne({
         _id: new Types.ObjectId(match[2]),
         bookingId,
-        providerStatus: match[3],
+        providerStatus: refundStatus,
       })
         .read("primary")
         .maxTimeMS(2000);
-      const outcome = record.payload.financialOutcome as { settlementStatus?: string } | undefined;
+      const outcome = record.payload["financialOutcome"] as
+        | { settlementStatus?: string }
+        | undefined;
       if (
         !refund ||
         refund.reason !== "BUSINESS_CANCELLATION" ||
@@ -160,18 +165,22 @@ export class BookingEmailDeliveryEligibility {
         const ledger = await BookingFinancialTransactionModel.findOne({
           _id: refund.succeededLedgerTransactionId,
           bookingId,
-          businessId: refund.businessId,
-          businessClientId: refund.businessClientId,
-          customerUserId: refund.customerUserId,
           type: "REFUND",
           direction: "CREDIT",
           status: "SUCCEEDED",
           amountCents: refund.expectedRefundAmountCents,
-          currency: refund.currency,
           providerReference: refund.providerRefundId,
           idempotencyKey: `refund-operation:${String(refund._id)}:ledger`,
           "metadata.sourceTransactionId": String(refund.sourceFinancialTransactionId),
         })
+          .where("businessId")
+          .equals(refund.businessId)
+          .where("businessClientId")
+          .equals(refund.businessClientId)
+          .where("customerUserId")
+          .equals(refund.customerUserId)
+          .where("currency")
+          .equals(refund.currency)
           .read("primary")
           .maxTimeMS(2000);
         if (!ledger) return false;
@@ -215,17 +224,20 @@ export class BookingEmailDeliveryEligibility {
       return false;
     if (refundEvidence) {
       const source = await BookingFinancialTransactionModel.findOne({
-        _id: refundEvidence.sourceFinancialTransactionId,
         bookingId: booking._id,
         businessId: booking.businessId,
         businessClientId: booking.customer.businessClientId,
-        customerUserId: booking.customer.customerUserId,
         type: { $in: ["PLATFORM_FEE", "DEPOSIT"] },
         status: "SUCCEEDED",
         amountCents: refundEvidence.expectedRefundAmountCents,
-        currency: refundEvidence.currency,
         providerReference: refundEvidence.sourcePaymentIntentId,
       })
+        .where("_id")
+        .equals(refundEvidence.sourceFinancialTransactionId)
+        .where("customerUserId")
+        .equals(booking.customer.customerUserId)
+        .where("currency")
+        .equals(refundEvidence.currency)
         .read("primary")
         .maxTimeMS(2000);
       if (
@@ -235,7 +247,6 @@ export class BookingEmailDeliveryEligibility {
           bookingId: booking._id,
           businessId: booking.businessId,
           businessClientId: booking.customer.businessClientId,
-          customerUserId: booking.customer.customerUserId,
           purpose: "BOOKING_DEPOSIT",
           productKind: "NORMAL_BOOKING",
           providerStatus: "SUCCEEDED",
@@ -243,6 +254,8 @@ export class BookingEmailDeliveryEligibility {
           compensationStatus: "NOT_REQUIRED",
           succeededTransactionId: source._id,
         })
+          .where("customerUserId")
+          .equals(booking.customer.customerUserId)
           .read("primary")
           .maxTimeMS(2000))
       )
@@ -324,12 +337,12 @@ export class BookingEmailDeliveryEligibility {
       tz = booking.schedule.timezone;
     if (confirmations.has(record.templateKey)) {
       if (
-        p.reference !== booking.reference ||
-        p.appointmentDate !== formatDateInTimezone(booking.schedule.startAt, tz) ||
-        p.appointmentTime !== formatTimeInTimezone(booking.schedule.startAt, tz)
+        p["reference"] !== booking.reference ||
+        p["appointmentDate"] !== formatDateInTimezone(booking.schedule.startAt, tz) ||
+        p["appointmentTime"] !== formatTimeInTimezone(booking.schedule.startAt, tz)
       )
         return false;
-      const paid = p.onlinePayment as
+      const paid = p["onlinePayment"] as
         | { kind?: string; paymentFor?: "BOOKING" | "PACKAGE_PURCHASE" | "PACKAGE_SESSION_EXTRAS" }
         | undefined;
       if (paid?.kind === "PAID") {
@@ -341,12 +354,13 @@ export class BookingEmailDeliveryEligibility {
         const attempt = await PaymentAttemptModel.findOne({
           bookingId: booking._id,
           businessId: booking.businessId,
-          customerUserId: booking.customer.customerUserId,
           businessClientId: booking.customer.businessClientId,
           providerStatus: "SUCCEEDED",
           persistenceStatus: "COMPLETED",
           compensationStatus: "NOT_REQUIRED",
         })
+          .where("customerUserId")
+          .equals(booking.customer.customerUserId)
           .read("primary")
           .maxTimeMS(2000);
         if (!attempt?.succeededTransactionId) return false;
@@ -354,10 +368,11 @@ export class BookingEmailDeliveryEligibility {
           _id: attempt.succeededTransactionId,
           bookingId: booking._id,
           businessId: booking.businessId,
-          customerUserId: booking.customer.customerUserId,
           businessClientId: booking.customer.businessClientId,
           type: { $in: ["PLATFORM_FEE", "DEPOSIT"] },
         })
+          .where("customerUserId")
+          .equals(booking.customer.customerUserId)
           .read("primary")
           .maxTimeMS(2000);
         if (
@@ -380,9 +395,9 @@ export class BookingEmailDeliveryEligibility {
     // are mandatory, staff notices retain their history-version check above.
     return (
       record.templateKey !== "BOOKING_RESCHEDULED_CUSTOMER" ||
-      (p.bookingReference === booking.reference &&
-        p.newDate === formatDateInTimezone(booking.schedule.startAt, tz) &&
-        p.newTime === formatTimeInTimezone(booking.schedule.startAt, tz))
+      (p["bookingReference"] === booking.reference &&
+        p["newDate"] === formatDateInTimezone(booking.schedule.startAt, tz) &&
+        p["newTime"] === formatTimeInTimezone(booking.schedule.startAt, tz))
     );
   }
 }

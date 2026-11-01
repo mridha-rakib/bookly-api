@@ -25,6 +25,7 @@ import { BookingFinancialTransactionRepository } from "../../../src/modules/book
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
@@ -45,6 +46,7 @@ import { PromoRepository } from "../../../src/modules/promo/promo.repository.js"
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
+import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
@@ -464,8 +466,11 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     const t = await recoveryFixture();
     paymentGateway.queueNextChargeOutcome("requires_action");
     await t.finalize();
-    t.business.set("status", "SUSPENDED");
-    await t.business.save();
+    await BusinessModel.updateOne(
+      { _id: t.business._id },
+      { $set: { status: "SUSPENDED" } },
+      { runValidators: true },
+    ).exec();
     // Legacy-age evidence remains discoverable; client privacy expiry is not payment expiry.
     await PaymentAttemptModel.collection.updateOne(
       { logicalIdempotencyKey: t.input.idempotencyKey },
@@ -545,6 +550,12 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
   });
   it("P4A 3DS status survives a fresh read and never authenticates or resubmits automatically", async () => {
     const t = await recoveryFixture();
+    const preview = await creationService.previewCustomerBooking(
+      String(t.customer._id),
+      String(t.business._id),
+      t.input,
+    );
+    expect(preview).toMatchObject({ taxMode: "PRE_ACTIVATION", dueNowCents: 2000, taxCents: 380 });
     paymentGateway.queueNextChargeOutcome("requires_action");
     const required = await t.finalize();
     if (required.status !== "requires_action") throw Error("expected authentication");
@@ -555,20 +566,27 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     });
     await t.status();
     expect(paymentGateway.paymentIntentInputs).toHaveLength(before);
-    t.business.set("status", "SUSPENDED");
-    await t.business.save();
+    await BusinessModel.updateOne(
+      { _id: t.business._id },
+      { $set: { status: "SUSPENDED" } },
+      { runValidators: true },
+    ).exec();
     const suspended = await t.status();
     expect(suspended.canResume).toBe(false);
     expect(suspended.resumeBlockedReason).toBe("BUSINESS_UNAVAILABLE");
     expect(suspended).not.toHaveProperty("clientSecret");
-    t.business.set("status", "APPROVED");
-    await t.business.save();
+    await BusinessModel.updateOne(
+      { _id: t.business._id },
+      { $set: { status: "APPROVED" } },
+      { runValidators: true },
+    ).exec();
     paymentGateway.succeedPaymentIntent(required.paymentIntentId);
     // GET is a stored observation, not a provider status call or Booking completion.
     await expect(t.status()).resolves.toMatchObject({ state: "AUTHENTICATION_REQUIRED" });
     await t.finalize();
     await expect(t.status()).resolves.toMatchObject({ state: "COMMITTED" });
     expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(preview.dueNowCents);
   });
   it("P4A a zero-upfront returning Booking requires a durable Booking, not a fake zero payment", async () => {
     const t = await recoveryFixture();
@@ -697,8 +715,11 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
   it("P4A the real status route permits owned recovery during Business suspension and denies management roles", async () => {
     const t = await recoveryFixture();
     await t.finalize();
-    t.business.set("status", "SUSPENDED");
-    await t.business.save();
+    await BusinessModel.updateOne(
+      { _id: t.business._id },
+      { $set: { status: "SUSPENDED" } },
+      { runValidators: true },
+    ).exec();
     const tokens = new TokenService(new SessionRepository());
     const customerToken = await issueTestAccessToken(tokens, {
       userId: t.customer._id,
@@ -765,39 +786,177 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     expect(pending.canDismiss).toBe(false);
     expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
     expect(paymentGateway.refundInputs).toHaveLength(1);
+    expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(2000);
+    expect(paymentGateway.refundInputs[0]?.amountCents).toBe(2000);
   });
 
   // --- First-booking activation charge --------------------------------------------------------
 
-  it("returns the VAT-inclusive preview contract while finalization still charges pre-tax", async () => {
-    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
-    const customer = await createCustomer("vat-preview");
-    await saveCard(customer._id);
-    await linkCustomerToBusiness(business._id, owner._id, customer._id);
-    const input = finalizeInput(service._id, membership._id);
-    taxGateway.queueNextTax(380);
+  it.each([380, 0])(
+    "discloses the actual pre-activation charge with %i cents informational VAT",
+    async (taxCents) => {
+      const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+      const customer = await createCustomer("vat-preview");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      const input = finalizeInput(service._id, membership._id);
+      taxGateway.queueNextTax(taxCents);
 
-    const preview = await creationService.previewCustomerBooking(
-      String(customer._id),
-      String(business._id),
-      input,
-    );
+      const preview = await creationService.previewCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input,
+      );
 
-    expect(taxGateway.calls.at(-1)?.amountCents).toBe(2_000);
-    expect(preview).toMatchObject({
-      preTaxChargeCents: 2_000,
+      expect(taxGateway.calls.at(-1)?.amountCents).toBe(2_000);
+      expect(preview).toMatchObject({
+        taxMode: "PRE_ACTIVATION",
+        preTaxChargeCents: 2_000,
+        taxCents,
+        dueNowCents: 2_000,
+        balanceDueCents: 8_000,
+      });
+
+      taxGateway.queueNextTax(taxCents);
+      const result = await creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input,
+      );
+      expect(result.status).toBe("confirmed");
+      expect(paymentGateway.paymentIntentInputs.at(-1)).toMatchObject({
+        amountCents: preview.dueNowCents,
+        metadata: {
+          taxMode: "PRE_ACTIVATION",
+          chargedAmountCents: "2000",
+          taxCents: String(taxCents),
+        },
+      });
+      if (result.status !== "confirmed") throw new Error("expected confirmed");
+      expect(result.booking.financials).toMatchObject({
+        totalCents: 10_000,
+        depositCents: 2_000,
+        balanceDueCents: 8_000,
+      });
+      expect(result.booking.financialContract?.onlineChargeCents).toBe(preview.dueNowCents);
+      expect(result.booking.financials.taxCents).toBeUndefined();
+      const replay = await creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        input,
+      );
+      expect(replay.status).toBe("confirmed");
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    },
+  );
+
+  it("rejects a failed tax calculation without a fabricated zero-tax preview or charge", async () => {
+    const f = await recoveryFixture();
+    taxGateway.queueNextFailure(new Error("Tax unavailable"));
+    await expect(
+      creationService.previewCustomerBooking(
+        String(f.customer._id),
+        String(f.business._id),
+        f.input,
+      ),
+    ).rejects.toMatchObject({ statusCode: 502, details: [{ code: "TAX_CALCULATION_FAILED" }] });
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+    expect(await BookingModel.countDocuments({ businessId: f.business._id })).toBe(0);
+  });
+
+  it("rejects a tax result for a different upfront basis", async () => {
+    const f = await recoveryFixture();
+    const calculation = vi.spyOn(taxGateway, "calculateTax").mockResolvedValueOnce({
+      preTaxAmountCents: 1999,
       taxCents: 380,
-      dueNowCents: 2_380,
-      balanceDueCents: 8_000,
+      amountTotalCents: 2379,
+      taxCalculationId: "taxcalc_wrong_basis",
+      currency: "eur",
     });
+    try {
+      await expect(
+        creationService.previewCustomerBooking(
+          String(f.customer._id),
+          String(f.business._id),
+          f.input,
+        ),
+      ).rejects.toMatchObject({ statusCode: 502, details: [{ code: "TAX_CALCULATION_FAILED" }] });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+    } finally {
+      calculation.mockRestore();
+    }
+  });
 
-    const result = await creationService.finalizeCustomerBooking(
-      String(customer._id),
-      String(business._id),
-      input,
+  it("keeps FIRST and RETURNING travel disclosures aligned with unchanged provider amounts", async () => {
+    const f = await recoveryFixture();
+    const businessUpdate = await BusinessModel.updateOne(
+      { _id: f.business._id },
+      { $set: { visitType: "TRAVEL_TO_CUSTOMER" } },
+      { runValidators: true },
+    ).exec();
+    expect(businessUpdate.matchedCount).toBe(1);
+    const serviceUpdate = await ServiceModel.updateOne(
+      { _id: f.service._id, businessId: f.business._id },
+      { $set: { servedCities: ["Larnaca"] } },
+      { runValidators: true },
+    ).exec();
+    expect(serviceUpdate.matchedCount).toBe(1);
+    await new BusinessTravelSettingsRepository().upsertByBusinessId(f.business._id, [
+      { city: "Larnaca", active: true, feeCents: 1000 },
+    ]);
+    const travel = {
+      customerCity: "Larnaca" as const,
+      travelAddress: {
+        city: "Larnaca" as const,
+        propertyType: "House" as const,
+        area: "Center",
+        streetName: "Main",
+        streetNumber: "2",
+      },
+    };
+    const firstInput = { ...f.input, ...travel };
+    const first = await creationService.previewCustomerBooking(
+      String(f.customer._id),
+      String(f.business._id),
+      firstInput,
     );
-    expect(result.status).toBe("confirmed");
-    expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(2_000);
+    expect(first).toMatchObject({
+      taxMode: "PRE_ACTIVATION",
+      dueNowCents: 2000,
+      taxCents: 380,
+      balanceDueCents: 9000,
+      financials: { totalCents: 11000, travelFeeCents: 1000 },
+    });
+    const booked = await creationService.finalizeCustomerBooking(
+      String(f.customer._id),
+      String(f.business._id),
+      firstInput,
+    );
+    expect(booked.status).toBe("confirmed");
+    const nextInput = { ...finalizeInput(f.service._id, f.membership._id, "14:00"), ...travel };
+    const returning = await creationService.previewCustomerBooking(
+      String(f.customer._id),
+      String(f.business._id),
+      nextInput,
+    );
+    expect(returning).toMatchObject({
+      taxMode: "PRE_ACTIVATION",
+      dueNowCents: 0,
+      taxCents: 0,
+      balanceDueCents: 11000,
+      financials: { totalCents: 11000, depositCents: 0 },
+    });
+    expect(
+      (
+        await creationService.finalizeCustomerBooking(
+          String(f.customer._id),
+          String(f.business._id),
+          nextInput,
+        )
+      ).status,
+    ).toBe("confirmed");
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(first.dueNowCents);
   });
 
   it("first-booking finalize charges the activation fee, persists the Booking, and activates the Client", async () => {
@@ -863,6 +1022,20 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     // €100 basis -> €20 deposit; first booking, so Bookly keeps it as platform fee.
     expect(first.booking.financials.depositCents).toBe(2000);
     expect(first.booking.financials.platformFeeCents).toBe(2000);
+
+    const returningPreview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "14:00"),
+    );
+    expect(returningPreview).toMatchObject({
+      taxMode: "PRE_ACTIVATION",
+      preTaxChargeCents: 0,
+      taxCents: 0,
+      dueNowCents: 0,
+      balanceDueCents: 10_000,
+      requiresSavedCard: true,
+    });
 
     const second = await creationService.finalizeCustomerBooking(
       String(customer._id),

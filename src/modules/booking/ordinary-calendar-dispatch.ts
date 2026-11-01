@@ -304,7 +304,7 @@ export class OrdinaryCalendarDispatch {
     depth = 0,
   ): Promise<OrdinaryCalendarDeliveryOutcome> {
     await verifyOrdinaryCalendarDeliveryAuthority();
-    let journal = await this.repository.findById(journalId);
+    let journal: OrdinaryCalendarJournalDocument | null = await this.repository.findById(journalId);
     if (!journal || journal.mode !== "AUTHORITATIVE") return "SKIPPED";
     if (journal.state === "CONFIRMED" && journal.confirmedSequence === journal.latest.sequence)
       return "DONE";

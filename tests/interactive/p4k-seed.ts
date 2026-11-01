@@ -105,11 +105,11 @@ async function business(input: {
   const assigned = memberships.map((m) => m._id);
   const common = {
     businessId: doc._id,
-    status: "ACTIVE",
+    status: "ACTIVE" as const,
     isPackageDeal: false,
     assignedStaffMembershipIds: assigned,
-    servedCities: ["Larnaca"],
-    scheduleMode: "AUTO",
+    servedCities: ["Larnaca" as const],
+    scheduleMode: "AUTO" as const,
     category: doc.category,
     subcategory: "P4K",
     serviceCategoryId: category._id,

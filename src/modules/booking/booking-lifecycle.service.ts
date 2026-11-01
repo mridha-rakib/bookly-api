@@ -1472,7 +1472,6 @@ export class BookingLifecycleService {
             providerPaymentIntentId: source.providerReference,
             bookingId: booking._id,
             businessId: booking.businessId,
-            customerUserId: booking.customer.customerUserId,
             businessClientId: booking.customer.businessClientId,
             purpose: "BOOKING_DEPOSIT",
             productKind: "NORMAL_BOOKING",
@@ -1481,6 +1480,8 @@ export class BookingLifecycleService {
             compensationStatus: "NOT_REQUIRED",
             succeededTransactionId: source._id,
           })
+            .where("customerUserId")
+            .equals(booking.customer.customerUserId)
             .session(session)
             .exec()
         : null;
@@ -1511,7 +1512,7 @@ export class BookingLifecycleService {
       event: BookingEventHistoryEntry;
       scopedToCustomerUserId?: string;
       penalty?: CancellationPenaltyPlan;
-      notificationBusiness?: BusinessDocument;
+      notificationBusiness?: BusinessDocument | undefined;
       cancelledBy?: "CUSTOMER" | "BUSINESS";
     },
     session: ClientSession,
@@ -1625,7 +1626,7 @@ export class BookingLifecycleService {
     event: BookingEventHistoryEntry;
     scopedToCustomerUserId?: string;
     penalty?: CancellationPenaltyPlan;
-    notificationBusiness?: BusinessDocument;
+    notificationBusiness?: BusinessDocument | undefined;
     cancelledBy?: "CUSTOMER" | "BUSINESS";
   }): Promise<BookingDocument> {
     const dbSession = await mongoose.startSession();

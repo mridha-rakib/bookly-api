@@ -42,7 +42,7 @@ describe("ordinary Business refund final notification", () => {
 
   const seed = async (
     status: "SUCCEEDED" | "FAILED" | "PROVIDER_PENDING" = "SUCCEEDED",
-    version: 1 | undefined = 1,
+    protocol: "CURRENT" | "HISTORICAL" = "CURRENT",
   ) => {
     const business = buildBusiness();
     const booking = buildCancelledBooking(
@@ -123,11 +123,15 @@ describe("ordinary Business refund final notification", () => {
       provider: "STRIPE",
       providerRefundId: "re_exact",
       providerStatus: status,
-      ...(version ? { finalNotificationProtocolVersion: version } : {}),
+      ...(protocol === "CURRENT" ? { finalNotificationProtocolVersion: 1 } : {}),
       ...(status === "SUCCEEDED" ? { succeededLedgerTransactionId: refundLedgerId } : {}),
       updatedAt: new Date(),
       createdAt: new Date(),
     } as never);
+    const persistedOperation = await RefundOperationModel.findById(operationId).lean().orFail();
+    expect(persistedOperation.finalNotificationProtocolVersion).toBe(
+      protocol === "CURRENT" ? 1 : undefined,
+    );
     return { booking, business, operationId, refundLedgerId };
   };
 
@@ -161,7 +165,11 @@ describe("ordinary Business refund final notification", () => {
     expect(await ensureBusinessRefundNotification(pending.operationId)).toBe("NOT_READY");
     expect(await EmailOutboxModel.countDocuments({})).toBe(0);
     await clearIsolatedDatabase();
-    const historical = await seed("SUCCEEDED", undefined);
+    const historical = await seed("SUCCEEDED", "HISTORICAL");
+    expect(
+      (await RefundOperationModel.findById(historical.operationId).lean())
+        ?.finalNotificationProtocolVersion,
+    ).toBeUndefined();
     expect(await ensureBusinessRefundNotification(historical.operationId)).toBe("NOT_APPLICABLE");
     expect(await new RefundOperationRepository().listFinalNotificationPending(10)).toHaveLength(0);
     await clearIsolatedDatabase();
@@ -377,7 +385,11 @@ describe("ordinary Business refund final notification", () => {
         ?.settlementStatus,
     ).toBe("PENDING");
     await clearIsolatedDatabase();
-    const historical = await seed("FAILED", undefined);
+    const historical = await seed("FAILED", "HISTORICAL");
+    expect(
+      (await RefundOperationModel.findById(historical.operationId).lean())
+        ?.finalNotificationProtocolVersion,
+    ).toBeUndefined();
     await BookingModel.updateOne(
       { _id: historical.booking._id },
       { $set: { "cancellationOutcome.settlementStatus": "PENDING" } },

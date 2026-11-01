@@ -563,6 +563,20 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     );
     if (first.status !== "confirmed") throw new Error("expected confirmed");
 
+    const returningPreview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "FIVE", "14:00"),
+    );
+    expect(returningPreview).toMatchObject({
+      taxMode: "PRE_ACTIVATION",
+      preTaxChargeCents: 0,
+      taxCents: 0,
+      dueNowCents: 0,
+      balanceDueCents: 7500,
+      financials: { totalCents: 7500 },
+    });
+
     const second = await creationService.finalizeCustomerBooking(
       String(customer._id),
       String(business._id),
@@ -970,11 +984,12 @@ describe("database-backed Promo Code system (Batch 13)", () => {
     await saveCard(customer._id);
     await linkCustomerToBusiness(business._id, owner._id, customer._id);
 
+    const input = finalizeInput(service._id, membership._id, "PREVIEWONLY");
     for (let i = 0; i < 3; i++) {
       const preview = await creationService.previewCustomerBooking(
         String(customer._id),
         String(business._id),
-        finalizeInput(service._id, membership._id, "PREVIEWONLY"),
+        input,
       );
       // P2: 25% off the €100 price = €25 -> €75 price -> FIRST 20% of €75 = €15.
       expect(preview.promo?.promoEligibleBaseCents).toBe(10_000);
@@ -983,12 +998,26 @@ describe("database-backed Promo Code system (Batch 13)", () => {
       expect(preview.balanceDueCents).toBe(6_000);
       expect(preview.preTaxChargeCents).toBe(1_500);
       expect(preview.taxCents).toBe(285);
-      expect(preview.dueNowCents).toBe(1_785);
+      expect(preview.dueNowCents).toBe(1_500);
+      expect(preview.taxMode).toBe("PRE_ACTIVATION");
       expect(taxGateway.calls.at(-1)?.amountCents).toBe(1_500);
     }
 
     const promo = await promoRepository.findByNormalizedCode("PREVIEWONLY");
     expect(promo?.redeemedCount).toBe(0);
+    const result = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      input,
+    );
+    expect(result.status).toBe("confirmed");
+    expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(1500);
+    if (result.status !== "confirmed") throw new Error("expected confirmed");
+    expect(result.booking.financials).toMatchObject({
+      totalCents: 7500,
+      depositCents: 1500,
+      balanceDueCents: 6000,
+    });
   });
 
   // --- Idempotency -----------------------------------------------------------------------------

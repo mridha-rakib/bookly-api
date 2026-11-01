@@ -161,11 +161,15 @@ export type BookingCreationPreview = {
     amountCents: number;
   }>;
   financials: BookingFinancials;
-  /** C2 customer-disclosure contract. These four integer-cent values are one atomic,
-   * server-authoritative quote: the client formats them but never calculates between them. */
+  /** Server-owned disclosure only; does not activate VAT collection or alter financial terms. */
+  taxMode: "PRE_ACTIVATION";
+  /** Current pre-tax upfront obligation. */
   preTaxChargeCents: number;
+  /** Compute-only calculated VAT, not charged in this checkout. */
   taxCents: number;
+  /** Actual current online obligation, excluding compute-only VAT. */
   dueNowCents: number;
+  /** Established remaining booking balance; calculated VAT is not added. */
   balanceDueCents: number;
   requiresSavedCard: boolean;
   hasSavedCard: boolean;
@@ -393,24 +397,25 @@ export class BookingCreationService {
     return this.taxService.computeForCharge({ amountCents, reference, idempotencyKey });
   }
 
-  /** Maps the one accepted Stripe Tax result into C2's public preview vocabulary. Production
+  /** Maps the accepted Stripe Tax result into the pre-activation public disclosure. Production
    * always wires `taxService`; failing when it is absent prevents a positive-charge preview from
-   * silently masquerading as VAT-free. `dueNowCents` is Stripe's `amount_total` verbatim. */
+   * silently masquerading as VAT-free. Calculated VAT is informational, not payable. */
   private toPreviewFinancialCommitment(
     preTaxChargeCents: number,
     balanceDueCents: number,
     computedTax: ComputedTax | undefined,
   ): Pick<
     BookingCreationPreview,
-    "preTaxChargeCents" | "taxCents" | "dueNowCents" | "balanceDueCents"
+    "taxMode" | "preTaxChargeCents" | "taxCents" | "dueNowCents" | "balanceDueCents"
   > {
     if (!computedTax || computedTax.preTaxAmountCents !== preTaxChargeCents) {
       throw new TaxError("TAX_CALCULATION_FAILED", 502);
     }
     return {
+      taxMode: "PRE_ACTIVATION",
       preTaxChargeCents: computedTax.preTaxAmountCents,
       taxCents: computedTax.taxCents,
-      dueNowCents: computedTax.dueNowWithTaxCents,
+      dueNowCents: preTaxChargeCents,
       balanceDueCents,
     };
   }

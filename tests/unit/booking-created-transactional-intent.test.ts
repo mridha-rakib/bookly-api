@@ -28,7 +28,10 @@ const setup = (users?: BookingNotificationUserPort, enqueueImpl?: () => Promise<
     businessId: business._id,
     createdBy: { actorUserId: new Types.ObjectId(), actorRole: "CUSTOMER" },
   });
-  const enqueue = vi.fn(enqueueImpl ?? (async () => ({ created: true, record: {} })));
+  const enqueue = vi.fn(
+    async (_input: Parameters<EmailOutboxService["enqueue"]>[0], _session?: ClientSession) =>
+      enqueueImpl ? enqueueImpl() : { created: true, record: {} },
+  );
   const notifier = new BookingCreatedNotifier(
     { enqueue } as unknown as Pick<EmailOutboxService, "enqueue">,
     users ?? ownerPort(business.ownerUserId),
@@ -39,7 +42,7 @@ const setup = (users?: BookingNotificationUserPort, enqueueImpl?: () => Promise<
 describe("BookingCreatedNotifier.enqueueBookingCreatedInTransaction", () => {
   it("writes the same rows as the legacy path, each with the caller's transaction session", async () => {
     const tx = setup();
-    const legacy = setup();
+    const legacy = setup(ownerPort(tx.business.ownerUserId));
 
     await tx.notifier.enqueueBookingCreatedInTransaction(tx.booking, tx.business, session);
     await legacy.notifier.notifyBookingCreated(tx.booking, tx.business);
@@ -48,6 +51,10 @@ describe("BookingCreatedNotifier.enqueueBookingCreatedInTransaction", () => {
       legacy.enqueue.mock.calls.map((call) => call[0]),
     );
     expect(tx.enqueue.mock.calls.every((call) => call[1] === session)).toBe(true);
+    expect(tx.enqueue.mock.calls.map(([input]) => input.recipient).sort()).toEqual([
+      "dana@example.com",
+      "owner@example.com",
+    ]);
     // Legacy keeps its exact one-argument call.
     expect(legacy.enqueue.mock.calls.every((call) => call.length === 1)).toBe(true);
     expect(tx.enqueue.mock.calls[0]?.[0]).toMatchObject({

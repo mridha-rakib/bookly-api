@@ -101,7 +101,13 @@ describe("30-minute consent cutoff, real persisted CAS, controlled server quote 
     s.advance(new Date(s.retained.seed.expiresAt.getTime() + 1));
     s.f.configuredPolicy.noShowPercentage = 99;
     expect((await s.accept(s.event)).body.data).toEqual(first.body.data);
-    expect((await s.present()).body.data.accepted).toEqual(first.body.data);
+    const { certification, purchaseAvailable, ...immutableAcceptance } = first.body.data;
+    expect(certification).toBe("UNRESOLVED");
+    expect(purchaseAvailable).toBe(false);
+    const presentation = (await s.present()).body.data;
+    expect(presentation.accepted).toEqual(immutableAcceptance);
+    expect(presentation.certification).toBe(certification);
+    expect(presentation.purchaseAvailable).toBe(purchaseAvailable);
   });
 
   it.each(["price", "policy", "availability"])(

@@ -359,7 +359,7 @@ describe("F4A committed Booking → outbox → worker (synthetic transport)", ()
       isConfigured: () => true,
       send: vi.fn(async (input) => {
         sent.push(input);
-        return { provider: "sendgrid", status: "PROVIDER_ACCEPTED" as const };
+        return { provider: "sendgrid" as const, status: "PROVIDER_ACCEPTED" as const };
       }),
     };
     const counts = await workerFor(outbox, new EmailService(transport)).runOnce(10);
