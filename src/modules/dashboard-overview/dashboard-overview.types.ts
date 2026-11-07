@@ -28,6 +28,7 @@ export type DashboardOverviewLeadType = "NEW_CUSTOMER" | "RETURNING" | "MANUAL";
  * different concept from the ledger-derived AGGREGATE figures in `DashboardOverviewFinancials`
  * below (what has actually settled this month) — see this module's own service-level comment. */
 export type DashboardOverviewScheduleRow = {
+  date?: string;
   bookingId: string;
   bookingReference: string;
   /** Business-local "HH:mm" (see common/time/business-clock.ts). */
@@ -46,6 +47,7 @@ export type DashboardOverviewScheduleRow = {
 /** One entry of the "Today's Schedule" timeline card — mirrors `initialTimelineEvents`' own
  * `{time, name, detail, duration}` shape. */
 export type DashboardOverviewTimelineEntry = {
+  date?: string;
   bookingId: string;
   time: string;
   customerName: string;
@@ -93,6 +95,7 @@ export type DashboardOverview = {
   currency: BookingCurrency;
   /** Business-local "YYYY-MM-DD" (see common/time/business-clock.ts). */
   todayDateStr: string;
+  period?: { fromDate: string; toDate: string; timezone: string; scheduleLimit: number };
   todayBookingsCount: number;
   /** Bookings today still `UPCOMING` and not yet started. */
   todayRemainingCount: number;

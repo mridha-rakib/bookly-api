@@ -14,6 +14,7 @@ import {
   paymentBatchMetadata,
 } from "../payment/payment-batch-binding.js";
 import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
+import type { CyprusTaxService } from "../payment/tax.service.js";
 import { UserModel } from "../user/user.model.js";
 import { BookingModel } from "./booking.model.js";
 import {
@@ -36,6 +37,7 @@ import {
 } from "./package-batch-contract.js";
 import type { PackageBatchPersistence } from "./package-batch-persistence.js";
 import { hashCanonicalPackageCheckoutContent as digest } from "./package-checkout-binding.js";
+import { calculatePackageQuoteTax } from "./package-checkout-quote-tax.js";
 import { verifyPackagePurchaseConsentCertification } from "./package-purchase-authority.js";
 
 /** Unregistered, activation-denied F2 parent. No provider is invoked in a transaction.
@@ -46,6 +48,8 @@ export class PackageBatchFinancialPersistence {
     private readonly relationships: FinancialRelationshipService,
     private readonly payments: PaymentService,
     private readonly clock: () => Date = () => new Date(),
+    /** Informational VAT only (the charge stays pre-tax). Absent = recorded as not calculated. */
+    private readonly tax?: Pick<CyprusTaxService, "computeForCharge">,
   ) {}
 
   public async complete(scope: PackageBatchScope) {
@@ -151,40 +155,65 @@ export class PackageBatchFinancialPersistence {
         customerUserId: String(p.customerUserId),
         businessClientId: String(p.businessClientId),
       };
-      const charge = await this.payments.chargeBookingDeposit({
-        userId: p.customerUserId,
-        amountCents: c.onlineChargeCents,
-        idempotencyKey: p.idempotencyKey,
-        packageBatchBinding: binding,
-        financialContract: {
-          version: 2,
-          classification,
-          productKind: "PACKAGE_PURCHASE",
-          businessClientId: String(p.businessClientId),
-        },
-        metadata: {
-          ...buildPaymentIntentMetadata({
-            bookingId: String(p.originBookingId),
-            businessId: String(p.businessId),
+      // Reuses the quote's own Stripe Tax calculation (same idempotency key and amount) so the
+      // PaymentIntent records the VAT the customer was shown. Informational, never blocking:
+      // an unavailable calculation is recorded as NOT_CALCULATED, never as zero VAT.
+      const computedTax = await calculatePackageQuoteTax(
+        this.tax,
+        String(p.quoteId),
+        c.onlineChargeCents,
+      );
+      const charge = await this.payments
+        .chargeBookingDeposit({
+          userId: p.customerUserId,
+          amountCents: c.onlineChargeCents,
+          idempotencyKey: p.idempotencyKey,
+          packageBatchBinding: binding,
+          financialContract: {
+            version: 2,
+            classification,
+            productKind: "PACKAGE_PURCHASE",
             businessClientId: String(p.businessClientId),
-            purpose: "PACKAGE_PURCHASE",
-            preTaxChargeCents: c.onlineChargeCents,
-            taxCents: 0,
-            chargedAmountCents: c.onlineChargeCents,
-            taxMode: "PRE_ACTIVATION",
-            financialContract: { version: 2, classification, productKind: "PACKAGE_PURCHASE" },
-          }),
-          ...paymentBatchMetadata(binding),
-        },
-        beforeProviderDispatch: async (attempt) => {
+          },
+          metadata: {
+            ...buildPaymentIntentMetadata({
+              bookingId: String(p.originBookingId),
+              businessId: String(p.businessId),
+              businessClientId: String(p.businessClientId),
+              purpose: "PACKAGE_PURCHASE",
+              preTaxChargeCents: c.onlineChargeCents,
+              taxCents: computedTax?.taxCalculationId ? computedTax.taxCents : 0,
+              chargedAmountCents: c.onlineChargeCents,
+              taxCalculationId: computedTax?.taxCalculationId,
+              taxNotCalculatedReason: computedTax?.taxCalculationId
+                ? undefined
+                : this.tax
+                  ? "TAX_CALCULATION_UNAVAILABLE"
+                  : "TAX_SERVICE_NOT_CONFIGURED",
+              taxMode: "PRE_ACTIVATION",
+              financialContract: { version: 2, classification, productKind: "PACKAGE_PURCHASE" },
+            }),
+            ...paymentBatchMetadata(binding),
+          },
+          beforeProviderDispatch: async (attempt) => {
+            if (classification === "FIRST")
+              await this.relationships.bindPaymentAttempt(
+                p.businessClientId,
+                p.idempotencyKey,
+                attempt._id,
+              );
+          },
+        })
+        .catch(async (error: unknown) => {
+          // Same as ordinary Booking: a thrown charge (e.g. no saved card) releases only an
+          // UNBOUND FIRST claim; a bound one defers to durable PaymentAttempt state. Never masks
+          // the original error.
           if (classification === "FIRST")
-            await this.relationships.bindPaymentAttempt(
-              p.businessClientId,
-              p.idempotencyKey,
-              attempt._id,
-            );
-        },
-      });
+            await this.relationships
+              .releaseAfterPreMoneyFailure(p.businessClientId, p.idempotencyKey)
+              .catch(() => this.relationships.reconcileQuietly(p.businessClientId));
+          throw error;
+        });
       if (charge.status !== "succeeded" || !charge.paymentAttemptId)
         throw new PackageBatchUnresolvedError();
       attemptId = charge.paymentAttemptId;

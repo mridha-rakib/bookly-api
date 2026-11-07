@@ -22,6 +22,10 @@ import { BookingFinancialTransactionService } from "../booking-financial-transac
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessLifecycleService } from "../business/business-lifecycle.service.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import {
+  createCentralPayoutRouter,
+  createCentralPayoutService,
+} from "../central-payout/central-payout.route.js";
 import { ClientRepository } from "../client/client.repository.js";
 import { BlogError } from "../content/blog.errors.js";
 import { BlogPostRepository } from "../content/blog.repository.js";
@@ -57,6 +61,7 @@ import {
   financePayoutHistoryQuerySchema,
   financeSummaryQuerySchema,
   financeTransactionsQuerySchema,
+  platformTransactionsExportQuerySchema,
   platformTransactionsQuerySchema,
 } from "../finance/finance.schema.js";
 import { FinanceService } from "../finance/finance.service.js";
@@ -130,6 +135,7 @@ import {
   superAdminAnalyticsPeriodQuerySchema,
   superAdminBookingIdParamsSchema,
   superAdminBusinessIdParamsSchema,
+  superAdminCustomerDetailQuerySchema,
   superAdminListBookingsQuerySchema,
   superAdminListBusinessesQuerySchema,
   superAdminListCustomersQuerySchema,
@@ -358,6 +364,18 @@ export const createSuperAdminRoute = (): Router => {
 
   router.use(authenticate, requireActiveUser(), requireRoles(["SUPER_ADMIN"]));
   router.use("/finance/refund-recovery-incidents", createRefundRecoveryIncidentReadRoute());
+  // P0.6 — central Stripe balance withdrawals (Super Admin only: mounted after the role gate).
+  router.use(
+    createCentralPayoutRouter(
+      createCentralPayoutService(userRepository, {
+        // Business-attributed amounts recorded as owed (EUR ledger); informational only.
+        businessAttributedUnpaid: async () => ({
+          currency: "eur",
+          amountCents: (await financeService.listPendingPayouts()).totalPendingCents,
+        }),
+      }),
+    ),
+  );
 
   // --- Platform Settings ---
   router.get("/settings/platform", asyncHandler(platformSettingsController.get));
@@ -462,13 +480,34 @@ export const createSuperAdminRoute = (): Router => {
     asyncHandler(customerController.list),
   );
   router.get(
+    "/customers/export",
+    validateRequest({ query: superAdminListCustomersQuerySchema }),
+    asyncHandler(customerController.exportCustomers),
+  );
+  router.get(
+    "/customers/:userId/bookings/export",
+    validateRequest({
+      params: superAdminUserIdParamsSchema,
+      query: superAdminCustomerDetailQuerySchema,
+    }),
+    asyncHandler(customerController.exportBookings),
+  );
+  router.get(
     "/customers/:userId",
-    validateRequest({ params: superAdminUserIdParamsSchema }),
+    validateRequest({
+      params: superAdminUserIdParamsSchema,
+      query: superAdminCustomerDetailQuerySchema,
+    }),
     asyncHandler(customerController.getById),
   );
 
   // --- Dashboard ---
-  router.get("/dashboard/summary", asyncHandler(dashboardController.getSummary));
+  // P1.9 — optional period: the same `[fromDate, toDate)` contract as /analytics/*.
+  router.get(
+    "/dashboard/summary",
+    validateRequest({ query: superAdminAnalyticsPeriodQuerySchema }),
+    asyncHandler(dashboardController.getSummary),
+  );
 
   // --- Analytics ---
   router.get(
@@ -685,7 +724,14 @@ export const createSuperAdminRoute = (): Router => {
     validateRequest({ query: platformTransactionsQuerySchema }),
     asyncHandler(controller.listPlatformTransactions),
   );
+  router.get(
+    "/finance/transactions/export.csv",
+    validateRequest({ query: platformTransactionsExportQuerySchema }),
+    asyncHandler(controller.exportPlatformTransactions),
+  );
   router.get("/finance/pending-payouts", asyncHandler(controller.listPendingPayouts));
+  router.get("/finance/pending-payouts/export.csv", asyncHandler(controller.exportPendingPayouts));
+  router.get("/finance/payouts/export.csv", asyncHandler(controller.exportPlatformPayouts));
   router.get(
     "/finance/promo-discounts",
     validateRequest({ query: financeSummaryQuerySchema }),

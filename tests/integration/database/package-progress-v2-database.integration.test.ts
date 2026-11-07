@@ -605,8 +605,10 @@ describe("internal accounting2 atomic expiry and restoration (synthetic accepted
         await f.origin.save();
       } else if (kind === "foreign Business") {
         const foreign = await fixture();
-        foreign.client.linkedUserId = f.customerId;
-        await foreign.client.save();
+        await BusinessClientModel.updateOne(
+          { _id: foreign.client._id },
+          { $set: { linkedUserId: f.customerId } },
+        );
         foreign.origin.customer.customerUserId = f.customerId;
         await foreign.origin.save();
         await f.origin.deleteOne();

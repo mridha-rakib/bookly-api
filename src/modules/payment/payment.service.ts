@@ -551,6 +551,10 @@ export class PaymentService {
   public async reconcilePaymentAttempt(paymentAttemptId: Types.ObjectId | string) {
     const attempt = await this.paymentAttemptRepository.findById(paymentAttemptId);
     if (!attempt) throw new PaymentError("PAYMENT_FAILED", 404);
+    if (attempt.packageBatchBinding) {
+      await verifyPackageBatchActivation();
+      assertPaymentBatchBinding(attempt);
+    }
     if (hasLifecyclePaymentEvidence(attempt)) {
       await verifyPackageBatchActivation();
       assertLifecyclePaymentBinding(attempt);
@@ -576,6 +580,46 @@ export class PaymentService {
       this.toProviderResultRecord(snapshot),
     );
     return { attempt: updated, snapshot };
+  }
+
+  /** Worker-only expiry. Unset policy is read-only. Age never proves cancellation,
+   * settlement, or release of a FIRST claim; always validate the original provider intent. */
+  public async reconcileAuthenticationExpiry(
+    paymentAttemptId: Types.ObjectId | string,
+    maximumAgeMs?: number,
+  ) {
+    const current = await this.reconcilePaymentAttempt(paymentAttemptId);
+    const { attempt, snapshot } = current;
+    if (
+      maximumAgeMs === undefined ||
+      !Number.isSafeInteger(maximumAgeMs) ||
+      maximumAgeMs <= 0 ||
+      Date.now() - attempt.createdAt.getTime() < maximumAgeMs ||
+      snapshot?.status !== "requires_action" ||
+      attempt.providerStatus !== "REQUIRES_ACTION" ||
+      attempt.persistenceStatus !== "NOT_STARTED" ||
+      attempt.compensationStatus !== "NOT_REQUIRED" ||
+      isPenaltyPurpose(attempt.purpose) ||
+      !this.gateway.cancelPaymentIntent
+    )
+      return current;
+
+    let canceled: PaymentIntentSnapshot;
+    try {
+      canceled = await this.gateway.cancelPaymentIntent(snapshot.paymentIntentId);
+    } catch {
+      // Authentication may have completed during cancellation, or its response was lost.
+      // Re-read the same PI; never infer failure or dispatch a replacement.
+      return this.reconcilePaymentAttempt(attempt._id);
+    }
+    this.assertPaymentMatches(canceled, attempt, attempt.providerCustomerId);
+    if (canceled.paymentIntentId !== snapshot.paymentIntentId)
+      throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
+    const stored = await this.paymentAttemptRepository.recordProviderResult(
+      attempt._id,
+      this.toProviderResultRecord(canceled),
+    );
+    return { attempt: stored, snapshot: canceled };
   }
 
   /**
@@ -838,6 +882,11 @@ export class PaymentService {
     attempt: import("./payment-attempt.model.js").PaymentAttemptDocument,
     customerId: string,
   ): void {
+    if (
+      attempt.providerPaymentIntentId &&
+      attempt.providerPaymentIntentId !== result.paymentIntentId
+    )
+      throw new PaymentError("PAYMENT_PROVIDER_CORRELATION_MISMATCH", 409);
     if (attempt.packageLifecycleBinding)
       assertLifecyclePaymentMetadata(attempt.packageLifecycleBinding, result.metadata);
     if (attempt.packageBatchBinding) {

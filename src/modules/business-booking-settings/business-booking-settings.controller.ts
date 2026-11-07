@@ -7,6 +7,7 @@ import type {
   UpdateBusinessBookingSettingsBody,
 } from "./business-booking-settings.schema.js";
 import type { BusinessBookingSettingsService } from "./business-booking-settings.service.js";
+import type { UpdateBusinessTaxSettingsBody } from "./business-tax-settings.js";
 
 export class BusinessBookingSettingsController {
   public constructor(
@@ -33,6 +34,28 @@ export class BusinessBookingSettingsController {
       body.gapEliminationEnabled,
     );
     sendSuccess(response, 200, "Business booking settings updated", result);
+  };
+
+  public getTax = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as BusinessBookingSettingsParams;
+    const result = await this.businessBookingSettingsService.getTaxSettings(
+      userId,
+      params.businessId,
+    );
+    sendSuccess(response, 200, "Business tax settings", result);
+  };
+
+  public updateTax = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as BusinessBookingSettingsParams;
+    const body = request.validated?.body as UpdateBusinessTaxSettingsBody;
+    const result = await this.businessBookingSettingsService.updateTaxSettings(
+      userId,
+      params.businessId,
+      body,
+    );
+    sendSuccess(response, 200, "Business tax settings updated", result);
   };
 
   private requireUserId(request: Request): string {

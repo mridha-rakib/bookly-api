@@ -76,6 +76,37 @@ const buildBooking = (overrides: Partial<BookingDocument> = {}): BookingDocument
   } as unknown as BookingDocument;
 };
 
+it("detail exposes the persisted First-Class package name and location snapshot without a live lookup", () => {
+  const booking = buildBooking();
+  const line = requireFirstLine(booking);
+  line.packageContext = {
+    packageId: new Types.ObjectId(),
+    definitionItemId: new Types.ObjectId(),
+    packageName: "Original purchased package",
+    role: "REDEMPTION",
+  };
+  line.pricingInput.packageProgressId = new Types.ObjectId();
+  line.pricingInput.packageItemId = new Types.ObjectId();
+  booking.fulfilment = {
+    mode: "TRAVEL_TO_CUSTOMER",
+    travelAddress: {
+      city: "Larnaca",
+      area: "Booked area",
+      streetName: "Booked street",
+      streetNumber: "12",
+      propertyType: "Apartment",
+      additionalDirections: "Saved directions",
+    },
+  };
+  const dto = toBookingDetailDto(booking);
+  expect(dto.serviceLines[0]).toMatchObject({
+    packageName: "Original purchased package",
+    packageRole: "REDEMPTION",
+  });
+  expect(dto.fulfilment).toEqual(booking.fulfilment);
+  expect(dto.serviceLines[0]).not.toHaveProperty("pricingInput");
+});
+
 const requireFirstLine = (booking: BookingDocument): BookingDocument["serviceLines"][number] => {
   const line = booking.serviceLines[0];
   if (!line) throw new Error("Test fixture requires one service line");

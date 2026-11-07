@@ -10,6 +10,7 @@ import {
   updateBusinessBookingSettingsBodySchema,
 } from "./business-booking-settings.schema.js";
 import { BusinessBookingSettingsService } from "./business-booking-settings.service.js";
+import { updateBusinessTaxSettingsBodySchema } from "./business-tax-settings.js";
 
 export const createBusinessBookingSettingsRoute = (): Router => {
   const router = Router({ mergeParams: true });
@@ -31,6 +32,19 @@ export const createBusinessBookingSettingsRoute = (): Router => {
       body: updateBusinessBookingSettingsBodySchema,
     }),
     asyncHandler(controller.update),
+  );
+  router.get(
+    "/:businessId/tax-settings",
+    validateRequest({ params: businessBookingSettingsParamsSchema }),
+    asyncHandler(controller.getTax),
+  );
+  router.put(
+    "/:businessId/tax-settings",
+    validateRequest({
+      params: businessBookingSettingsParamsSchema,
+      body: updateBusinessTaxSettingsBodySchema,
+    }),
+    asyncHandler(controller.updateTax),
   );
 
   return router;

@@ -1,5 +1,5 @@
 import mongoose, { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
@@ -78,6 +78,9 @@ describe("database-backed Business Finance (Batch 7)", () => {
   }, 120_000);
 
   beforeEach(async () => {
+    // Date-only control keeps ledger/period assertions deterministic; driver timers remain real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2030-08-19T08:00:00Z"));
     await clearIsolatedDatabase();
     userRepository = new UserRepository();
     businessRepository = new BusinessRepository();
@@ -172,6 +175,8 @@ describe("database-backed Business Finance (Batch 7)", () => {
     );
   });
 
+  afterEach(() => vi.useRealTimers());
+
   afterAll(async () => {
     await stopIsolatedReplicaSet();
   });
@@ -198,6 +203,11 @@ describe("database-backed Business Finance (Batch 7)", () => {
       briefDescription: "A great business",
       category: "Barber",
       subcategories: ["Haircut"],
+    });
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
     });
     return { owner, business };
   };
@@ -387,10 +397,7 @@ describe("database-backed Business Finance (Batch 7)", () => {
       second.booking,
     );
 
-    await BookingModel.updateOne(
-      { _id: second.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
+    vi.setSystemTime(second.booking.schedule.startAt.getTime() - 60 * 60 * 1000);
     await lifecycleService.cancelByCustomer(String(customer._id), String(second.booking._id), "x");
 
     const summary = await financeService.getSummary(
@@ -555,10 +562,7 @@ describe("database-backed Business Finance (Batch 7)", () => {
     if (booking.status !== "confirmed") throw new Error("expected confirmed");
     expect(booking.booking.financials.platformFeeCents).toBeGreaterThan(0);
 
-    await BookingModel.updateOne(
-      { _id: booking.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
+    vi.setSystemTime(booking.booking.schedule.startAt.getTime() - 60 * 60 * 1000);
     await lifecycleService.cancelByCustomer(String(customer._id), String(booking.booking._id), "x");
 
     const page = await financeService.listTransactions(
@@ -609,10 +613,7 @@ describe("database-backed Business Finance (Batch 7)", () => {
         finalizeInput(service._id, membership._id, cancelTime),
       );
       if (second.status !== "confirmed") throw new Error("expected confirmed");
-      await BookingModel.updateOne(
-        { _id: second.booking._id },
-        { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-      ).exec();
+      vi.setSystemTime(second.booking.schedule.startAt.getTime() - 60 * 60 * 1000);
       await lifecycleService.cancelByCustomer(
         String(customer._id),
         String(second.booking._id),
@@ -665,10 +666,7 @@ describe("database-backed Business Finance (Batch 7)", () => {
       finalizeInput(a.service._id, a.membership._id, "14:00"),
     );
     if (second.status !== "confirmed") throw new Error("expected confirmed");
-    await BookingModel.updateOne(
-      { _id: second.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
+    vi.setSystemTime(second.booking.schedule.startAt.getTime() - 60 * 60 * 1000);
     await lifecycleService.cancelByCustomer(String(customer._id), String(second.booking._id), "x");
 
     const summaryA = await financeService.getSummary(

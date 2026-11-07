@@ -7,6 +7,7 @@ import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { UserRole } from "../user/user.types.js";
 import { SupportError } from "./support.errors.js";
+import { encodeSupportMessageCursor, type ListSupportMessagesQuery } from "./support.schema.js";
 import {
   SUPPORT_REOPENABLE_FROM,
   SUPPORT_STATUS_TRANSITIONS,
@@ -22,6 +23,13 @@ import type {
   SupportTicketPagination,
   SupportTicketRepository,
 } from "./support-ticket.repository.js";
+
+/** `history` is present only for P1.8 latest-first reads (see support.schema.ts). */
+export type SupportMessageListResult = {
+  messages: SupportMessageDocument[];
+  total: number;
+  history?: { hasOlder: boolean; olderCursor: string | null } | undefined;
+};
 
 export type CreateSupportTicketWriteInput = {
   subject: string;
@@ -104,13 +112,15 @@ export class SupportService {
     return this.requireOwnedTicket(ticketId, actorUserId);
   }
 
+  /** Every message page (initial or older) re-runs the requester ownership check — never only
+   * the ticket-detail read. */
   public async listOwnMessages(
     ticketId: string,
     actorUserId: string,
-    pagination: SupportTicketPagination,
-  ): Promise<{ messages: SupportMessageDocument[]; total: number }> {
+    query: ListSupportMessagesQuery | SupportTicketPagination,
+  ): Promise<SupportMessageListResult> {
     const ticket = await this.requireOwnedTicket(ticketId, actorUserId);
-    return this.messageRepository.listByTicketId(ticket._id, pagination);
+    return this.readMessages(ticket, query);
   }
 
   public async replyAsRequester(
@@ -154,10 +164,10 @@ export class SupportService {
 
   public async listMessagesForAdmin(
     ticketId: string,
-    pagination: SupportTicketPagination,
-  ): Promise<{ messages: SupportMessageDocument[]; total: number }> {
+    query: ListSupportMessagesQuery | SupportTicketPagination,
+  ): Promise<SupportMessageListResult> {
     const ticket = await this.requireTicket(ticketId);
-    return this.messageRepository.listByTicketId(ticket._id, pagination);
+    return this.readMessages(ticket, query);
   }
 
   public async replyAsAdmin(
@@ -224,6 +234,33 @@ export class SupportService {
 
   // --- Internal ---------------------------------------------------------------------------------
 
+  /** Shared by requester and Super Admin reads, always after that side's own ticket check. */
+  private async readMessages(
+    ticket: SupportTicketDocument,
+    query: ListSupportMessagesQuery | SupportTicketPagination,
+  ): Promise<SupportMessageListResult> {
+    // A bare `{ page, limit }` is the pre-P1.8 offset contract.
+    if (!("mode" in query) || query.mode === "page") {
+      return this.messageRepository.listByTicketId(ticket._id, {
+        page: query.page,
+        limit: query.limit,
+      });
+    }
+    const result = await this.messageRepository.listHistoryByTicketId(ticket._id, {
+      limit: query.limit,
+      before: query.before,
+    });
+    const oldest = result.messages[0];
+    return {
+      messages: result.messages,
+      total: result.total,
+      history: {
+        hasOlder: result.hasOlder,
+        olderCursor: result.hasOlder && oldest ? encodeSupportMessageCursor(oldest) : null,
+      },
+    };
+  }
+
   private requireSupportedRole(role: UserRole): SupportTicketRequesterRole {
     if (!(supportTicketRequesterRoles as readonly string[]).includes(role)) {
       throw new SupportError("SUPPORT_TICKET_NOT_FOUND", 404);
@@ -252,7 +289,13 @@ export class SupportService {
 
     // SUPERVISOR | STAFF
     const membership = await this.staffRepository.findActiveByUserId(actorUserId);
-    if (!membership || membership.role !== requesterRole) {
+    if (
+      !membership ||
+      membership.role !== requesterRole ||
+      membership.employmentActive !== true ||
+      membership.removedAt != null ||
+      !membership.userId.equals(actorUserId)
+    ) {
       throw new SupportError("SUPPORT_BUSINESS_CONTEXT_UNAVAILABLE", 400);
     }
     return membership.businessId;

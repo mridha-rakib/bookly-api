@@ -33,7 +33,7 @@ export const assertMoneyRecoveryLaunch = (
 
 type Signal = "SIGINT" | "SIGTERM";
 type SignalSource = {
-  once: (signal: Signal, listener: () => void) => unknown;
+  on: (signal: Signal, listener: () => void) => unknown;
   removeListener: (signal: Signal, listener: () => void) => unknown;
 };
 
@@ -46,12 +46,18 @@ export const withMoneyRecoveryLifecycle = async (options: {
     wait: (milliseconds: number) => Promise<void>,
   ) => Promise<void>;
   onStopping: () => void;
+  shutdownTimeoutMs?: number;
+  onShutdownTimeout?: () => void;
 }): Promise<void> => {
   let stopping = false;
   let releaseWait: (() => void) | undefined;
+  let shutdownTimeout: ReturnType<typeof setTimeout> | undefined;
   const shutdown = (): void => {
     if (stopping) return;
     stopping = true;
+    if (options.shutdownTimeoutMs !== undefined && options.onShutdownTimeout) {
+      shutdownTimeout = setTimeout(options.onShutdownTimeout, options.shutdownTimeoutMs);
+    }
     releaseWait?.();
     options.onStopping();
   };
@@ -72,13 +78,14 @@ export const withMoneyRecoveryLifecycle = async (options: {
       };
     });
 
-  options.signals.once("SIGINT", shutdown);
-  options.signals.once("SIGTERM", shutdown);
+  options.signals.on("SIGINT", shutdown);
+  options.signals.on("SIGTERM", shutdown);
   try {
     await options.connect();
     if (!stopping) await options.execute(() => stopping, wait);
   } finally {
     releaseWait?.();
+    if (shutdownTimeout) clearTimeout(shutdownTimeout);
     try {
       await options.disconnect();
     } finally {

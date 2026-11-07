@@ -2291,16 +2291,25 @@ describe("database-backed Package Deal integration", () => {
       // The $0 session Booking never had any money to refund.
       const ledger = await financialTransactionService.listForBooking(session2._id);
       expect(ledger.filter((e) => e.type === "REFUND")).toHaveLength(0);
+      // Record-only: no refund operation is invented, and a repeated request cannot restore twice.
+      expect(cancelled.cancellationOutcome?.refundOwedCents).toBe(0);
+      expect(
+        await paymentService.findRefundOperation(`customer-cancel-refund:${String(session2._id)}`),
+      ).toBeNull();
+      await expect(
+        lifecycleService.cancelByCustomer(String(customer._id), String(session2._id), undefined),
+      ).rejects.toThrow();
+      const afterRepeat = await PackageProgressModel.findById(progress._id).orFail().exec();
+      expect(afterRepeat.remainingSessions).toBe(4);
     });
 
     it("LATE cancellation FORFEITS the session (never restored) and charges no additional Package base-service fee", async () => {
       const { owner, business, staff, customer, progress } = await setUpSettledPackage();
-      // Force every tier (all far-future test dates land in MORE_THAN_72_HOURS) to classify as a
-      // fee-bearing tier, so cancelByCustomer's own classifier assigns LATE_CANCELLATION.
+      // Approved v2 terms: the redeemed session is a fee window when cancelled 12-24 h ahead.
       await cancellationPolicyRepository.replace(
         business._id,
         cancellationTiers.map((tier) =>
-          tier === "MORE_THAN_72_HOURS"
+          tier === "BETWEEN_12_AND_24_HOURS"
             ? { tier, mode: "PERCENTAGE" as const, percentage: 50 }
             : { tier, mode: "FREE" as const },
         ),
@@ -2312,17 +2321,30 @@ describe("database-backed Package Deal integration", () => {
         String(progress._id),
         redeemInput(staff[0]!.membership._id),
       );
+      expect(session2.cancellationTermsVersion).toBe(2);
 
-      const cancelled = await lifecycleService.cancelByCustomer(
-        String(customer._id),
-        String(session2._id),
-        undefined,
-      );
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(session2.schedule.startAt.getTime() - 18 * 60 * 60 * 1000));
+      let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+      try {
+        cancelled = await lifecycleService.cancelByCustomer(
+          String(customer._id),
+          String(session2._id),
+          undefined,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
       expect(cancelled.status).toBe("LATE_CANCELLATION");
       // Confirmed rule: "the lost session IS the penalty" — no percentage fee layered on top of
       // a Package base session (amount would otherwise be 50% of a real basis; here it's 0).
       expect(cancelled.cancellationOutcome?.cancellationFeeCents).toBe(0);
       expect(cancelled.cancellationOutcome?.additionalChargeCents).toBe(0);
+      expect(cancelled.cancellationOutcome?.refundOwedCents).toBe(0);
+      const lateLedger = await financialTransactionService.listForBooking(session2._id);
+      expect(
+        lateLedger.filter((e) => ["REFUND", "CANCELLATION_FEE"].includes(e.type)),
+      ).toHaveLength(0);
 
       const after = await PackageProgressModel.findById(progress._id).orFail().exec();
       expect(after.remainingSessions).toBe(3); // NOT restored
@@ -2442,6 +2464,17 @@ describe("database-backed Package Deal integration", () => {
       expect(after.remainingSessions).toBe(5);
       const entry = after.sessions.find((s) => String(s.bookingId) === String(purchase._id));
       expect(entry?.status).toBe("CANCELLED");
+      // The real purchase deposit stays recorded; only the whole-Package void refunds it.
+      const ledger = await financialTransactionService.listForBooking(purchase._id);
+      expect(
+        ledger.some(
+          (e) => ["PLATFORM_FEE", "DEPOSIT"].includes(e.type) && e.status === "SUCCEEDED",
+        ),
+      ).toBe(true);
+      expect(ledger.filter((e) => e.type === "REFUND")).toHaveLength(0);
+      expect(
+        await paymentService.findRefundOperation(`customer-cancel-refund:${String(purchase._id)}`),
+      ).toBeNull();
     });
   });
 

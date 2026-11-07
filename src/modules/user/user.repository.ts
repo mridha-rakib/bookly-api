@@ -105,11 +105,8 @@ export class UserRepository {
       .exec();
   }
 
-  /** Batch 11 — Super Admin global Customer list: bounded, server-side paginated, filtered by
-   * the existing `{role:1, status:1}` index. `q` (email or name) is a best-effort
-   * case-insensitive substring match against normalizedEmail directly, plus a first batched
-   * lookup of matching UserProfile rows by name — two bounded queries, never a `$lookup`
-   * aggregation or an unbounded scan. */
+  /** Global role directory with stable server pagination. Search joins profiles in Mongo
+   * instead of materializing an unbounded list of matching user IDs in application memory. */
   public async listByRole(
     role: UserRole,
     filter: { status?: UserStatus | undefined; q?: string | undefined },
@@ -121,19 +118,67 @@ export class UserRepository {
     if (filter.q) {
       const escaped = filter.q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = new RegExp(escaped, "i");
-      const matchingProfileUserIds = await UserProfileModel.find(
-        { $or: [{ firstName: pattern }, { lastName: pattern }] },
-        { userId: 1 },
-      ).exec();
-      query["$or"] = [
-        { normalizedEmail: pattern },
-        { _id: { $in: matchingProfileUserIds.map((p) => p.userId) } },
-      ];
+      // Keep search/pagination in Mongo; never materialize every matching profile ID.
+      const [result] = await UserModel.aggregate<{
+        users: UserDocument[];
+        totals: { count: number }[];
+      }>([
+        { $match: query },
+        {
+          $lookup: {
+            from: UserProfileModel.collection.name,
+            localField: "_id",
+            foreignField: "userId",
+            as: "searchProfile",
+          },
+        },
+        {
+          $set: {
+            searchName: {
+              $trim: {
+                input: {
+                  $concat: [
+                    { $ifNull: [{ $first: "$searchProfile.firstName" }, ""] },
+                    " ",
+                    { $ifNull: [{ $first: "$searchProfile.lastName" }, ""] },
+                  ],
+                },
+              },
+            },
+          },
+        },
+        {
+          $match: {
+            $or: [
+              { normalizedEmail: pattern },
+              { searchName: pattern },
+              { "searchProfile.phone.e164": pattern },
+              { "searchProfile.phone.nationalNumber": pattern },
+            ],
+          },
+        },
+        {
+          $facet: {
+            users: [
+              { $sort: { createdAt: -1, _id: -1 } },
+              { $skip: (pagination.page - 1) * pagination.limit },
+              { $limit: pagination.limit },
+              { $project: { searchProfile: 0, searchName: 0, passwordHash: 0 } },
+            ],
+            totals: [{ $count: "count" }],
+          },
+        },
+      ]).exec();
+      return { users: result?.users ?? [], total: result?.totals[0]?.count ?? 0 };
     }
 
     const skip = (pagination.page - 1) * pagination.limit;
     const [users, total] = await Promise.all([
-      UserModel.find(query).sort({ createdAt: -1 }).skip(skip).limit(pagination.limit).exec(),
+      UserModel.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(pagination.limit)
+        .exec(),
       UserModel.countDocuments(query).exec(),
     ]);
 

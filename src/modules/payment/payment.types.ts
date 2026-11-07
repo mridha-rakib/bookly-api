@@ -171,6 +171,9 @@ export interface PaymentGateway {
 
   retrievePaymentIntent?(paymentIntentId: string): Promise<PaymentIntentSnapshot>;
 
+  /** Cancels the original intent; callers must reconcile a concurrent settlement. */
+  cancelPaymentIntent?(paymentIntentId: string): Promise<PaymentIntentSnapshot>;
+
   findPaymentIntentByMetadata?(
     paymentAttemptId: string,
   ): Promise<ProviderLookupResult<PaymentIntentSnapshot>>;

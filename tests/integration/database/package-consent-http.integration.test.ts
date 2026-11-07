@@ -5,7 +5,7 @@ import express from "express";
 import { SignJWT } from "jose";
 import mongoose, { Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { env } from "../../../src/config/env.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
@@ -20,6 +20,8 @@ import {
   type PackageConsentServices,
   packageConsentOperationKey,
 } from "../../../src/modules/booking/package-consent.route.js";
+import * as hostClock from "../../../src/modules/booking/trusted-time/host-clock.js";
+import * as qualifiedHost from "../../../src/modules/booking/trusted-time/qualified-host.js";
 import { BusinessOpeningHoursModel } from "../../../src/modules/business-hours/business-hours.model.js";
 import { createCatalogRoute } from "../../../src/modules/catalog/catalog.route.js";
 import { ServiceCategoryModel } from "../../../src/modules/services/service-category.model.js";
@@ -31,6 +33,10 @@ import { daysOfWeek } from "../../../src/modules/staff/staff-schedule.types.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
+import {
+  syntheticConsentHost,
+  syntheticHostObservation,
+} from "../../helpers/consent-host-fixture.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -176,6 +182,7 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
     );
   }, 60000);
   beforeEach(clearIsolatedDatabase);
+  afterEach(() => vi.restoreAllMocks());
   afterAll(stopIsolatedReplicaSet);
   it("default off prevents composition, reads and writes, including acceptance reads", async () => {
     const build = vi.fn();
@@ -201,9 +208,12 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
     expect(presentation.status).toBe(200);
     const p = presentation.body.data;
     expect(Object.keys(p).sort()).toEqual([
+      "certification",
       "challenge",
       "disclosureHash",
       "presentationId",
+      "purchaseAvailable",
+      "quote",
       "quoteHash",
       "templateVersion",
       "text",
@@ -388,6 +398,71 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
       ).status,
     ).toBe(409);
   });
+  it("P0.7 reopening restores the original appointments without reissuing, and denies other Customers", async () => {
+    const s = await setup();
+    await s.quote();
+    const first = (await s.present()).body.data;
+    const claimsBefore = await BookingCreationClaimModel.countDocuments();
+    const retained = (await BookingCreationClaimModel.findOne().orFail()).packageCheckoutRetention;
+    if (!retained) throw new Error("Retention missing");
+    const expected = s.f.intent.selections.map((row) => ({
+      selectionId: String(row.selectionId),
+      definitionItemId: String(row.definitionItemId),
+      serviceId: String(row.serviceId),
+      staffMembershipId: String(row.staffMembershipId),
+      startAt: new Date(row.startAt).toISOString(),
+      addons: row.addonIds.map((id) => expect.objectContaining({ id: String(id) })),
+    }));
+    // Refresh in the same session: same presentation, same quote, same appointments.
+    const refreshed = (await s.present().expect(200)).body.data;
+    expect(refreshed.presentationId).toBe(first.presentationId);
+    expect(refreshed.quote.quoteId).toBe(first.quote.quoteId);
+    expect(refreshed.quote.expiresAt).toBe(retained.seed.expiresAt.toISOString());
+    expect(refreshed.quote.appointments).toEqual(
+      expect.arrayContaining(expected.map((row) => expect.objectContaining(row))),
+    );
+    // A new tab/session of the same Customer reads the original quote with its appointments.
+    const sameCustomer = await issueTestAccessToken(s.services.tokens, {
+      userId: s.f.context.customerUserId,
+      role: "CUSTOMER",
+    });
+    const reopened = await request(s.app)
+      .get(`${s.path}/quote`)
+      .set("Authorization", `Bearer ${sameCustomer}`)
+      .expect(200);
+    expect(reopened.body.data.quote.quoteId).toBe(first.quote.quoteId);
+    expect(reopened.body.data.quote.issuedAt).toBe(retained.seed.issuedAt.toISOString());
+    expect(reopened.body.data.quote.expiresAt).toBe(retained.seed.expiresAt.toISOString());
+    expect(reopened.body.data.quote.appointments).toHaveLength(expected.length);
+    expect(reopened.body.data.quote.appointments).toEqual(
+      expect.arrayContaining(expected.map((row) => expect.objectContaining(row))),
+    );
+    // Another Customer learns nothing about the operation.
+    const other = await UserModel.create({
+      normalizedEmail: "p07-foreign@consent.test",
+      passwordHash: "synthetic",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const foreign = await issueTestAccessToken(s.services.tokens, {
+      userId: other._id,
+      role: "CUSTOMER",
+    });
+    const denied = await request(s.app)
+      .get(`${s.path}/quote`)
+      .set("Authorization", `Bearer ${foreign}`);
+    expect(denied.status).toBe(409);
+    expect(JSON.stringify(denied.body)).not.toContain(
+      String(s.f.intent.selections[0]?.staffMembershipId),
+    );
+    // Nothing was reissued, accepted or duplicated by any read.
+    expect(await BookingCreationClaimModel.countDocuments()).toBe(claimsBefore);
+    const after = await BookingCreationClaimModel.findOne().orFail();
+    expect(after.packageCheckoutRetention?.seed.expiresAt).toEqual(retained.seed.expiresAt);
+    expect(after.packageCheckoutRetention?.seed.quoteId).toEqual(retained.seed.quoteId);
+    expect(after.packageCheckoutAcceptance).toBeUndefined();
+  });
   it("concurrent conflicting requests elect one accepted result", async () => {
     const s = await setup();
     await s.quote();
@@ -431,11 +506,23 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
     s.advance(new Date(expiry.getTime() + 1));
     s.f.configuredPolicy.noShowPercentage = 99;
     expect((await s.accept(action)).body.data).toEqual(first.body.data);
-    expect((await s.present()).body.data.accepted).toEqual(first.body.data);
+    const { certification, purchaseAvailable, ...accepted } = first.body.data;
+    const presentation = (await s.present()).body.data;
+    expect(presentation.accepted).toEqual(accepted);
+    expect(presentation.certification).toBe(certification);
+    expect(presentation.purchaseAvailable).toBe(purchaseAvailable);
   });
   it("production composition uses real persisted definition, policy, staff and availability; approved expiry never slides", async () => {
     const s = await setup(),
       f = s.f;
+    f.client.set({
+      createdByUserId: f.business.ownerUserId,
+      firstName: "Synthetic Customer",
+      normalizedEmail: "http@consent.test",
+      phone: { countryCode: "+357", nationalNumber: "99112234", e164: "+35799112234" },
+      linkState: "LINKED",
+    });
+    await f.client.save();
     f.business.set({
       ownerName: "Synthetic Owner",
       email: "business@consent.test",
@@ -507,6 +594,21 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
       createPackageConsentRoute({ enabled: true, build: () => production }),
     );
     app.use(createErrorHandler());
+    const denied = await request(app)
+      .post(`${s.base}/quotes`)
+      .set("Authorization", s.auth)
+      .send({ operationId: s.operationId, intent });
+    expect(denied.status).toBe(503);
+    expect(denied.body.errors[0].code).toBe("PACKAGE_CONSENT_HOST_UNQUALIFIED");
+    expect(await BookingCreationClaimModel.countDocuments()).toBe(0);
+    // Exercise persisted reads under isolated synthetic authority, never a production grant.
+    vi.spyOn(qualifiedHost, "requireQualifiedConsentHost").mockReturnValue(syntheticConsentHost);
+    vi.spyOn(qualifiedHost, "requireConsentHostVerificationProfile").mockReturnValue(
+      syntheticConsentHost,
+    );
+    vi.spyOn(hostClock, "observeConsentHost").mockImplementation(async (witness) =>
+      syntheticHostObservation(witness),
+    );
     const quote = await request(app)
       .post(`${s.base}/quotes`)
       .set("Authorization", s.auth)
@@ -540,7 +642,10 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
       .post(`${s.path}/presentation`)
       .set("Authorization", s.auth)
       .send({});
-    expect(replay.body.data.accepted).toEqual(result.body.data);
+    const { certification, purchaseAvailable, ...accepted } = result.body.data;
+    expect(replay.body.data.accepted).toEqual(accepted);
+    expect(replay.body.data.certification).toBe(certification);
+    expect(replay.body.data.purchaseAvailable).toBe(purchaseAvailable);
     const directory = process.env["BOOKLY_CONSENT_BROWSER_ARTIFACTS"];
     if (directory) {
       const bundle = await readFile(join(directory, "consent-browser.js"), "utf8");

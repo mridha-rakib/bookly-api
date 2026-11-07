@@ -18,7 +18,10 @@ import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { DashboardOverviewController } from "./dashboard-overview.controller.js";
-import { dashboardOverviewParamsSchema } from "./dashboard-overview.schema.js";
+import {
+  dashboardOverviewParamsSchema,
+  dashboardOverviewQuerySchema,
+} from "./dashboard-overview.schema.js";
 import { DashboardOverviewService } from "./dashboard-overview.service.js";
 
 /**
@@ -64,7 +67,7 @@ export const createDashboardOverviewRoute = (): Router => {
     authenticate,
     requireActiveUser(),
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR", "STAFF"]),
-    validateRequest({ params: dashboardOverviewParamsSchema }),
+    validateRequest({ params: dashboardOverviewParamsSchema, query: dashboardOverviewQuerySchema }),
     asyncHandler(controller.getOverview),
   );
 

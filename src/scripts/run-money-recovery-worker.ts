@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-
+import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { DatabaseManager } from "../database/database-manager.js";
 import { BookingRepository } from "../modules/booking/booking.repository.js";
@@ -97,6 +97,7 @@ const buildService = (): MoneyRecoveryService => {
     penaltyCollection,
     providerReversals,
     new RefundRecoveryIncidentService(incidentAlertPolicy),
+    env.PAYMENT_AUTHENTICATION_MAX_AGE_MS,
   );
 };
 

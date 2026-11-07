@@ -1,6 +1,8 @@
-import type {
-  CancellationFeeMode,
-  CancellationTier,
+import {
+  type BookingCancellationTier,
+  type CancellationFeeMode,
+  type CancellationTier,
+  NORMAL_CANCELLATION_TERMS_VERSION,
 } from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import type {
   BookingCancellationOutcome,
@@ -48,6 +50,17 @@ export const classifyCancellationTier = (hoursUntilStart: number): CancellationT
   return "UNDER_2_HOURS";
 };
 
+/** Approved v2 Normal Booking windows (business-cancellation-policy.model.ts). Same boundary
+ * convention as above: exactly 24 h before the start is still "more than 24 hours". */
+export const classifyNormalCancellationTier = (
+  hoursUntilStart: number,
+): BookingCancellationTier => {
+  if (hoursUntilStart >= 24) return "MORE_THAN_24_HOURS";
+  if (hoursUntilStart >= 12) return "BETWEEN_12_AND_24_HOURS";
+  if (hoursUntilStart >= 2) return "BETWEEN_2_AND_12_HOURS";
+  return "UNDER_2_HOURS";
+};
+
 export const buildCancellationOutcome = (input: {
   scheduledStartAt: Date;
   now: Date;
@@ -57,15 +70,45 @@ export const buildCancellationOutcome = (input: {
    * fee actually paid; 0 for a returning customer or a MANUAL Booking) — see
    * BookingCancellationOutcome's own doc comment for why this nets against the fee below. */
   depositAlreadyPaidCents: number;
+  /** The Booking's own `cancellationTermsVersion`; absent = the five-window terms it was made under. */
+  termsVersion?: typeof NORMAL_CANCELLATION_TERMS_VERSION | undefined;
 }): BookingCancellationOutcome => {
   const hoursUntilStart = (input.scheduledStartAt.getTime() - input.now.getTime()) / MS_PER_HOUR;
-  const tier = classifyCancellationTier(hoursUntilStart);
+  if (input.termsVersion === NORMAL_CANCELLATION_TERMS_VERSION) {
+    const normalTier = classifyNormalCancellationTier(hoursUntilStart);
+    // v2: free, and the deposit actually paid is owed back. The caller decides whether this
+    // Booking kind may be refunded (e.g. Package-linked and MANUAL Bookings are not).
+    if (normalTier === "MORE_THAN_24_HOURS") {
+      const refundOwedCents = Math.max(0, input.depositAlreadyPaidCents);
+      return {
+        classifiedAt: input.now,
+        tier: normalTier,
+        feeMode: "FREE",
+        cancellationFeeCents: 0,
+        depositAppliedCents: 0,
+        additionalChargeCents: 0,
+        refundOwedCents,
+        settlementStatus: refundOwedCents > 0 ? "PENDING" : "NOT_APPLICABLE",
+      };
+    }
+    return withFee(input, normalTier);
+  }
+  return withFee(input, classifyCancellationTier(hoursUntilStart));
+};
 
+/** The fee windows shared by both term versions: the Booking's snapshotted rule, netted against
+ * the deposit; the deposit itself is retained (never refunded) for a customer cancellation. */
+const withFee = (
+  input: Parameters<typeof buildCancellationOutcome>[0],
+  tier: BookingCancellationTier,
+): BookingCancellationOutcome => {
   let feeMode: CancellationFeeMode = "FREE";
   let feePercentage: number | undefined;
 
-  if (input.policySnapshot) {
-    const rule = input.policySnapshot.tiers.find((entry) => entry.tier === tier);
+  if (input.policySnapshot && tier !== "MORE_THAN_24_HOURS") {
+    const rule = input.policySnapshot.tiers.find(
+      (entry) => entry.tier === (tier as CancellationTier),
+    );
     if (rule) {
       feeMode = rule.mode;
       feePercentage = rule.percentage;

@@ -222,6 +222,7 @@ const paginationQuerySchema = z.object({
 
 export const listBusinessBookingsQuerySchema = paginationQuerySchema
   .extend({
+    reference: z.string().trim().max(200).optional(),
     status: z.string().optional(),
     staffMembershipId: objectIdSchema.optional(),
     businessClientId: objectIdSchema.optional(),
@@ -241,6 +242,7 @@ export const listBusinessBookingsQuerySchema = paginationQuerySchema
       : undefined,
     staffMembershipId: value.staffMembershipId,
     businessClientId: value.businessClientId,
+    reference: value.reference,
     fromDate: value.fromDate ? new Date(value.fromDate) : undefined,
     toDate: value.toDate ? new Date(value.toDate) : undefined,
   }));

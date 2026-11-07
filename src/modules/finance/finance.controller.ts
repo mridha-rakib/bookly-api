@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { streamCsv } from "../../common/http/csv.js";
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
 import { ProviderReversalQueryService } from "../provider-reversal/provider-reversal.query.js";
@@ -23,6 +24,85 @@ import type { FinanceService } from "./finance.service.js";
  * that Owner actually owns THIS businessId (defense in depth, matching StaffService).
  */
 export class FinanceController {
+  public exportTransactions = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request),
+      params = request.validated?.params as FinanceBusinessParams;
+    const period = request.validated?.query as FinanceTransactionsQuery;
+    await streamCsv(
+      response,
+      "finance-transactions.csv",
+      [
+        "CLIENT",
+        "REFERENCE",
+        "DATE",
+        "TYPE",
+        "CUSTOMER",
+        "AMOUNT CENTS",
+        "BUSINESS OWNED CENTS",
+        "CURRENCY",
+        "STATUS",
+      ],
+      async (page) =>
+        this.financeService.listTransactions(
+          userId,
+          params.businessId,
+          { from: period.from, to: period.to },
+          { page, limit: 100 },
+        ),
+      (row) => {
+        const dto = toFinanceTransactionRowDto(row);
+        return [
+          dto.customerName,
+          dto.bookingReference,
+          dto.date,
+          dto.type,
+          dto.customerType,
+          dto.amountCents,
+          dto.businessOwnedCents,
+          "EUR",
+          dto.status,
+        ];
+      },
+    );
+  };
+  public exportPayouts = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request),
+      params = request.validated?.params as FinanceBusinessParams;
+    await streamCsv(
+      response,
+      "finance-payouts.csv",
+      [
+        "PERIOD START",
+        "PERIOD END",
+        "GROSS CENTS",
+        "PROCESSING FEES CENTS",
+        "NET CENTS",
+        "CURRENCY",
+        "PAID AT",
+        "STATUS",
+      ],
+      async (page) => {
+        const result = await this.financeService.listPayoutHistory(userId, params.businessId, {
+          page,
+          limit: 100,
+        });
+        return { rows: result.items, total: result.total };
+      },
+      (row) => {
+        const dto = toFinancePayoutHistoryItemDto(row);
+        return [
+          dto.periodStart,
+          dto.periodEnd,
+          dto.grossBusinessOwnedCents,
+          dto.processingFeesCents,
+          dto.netPayoutCents,
+          dto.currency,
+          dto.paidAt,
+          dto.status,
+        ];
+      },
+    );
+  };
   public constructor(
     private readonly financeService: FinanceService,
     // P6 — the Business's own view of provider reversals it bears (optional trailing dep).

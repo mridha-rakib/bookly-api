@@ -718,6 +718,10 @@ describe("database-backed authentication integration", () => {
     expect(beforeProfile.email).toBe("progress-test@example.com");
     expect(beforeProfile.firstName).toBeUndefined();
     expect(beforeProfile.phoneVerified).toBe(false);
+    // No phone captured yet: the key must be absent, not an empty object the signup form would
+    // hydrate as an undefined country code (BC-F05B registration defect).
+    expect(beforeProfile).not.toHaveProperty("phone");
+    expect(JSON.parse(JSON.stringify(beforeProfile))).not.toHaveProperty("phone");
 
     await parts.authService.submitProfile(
       profileBodySchema.parse({

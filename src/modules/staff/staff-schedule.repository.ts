@@ -35,17 +35,15 @@ export class StaffScheduleRepository {
   }
 
   /**
-   * Replaces the whole week in one upsert — this is what enforces "one shift per day", and
-   * now also carries the explicit Weekend/Off days for the same week in the same atomic
-   * write, so a save never leaves stale `offDays` behind after `days` changes (or vice versa).
+   * Replaces working days. Omitted off-days preserve the latest persisted value; an explicit
+   * array replaces it. A newly working day leaves the off-day set. Read/merge/write shares
+   * the established Business fence and transaction, including transient-write retries.
    */
   public async replace(
     membershipId: Types.ObjectId,
     businessId: Types.ObjectId,
     days: StaffScheduleDayDocument[],
-    // Defaults to [] so every existing caller (test seed helpers included) that only ever
-    // replaced working `days` keeps compiling and behaving exactly as before.
-    offDays: DayOfWeek[] = [],
+    offDays?: DayOfWeek[],
     session?: ClientSession,
   ): Promise<StaffScheduleDocument> {
     return withPackageEligibility(businessId, session, async (transaction) => {
@@ -55,9 +53,19 @@ export class StaffScheduleRepository {
         removedAt: { $exists: false },
       }).session(transaction);
       if (!member) throw new StaffError("STAFF_NOT_FOUND", 404);
+      const current =
+        offDays === undefined
+          ? await StaffScheduleModel.findOne({ membershipId, businessId }).session(transaction)
+          : null;
+      const workingDays = new Set(
+        days.filter((day) => day.intervals.length > 0).map((day) => day.dayOfWeek),
+      );
+      const mergedOffDays = [...new Set(offDays ?? current?.offDays ?? [])].filter(
+        (day) => !workingDays.has(day),
+      );
       return StaffScheduleModel.findOneAndUpdate(
-        { membershipId },
-        { $set: { businessId, days, offDays } },
+        { membershipId, businessId },
+        { $set: { businessId, days, offDays: mergedOffDays } },
         { session: transaction, upsert: true, returnDocument: "after", runValidators: true },
       ).exec() as Promise<StaffScheduleDocument>;
     });

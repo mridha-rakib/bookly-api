@@ -4,7 +4,10 @@ import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
 import type { UserRole } from "../user/user.types.js";
 import { toDashboardOverviewDto } from "./dashboard-overview.dto.js";
-import type { DashboardOverviewParams } from "./dashboard-overview.schema.js";
+import type {
+  DashboardOverviewParams,
+  DashboardOverviewQuery,
+} from "./dashboard-overview.schema.js";
 import type { DashboardOverviewService } from "./dashboard-overview.service.js";
 
 export class DashboardOverviewController {
@@ -18,6 +21,7 @@ export class DashboardOverviewController {
       userId,
       role,
       params.businessId,
+      request.query["range"] ? (request.validated?.query as DashboardOverviewQuery) : undefined,
     );
 
     sendSuccess(response, 200, "Dashboard overview", toDashboardOverviewDto(overview));

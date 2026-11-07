@@ -4,6 +4,7 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
+import { verifyPackageBatchActivation } from "../../../src/modules/booking/package-batch-authority.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { createPackageViewRoute } from "../../../src/modules/package-progress/package-view.route.js";
@@ -21,7 +22,8 @@ import {
 } from "./mongo-replset-helper.js";
 
 // Only this isolated persistence fixture can materialize records. Shipped routes have no grant.
-vi.mock("../../../src/modules/booking/package-batch-authority.js", () => ({
+vi.mock("../../../src/modules/booking/package-batch-authority.js", async (original) => ({
+  ...(await original<object>()),
   verifyPackageBatchActivation: vi.fn(async () => undefined),
 }));
 describe("S6 authenticated customer/management transport with disposable records", () => {
@@ -221,22 +223,41 @@ describe("S6 authenticated customer/management transport with disposable records
   });
   it("A12/A16: actions deny before any booking/progress/payment effects; identity fields rejected", async () => {
     const t = await fixture();
-    for (const action of ["purchase", "consent", "redeem", "reschedule", "cancel", "settlement"]) {
-      const res = await request(app)
-        .post(`/package-views/actions/${action}`)
+    const engineeringGrant = vi.mocked(verifyPackageBatchActivation).getMockImplementation();
+    const shipped = await vi.importActual<
+      typeof import("../../../src/modules/booking/package-batch-authority.js")
+    >("../../../src/modules/booking/package-batch-authority.js");
+    vi.mocked(verifyPackageBatchActivation).mockImplementation(
+      shipped.verifyPackageBatchActivation,
+    );
+    try {
+      for (const action of [
+        "purchase",
+        "consent",
+        "redeem",
+        "reschedule",
+        "cancel",
+        "settlement",
+      ]) {
+        const res = await request(app)
+          .post(`/package-views/actions/${action}`)
+          .set("Authorization", t.authorization)
+          .send({})
+          .expect(503);
+        expect(res.body.errors[0].code).toBe("PACKAGE_BATCH_ACTIVATION_UNAVAILABLE");
+      }
+      await request(app)
+        .post("/package-views/actions/purchase")
         .set("Authorization", t.authorization)
-        .send({})
-        .expect(503);
-      expect(res.body.errors[0].code).toBe("PACKAGE_BATCH_ACTIVATION_UNAVAILABLE");
+        .send({ customerUserId: String(t.f.context.customerUserId) })
+        .expect(400);
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+      expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+    } finally {
+      if (engineeringGrant)
+        vi.mocked(verifyPackageBatchActivation).mockImplementation(engineeringGrant);
     }
-    await request(app)
-      .post("/package-views/actions/purchase")
-      .set("Authorization", t.authorization)
-      .send({ customerUserId: String(t.f.context.customerUserId) })
-      .expect(400);
-    expect(await BookingModel.countDocuments()).toBe(0);
-    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
-    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
   });
   it("persisted Supervisor membership is required and revocation takes effect", async () => {
     const t = await fixture(true);

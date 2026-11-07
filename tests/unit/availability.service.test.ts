@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from "vitest";
 import { businessLocalToUtc } from "../../src/common/time/business-clock.js";
 import { getAvailabilityQuerySchema } from "../../src/modules/availability/availability.schema.js";
 import { AvailabilityService } from "../../src/modules/availability/availability.service.js";
+import { validateSchedulingLine } from "../../src/modules/booking/booking-scheduling-admission.js";
 import type { BookingSlotReservationDocument } from "../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import type { BusinessDocument } from "../../src/modules/business/business.model.js";
 import type { BusinessOpeningHoursDocument } from "../../src/modules/business-hours/business-hours.model.js";
 import { catalogAvailabilityQuerySchema } from "../../src/modules/catalog/catalog.schema.js";
 import type { ServiceDocument } from "../../src/modules/services/service.model.js";
+import { ServiceModel } from "../../src/modules/services/service.model.js";
 import type { StaffMembershipDocument } from "../../src/modules/staff/staff.model.js";
+import { StaffMembershipModel } from "../../src/modules/staff/staff.model.js";
 import type { StaffScheduleDocument } from "../../src/modules/staff/staff-schedule.model.js";
 import type { StaffTimeOffDocument } from "../../src/modules/staff/staff-time-off.model.js";
 
@@ -103,6 +106,138 @@ const buildOpeningHours = (
 
 type Harness = ReturnType<typeof buildHarness>;
 
+describe("P1.3 Business restrictions in the shared availability/admission pipeline", () => {
+  it("the shared Normal/Package transaction admission adapter propagates a newly saved restriction", async () => {
+    const f = fixture();
+    f.h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+      availability: { closedPeriods: [{ startDate: "2030-08-20", endDate: "2030-08-20" }] },
+    });
+    const serviceRead = vi
+      .spyOn(ServiceModel, "findOne")
+      .mockReturnValue({ session: async () => f.service } as never);
+    const staffRead = vi
+      .spyOn(StaffMembershipModel, "findOne")
+      .mockReturnValue({ session: async () => f.staff } as never);
+    try {
+      await expect(
+        validateSchedulingLine(
+          {
+            business: f.business,
+            serviceId: f.service._id,
+            staffMembershipId: f.staff._id,
+            startAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "10:00"),
+            endAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "11:00"),
+            partySize: 1,
+            capacityMax: 1,
+            allowInactive: true,
+            fulfilment: { mode: "AT_BUSINESS_LOCATION" },
+          },
+          f.h.service,
+          { inTransaction: () => true } as never,
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+    } finally {
+      serviceRead.mockRestore();
+      staffRead.mockRestore();
+    }
+  });
+  function fixture() {
+    const h = buildHarness(),
+      business = buildBusiness(),
+      staff = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id]);
+    h.businessRepository.findById.mockResolvedValue(business);
+    h.serviceRepository.findById.mockResolvedValue(service);
+    h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+    wireStandardOpenSchedule(h, business, staff);
+    const get = () =>
+      h.service.getAvailability({
+        businessId: String(business._id),
+        serviceId: String(service._id),
+        fromDate: "2030-08-20",
+        toDate: "2030-08-20",
+      });
+    const admit = (session?: never) =>
+      h.service.assertSlotIsBookable(
+        {
+          business,
+          service,
+          staffMembership: staff,
+          startAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "10:00"),
+          endAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "11:00"),
+          partySize: 1,
+        },
+        session,
+      );
+    return { h, business, staff, service, get, admit };
+  }
+  it("rejects a formerly offered slot after a block is saved, re-reads in admission session and permits reopening", async () => {
+    const f = fixture();
+    expect(
+      (await f.get()).days[0]?.slots.some(
+        (slot) =>
+          slot.startAt === businessLocalToUtc(TIMEZONE, "2030-08-20", "10:00").toISOString(),
+      ),
+    ).toBe(true);
+    f.h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+      availability: {
+        slotBlocks: [
+          {
+            staffMembershipId: String(f.staff._id),
+            startAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "10:00"),
+            endAt: businessLocalToUtc(TIMEZONE, "2030-08-20", "11:00"),
+          },
+        ],
+      },
+    });
+    expect(
+      (await f.get()).days[0]?.slots.some(
+        (slot) =>
+          slot.startAt === businessLocalToUtc(TIMEZONE, "2030-08-20", "10:00").toISOString(),
+      ),
+    ).toBe(false);
+    const session = { inTransaction: () => true } as never;
+    await expect(f.admit(session)).rejects.toMatchObject({ statusCode: 409 });
+    expect(f.h.businessBookingSettingsRepository.findByBusinessId).toHaveBeenLastCalledWith(
+      f.business._id,
+      session,
+    );
+    f.h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+      availability: { slotBlocks: [] },
+    });
+    await expect(f.admit(session)).resolves.toMatchObject({ capacityMax: 1 });
+  });
+  it.each([false, true])(
+    "closures hide slots and reject final admission for legacy-package=%s",
+    async (legacy) => {
+      const f = fixture();
+      if (legacy) {
+        f.service.isPackageDeal = true;
+        f.service.packagePricing = { priceCents: 5000, durationMin: 60, totalSessions: 3 } as never;
+      }
+      f.h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+        availability: { closedPeriods: [{ startDate: "2030-08-20", endDate: "2030-08-20" }] },
+      });
+      expect((await f.get()).days[0]).toMatchObject({ isOpen: false, slots: [] });
+      await expect(f.admit()).rejects.toMatchObject({ statusCode: 409 });
+    },
+  );
+  it("booking-window changes exclude slots and are rechecked before reservation writes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-15T08:00:00Z"));
+    try {
+      const f = fixture();
+      f.h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+        availability: { maximumAdvanceMonths: 1 },
+      });
+      expect((await f.get()).days[0]?.slots).toEqual([]);
+      await expect(f.admit()).rejects.toMatchObject({ statusCode: 409 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 function buildHarness() {
   const businessRepository = { findById: vi.fn() };
   const serviceRepository = { findById: vi.fn() };
@@ -181,7 +316,98 @@ function wireStandardOpenSchedule(
   ]);
 }
 
+describe("AvailabilityService — gap ordering belongs to eligible professionals", () => {
+  it.each([false, true])(
+    "adjacent occupancy belongs to an eligible professional: %s",
+    async (eligibleOccupancy) => {
+      const h = buildHarness();
+      const business = buildBusiness();
+      const staff = buildStaff(business._id),
+        other = buildStaff(business._id);
+      const service = buildFixedService(business._id, [staff._id, other._id], {
+        fixedPricing: { priceCents: 2000, durationMin: 60, bookingIntervalMin: 60 },
+      });
+      h.businessRepository.findById.mockResolvedValue(business);
+      h.serviceRepository.findById.mockResolvedValue(service);
+      h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff, other]);
+      // Only the first professional works that day; the other's reservation cannot pack a slot
+      // for them. This exercises normal slot generation, not a call to the private sorter.
+      wireStandardOpenSchedule(h, business, staff);
+      const date = "2030-08-20";
+      h.reservationRepository.findManyForStaffInDateRange.mockResolvedValue([
+        {
+          staffMembershipId: eligibleOccupancy ? staff._id : other._id,
+          occupancyDate: date,
+          intervals: [
+            {
+              startAt: businessLocalToUtc(TIMEZONE, date, "11:00"),
+              endAt: businessLocalToUtc(TIMEZONE, date, "12:00"),
+              serviceId: service._id,
+              capacityMax: 1,
+              capacityUsed: 1,
+              status: "CONFIRMED",
+            },
+          ],
+        } as BookingSlotReservationDocument,
+      ]);
+      const input = {
+        businessId: String(business._id),
+        serviceId: String(service._id),
+        fromDate: date,
+        toDate: date,
+      };
+      const chronological = await h.service.getAvailability(input);
+      h.businessBookingSettingsRepository.findByBusinessId.mockResolvedValue({
+        gapEliminationEnabled: true,
+      });
+      const ranked = await h.service.getAvailability(input);
+      expect(ranked.days[0]!.slots[0]!.startAt).toBe(
+        businessLocalToUtc(TIMEZONE, date, eligibleOccupancy ? "10:00" : "09:00").toISOString(),
+      );
+      // Ranking never hides slots, changes their eligibility, or bypasses conflict checks.
+      expect([...ranked.days[0]!.slots].sort((a, b) => a.startAt.localeCompare(b.startAt))).toEqual(
+        chronological.days[0]!.slots,
+      );
+    },
+  );
+});
+
 describe("AvailabilityService — slot generation (AUTO)", () => {
+  it("P1.6: preserved recurring off-days have no slots and edited Thursday hours bound availability", async () => {
+    const h = buildHarness(),
+      business = buildBusiness(),
+      staff = buildStaff(business._id);
+    const service = buildFixedService(business._id, [staff._id], {
+      fixedPricing: { priceCents: 2000, durationMin: 60, bookingIntervalMin: 60 },
+    });
+    h.businessRepository.findById.mockResolvedValue(business);
+    h.serviceRepository.findById.mockResolvedValue(service);
+    h.staffRepository.findManyByIdsForBusiness.mockResolvedValue([staff]);
+    wireStandardOpenSchedule(h, business, staff);
+    const schedule = buildSchedule(staff._id, business._id, [
+      { dayOfWeek: "THURSDAY", intervals: [{ startTime: "11:00", endTime: "17:00" }] },
+      { dayOfWeek: "FRIDAY", intervals: [{ startTime: "09:00", endTime: "18:00" }] },
+    ]);
+    schedule.offDays = ["WEDNESDAY", "SATURDAY", "SUNDAY"];
+    h.staffScheduleRepository.findManyByMembershipIds.mockResolvedValue([schedule]);
+    const result = await h.service.getAvailability({
+      businessId: String(business._id),
+      serviceId: String(service._id),
+      fromDate: "2026-11-11",
+      toDate: "2026-11-15",
+    });
+    for (const date of ["2026-11-11", "2026-11-14", "2026-11-15"])
+      expect(result.days.find((day) => day.date === date)?.slots).toEqual([]);
+    const thursday = result.days.find((day) => day.date === "2026-11-12");
+    expect(thursday?.slots.map((slot) => slot.startAt)).toEqual([
+      "2026-11-12T09:00:00.000Z",
+      "2026-11-12T10:00:00.000Z",
+      "2026-11-12T11:00:00.000Z",
+      "2026-11-12T12:00:00.000Z",
+      "2026-11-12T13:00:00.000Z",
+      "2026-11-12T14:00:00.000Z",
+    ]);
+  });
   it("generates candidate starts spaced by bookingIntervalMin, never past the boundary", async () => {
     const harness = buildHarness();
     const business = buildBusiness();

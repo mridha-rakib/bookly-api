@@ -183,6 +183,7 @@ export type HomeRankParams = {
 export type CustomerAffinity = { categories: string[]; cities: BusinessCity[] };
 
 const homeVisibilityMatch = (excludeIds: Types.ObjectId[]): Record<string, unknown> => ({
+  publicVisible: { $ne: false },
   status: { $in: PUBLICLY_VISIBLE_STATUSES },
   ...(excludeIds.length > 0 ? { _id: { $nin: excludeIds } } : {}),
 });
@@ -266,7 +267,10 @@ export class DiscoveryRepository {
     sort: DiscoverySortOption,
     pagination: DiscoveryPagination,
   ): Promise<{ rows: DiscoveryAggregateRow[]; total: number }> {
-    const match: Record<string, unknown> = { status: { $in: PUBLICLY_VISIBLE_STATUSES } };
+    const match: Record<string, unknown> = {
+      status: { $in: PUBLICLY_VISIBLE_STATUSES },
+      publicVisible: { $ne: false },
+    };
     if (filter.city && filter.city.length > 0) match["address.city"] = { $in: filter.city };
     if (filter.visitType) match["visitType"] = filter.visitType;
     if (filter.category && filter.category.length > 0) match["category"] = { $in: filter.category };
@@ -330,7 +334,7 @@ export class DiscoveryRepository {
     }
 
     const pipeline: PipelineStage[] = [
-      { $match: { _id: { $in: businessIds } } },
+      { $match: { _id: { $in: businessIds }, publicVisible: { $ne: false } } },
       ...ratingAndPriceLookupStages,
       { $project: cardProjection },
     ];
@@ -578,7 +582,11 @@ export class DiscoveryRepository {
    * step in the service, exactly like `search`. */
   public async listFoundingPartners(): Promise<FoundingPartnerRow[]> {
     return BusinessModel.find(
-      { isFoundingPartner: true, status: { $in: PUBLICLY_VISIBLE_STATUSES } },
+      {
+        isFoundingPartner: true,
+        status: { $in: PUBLICLY_VISIBLE_STATUSES },
+        publicVisible: { $ne: false },
+      },
       { _id: 1, name: 1, "address.city": 1 },
     )
       .sort({ name: 1 })
@@ -603,6 +611,7 @@ export class DiscoveryRepository {
    */
   public async listDistinctCategories(): Promise<string[]> {
     const categories = await BusinessModel.distinct("category", {
+      publicVisible: { $ne: false },
       status: { $in: PUBLICLY_VISIBLE_STATUSES },
     }).exec();
 

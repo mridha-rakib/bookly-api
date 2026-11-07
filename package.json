@@ -10,7 +10,9 @@
     "pnpm": ">=11 <12"
   },
   "scripts": {
-    "dev": "tsx watch src/app/server.ts",
+    "dev": "pnpm run dev:purchase",
+    "dev:purchase:init": "tsx dev/main-purchase/initialize.ts --approved-existing-development-data",
+    "dev:purchase": "node --watch --import tsx --import ./dev/main-purchase/register.mjs dev/main-purchase/server.ts",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "pnpm clean && tsc -p tsconfig.json",
     "start": "node dist/app/server.js",

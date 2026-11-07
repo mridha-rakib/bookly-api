@@ -5,6 +5,26 @@ import type { BusinessRepository } from "../business/business.repository.js";
 import { BusinessBookingSettingsError } from "./business-booking-settings.errors.js";
 import type { BusinessBookingSettingsDocument } from "./business-booking-settings.model.js";
 import type { BusinessBookingSettingsRepository } from "./business-booking-settings.repository.js";
+import {
+  assessBusinessFeeTax,
+  type BusinessFeeTaxBlocker,
+  type BusinessTaxStatus,
+  isBusinessTaxSetupComplete,
+  type UpdateBusinessTaxSettingsBody,
+} from "./business-tax-settings.js";
+
+/** Owner-only view. `setupComplete` (configuration) is deliberately separate from
+ * `feeVatCalculationEnabled` (whether Bookly can calculate VAT on this Business's fees). */
+export type BusinessTaxSettingsDto = {
+  businessId: string;
+  status: BusinessTaxStatus;
+  countryCode: "CY" | null;
+  vatNumber: string | null;
+  updatedAt: string | null;
+  setupComplete: boolean;
+  feeVatCalculationEnabled: false;
+  feeVatBlocker: BusinessFeeTaxBlocker;
+};
 
 export type BusinessBookingSettingsDto = {
   businessId: string;
@@ -41,6 +61,26 @@ export class BusinessBookingSettingsService {
     return this.toDto(businessId, settings);
   }
 
+  public async getTaxSettings(userId: string, businessId: string): Promise<BusinessTaxSettingsDto> {
+    await this.requireOwnedBusiness(userId, businessId);
+    const settings = await this.businessBookingSettingsRepository.findByBusinessId(businessId);
+    return this.toTaxDto(businessId, settings);
+  }
+
+  public async updateTaxSettings(
+    userId: string,
+    businessId: string,
+    body: UpdateBusinessTaxSettingsBody,
+  ): Promise<BusinessTaxSettingsDto> {
+    await this.requireOwnedBusiness(userId, businessId);
+    const settings = await this.businessBookingSettingsRepository.upsertTaxByBusinessId(
+      businessId,
+      body,
+      userId,
+    );
+    return this.toTaxDto(businessId, settings);
+  }
+
   // Owner-only, no BusinessAccess fallback — same rationale as Services (see
   // service.service.ts): booking settings are a management surface, not a shared read.
   private async requireOwnedBusiness(
@@ -73,6 +113,23 @@ export class BusinessBookingSettingsService {
       gapEliminationEnabled: settings?.gapEliminationEnabled ?? false,
       createdAt: settings?.createdAt.toISOString(),
       updatedAt: settings?.updatedAt.toISOString(),
+    };
+  }
+
+  private toTaxDto(
+    businessId: string,
+    settings: BusinessBookingSettingsDocument | null,
+  ): BusinessTaxSettingsDto {
+    const tax = settings?.tax;
+    return {
+      businessId,
+      status: tax?.status ?? "NOT_CONFIGURED",
+      countryCode: tax?.countryCode ?? null,
+      vatNumber: tax?.vatNumber ?? null,
+      updatedAt: tax?.updatedAt.toISOString() ?? null,
+      setupComplete: isBusinessTaxSetupComplete(tax),
+      feeVatCalculationEnabled: false,
+      feeVatBlocker: assessBusinessFeeTax(tax).blocker,
     };
   }
 }

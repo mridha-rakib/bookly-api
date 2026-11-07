@@ -2,7 +2,10 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createErrorHandler } from "../../src/common/middleware/error-handler.js";
-import { readPackageCheckoutAvailability } from "../../src/modules/booking/package-checkout-availability.js";
+import {
+  readPackageCheckoutAvailability,
+  readPackageCheckoutReadiness,
+} from "../../src/modules/booking/package-checkout-availability.js";
 import { createPackageConsentRoute } from "../../src/modules/booking/package-consent.route.js";
 import {
   readPackageConsentHttpReadiness,
@@ -37,6 +40,26 @@ beforeEach(() => {
 });
 
 describe("P4K-1 checkout availability matches the actual consent/purchase composition", () => {
+  it("exposes only the first unmet readiness gate without granting authority", async () => {
+    await expect(readPackageCheckoutReadiness()).resolves.toEqual({
+      available: false,
+      reason: "CONSENT_HTTP_DISABLED",
+    });
+    await expect(readPackageCheckoutReadiness(consentEnabled)).resolves.toEqual({
+      available: false,
+      reason: "CONSENT_HOST_UNQUALIFIED",
+    });
+    authority.host = true;
+    await expect(readPackageCheckoutReadiness(consentEnabled)).resolves.toEqual({
+      available: false,
+      reason: "BATCH_AUTHORITY_UNAVAILABLE",
+    });
+    authority.batch = true;
+    await expect(readPackageCheckoutReadiness(consentEnabled)).resolves.toEqual({
+      available: true,
+      reason: null,
+    });
+  });
   it("normal composition: unavailable and the mounted consent route is denied", async () => {
     expect(shippedPackageConsentHttpActivation).toEqual({});
     expect(readPackageConsentHttpReadiness(shippedPackageConsentHttpActivation).state).toBe(
@@ -63,8 +86,14 @@ describe("P4K-1 checkout availability matches the actual consent/purchase compos
     authority.batch = true;
     await expect(readPackageCheckoutAvailability(consentEnabled)).resolves.toBe(false);
   });
-  it("Consent HTTP enabled without an approved lifetime stays unavailable, matching the route", () => {
-    expect(readPackageConsentHttpReadiness({ enabled: true }).state).not.toBe("READY");
+  it("Consent HTTP uses the approved default lifetime without granting shipped activation", () => {
+    expect(readPackageConsentHttpReadiness({ enabled: true })).toEqual({
+      state: "READY",
+      lifetimeMs: 1800000,
+    });
+    expect(readPackageConsentHttpReadiness(shippedPackageConsentHttpActivation).state).toBe(
+      "DISABLED",
+    );
   });
   it("only a fully authorized composition reports availability", async () => {
     authority.host = true;

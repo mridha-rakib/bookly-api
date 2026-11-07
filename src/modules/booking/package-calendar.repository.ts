@@ -27,6 +27,14 @@ export class PackageCalendarRepository {
   ) {
     await verifyPackageBatchActivation();
     const next = calendarJournalSchema.parse(input);
+    // Mongo compares embedded documents in BSON field order. Parsing a Mixed journal
+    // canonicalizes its keys, so use the exact read snapshot for the atomic filter while
+    // still requiring the caller's validated previous state to match that snapshot.
+    if (
+      previous &&
+      !isDeepStrictEqual(calendarJournalSchema.parse(booking.packageCalendarDelivery), previous)
+    )
+      return false;
     if (
       next.bookingId !== String(booking._id) ||
       next.businessId !== String(booking.businessId) ||
@@ -54,7 +62,9 @@ export class PackageCalendarRepository {
         rescheduleHistory: booking.rescheduleHistory,
         serviceLines: booking.serviceLines,
         googleCalendarEventId: booking.googleCalendarEventId ?? { $exists: false },
-        packageCalendarDelivery: previous ?? { $exists: false },
+        packageCalendarDelivery: previous
+          ? (booking.packageCalendarDelivery as CalendarJournal)
+          : { $exists: false },
       },
       {
         $set: {

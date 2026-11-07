@@ -5,6 +5,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
 import { PackageCheckoutConflictError } from "../../../src/modules/booking/package-checkout.errors.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
@@ -14,6 +15,7 @@ import {
   connectIsolatedDatabase,
   stopIsolatedReplicaSet,
 } from "../../helpers/consent-isolated-database.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 
 const row = () => BookingCreationClaimModel.findOne().orFail();
 const prepared = async () => {
@@ -37,6 +39,53 @@ describe("30-minute consent cutoff, real persisted CAS, controlled server quote 
     s.advance(new Date(s.retained.seed.expiresAt.getTime() + offset));
     expect((await s.accept(s.event)).status).toBe(offset < 0 ? 200 : 409);
     expect(Boolean((await row()).packageCheckoutAcceptance)).toBe(offset < 0);
+  });
+
+  it("informational VAT accompanies every quote read without touching retained terms", async () => {
+    const gateway = new FakeTaxGateway();
+    const s = await setupConsentHttp({ tax: new CyprusTaxService(gateway) });
+    const first = (await s.quote()).body.data.quote;
+    const before = (await row()).packageCheckoutRetention;
+    const presented = (await s.present()).body.data;
+    const read = (await request(s.app).get(`${s.path}/quote`).set("Authorization", s.auth)).body
+      .data.quote;
+    const upfront = first.financials.requiredUpfrontCents;
+    for (const quote of [first, presented.quote, read]) {
+      expect(quote.termsHash).toBe(first.termsHash);
+      expect(quote.financials).toEqual(first.financials);
+      expect(quote.tax).toMatchObject({ status: "CALCULATED", preTaxChargeCents: upfront });
+    }
+    // The VAT is outside the hashed quote and signed disclosure; neither mentions it.
+    expect(presented.quoteHash).toBe(first.termsHash);
+    expect(presented.text).not.toMatch(/VAT/);
+    const after = (await row()).packageCheckoutRetention;
+    expect(after?.quote.termsHash).toBe(before?.quote.termsHash);
+    expect(after?.seed.expiresAt).toEqual(before?.seed.expiresAt);
+    // One stable Stripe idempotency key per quote, so repeated reads reuse one calculation.
+    expect(upfront).toBeGreaterThan(0);
+    expect(gateway.calls).toHaveLength(3);
+    expect(gateway.calls.every((c) => c.amountCents === upfront)).toBe(true);
+    expect(new Set(gateway.calls.map((c) => c.idempotencyKey))).toEqual(
+      new Set([`package-quote:${first.quoteId}:tax`]),
+    );
+  });
+
+  it("a Stripe Tax failure reports UNAVAILABLE and the quote still works", async () => {
+    const gateway = new FakeTaxGateway();
+    gateway.queueNextFailure(new Error("provider down"));
+    const s = await setupConsentHttp({ tax: new CyprusTaxService(gateway) });
+    const response = await s.quote();
+    expect(response.status).toBe(200);
+    const quote = response.body.data.quote;
+    expect(quote.tax).toEqual({ status: "UNAVAILABLE", taxMode: "PRE_ACTIVATION" });
+  });
+
+  it("without an injected tax service a test composition never reaches a provider", async () => {
+    const s = await setupConsentHttp();
+    expect((await s.quote()).body.data.quote.tax).toEqual({
+      status: "UNAVAILABLE",
+      taxMode: "PRE_ACTIVATION",
+    });
   });
 
   it("retry, repeated presentation and FOREVER do not slide original timestamps", async () => {

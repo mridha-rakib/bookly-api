@@ -51,6 +51,8 @@ import { RegistrationSessionRepository } from "../registration-session/registrat
 import { ReviewRepository } from "../review/review.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
+import { StaffAvatarRepository } from "../staff-avatar/staff-avatar.repository.js";
+import { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import { StaffInvitationController } from "../staff-invitation/staff-invitation.controller.js";
 import { StaffInvitationRepository } from "../staff-invitation/staff-invitation.repository.js";
 import { createStaffInvitationRoute } from "../staff-invitation/staff-invitation.route.js";
@@ -290,6 +292,13 @@ export const createAuthRoute = (): Router => {
     emailOutboxService,
     linkedAccountService,
     linkedAccountRepository,
+    new StaffAvatarService(
+      new StaffAvatarRepository(),
+      businessRepository,
+      staffRepository,
+      createDeferredStorageServiceFromEnv(),
+      { maxUploadBytes: env.STAFF_AVATAR_MAX_UPLOAD_BYTES },
+    ),
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);

@@ -11,6 +11,8 @@ import { PaymentService } from "../payment/payment.service.js";
 import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import { RefundOperationRepository } from "../payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../payment/stripe-payment-gateway.js";
+import { StripeTaxGateway } from "../payment/stripe-tax-gateway.js";
+import { CyprusTaxService } from "../payment/tax.service.js";
 import { verifyPackageBatchActivation } from "./package-batch-authority.js";
 import { PackageBatchFinancialPersistence } from "./package-batch-financial-persistence.js";
 import { PackageBatchPersistence } from "./package-batch-persistence.js";
@@ -51,7 +53,10 @@ export function buildPackagePurchaseService() {
         refundOperationRepository: refunds,
       }),
       payments,
+      undefined,
+      new CyprusTaxService(new StripeTaxGateway()),
     ),
+    payments,
   );
 }
 export class PackagePurchaseHttpController {

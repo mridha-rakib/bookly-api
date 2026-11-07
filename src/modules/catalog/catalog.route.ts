@@ -17,6 +17,7 @@ import { AvailabilityService } from "../availability/availability.service.js";
 import { BookingSlotReservationRepository } from "../booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import { BusinessCancellationPolicyRepository } from "../business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
@@ -114,6 +115,7 @@ export const createCatalogRoute = (): Router => {
     staffAvatarService,
     storageService,
     new PackageProgressRepository(),
+    new BusinessCancellationPolicyRepository(),
   );
   const controller = new CatalogController(catalogService);
 

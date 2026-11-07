@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { streamCsv } from "../../common/http/csv.js";
 
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
@@ -13,6 +14,32 @@ import type {
 import type { ClientService } from "./client.service.js";
 
 export class ClientController {
+  public exportCsv = async (request: Request, response: Response): Promise<void> => {
+    const { userId, role } = this.requireAuth(request);
+    const params = request.validated?.params as ClientBusinessParams;
+    const filters = request.validated?.query as ListClientsQuery;
+    await streamCsv(
+      response,
+      "business-clients.csv",
+      ["NAME", "EMAIL", "PHONE", "TAG", "LINK STATE", "CREATED AT"],
+      async (page) => {
+        const result = await this.clientService.listClients(userId, role, params.businessId, {
+          ...filters,
+          page,
+          limit: 100,
+        });
+        return { rows: result.clients, total: result.pagination.total };
+      },
+      (client) => [
+        `${client.firstName} ${client.lastName ?? ""}`.trim(),
+        client.email,
+        client.phone.e164,
+        client.tag,
+        client.linkState,
+        client.createdAt,
+      ],
+    );
+  };
   public constructor(private readonly clientService: ClientService) {}
 
   public list = async (request: Request, response: Response): Promise<void> => {

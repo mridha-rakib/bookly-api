@@ -308,7 +308,7 @@ export class RefundOperationRepository {
     return RefundOperationModel.find({
       finalNotificationProtocolVersion: 1,
       finalNotificationRecordedAt: { $exists: false },
-      reason: "BUSINESS_CANCELLATION",
+      reason: { $in: ["BUSINESS_CANCELLATION", "CUSTOMER_EARLY_CANCELLATION"] },
       packageProgressId: { $exists: false },
       providerRefundId: { $exists: true },
       providerStatus: { $in: ["SUCCEEDED", "FAILED"] },

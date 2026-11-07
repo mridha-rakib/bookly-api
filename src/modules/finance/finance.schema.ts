@@ -69,6 +69,25 @@ export const platformTransactionsQuerySchema = paginationQuerySchema
       : undefined,
   }));
 
+/** P1.9 — the platform transaction log's CSV export: the same period and type filter as the
+ * paginated list, without page/limit (the export walks every matching page server-side). */
+export const platformTransactionsExportQuerySchema = periodQuerySchema
+  .extend({ types: z.string().optional() })
+  .strict()
+  .transform((value) => ({
+    from: new Date(value.from),
+    to: new Date(value.to),
+    types: value.types
+      ? (value.types
+          .split(",")
+          .filter((t) => (platformTransactionTypes as readonly string[]).includes(t)) as Array<
+          (typeof platformTransactionTypes)[number]
+        >)
+      : undefined,
+  }));
+
+export type PlatformTransactionsExportQuery = z.infer<typeof platformTransactionsExportQuerySchema>;
+
 export const executePayoutBodySchema = z
   .object({
     providerReference: z.string().trim().min(1).max(200).optional(),

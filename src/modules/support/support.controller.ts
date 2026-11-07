@@ -2,7 +2,11 @@ import type { Request, Response } from "express";
 
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
-import { toRequesterTicketDto, toSupportMessageDto } from "./support.dto.js";
+import {
+  toRequesterTicketDto,
+  toSupportMessageDto,
+  toSupportMessageListDto,
+} from "./support.dto.js";
 import type {
   CreateSupportTicketBody,
   ListSupportMessagesQuery,
@@ -59,15 +63,14 @@ export class SupportController {
     const params = request.validated?.params as SupportTicketIdParams;
     const query = request.validated?.query as ListSupportMessagesQuery;
 
-    const result = await this.supportService.listOwnMessages(params.ticketId, userId, {
-      page: query.page,
-      limit: query.limit,
-    });
+    const result = await this.supportService.listOwnMessages(params.ticketId, userId, query);
 
-    sendSuccess(response, 200, "Support ticket conversation", {
-      messages: result.messages.map(toSupportMessageDto),
-      pagination: { page: query.page, limit: query.limit, total: result.total },
-    });
+    sendSuccess(
+      response,
+      200,
+      "Support ticket conversation",
+      toSupportMessageListDto(result, query),
+    );
   };
 
   public reply = async (request: Request, response: Response): Promise<void> => {

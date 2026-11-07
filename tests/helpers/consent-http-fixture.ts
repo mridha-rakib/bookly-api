@@ -12,6 +12,7 @@ import {
   createPackageConsentRoute,
   type PackageConsentServices,
 } from "../../src/modules/booking/package-consent.route.js";
+import type { CyprusTaxService } from "../../src/modules/payment/tax.service.js";
 import { SessionRepository } from "../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import { UserModel, UserProfileModel } from "../../src/modules/user/user.model.js";
@@ -20,7 +21,9 @@ import { issueTestAccessToken } from "./access-token.js";
 import { CHECK_TIME, checkoutFixture } from "./package-checkout-fixture.js";
 
 /** Real HTTP/JWT/Mongo authority; synthetic domain read fixture and controlled quote clock. */
-export const setupConsentHttp = async (): Promise<{
+export const setupConsentHttp = async (
+  options: { tax?: Pick<CyprusTaxService, "computeForCharge"> } = {},
+): Promise<{
   f: ReturnType<typeof checkoutFixture>;
   services: PackageConsentServices;
   app: express.Express;
@@ -101,6 +104,7 @@ export const setupConsentHttp = async (): Promise<{
       lifetimeMs: 1800000,
       origins: ["http://localhost:3000"],
       build,
+      ...(options.tax ? { tax: options.tax } : {}),
     }),
   );
   app.use(createErrorHandler({ isProduction: true }));

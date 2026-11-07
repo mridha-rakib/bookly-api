@@ -34,10 +34,57 @@ export const listSupportTicketsQuerySchema = paginationQuerySchema.strict().tran
   limit: value.limit ? Math.min(50, Math.max(1, Number(value.limit))) : 20,
 }));
 
-export const listSupportMessagesQuerySchema = paginationQuerySchema.strict().transform((value) => ({
-  page: value.page ? Math.max(1, Number(value.page)) : 1,
-  limit: value.limit ? Math.min(100, Math.max(1, Number(value.limit))) : 50,
-}));
+/** P1.8 — opaque older-history cursor: `<createdAt epoch ms>_<message ObjectId>`, the exact
+ * `(createdAt, _id)` sort key of the oldest message the caller already holds. */
+const SUPPORT_MESSAGE_CURSOR_PATTERN = /^(\d{1,16})_([a-f\d]{24})$/i;
+
+export type SupportMessageCursor = { createdAt: Date; id: string };
+
+export const encodeSupportMessageCursor = (message: { createdAt: Date; _id: unknown }): string =>
+  `${message.createdAt.getTime()}_${String(message._id)}`;
+
+export const decodeSupportMessageCursor = (value: string): SupportMessageCursor | null => {
+  const match = SUPPORT_MESSAGE_CURSOR_PATTERN.exec(value);
+  if (!match) return null;
+  const createdAt = new Date(Number(match[1]));
+  if (Number.isNaN(createdAt.getTime())) return null;
+  return { createdAt, id: (match[2] as string).toLowerCase() };
+};
+
+export type ListSupportMessagesQuery =
+  | { mode: "page"; page: number; limit: number }
+  | { mode: "history"; limit: number; before?: SupportMessageCursor | undefined };
+
+/** Two read shapes over the same collection/index:
+ * - legacy `page`/`limit` (oldest-first offset pages) — kept unchanged for compatibility;
+ * - P1.8 `history=latest` (optionally with `before=<cursor>`) — newest-first keyset pages, so a
+ *   ticket opens on its latest messages and older history is fetched in bounded, stable pages
+ *   that new replies never shift. `before` alone also selects history mode. */
+export const listSupportMessagesQuerySchema = paginationQuerySchema
+  .extend({
+    history: z.literal("latest").optional(),
+    before: z
+      .string()
+      .regex(SUPPORT_MESSAGE_CURSOR_PATTERN, "Invalid cursor")
+      .refine((value) => decodeSupportMessageCursor(value) !== null, "Invalid cursor")
+      .optional(),
+  })
+  .strict()
+  .refine((value) => !(value.page && (value.history || value.before)), {
+    message: "page cannot be combined with history cursors",
+    path: ["page"],
+  })
+  .transform((value): ListSupportMessagesQuery => {
+    const limit = value.limit ? Math.min(100, Math.max(1, Number(value.limit))) : 50;
+    if (value.history || value.before) {
+      return {
+        mode: "history",
+        limit,
+        before: value.before ? (decodeSupportMessageCursor(value.before) ?? undefined) : undefined,
+      };
+    }
+    return { mode: "page", page: value.page ? Math.max(1, Number(value.page)) : 1, limit };
+  });
 
 export const listAdminSupportTicketsQuerySchema = paginationQuerySchema
   .extend({
@@ -66,6 +113,5 @@ export type SupportTicketIdParams = z.infer<typeof supportTicketIdParamsSchema>;
 export type CreateSupportTicketBody = z.infer<typeof createSupportTicketBodySchema>;
 export type SupportMessageBody = z.infer<typeof supportMessageBodySchema>;
 export type ListSupportTicketsQuery = z.infer<typeof listSupportTicketsQuerySchema>;
-export type ListSupportMessagesQuery = z.infer<typeof listSupportMessagesQuerySchema>;
 export type ListAdminSupportTicketsQuery = z.infer<typeof listAdminSupportTicketsQuerySchema>;
 export type ChangeSupportTicketStatusBody = z.infer<typeof changeSupportTicketStatusBodySchema>;

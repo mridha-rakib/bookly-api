@@ -2,6 +2,7 @@ import { BookingRepository } from "../booking/booking.repository.js";
 import { createPenaltyCollectionService } from "../booking/penalty-collection.factory.js";
 import { BookingFinancialTransactionRepository } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import { createCentralPayoutService } from "../central-payout/central-payout.route.js";
 import { createFinancialRelationshipService } from "../client/financial-relationship.factory.js";
 import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../payment/customer-payment-profile.repository.js";
@@ -61,5 +62,6 @@ export const createStripeWebhookService = (): StripeWebhookService => {
       refundOperationRepository,
       bookingRepository,
     }),
+    createCentralPayoutService(new UserRepository()),
   );
 };

@@ -22,6 +22,7 @@ import "../modules/business-cancellation-policy/business-cancellation-policy.mod
 import "../modules/business-hours/business-hours.model.js";
 import "../modules/business-media/business-media.model.js";
 import "../modules/business-travel-settings/business-travel-settings.model.js";
+import "../modules/central-payout/central-payout-operation.model.js";
 import "../modules/business-onboarding/business-onboarding.model.js";
 import "../modules/client/client.model.js";
 import "../modules/email-outbox/email-outbox.model.js";

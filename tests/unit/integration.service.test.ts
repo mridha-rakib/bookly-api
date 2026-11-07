@@ -13,31 +13,44 @@ import type { BusinessRepository } from "../../src/modules/business/business.rep
 import type { GoogleCalendarIntegrationDocument } from "../../src/modules/integration/integration.model.js";
 import type { IntegrationRepository } from "../../src/modules/integration/integration.repository.js";
 
-const mockEnv = {
+const mockEnv = vi.hoisted(() => ({
   GOOGLE_CLIENT_ID: "test-client-id",
   GOOGLE_CLIENT_SECRET: "test-client-secret",
   GOOGLE_CALENDAR_REDIRECT_URI:
     "http://localhost:3000/api/v1/businesses/integrations/google-calendar/callback",
   GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY: "b".repeat(64),
-};
+}));
 
 vi.mock("../../src/config/env.js", () => ({ env: mockEnv }));
 vi.mock("../../src/config/logger.js", () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
 }));
 
-const buildGoogleAuthUrl = vi.fn(
-  (_state: string) => "https://accounts.google.com/o/oauth2/v2/auth?mock=1",
-);
-const exchangeGoogleAuthCode = vi.fn();
-const refreshGoogleAccessToken = vi.fn();
-const createGoogleCalendarEvent = vi.fn();
-const deleteGoogleCalendarEvent = vi.fn();
-const patchGoogleCalendarEventSchedule = vi.fn();
-const getGoogleCalendarEvent = vi.fn();
-const insertGoogleCalendarEventWithId = vi.fn();
-const resolveGoogleCalendarDestination = vi.fn();
-const deleteGoogleCalendarEventConditionally = vi.fn();
+const {
+  buildGoogleAuthUrl,
+  exchangeGoogleAuthCode,
+  refreshGoogleAccessToken,
+  createGoogleCalendarEvent,
+  deleteGoogleCalendarEvent,
+  patchGoogleCalendarEventSchedule,
+  getGoogleCalendarEvent,
+  insertGoogleCalendarEventWithId,
+  resolveGoogleCalendarDestination,
+  deleteGoogleCalendarEventConditionally,
+} = vi.hoisted(() => ({
+  buildGoogleAuthUrl: vi.fn(
+    (_state: string) => "https://accounts.google.com/o/oauth2/v2/auth?mock=1",
+  ),
+  exchangeGoogleAuthCode: vi.fn(),
+  refreshGoogleAccessToken: vi.fn(),
+  createGoogleCalendarEvent: vi.fn(),
+  deleteGoogleCalendarEvent: vi.fn(),
+  patchGoogleCalendarEventSchedule: vi.fn(),
+  getGoogleCalendarEvent: vi.fn(),
+  insertGoogleCalendarEventWithId: vi.fn(),
+  resolveGoogleCalendarDestination: vi.fn(),
+  deleteGoogleCalendarEventConditionally: vi.fn(),
+}));
 
 vi.mock("../../src/modules/integration/integration.google-client.js", () => ({
   buildGoogleAuthUrl,

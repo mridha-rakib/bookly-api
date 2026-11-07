@@ -7,6 +7,8 @@ import type { BookingFinancialTransactionService } from "../booking-financial-tr
 import type { BookingSlotReservationService } from "../booking-slot-reservation/booking-slot-reservation.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import { restoreFirstAfterCustomerCancellation } from "../client/customer-refund-first-restoration.js";
 import { createFinancialRelationshipService } from "../client/financial-relationship.factory.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { IntegrationService } from "../integration/integration.service.js";
@@ -181,6 +183,14 @@ type CancellationPenaltyPlan = {
  * with its own actor/authorization/timing rules. No-show charging, refund execution, and the
  * 90-minute worker are explicitly out of scope — see the Batch 3 final report.
  */
+/** RefundOperation reason for the approved v2 customer refund (more than 24 h ahead). */
+export const CUSTOMER_EARLY_CANCELLATION_REFUND = "CUSTOMER_EARLY_CANCELLATION" as const;
+/** One logical refund per Booking per cause. The Business key is unchanged for existing rows. */
+const refundLogicalKey = (bookingId: Types.ObjectId, reason?: string) =>
+  reason === CUSTOMER_EARLY_CANCELLATION_REFUND
+    ? `customer-cancel-refund:${String(bookingId)}`
+    : `business-cancel-refund:${String(bookingId)}`;
+
 export class BookingLifecycleService {
   public constructor(
     private readonly bookingService: BookingService,
@@ -256,6 +266,7 @@ export class BookingLifecycleService {
       bookingRepository,
       businessRepository,
       packageProgressRepository,
+      businessTaxSettings: new BusinessBookingSettingsRepository(),
     }),
     // P4B-2A — durable ordinary Calendar desired state, recorded inside the reschedule and
     // cancellation transactions. Optional trailing dep; absent in directly constructed suites.
@@ -586,6 +597,7 @@ export class BookingLifecycleService {
       policySnapshot: booking.cancellationPolicySnapshot,
       eligiblePlatformFeeBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
       depositAlreadyPaidCents: upfrontPayment?.amountCents ?? 0,
+      termsVersion: booking.cancellationTermsVersion,
     });
     // The STATUS classification (on-time vs late) is always derived from the real, unmodified
     // classification above — reused exactly as-is, never a new cutoff (confirmed Package rule).
@@ -605,6 +617,11 @@ export class BookingLifecycleService {
     // P5 Rule 6 — a MANUAL booking is financially outside Bookly (rule E, matching the no-show
     // worker's existing MANUAL skip): it keeps its lifecycle classification, but automatic
     // off-session collection is NOT_APPLICABLE, so a linked customer's saved card is never used.
+    //
+    // Approved v2 terms: a customer cancellation more than 24 h ahead refunds the deposit actually
+    // paid. That refund is offered only for an ordinary online-paid Booking: a Package-linked
+    // Booking's upfront belongs to the whole Package (not approved here) and MANUAL is outside
+    // Bookly's money flow, so both keep refundOwedCents 0 exactly as before.
     const outcome: BookingCancellationOutcome =
       isPackageLinkedBooking(booking) || booking.source === "MANUAL"
         ? {
@@ -612,6 +629,7 @@ export class BookingLifecycleService {
             cancellationFeeCents: 0,
             depositAppliedCents: 0,
             additionalChargeCents: 0,
+            refundOwedCents: 0,
             settlementStatus: "NOT_APPLICABLE",
           }
         : classifiedOutcome;
@@ -660,6 +678,24 @@ export class BookingLifecycleService {
 
     await this.syncBookingCancelledToGoogleCalendar(cancelled);
     await this.retireAppointmentReminder(cancelled, `BOOKING_${cancelled.status}`);
+
+    // The refund operation was prepared inside the cancellation transaction; dispatch it now.
+    // A lost or ambiguous provider answer stays PENDING for money recovery (same key, never a
+    // second refund).
+    if (outcome.refundOwedCents > 0 && upfrontPayment) {
+      const refunded = await this.executeBusinessCancellationRefund(cancelled, upfrontPayment, {
+        domainReason: CUSTOMER_EARLY_CANCELLATION_REFUND,
+      });
+      if (!this.bookingCancelledNotifier?.enqueueBookingCancelledInTransaction)
+        await this.dispatchCancellationNotifications(refunded.booking, "CUSTOMER", undefined, {
+          succeeded: refunded.refundSucceeded,
+          amountCents: refunded.refundedAmountCents,
+          status: refunded.settlementStatus,
+        });
+      if (!this.staffBookingNotifier?.enqueueBookingCancelledToStaffInTransaction)
+        await this.dispatchStaffCancellationNotification(refunded.booking, "CUSTOMER");
+      return refunded.booking;
+    }
 
     const prepared = penaltyResult.prepared;
     if (!prepared) {
@@ -974,6 +1010,7 @@ export class BookingLifecycleService {
             policySnapshot: booking.cancellationPolicySnapshot,
             eligiblePlatformFeeBasisCents: booking.financials.eligiblePlatformFeeBasisCents,
             depositAlreadyPaidCents: upfront?.amountCents ?? 0,
+            termsVersion: booking.cancellationTermsVersion,
           });
           const nextStatus: BookingStatus = customer
             ? classified.feeMode === "PERCENTAGE"
@@ -986,6 +1023,7 @@ export class BookingLifecycleService {
                 cancellationFeeCents: 0,
                 depositAppliedCents: 0,
                 additionalChargeCents: 0,
+                refundOwedCents: 0,
                 settlementStatus: "NOT_APPLICABLE",
               }
             : {
@@ -1318,7 +1356,11 @@ export class BookingLifecycleService {
       amountCents: number;
     },
     options: {
-      domainReason?: "BUSINESS_CANCELLATION" | "PACKAGE_VOID" | "BUSINESS_PACKAGE_TERMINATION";
+      domainReason?:
+        | "BUSINESS_CANCELLATION"
+        | "PACKAGE_VOID"
+        | "BUSINESS_PACKAGE_TERMINATION"
+        | typeof CUSTOMER_EARLY_CANCELLATION_REFUND;
       packageProgressId?: Types.ObjectId | undefined;
     } = {},
   ): Promise<{
@@ -1333,7 +1375,7 @@ export class BookingLifecycleService {
     refundOperationId?: string | undefined;
     providerRefundId?: string | undefined;
   }> {
-    const idempotencyKey = `business-cancel-refund:${String(booking._id)}`;
+    const idempotencyKey = refundLogicalKey(booking._id, options.domainReason);
     let settlementStatus: "PENDING" | "SUCCEEDED" | "FAILED" = "PENDING";
     let refundId: string | undefined;
     let refundOperationId: string | undefined;
@@ -1466,8 +1508,12 @@ export class BookingLifecycleService {
     if (!source || source.amountCents <= 0) return undefined;
     if (!source.providerReference)
       throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+    // Opt-in exact-event final notification: ordinary Business cancellations and the approved
+    // v2 customer early-cancellation refund, both only with exact ordinary payment evidence.
     const supportedAttempt =
-      reason === "BUSINESS_CANCELLATION" && !packageId && !isPackageLinkedBooking(booking)
+      (reason === "BUSINESS_CANCELLATION" || reason === CUSTOMER_EARLY_CANCELLATION_REFUND) &&
+      !packageId &&
+      !isPackageLinkedBooking(booking)
         ? await PaymentAttemptModel.findOne({
             providerPaymentIntentId: source.providerReference,
             bookingId: booking._id,
@@ -1487,7 +1533,7 @@ export class BookingLifecycleService {
         : null;
     return this.paymentService.prepareRefund(
       {
-        logicalIdempotencyKey: `business-cancel-refund:${String(booking._id)}`,
+        logicalIdempotencyKey: refundLogicalKey(booking._id, reason),
         sourcePaymentIntentId: source.providerReference,
         sourceFinancialTransactionId: source._id,
         expectedRefundAmountCents: source.amountCents,
@@ -1540,6 +1586,23 @@ export class BookingLifecycleService {
         );
     if (!updated) throw new BookingError("BOOKING_INVALID_STATUS_TRANSITION", 409);
     await this.syncPackageSessionOnTerminalStatus(updated, session);
+    if (params.cancelledBy === "CUSTOMER" && params.cancellationOutcome.refundOwedCents > 0) {
+      const source = await this.financialTransactionService.findSucceededUpfrontPayment(
+        updated._id,
+      );
+      // The classified amount must be exactly the deposit that settled for this Booking.
+      if (!source || source.amountCents !== params.cancellationOutcome.refundOwedCents)
+        throw new BookingError("BOOKING_FINANCIAL_CONTRACT_CONFLICT", 409);
+      await this.prepareRefundIntent(updated, source, session, CUSTOMER_EARLY_CANCELLATION_REFUND);
+    } else if (
+      params.cancelledBy === "CUSTOMER" &&
+      updated.financialContract?.classification === "FIRST" &&
+      updated.financialContract.onlineChargeCents === 0
+    ) {
+      // Nothing was paid, so no refund can confirm anything: evaluate FIRST restoration now,
+      // atomically with the cancellation (the paid path waits for the confirmed refund).
+      await restoreFirstAfterCustomerCancellation({ bookingId: updated._id, session });
+    }
     if (params.nextStatus === "CANCELLED_BY_BUSINESS") {
       const source = await this.financialTransactionService.findSucceededUpfrontPayment(
         updated._id,

@@ -21,6 +21,7 @@ import { renderBookingCustomerConfirmedEmail } from "./templates/booking/booking
 import type { BookingEmailData } from "./templates/booking/booking-email-data.js";
 import { renderBookingForClientConfirmedEmail } from "./templates/booking/booking-for-client-confirmed.template.js";
 import { renderBookingOwnerNewBookingEmail } from "./templates/booking/booking-owner-new-booking.template.js";
+import { renderBookingRefundCompletedCustomerEmail } from "./templates/booking/booking-refund-completed-customer.template.js";
 import {
   type BookingRescheduledEmailData,
   renderBookingRescheduledCustomerEmail,
@@ -116,6 +117,8 @@ export type EmailTemplateKey =
   // Stage D — cancellation + no-show + business registration
   | "BOOKING_CANCELLED_CUSTOMER"
   | "BOOKING_CANCELLED_OWNER"
+  // Confirmed customer refund (approved v2 early-cancellation refund)
+  | "BOOKING_REFUND_COMPLETED_CUSTOMER"
   | "NO_SHOW_CHARGED"
   | "NO_SHOW_WAIVED"
   | "NO_SHOW_CANCELLED"
@@ -172,6 +175,9 @@ const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> 
     renderBookingCancelledCustomerEmail,
   ),
   BOOKING_CANCELLED_OWNER: asRenderer<CancellationEmailData>(renderBookingCancelledOwnerEmail),
+  BOOKING_REFUND_COMPLETED_CUSTOMER: asRenderer<CancellationEmailData>(
+    renderBookingRefundCompletedCustomerEmail,
+  ),
   NO_SHOW_CHARGED: asRenderer<NoShowEmailData>(renderNoShowChargedEmail),
   NO_SHOW_WAIVED: asRenderer<NoShowEmailData>(renderNoShowWaivedEmail),
   NO_SHOW_CANCELLED: asRenderer<NoShowEmailData>(renderNoShowCancelledEmail),

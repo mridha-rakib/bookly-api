@@ -549,6 +549,21 @@ describe("P2C package batch Calendar delivery (fake provider)", () => {
       expect(d.c.writes().filter((call) => call.startsWith("insert:"))).toHaveLength(1);
     });
 
+    it("journal CAS accepts a validated read snapshot and rejects its stale replay without provider writes", async () => {
+      const d = await durableFixture();
+      await d.release();
+      const snapshot = await d.repository.read(String(d.booking._id), String(d.booking.businessId));
+      if (!snapshot) throw Error("Released booking required");
+      const previous = calendarJournalSchema.parse(snapshot.packageCalendarDelivery);
+      const next = { ...previous, state: "RETRYABLE_FAILURE" as const };
+      expect(await d.repository.compareAndSet(snapshot, previous, next)).toBe(true);
+      expect(await d.repository.compareAndSet(snapshot, previous, next)).toBe(false);
+      const current = await d.repository.read(String(d.booking._id), String(d.booking.businessId));
+      if (!current) throw Error("Current booking required");
+      expect(await d.repository.compareAndSet(current, previous, next)).toBe(false);
+      expect(d.c.writes()).toEqual([]);
+    });
+
     it("unknown insert plus a missing provider observation blocks without another create", async () => {
       const d = await durableFixture({ loseInsertResponses: 1 });
       await d.release();

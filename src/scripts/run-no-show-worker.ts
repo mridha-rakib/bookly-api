@@ -18,6 +18,9 @@ import { PaymentAttemptRepository } from "../modules/payment/payment-attempt.rep
 import { RefundOperationRepository } from "../modules/payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../modules/payment/stripe-payment-gateway.js";
 import { UserRepository } from "../modules/user/user.repository.js";
+import { withMoneyRecoveryLifecycle as withWorkerLifecycle } from "./money-recovery-runtime.js";
+
+type NoShowWorker = Pick<NoShowResolutionService, "runOnce">;
 
 /**
  * The no-show resolution worker's runnable entry point (Batch 4, Phase 8). This process is
@@ -26,9 +29,8 @@ import { UserRepository } from "../modules/user/user.repository.js";
  * actual correctness guarantee lives in `NoShowResolutionService.autoResolve` (CAS on Booking
  * status + the ledger's own unique idempotencyKey index — see that class's own doc comment), NOT
  * in this loop: running this script from multiple hosts/processes simultaneously is safe by
- * construction, and running it exactly once is equally correct. `setInterval` here is only a
- * convenience for continuous operation in an environment with no external scheduler, never the
- * source of correctness.
+ * construction, and running it exactly once is equally correct. Continuous polling waits for
+ * each pass to settle before starting another one; the poll interval is a delay between passes.
  *
  * Run once (e.g. from an external cron/scheduler):
  *   node dist/scripts/run-no-show-worker.js --once
@@ -67,9 +69,70 @@ const buildService = (): NoShowResolutionService => {
   );
 };
 
-const runOnce = async (service: NoShowResolutionService): Promise<void> => {
-  const counts = await service.runOnce(env.NO_SHOW_WORKER_BATCH_SIZE);
+const runOnce = async (
+  service: NoShowWorker,
+  batchSize = env.NO_SHOW_WORKER_BATCH_SIZE,
+  shouldStop: () => boolean = () => false,
+): Promise<void> => {
+  const counts = await service.runOnce(batchSize, shouldStop);
+  if (counts.error > 0) {
+    logger.warn({ counts }, "No-show worker pass completed with unresolved item errors");
+    return;
+  }
   logger.info({ counts }, "No-show worker pass complete");
+};
+
+const runContinuous = async (
+  service: NoShowWorker,
+  shouldStop: () => boolean,
+  wait: (milliseconds: number) => Promise<void>,
+  batchSize = env.NO_SHOW_WORKER_BATCH_SIZE,
+  pollIntervalMs = env.NO_SHOW_WORKER_POLL_INTERVAL_MS,
+): Promise<void> => {
+  while (!shouldStop()) {
+    try {
+      await runOnce(service, batchSize, shouldStop);
+    } catch {
+      logger.error({ event: "NO_SHOW_WORKER_PASS_FAILED" }, "No-show worker pass failed");
+    }
+    if (!shouldStop()) await wait(pollIntervalMs);
+  }
+};
+
+export const runNoShowWorkerLifecycle = async (options: {
+  service: NoShowWorker;
+  runForever: boolean;
+  signals: NodeJS.Process;
+  connect: () => Promise<void>;
+  disconnect: () => Promise<void>;
+  batchSize: number;
+  pollIntervalMs: number;
+  shutdownTimeoutMs: number;
+  onShutdownTimeout: () => void;
+}): Promise<void> => {
+  await withWorkerLifecycle({
+    signals: options.signals,
+    connect: options.connect,
+    disconnect: options.disconnect,
+    onStopping: () =>
+      logger.info("No-show worker stopping: no new candidate claims; draining the active item"),
+    shutdownTimeoutMs: options.shutdownTimeoutMs,
+    onShutdownTimeout: options.onShutdownTimeout,
+    execute: async (shouldStop, wait) => {
+      logger.info({ mode: options.runForever ? "continuous" : "once" }, "No-show worker started");
+      if (options.runForever) {
+        await runContinuous(
+          options.service,
+          shouldStop,
+          wait,
+          options.batchSize,
+          options.pollIntervalMs,
+        );
+      } else if (!shouldStop()) {
+        await runOnce(options.service, options.batchSize, shouldStop);
+      }
+    },
+  });
 };
 
 const runCli = async (): Promise<void> => {
@@ -78,46 +141,27 @@ const runCli = async (): Promise<void> => {
   const runForever = !process.argv.includes("--once");
 
   try {
-    await databaseManager.connect();
-
-    if (!runForever) {
-      await runOnce(service);
-      return;
-    }
-
-    logger.info(
-      { intervalMs: env.NO_SHOW_WORKER_POLL_INTERVAL_MS },
-      "No-show worker starting continuous polling",
-    );
-
-    let stopping = false;
-    const shutdown = async (): Promise<void> => {
-      if (stopping) return;
-      stopping = true;
-      clearInterval(interval);
-      await databaseManager.disconnect();
-      logger.info("No-show worker stopped");
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
-
-    const interval = setInterval(() => {
-      runOnce(service).catch((error: unknown) => {
-        logger.error({ err: error }, "No-show worker pass failed");
-      });
-    }, env.NO_SHOW_WORKER_POLL_INTERVAL_MS);
-
-    // Run an immediate first pass rather than waiting a full interval.
-    await runOnce(service);
-    return;
+    await runNoShowWorkerLifecycle({
+      service,
+      runForever,
+      signals: process,
+      connect: () => databaseManager.connect(),
+      disconnect: () => databaseManager.disconnect(),
+      batchSize: env.NO_SHOW_WORKER_BATCH_SIZE,
+      pollIntervalMs: env.NO_SHOW_WORKER_POLL_INTERVAL_MS,
+      shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS,
+      onShutdownTimeout: () => {
+        logger.error(
+          { timeoutMs: env.SHUTDOWN_TIMEOUT_MS },
+          "No-show worker drain exceeded the configured shutdown grace period",
+        );
+        process.exit(1);
+      },
+    });
+    logger.info("No-show worker stopped");
   } catch (error) {
-    logger.error({ err: error }, "No-show worker failed to start");
+    logger.error({ err: error }, "No-show worker failed");
     throw error;
-  } finally {
-    if (!runForever) {
-      await databaseManager.disconnect();
-    }
   }
 };
 
@@ -125,4 +169,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   await runCli();
 }
 
-export { buildService, runOnce };
+export { buildService, runContinuous, runOnce };

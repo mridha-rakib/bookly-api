@@ -212,6 +212,13 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
       category: "Barber",
       subcategories: ["Haircut"],
     });
+    // Customers can only book an approved Business (booking-scheduling-admission). Use the real
+    // approval transition, exactly as the payment suite's fixture does.
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     return { owner, business };
   };
 
@@ -566,16 +573,20 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
     );
     if (result.status !== "confirmed") throw new Error("expected confirmed");
 
-    await BookingModel.updateOne(
-      { _id: result.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
-
-    const cancelled = await lifecycleService.cancelByCustomer(
-      String(customer._id),
-      String(result.booking._id),
-      "Can't make it",
-    );
+    // Keep the reserved interval and immutable intent aligned; only the classification clock
+    // is moved to one hour before the start (same approach as the payment suite).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(result.booking.schedule.startAt.getTime() - 60 * 60 * 1000));
+    let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(result.booking._id),
+        "Can't make it",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
     expect(cancelled.status).toBe("LATE_CANCELLATION");
     expect(cancelled.cancellationOutcome?.settlementStatus).toBe("SUCCEEDED");
 

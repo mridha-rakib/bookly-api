@@ -20,7 +20,7 @@ it("production purchase, status and direct controller entry deny before dependen
       throw Error("dependency touched");
     },
   });
-  const service = new PackagePurchaseService(untouched, untouched);
+  const service = new PackagePurchaseService(untouched, untouched, untouched);
   for (const action of [service.complete.bind(service), service.status.bind(service)])
     await expect(action(undefined, new Types.ObjectId(), "forged")).rejects.toMatchObject({
       code: "PACKAGE_BATCH_ACTIVATION_UNAVAILABLE",
@@ -76,6 +76,50 @@ it("the original quote view keeps the exact issuance/hash/expiry and never certi
   expect(after.certification).toBe("UNRESOLVED");
   expect(after.purchaseAvailable).toBe(false);
   expect(after).not.toHaveProperty("sessionFamilyId");
+});
+it("P0.7 the original quote view restores each appointment exactly from the retained payload", async () => {
+  const f = checkoutFixture();
+  const quote = await f.preparer.prepare(f.context, f.intent, f.seed);
+  const retained = packageCheckoutRetentionSchema.parse({
+    version: 1,
+    state: "INTERNAL_RETAINED_NOT_ACCEPTED",
+    seed: f.seed,
+    intent: f.intent,
+    quote,
+  });
+  const view = packageCheckoutHttpView(retained);
+  const payload = retained.quote.payload;
+  expect(view.appointments).toHaveLength(payload.appointments.length);
+  for (const [index, row] of payload.appointments.entries()) {
+    const restored = view.appointments[index];
+    const money = payload.financials.appointments.find((m) => m.bookingId.equals(row.bookingId));
+    expect(restored).toMatchObject({
+      selectionId: String(row.selectionId),
+      definitionItemId: String(row.definitionItemId),
+      serviceId: String(row.serviceId),
+      staffMembershipId: String(row.staffMembershipId),
+      startAt: row.startAt,
+      endAt: row.endAt,
+      durationMin: row.timing.baseDurationMin,
+      addons: row.addons.map((a) => ({
+        id: String(a.addonId),
+        name: a.name,
+        priceCents: a.priceCents,
+      })),
+      location: { mode: row.location.mode },
+      travelFeeCents: row.travelFeeCents,
+      financials: {
+        upfrontCents: money?.upfrontCents,
+        manualVenueDuesCents: money?.manualVenueDuesCents,
+      },
+    });
+    expect(restored?.serviceName).toEqual(expect.any(String));
+    expect(restored?.location.address).not.toHaveProperty("location");
+    expect(restored).not.toHaveProperty("bookingId");
+  }
+  // Reading never reissues: identity, hash and deadline are the retained ones.
+  expect(view.quoteId).toBe(String(payload.quoteId));
+  expect(view.expiresAt).toEqual(f.seed.expiresAt);
 });
 it("late, unknown and unapproved post-commit clocks never certify consent", () => {
   const q = 1_800_000,

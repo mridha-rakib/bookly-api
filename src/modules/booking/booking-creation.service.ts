@@ -16,6 +16,10 @@ import {
   businessCities,
   normalizeBusinessVisitType,
 } from "../business/business.types.js";
+import {
+  NORMAL_CANCELLATION_TERMS_VERSION,
+  normalCancellationFeeTiers,
+} from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import type { BusinessCancellationPolicyRepository } from "../business-cancellation-policy/business-cancellation-policy.repository.js";
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import type { BusinessClientDocument } from "../client/client.model.js";
@@ -91,6 +95,7 @@ import {
   type FinancialContractProductKind,
   type FinancialContractVersion,
   findFinancialContractMismatch,
+  newPurchaseReturningUpfrontCents,
   type RelationshipClassification,
 } from "./financial-contract.js";
 import {
@@ -167,6 +172,8 @@ export type BookingCreationPreview = {
     amountCents: number;
   }>;
   financials: BookingFinancials;
+  /** Sanitized Business cancellation policy captured by this quote; absent means unavailable or unconfigured. */
+  cancellationPolicy?: BookingCancellationPolicySnapshot;
   /** Server-owned disclosure only; does not activate VAT collection or alter financial terms. */
   taxMode: "PRE_ACTIVATION";
   /** Current pre-tax upfront obligation. */
@@ -647,6 +654,7 @@ export class BookingCreationService {
       financials.balanceDueCents,
       computedTax,
     );
+    const cancellationPolicy = await this.resolveCancellationPolicySnapshot(business);
 
     return {
       finalizable: true,
@@ -667,6 +675,7 @@ export class BookingCreationService {
         amountCents: line.amountCents,
       })),
       financials,
+      ...(cancellationPolicy ? { cancellationPolicy } : {}),
       // Batch 6.5: the amount actually charged online is ALWAYS the deposit, first booking or
       // returning — never platformFeeCents, which is 0 for a returning customer even though a
       // real deposit is still due (see BookingFinancials's own doc comment). P2: with a promo,
@@ -1219,6 +1228,7 @@ export class BookingCreationService {
       financials.balanceDueCents,
       computedTax,
     );
+    const cancellationPolicy = await this.resolveCancellationPolicySnapshot(business);
 
     return {
       finalizable: true,
@@ -1241,6 +1251,7 @@ export class BookingCreationService {
         },
       ],
       financials,
+      ...(cancellationPolicy ? { cancellationPolicy } : {}),
       ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
@@ -1877,6 +1888,7 @@ export class BookingCreationService {
           taxCents: computedTax?.taxCents ?? 0,
           chargedAmountCents: customerChargeNowCents,
           taxCalculationId: computedTax?.taxCalculationId,
+          taxNotCalculatedReason: computedTax ? undefined : "TAX_SERVICE_NOT_CONFIGURED",
           taxMode: "PRE_ACTIVATION",
         }),
       });
@@ -2016,6 +2028,7 @@ export class BookingCreationService {
                 },
               ],
               ...(cancellationPolicySnapshot ? { cancellationPolicySnapshot } : {}),
+              cancellationTermsVersion: NORMAL_CANCELLATION_TERMS_VERSION,
               ...(noShowEligibilitySnapshot ? { noShowEligibilitySnapshot } : {}),
               sessionEndReminderSnapshot,
               ...(input.notes ? { notes: input.notes } : {}),
@@ -2521,6 +2534,7 @@ export class BookingCreationService {
               ...(params.cancellationPolicySnapshot
                 ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
                 : {}),
+              cancellationTermsVersion: NORMAL_CANCELLATION_TERMS_VERSION,
               ...(params.noShowEligibilitySnapshot
                 ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
                 : {}),
@@ -3155,11 +3169,12 @@ export class BookingCreationService {
       travelFeeCents,
       promoDiscountCents,
     );
-    if (classification === "RETURNING") {
+    const returningUpfront = newPurchaseReturningUpfrontCents(classification);
+    if (returningUpfront === 0) {
       return {
         financials: {
           ...returning,
-          depositCents: 0,
+          depositCents: returningUpfront,
           platformFeeCents: 0,
           balanceDueCents: returning.totalCents,
         },
@@ -3356,6 +3371,7 @@ export class BookingCreationService {
         taxCents: params.computedTax?.taxCents ?? 0,
         chargedAmountCents: contract.onlineChargeCents,
         taxCalculationId: params.computedTax?.taxCalculationId,
+        taxNotCalculatedReason: params.computedTax ? undefined : "TAX_SERVICE_NOT_CONFIGURED",
         taxMode: "PRE_ACTIVATION",
         financialContract: correlation,
       }),
@@ -3381,12 +3397,17 @@ export class BookingCreationService {
       return undefined;
     }
 
+    // Approved v2 terms (business-cancellation-policy.model.ts): only the three fee windows are
+    // the Business's to set for a Normal/legacy Package Booking; more than 24 h is always free.
+    // The 72 h and 24–72 h rows remain stored for First-Class quotes and are not snapshotted here.
     return {
-      tiers: policy.tiers.map((tier) => ({
-        tier: tier.tier,
-        mode: tier.mode,
-        ...(tier.percentage !== undefined ? { percentage: tier.percentage } : {}),
-      })),
+      tiers: policy.tiers
+        .filter((tier) => (normalCancellationFeeTiers as readonly string[]).includes(tier.tier))
+        .map((tier) => ({
+          tier: tier.tier,
+          mode: tier.mode,
+          ...(tier.percentage !== undefined ? { percentage: tier.percentage } : {}),
+        })),
       noShowPercentage: policy.noShowPercentage,
     };
   }
@@ -3549,6 +3570,7 @@ export class BookingCreationService {
               ...(params.cancellationPolicySnapshot
                 ? { cancellationPolicySnapshot: params.cancellationPolicySnapshot }
                 : {}),
+              cancellationTermsVersion: NORMAL_CANCELLATION_TERMS_VERSION,
               ...(params.noShowEligibilitySnapshot
                 ? { noShowEligibilitySnapshot: params.noShowEligibilitySnapshot }
                 : {}),

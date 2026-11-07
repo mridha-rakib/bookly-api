@@ -13,12 +13,15 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { BusinessTravelSettingsModel } from "../business-travel-settings/business-travel-settings.model.js";
+import { StripeTaxGateway } from "../payment/stripe-tax-gateway.js";
+import { CyprusTaxService } from "../payment/tax.service.js";
 import { PackageCheckoutConflictError } from "./package-checkout.errors.js";
 import { packageCheckoutAffirmativeActionSchema } from "./package-checkout-acceptance.js";
-import { readPackageCheckoutAvailability } from "./package-checkout-availability.js";
+import { readPackageCheckoutReadiness } from "./package-checkout-availability.js";
 import { packageCheckoutIntentSchema } from "./package-checkout-contract.js";
 import { readPackageCheckoutCustomer } from "./package-checkout-customer-authority.js";
 import { packageCheckoutHttpView } from "./package-checkout-http-view.js";
+import { readPackageQuoteTax } from "./package-checkout-quote-tax.js";
 import { buildPackageConsentServices } from "./package-consent.factory.js";
 import { readPackageConsentPublicState } from "./package-consent-certification.js";
 import {
@@ -58,6 +61,8 @@ type Options = {
   lifetimeMs?: number;
   origins?: string[];
   build?: (lifetime: number) => PackageConsentServices;
+  /** Informational VAT for quote reads; defaults to the same Stripe Tax service Normal Booking uses. */
+  tax?: Pick<CyprusTaxService, "computeForCharge">;
 };
 export const packageConsentOperationKey = (customerId: Types.ObjectId, operationId: string) =>
   `package-consent:${customerId.toHexString()}:${operationId}`;
@@ -68,6 +73,15 @@ export const createPackageConsentRoute = (
 ): Router => {
   const router = Router();
   let services: PackageConsentServices | undefined;
+  // The shipped composition uses the real Stripe Tax service; an injected test composition
+  // (`build`) gets VAT only when it also injects `tax`, so tests never reach a provider.
+  let tax = options.tax;
+  const quoteView = async (retention: Parameters<typeof packageCheckoutHttpView>[0]) => {
+    const view = packageCheckoutHttpView(retention);
+    if (!tax && !options.build) tax = new CyprusTaxService(new StripeTaxGateway());
+    // Informational VAT sits beside, never inside, the hashed/signed retained terms.
+    return { ...view, tax: await readPackageQuoteTax(tax, view) };
+  };
   router.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     // Shipped composition passes no options (= shippedPackageConsentHttpActivation, disabled).
@@ -178,6 +192,7 @@ export const createPackageConsentRoute = (
         status: "ACTIVE",
         archivedAt: { $exists: false },
       }).maxTimeMS(2000);
+      const checkout = await readPackageCheckoutReadiness(options);
       sendSuccess(res, 200, "Package terms selection", {
         businessId,
         packageId,
@@ -187,7 +202,8 @@ export const createPackageConsentRoute = (
         fulfilmentMode: business.visitType,
         bundlePriceCents: definition.bundlePriceCents,
         // Same display hint as the catalogue; acceptance and purchase still re-check authority.
-        checkoutAvailable: await readPackageCheckoutAvailability(options),
+        checkoutAvailable: checkout.available,
+        checkoutUnavailableReason: checkout.reason,
         items: definition.items.map((i) => ({
           definitionItemId: i.itemId,
           serviceId: i.serviceId,
@@ -245,7 +261,7 @@ export const createPackageConsentRoute = (
       );
       sendSuccess(res, 200, "Package quote retained", {
         operationId: body.operationId,
-        quote: packageCheckoutHttpView(retained),
+        quote: await quoteView(retained),
       });
     }),
   );
@@ -281,7 +297,7 @@ export const createPackageConsentRoute = (
         quoteHash: p.disclosure.content.quoteHash,
         disclosureHash: p.disclosure.contentHash,
         text: p.disclosure.content.renderedTermsSnapshot,
-        quote: { ...packageCheckoutHttpView(stored.retention), ...consentState },
+        quote: { ...(await quoteView(stored.retention)), ...consentState },
         ...consentState,
         ...(accepted
           ? {
@@ -382,7 +398,7 @@ export const createPackageConsentRoute = (
       );
       sendSuccess(res, 200, "Original retained Package quote", {
         operationId: params.operationId,
-        quote: { ...packageCheckoutHttpView(stored.retention), ...consentState },
+        quote: { ...(await quoteView(stored.retention)), ...consentState },
         acceptanceRecorded: Boolean(stored.accepted),
       });
     }),

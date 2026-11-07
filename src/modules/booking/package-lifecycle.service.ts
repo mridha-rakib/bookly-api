@@ -29,7 +29,7 @@ import {
 import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.js";
 import { ServiceModel } from "../services/service.model.js";
 import { StaffMembershipModel } from "../staff/staff.model.js";
-import { UserModel } from "../user/user.model.js";
+import { UserModel, UserProfileModel } from "../user/user.model.js";
 import { type BookingDocument, BookingModel } from "./booking.model.js";
 import { BookingRepository } from "./booking.repository.js";
 import type { BookingService } from "./booking.service.js";
@@ -483,6 +483,16 @@ export class PackageLifecycleService {
               },
               session,
             );
+            // Same optional display snapshot the initial batch members carry (package-batch-
+            // persistence), so redeemed sessions show the professional's name in readbacks.
+            const staffMember = await StaffMembershipModel.findById(intent.staffMembershipId)
+              .session(session)
+              .exec();
+            const staffProfile = staffMember
+              ? await UserProfileModel.findOne({ userId: staffMember.userId })
+                  .session(session)
+                  .exec()
+              : null;
             booking = await new BookingRepository().create(
               {
                 _id: operation.bookingId,
@@ -507,6 +517,14 @@ export class PackageLifecycleService {
                   {
                     serviceId: item.serviceId,
                     responsibleStaffMembershipId: intent.staffMembershipId,
+                    ...(staffProfile
+                      ? {
+                          staffSnapshot: {
+                            firstName: staffProfile.firstName,
+                            lastName: staffProfile.lastName,
+                          },
+                        }
+                      : {}),
                     serviceSnapshot: {
                       name: item.serviceSnapshot.name,
                       pricingMode: "PACKAGE",

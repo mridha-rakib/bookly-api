@@ -6,12 +6,15 @@ import {
   businessVisitTypes,
 } from "../business/business.types.js";
 import {
+  type BookingCancellationTier,
+  bookingCancellationTiers,
   CANCELLATION_PERCENTAGE_MAX,
   CANCELLATION_PERCENTAGE_MIN,
   type CancellationFeeMode,
   type CancellationTier,
   cancellationFeeModes,
   cancellationTiers,
+  NORMAL_CANCELLATION_TERMS_VERSION,
 } from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import { type ClientPropertyType, clientPropertyTypes } from "../client/client.types.js";
 import { type PromoFundingOwner, promoFundingOwners } from "../promo/promo.types.js";
@@ -416,7 +419,7 @@ export type BookingSessionEndReminderSnapshot = {
  */
 export type BookingCancellationOutcome = {
   classifiedAt: Date;
-  tier: CancellationTier;
+  tier: BookingCancellationTier;
   feeMode: CancellationFeeMode;
   feePercentage?: number | undefined;
   cancellationFeeCents: number;
@@ -505,6 +508,11 @@ export type BookingDocument = {
    */
   noShowChargeClaimedAt?: Date | undefined;
   cancellationPolicySnapshot?: BookingCancellationPolicySnapshot | undefined;
+  /** 2 = the approved Normal Booking terms (business-cancellation-policy.model.ts): >24 h free
+   * with a deposit refund, then the three snapshotted fee windows. Absent = the five-window
+   * terms the Booking was created under, including every First-Class Booking. Set at creation
+   * only; never back-filled onto an existing Booking. */
+  cancellationTermsVersion?: typeof NORMAL_CANCELLATION_TERMS_VERSION | undefined;
   noShowEligibilitySnapshot?: BookingNoShowEligibilitySnapshot | undefined;
   sessionEndReminderSnapshot?: BookingSessionEndReminderSnapshot | undefined;
   cancellationOutcome?: BookingCancellationOutcome | undefined;
@@ -934,7 +942,7 @@ const bookingSessionEndReminderSnapshotSchema = new Schema<BookingSessionEndRemi
 const bookingCancellationOutcomeSchema = new Schema<BookingCancellationOutcome>(
   {
     classifiedAt: { type: Date, required: true },
-    tier: { type: String, enum: cancellationTiers, required: true },
+    tier: { type: String, enum: bookingCancellationTiers, required: true },
     feeMode: { type: String, enum: cancellationFeeModes, required: true },
     feePercentage: {
       type: Number,
@@ -1020,6 +1028,7 @@ const bookingSchema = new Schema<BookingDocument>(
     noShowDeadlineAt: { type: Date },
     noShowChargeClaimedAt: { type: Date },
     cancellationPolicySnapshot: { type: bookingCancellationPolicySnapshotSchema },
+    cancellationTermsVersion: { type: Number, enum: [NORMAL_CANCELLATION_TERMS_VERSION] },
     noShowEligibilitySnapshot: { type: bookingNoShowEligibilitySnapshotSchema },
     sessionEndReminderSnapshot: { type: bookingSessionEndReminderSnapshotSchema },
     cancellationOutcome: { type: bookingCancellationOutcomeSchema },

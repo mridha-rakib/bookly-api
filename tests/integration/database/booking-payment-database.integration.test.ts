@@ -2,27 +2,43 @@ import express from "express";
 import mongoose, { Types } from "mongoose";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
+import { validateRequest } from "../../../src/common/middleware/validate-request.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
+import {
+  createAuthenticateAccessTokenMiddleware,
+  requireActiveUser,
+  requireApprovedBusiness,
+  requireRoles,
+} from "../../../src/modules/auth/auth.middleware.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { BookingController } from "../../../src/modules/booking/booking.controller.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import {
   createBusinessBookingRoute,
   createCustomerBookingRoute,
 } from "../../../src/modules/booking/booking.route.js";
+import {
+  bookingBusinessParamsSchema,
+  bookingIdOnlyParamsSchema,
+  createCustomerBookingPreviewBodySchema,
+} from "../../../src/modules/booking/booking.schema.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
+import { BookingEmailDeliveryEligibility } from "../../../src/modules/booking/booking-email-delivery-eligibility.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
 import { BookingRecoveryInbox } from "../../../src/modules/booking/booking-recovery-inbox.js";
 import { NoShowResolutionService } from "../../../src/modules/booking/no-show-resolution.service.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
@@ -37,10 +53,16 @@ import { ClientRepository } from "../../../src/modules/client/client.repository.
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
 import { BookingCancelledNotifier } from "../../../src/modules/notification/booking-cancelled.notifier.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
+import { ensureBusinessRefundNotification } from "../../../src/modules/payment/business-refund-notification.js";
 import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
+import { MoneyRecoveryService } from "../../../src/modules/payment/money-recovery.service.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
 import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
+import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
+import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
+import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
@@ -52,6 +74,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
+import type { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
@@ -830,8 +853,18 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
           taxMode: "PRE_ACTIVATION",
           chargedAmountCents: "2000",
           taxCents: String(taxCents),
+          // A Stripe-calculated €0 stays CALCULATED (distinct from "not calculated"), and the
+          // informational VAT is never recorded as collected.
+          taxStatus: "CALCULATED",
+          taxCollectedCents: "0",
         },
       });
+      expect(paymentGateway.paymentIntentInputs.at(-1)?.metadata["taxCalculationId"]).toMatch(
+        /^taxcalc_fake_/,
+      );
+      expect(
+        paymentGateway.paymentIntentInputs.at(-1)?.metadata["taxNotCalculatedReason"],
+      ).toBeUndefined();
       if (result.status !== "confirmed") throw new Error("expected confirmed");
       expect(result.booking.financials).toMatchObject({
         totalCents: 10_000,
@@ -934,6 +967,7 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     );
     expect(booked.status).toBe("confirmed");
     const nextInput = { ...finalizeInput(f.service._id, f.membership._id, "14:00"), ...travel };
+    const taxCallsBeforeReturning = taxGateway.calls.length;
     const returning = await creationService.previewCustomerBooking(
       String(f.customer._id),
       String(f.business._id),
@@ -957,6 +991,8 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     ).toBe("confirmed");
     expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
     expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(first.dueNowCents);
+    // RETURNING €0 upfront: no Stripe Tax calculation and no PaymentIntent.
+    expect(taxGateway.calls.length).toBe(taxCallsBeforeReturning);
   });
 
   it("first-booking finalize charges the activation fee, persists the Booking, and activates the Client", async () => {
@@ -987,6 +1023,196 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     const platformFeeEntry = ledger.find((entry) => entry.type === "PLATFORM_FEE");
     expect(platformFeeEntry?.status).toBe("SUCCEEDED");
     expect(platformFeeEntry?.amountCents).toBe(result.booking.financials.platformFeeCents);
+  });
+
+  it.each([
+    { mode: "HOURLY" as const, pricingInput: { hours: 3 }, amount: 3000, minutes: 180 },
+    { mode: "PER_PERSON" as const, pricingInput: { personCount: 3 }, amount: 3000, minutes: 60 },
+  ])(
+    "BC-F01 $mode finalize preserves quantity, money and occupied duration",
+    async ({ mode, pricingInput, amount, minutes }) => {
+      const t = await recoveryFixture();
+      await ServiceModel.updateOne(
+        { _id: t.service._id },
+        {
+          $set: {
+            pricingMode: mode,
+            ...(mode === "HOURLY"
+              ? {
+                  hourlyPricing: {
+                    ratePerHourCents: 1000,
+                    minHours: 2,
+                    maxHours: 4,
+                    bufferAfterMin: 0,
+                  },
+                }
+              : {
+                  perPersonPricing: {
+                    ratePerPersonCents: 1000,
+                    minPersons: 1,
+                    maxPersons: 4,
+                    durationMin: 60,
+                  },
+                }),
+          },
+          $unset: { fixedPricing: 1 },
+        },
+        { runValidators: true },
+      );
+      const input = {
+        ...t.input,
+        serviceLines: t.input.serviceLines.map((line) => ({ ...line, pricingInput })),
+      };
+      const preview = await creationService.previewCustomerBooking(
+        String(t.customer._id),
+        String(t.business._id),
+        input,
+      );
+      const result = await creationService.finalizeCustomerBooking(
+        String(t.customer._id),
+        String(t.business._id),
+        input,
+      );
+      expect(result.status).toBe("confirmed");
+      if (result.status !== "confirmed") throw Error("Expected committed booking");
+      const booking = await BookingModel.findById(result.booking._id).orFail();
+      expect(booking.serviceLines[0]?.pricingInput).toMatchObject(pricingInput);
+      expect(booking.financials.totalCents).toBe(amount);
+      expect(booking.schedule.endAt.getTime() - booking.schedule.startAt.getTime()).toBe(
+        minutes * 60_000,
+      );
+      expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(preview.dueNowCents);
+      const reservation = await BookingSlotReservationModel.findOne({ businessId: t.business._id });
+      expect(reservation).not.toBeNull();
+      const interval = reservation?.intervals[0];
+      expect(interval).toBeDefined();
+      if (!interval) throw Error("Expected committed reservation");
+      expect(interval.endAt.getTime() - interval.startAt.getTime()).toBe(minutes * 60_000);
+      expect(interval.capacityUsed).toBe(mode === "PER_PERSON" ? 3 : 1);
+    },
+  );
+
+  it("BC-F01 competing group finalizations cannot exceed capacity", async () => {
+    const t = await recoveryFixture();
+    await ServiceModel.updateOne(
+      { _id: t.service._id },
+      {
+        $set: {
+          pricingMode: "PER_PERSON",
+          perPersonPricing: {
+            ratePerPersonCents: 1000,
+            minPersons: 1,
+            maxPersons: 4,
+            durationMin: 60,
+          },
+        },
+        $unset: { fixedPricing: 1 },
+      },
+      { runValidators: true },
+    );
+    const other = await createCustomer("group-racer");
+    await saveCard(other._id);
+    await linkCustomerToBusiness(t.business._id, t.owner._id, other._id);
+    const inputs = [t.customer, other].map(() => ({
+      ...finalizeInput(t.service._id, t.membership._id),
+      serviceLines: t.input.serviceLines.map((line) => ({
+        ...line,
+        pricingInput: { personCount: 3 },
+      })),
+    }));
+    const results = await Promise.allSettled(
+      inputs.map((input, index) =>
+        creationService.finalizeCustomerBooking(
+          String(index === 0 ? t.customer._id : other._id),
+          String(t.business._id),
+          input,
+        ),
+      ),
+    );
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(await BookingModel.countDocuments()).toBe(1);
+    const day = await BookingSlotReservationModel.findOne({ businessId: t.business._id }).orFail();
+    expect(day.intervals).toHaveLength(1);
+    expect(day.intervals[0]?.capacityUsed).toBe(3);
+    expect(day.intervals[0]?.capacityMax).toBe(4);
+  });
+
+  it("BC-F01 authenticated HTTP preview, finalize, retry and owned detail converge on one booking", async () => {
+    const t = await setupBookableBusiness();
+    const customer = await createCustomer("new-self-service");
+    await userRepository.createProfile({
+      userId: customer._id,
+      firstName: "New",
+      lastName: "Customer",
+      gender: "other",
+      phone: { countryCode: "+357", nationalNumber: "99123456", e164: "+35799123456" },
+    });
+    await saveCard(customer._id);
+    // Deliberately no pre-linked BusinessClient: exercise genuine first-customer provisioning.
+    const tokens = new TokenService(new SessionRepository());
+    const token = await issueTestAccessToken(tokens, { userId: customer._id, role: "CUSTOMER" });
+    const controller = new BookingController(bookingService, creationService, lifecycleService);
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createAuthenticateAccessTokenMiddleware(tokens, userRepository),
+      requireActiveUser(),
+      requireRoles(["CUSTOMER"]),
+    );
+    for (const [suffix, handler] of [
+      ["preview", controller.previewCustomerBooking],
+      ["finalize", controller.finalizeCustomerBooking],
+    ] as const) {
+      app.post(
+        `/businesses/:businessId/bookings/${suffix}`,
+        requireApprovedBusiness(businessRepository),
+        validateRequest({
+          params: bookingBusinessParamsSchema,
+          body: createCustomerBookingPreviewBodySchema,
+        }),
+        asyncHandler(handler),
+      );
+    }
+    app.get(
+      "/me/bookings/:bookingId",
+      validateRequest({ params: bookingIdOnlyParamsSchema }),
+      asyncHandler(controller.getDetailForCustomer),
+    );
+    app.use(createErrorHandler());
+    const input = finalizeInput(t.service._id, t.membership._id);
+    const base = `/businesses/${t.business._id}/bookings`;
+    const preview = await request(app)
+      .post(`${base}/preview`)
+      .set("Authorization", `Bearer ${token}`)
+      .send(input)
+      .expect(200);
+    const first = await request(app)
+      .post(`${base}/finalize`)
+      .set("Authorization", `Bearer ${token}`)
+      .send(input)
+      .expect(201);
+    const retry = await request(app)
+      .post(`${base}/finalize`)
+      .set("Authorization", `Bearer ${token}`)
+      .send(input)
+      .expect(201);
+    expect(retry.body.data.id).toBe(first.body.data.id);
+    expect(first.body.data.id).toBeDefined();
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+    expect(paymentGateway.paymentIntentInputs[0]?.amountCents).toBe(preview.body.data.dueNowCents);
+    expect(await BookingModel.countDocuments()).toBe(1);
+    const detail = await request(app)
+      .get(`/me/bookings/${first.body.data.id}`)
+      .set("Authorization", `Bearer ${token}`)
+      .expect(200);
+    expect(detail.body.data.id).toBe(first.body.data.id);
+    const other = await createCustomer("foreign");
+    const otherToken = await issueTestAccessToken(tokens, { userId: other._id, role: "CUSTOMER" });
+    await request(app)
+      .get(`/me/bookings/${first.body.data.id}`)
+      .set("Authorization", `Bearer ${otherToken}`)
+      .expect(404);
   });
 
   it("finalize without a saved card is rejected before any reservation is made", async () => {
@@ -1385,7 +1611,8 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     expect(feeEntry?.status).toBe("SUCCEEDED");
   });
 
-  it("a FREE customer cancellation never attempts a charge", async () => {
+  // Approved Normal Booking terms v2 (2026-11-05): >24 h is free and refunds the deposit paid.
+  it("a customer cancellation more than 24 hours ahead never charges and refunds the deposit exactly once", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness();
     const customer = await createCustomer("h");
     await saveCard(customer._id);
@@ -1398,6 +1625,9 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     );
     expect(finalizeResult.status).toBe("confirmed");
     if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    expect(finalizeResult.booking.cancellationTermsVersion).toBe(2);
+    const depositCents = finalizeResult.booking.financials.depositCents;
+    expect(depositCents).toBeGreaterThan(0);
 
     const cancelled = await lifecycleService.cancelByCustomer(
       String(customer._id),
@@ -1406,10 +1636,407 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     );
 
     expect(cancelled.status).toBe("CANCELLED_BY_CUSTOMER");
-    expect(cancelled.cancellationOutcome?.settlementStatus).toBe("NOT_APPLICABLE");
+    expect(cancelled.cancellationOutcome).toMatchObject({
+      tier: "MORE_THAN_24_HOURS",
+      feeMode: "FREE",
+      cancellationFeeCents: 0,
+      additionalChargeCents: 0,
+      refundOwedCents: depositCents,
+      settlementStatus: "SUCCEEDED",
+    });
 
+    const bookingId = String(finalizeResult.booking._id);
+    const operation = await paymentService.findRefundOperation(
+      `customer-cancel-refund:${bookingId}`,
+    );
+    expect(operation).toMatchObject({
+      reason: "CUSTOMER_EARLY_CANCELLATION",
+      expectedRefundAmountCents: depositCents,
+      providerStatus: "SUCCEEDED",
+    });
+    expect(
+      await paymentService.findRefundOperation(`business-cancel-refund:${bookingId}`),
+    ).toBeNull();
+    expect(
+      paymentGateway.refundInputs.filter(
+        (input) => input.idempotencyKey === `refund-operation:${String(operation?._id)}`,
+      ),
+    ).toHaveLength(1);
+
+    // A repeated cancellation is rejected and never creates a second refund.
+    await expect(
+      lifecycleService.cancelByCustomer(String(customer._id), bookingId, undefined),
+    ).rejects.toThrow();
     const ledger = await financialTransactionService.listForBooking(finalizeResult.booking._id);
     expect(ledger.find((entry) => entry.type === "CANCELLATION_FEE")).toBeUndefined();
+    const refunds = ledger.filter((entry) => entry.type === "REFUND");
+    expect(refunds).toHaveLength(1);
+    expect(refunds[0]).toMatchObject({ status: "SUCCEEDED", amountCents: depositCents });
+  });
+
+  it("v2 ignores the First-Class-only 72 h and 24-72 h rows: 30 hours ahead is free with a refund", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+    await cancellationPolicyRepository.replace(
+      business._id,
+      [
+        { tier: "MORE_THAN_72_HOURS", mode: "PERCENTAGE", percentage: 100 },
+        { tier: "BETWEEN_24_AND_72_HOURS", mode: "PERCENTAGE", percentage: 100 },
+        { tier: "BETWEEN_12_AND_24_HOURS", mode: "PERCENTAGE", percentage: 40 },
+        { tier: "BETWEEN_2_AND_12_HOURS", mode: "PERCENTAGE", percentage: 60 },
+        { tier: "UNDER_2_HOURS", mode: "PERCENTAGE", percentage: 80 },
+      ],
+      90,
+    );
+    const customer = await createCustomer("v2-30h");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const finalizeResult = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    // Only the three Normal fee windows are snapshotted for the Booking's own terms.
+    expect(
+      finalizeResult.booking.cancellationPolicySnapshot?.tiers.map((rule) => rule.tier),
+    ).toEqual(["BETWEEN_12_AND_24_HOURS", "BETWEEN_2_AND_12_HOURS", "UNDER_2_HOURS"]);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(finalizeResult.booking.schedule.startAt.getTime() - 30 * 3_600_000));
+    let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(finalizeResult.booking._id),
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(cancelled.status).toBe("CANCELLED_BY_CUSTOMER");
+    expect(cancelled.cancellationOutcome).toMatchObject({
+      tier: "MORE_THAN_24_HOURS",
+      cancellationFeeCents: 0,
+      refundOwedCents: finalizeResult.booking.financials.depositCents,
+    });
+  });
+
+  it("v2 applies the Business's 12-24 h fee, nets it against the deposit and refunds nothing", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+    await cancellationPolicyRepository.replace(
+      business._id,
+      [
+        { tier: "MORE_THAN_72_HOURS", mode: "FREE" },
+        { tier: "BETWEEN_24_AND_72_HOURS", mode: "FREE" },
+        { tier: "BETWEEN_12_AND_24_HOURS", mode: "PERCENTAGE", percentage: 40 },
+        { tier: "BETWEEN_2_AND_12_HOURS", mode: "PERCENTAGE", percentage: 60 },
+        { tier: "UNDER_2_HOURS", mode: "PERCENTAGE", percentage: 80 },
+      ],
+      90,
+    );
+    const customer = await createCustomer("v2-18h");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const finalizeResult = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    const { depositCents, eligiblePlatformFeeBasisCents } = finalizeResult.booking.financials;
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(finalizeResult.booking.schedule.startAt.getTime() - 18 * 3_600_000));
+    let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(finalizeResult.booking._id),
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    const fee = Math.round((eligiblePlatformFeeBasisCents * 40) / 100);
+    expect(cancelled.status).toBe("LATE_CANCELLATION");
+    expect(cancelled.cancellationOutcome).toMatchObject({
+      tier: "BETWEEN_12_AND_24_HOURS",
+      feePercentage: 40,
+      cancellationFeeCents: fee,
+      depositAppliedCents: Math.min(fee, depositCents),
+      additionalChargeCents: Math.max(0, fee - depositCents),
+      refundOwedCents: 0,
+    });
+    const bookingId = String(finalizeResult.booking._id);
+    expect(
+      await paymentService.findRefundOperation(`customer-cancel-refund:${bookingId}`),
+    ).toBeNull();
+    const ledger = await financialTransactionService.listForBooking(finalizeResult.booking._id);
+    expect(ledger.filter((entry) => entry.type === "REFUND")).toHaveLength(0);
+  });
+
+  it("a pending early-cancellation refund stays PENDING, then money recovery settles it without a second refund", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness();
+    const customer = await createCustomer("v2-pending-refund");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const finalizeResult = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    const bookingId = String(finalizeResult.booking._id);
+
+    paymentGateway.queueNextRefundOutcome("pending");
+    const cancelled = await lifecycleService.cancelByCustomer(
+      String(customer._id),
+      bookingId,
+      undefined,
+    );
+    expect(cancelled.cancellationOutcome?.settlementStatus).toBe("PENDING");
+    const operation = await paymentService.findRefundOperation(
+      `customer-cancel-refund:${bookingId}`,
+    );
+    expect(operation?.providerRefundId).toBeDefined();
+    expect(
+      (await financialTransactionService.listForBooking(finalizeResult.booking._id)).filter(
+        (entry) => entry.type === "REFUND" && entry.status === "SUCCEEDED",
+      ),
+    ).toHaveLength(0);
+
+    if (!operation?.providerRefundId) throw new Error("expected a provider refund");
+    paymentGateway.succeedRefund(operation.providerRefundId);
+    await RefundOperationModel.updateOne(
+      { _id: operation._id },
+      { $unset: { nextRecoveryAt: 1 } },
+    ).exec();
+    await new MoneyRecoveryService(
+      paymentService,
+      new PaymentAttemptRepository(),
+      new RefundOperationRepository(),
+      bookingRepository,
+      financialTransactionService,
+      { recoverDue: async () => ({ processed: 0, failed: 0 }) } as unknown as StripeWebhookService,
+    ).runOnce();
+
+    const settled = await BookingModel.findById(finalizeResult.booking._id).orFail().exec();
+    expect(settled.cancellationOutcome?.settlementStatus).toBe("SUCCEEDED");
+    const operationKey = `refund-operation:${String(operation._id)}`;
+    const providerCalls = paymentGateway.refundInputs.filter(
+      (input) => input.idempotencyKey === operationKey,
+    );
+    expect(new Set(providerCalls.map((input) => input.idempotencyKey)).size).toBe(1);
+    const succeededRefunds = (
+      await financialTransactionService.listForBooking(finalizeResult.booking._id)
+    ).filter((entry) => entry.type === "REFUND" && entry.status === "SUCCEEDED");
+    expect(succeededRefunds).toHaveLength(1);
+  });
+
+  // --- Approved Decision A / D: FIRST restoration + refund-completed email -------------------------
+
+  const relationshipOf = async (businessClientId: Types.ObjectId) =>
+    (await BusinessClientModel.findById(businessClientId).orFail().exec()).financialRelationship;
+  const refundCompletedEmails = (bookingId: string) =>
+    EmailOutboxModel.find({
+      eventKey: { $regex: `^CUSTOMER_REFUND:${bookingId}:` },
+      templateKey: "BOOKING_REFUND_COMPLETED_CUSTOMER",
+    }).exec();
+  const firstBooking = async (
+    tag: string,
+    setup?: Awaited<ReturnType<typeof setupBookableBusiness>>,
+  ) => {
+    const bookable = setup ?? (await setupBookableBusiness());
+    const customer = await createCustomer(tag);
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(bookable.business._id, bookable.owner._id, customer._id);
+    const result = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(bookable.business._id),
+      finalizeInput(bookable.service._id, bookable.membership._id),
+    );
+    if (result.status !== "confirmed") throw new Error("expected confirmed");
+    expect(result.booking.financialContract?.classification).toBe("FIRST");
+    return { ...bookable, customer, booking: result.booking };
+  };
+
+  it("a confirmed >24 h refund of the FIRST deposit restores FIRST once and sends one refund-completed email", async () => {
+    const { customer, booking } = await firstBooking("first-restore");
+    const clientId = booking.customer.businessClientId;
+    expect((await relationshipOf(clientId))?.state).toBe("CONSUMED");
+
+    await lifecycleService.cancelByCustomer(String(customer._id), String(booking._id), undefined);
+
+    const relationship = await relationshipOf(clientId);
+    expect(relationship).toMatchObject({
+      state: "ELIGIBLE",
+      lastRelease: { reason: "CUSTOMER_EARLY_CANCELLATION" },
+    });
+    const operation = await paymentService.findRefundOperation(
+      `customer-cancel-refund:${String(booking._id)}`,
+    );
+    expect(operation?.finalNotificationRecordedAt).toBeInstanceOf(Date);
+    const emails = await refundCompletedEmails(String(booking._id));
+    expect(emails).toHaveLength(1);
+    expect(emails[0]?.recipient).toBe(booking.customer.contact.normalizedEmail);
+    expect(
+      (emails[0]?.payload as { financialOutcome?: { refundFormatted?: string } } | undefined)
+        ?.financialOutcome?.refundFormatted,
+    ).toBe(`€${(booking.financials.depositCents / 100).toFixed(2)}`);
+
+    // The send-time gate approves it against the confirmed refund, ledger and marker.
+    const [email] = emails;
+    if (!email || !operation) throw new Error("expected the refund email and operation");
+    expect(await new BookingEmailDeliveryEligibility().check(email, new Date())).toBe(true);
+
+    // A repeated webhook / recovery pass changes nothing and sends nothing new.
+    expect(await ensureBusinessRefundNotification(operation._id)).toBe("ALREADY_RECORDED");
+    expect(await refundCompletedEmails(String(booking._id))).toHaveLength(1);
+    expect((await relationshipOf(clientId))?.revision).toBe(relationship?.revision);
+  });
+
+  it("a pending refund neither restores FIRST nor emails; recovery does both exactly once after confirmation", async () => {
+    const { customer, booking } = await firstBooking("first-pending");
+    const clientId = booking.customer.businessClientId;
+    paymentGateway.queueNextRefundOutcome("pending");
+    await lifecycleService.cancelByCustomer(String(customer._id), String(booking._id), undefined);
+    expect((await relationshipOf(clientId))?.state).toBe("CONSUMED");
+    expect(await refundCompletedEmails(String(booking._id))).toHaveLength(0);
+
+    const operation = await paymentService.findRefundOperation(
+      `customer-cancel-refund:${String(booking._id)}`,
+    );
+    if (!operation?.providerRefundId) throw new Error("expected a provider refund");
+    paymentGateway.succeedRefund(operation.providerRefundId);
+    const recovery = new MoneyRecoveryService(
+      paymentService,
+      new PaymentAttemptRepository(),
+      new RefundOperationRepository(),
+      bookingRepository,
+      financialTransactionService,
+      { recoverDue: async () => ({ processed: 0, failed: 0 }) } as unknown as StripeWebhookService,
+    );
+    for (let pass = 0; pass < 3; pass += 1) {
+      await RefundOperationModel.updateOne(
+        { _id: operation._id },
+        { $unset: { nextRecoveryAt: 1 } },
+      ).exec();
+      await recovery.runOnce();
+    }
+    expect((await relationshipOf(clientId))?.state).toBe("ELIGIBLE");
+    expect(await refundCompletedEmails(String(booking._id))).toHaveLength(1);
+  });
+
+  it("another qualifying Booking with the same Business keeps the relationship CONSUMED", async () => {
+    const first = await firstBooking("first-other-booking");
+    const returning = await creationService.finalizeCustomerBooking(
+      String(first.customer._id),
+      String(first.business._id),
+      finalizeInput(first.service._id, first.membership._id, "14:00"),
+    );
+    if (returning.status !== "confirmed") throw new Error("expected confirmed");
+    expect(returning.booking.financialContract?.classification).toBe("RETURNING");
+
+    await lifecycleService.cancelByCustomer(
+      String(first.customer._id),
+      String(first.booking._id),
+      undefined,
+    );
+    expect((await relationshipOf(first.booking.customer.businessClientId))?.state).toBe("CONSUMED");
+    // The refund itself is still owed and confirmed; only FIRST eligibility is withheld.
+    expect(await refundCompletedEmails(String(first.booking._id))).toHaveLength(1);
+  });
+
+  it("another unvoided Package with the same Business keeps the relationship CONSUMED", async () => {
+    const first = await firstBooking("first-other-package");
+    // Synthetic qualifying package record for this relationship (only its owner and void state are read).
+    await PackageProgressModel.collection.insertOne({
+      businessId: first.business._id,
+      businessClientId: first.booking.customer.businessClientId,
+      customerUserId: first.customer._id,
+    });
+    await lifecycleService.cancelByCustomer(
+      String(first.customer._id),
+      String(first.booking._id),
+      undefined,
+    );
+    expect((await relationshipOf(first.booking.customer.businessClientId))?.state).toBe("CONSUMED");
+  });
+
+  it("history with Business B never decides FIRST restoration for Business A", async () => {
+    const atA = await firstBooking("first-two-businesses");
+    const businessB = await setupBookableBusiness();
+    await linkCustomerToBusiness(businessB.business._id, businessB.owner._id, atA.customer._id);
+    const atB = await creationService.finalizeCustomerBooking(
+      String(atA.customer._id),
+      String(businessB.business._id),
+      finalizeInput(businessB.service._id, businessB.membership._id),
+    );
+    if (atB.status !== "confirmed") throw new Error("expected confirmed");
+    expect(atB.booking.financialContract?.classification).toBe("FIRST");
+
+    await lifecycleService.cancelByCustomer(
+      String(atA.customer._id),
+      String(atA.booking._id),
+      undefined,
+    );
+    expect((await relationshipOf(atA.booking.customer.businessClientId))?.state).toBe("ELIGIBLE");
+    expect((await relationshipOf(atB.booking.customer.businessClientId))?.state).toBe("CONSUMED");
+  });
+
+  it("a Booking created under the earlier five-window terms keeps them: 30 hours ahead is still a 24-72 h fee", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(10_000);
+    const customer = await createCustomer("legacy-terms");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    const finalizeResult = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id),
+    );
+    if (finalizeResult.status !== "confirmed") throw new Error("expected confirmed");
+    // Recreate a pre-existing Booking's stored contract: no terms version, five-window snapshot.
+    await BookingModel.updateOne(
+      { _id: finalizeResult.booking._id },
+      {
+        $unset: { cancellationTermsVersion: 1 },
+        $set: {
+          cancellationPolicySnapshot: {
+            tiers: [
+              { tier: "MORE_THAN_72_HOURS", mode: "FREE" },
+              { tier: "BETWEEN_24_AND_72_HOURS", mode: "PERCENTAGE", percentage: 50 },
+              { tier: "BETWEEN_12_AND_24_HOURS", mode: "PERCENTAGE", percentage: 60 },
+              { tier: "BETWEEN_2_AND_12_HOURS", mode: "PERCENTAGE", percentage: 80 },
+              { tier: "UNDER_2_HOURS", mode: "PERCENTAGE", percentage: 100 },
+            ],
+            noShowPercentage: 100,
+          },
+        },
+      },
+    ).exec();
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(finalizeResult.booking.schedule.startAt.getTime() - 30 * 3_600_000));
+    let cancelled: Awaited<ReturnType<typeof lifecycleService.cancelByCustomer>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(finalizeResult.booking._id),
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(cancelled.status).toBe("LATE_CANCELLATION");
+    expect(cancelled.cancellationOutcome).toMatchObject({
+      tier: "BETWEEN_24_AND_72_HOURS",
+      feePercentage: 50,
+      refundOwedCents: 0,
+    });
+    const bookingId = String(finalizeResult.booking._id);
+    expect(
+      await paymentService.findRefundOperation(`customer-cancel-refund:${bookingId}`),
+    ).toBeNull();
   });
 
   // --- Business cancellation refund -------------------------------------------------------------

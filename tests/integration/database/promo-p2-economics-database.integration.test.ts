@@ -273,6 +273,11 @@ describe("P2.1 — business-funded booking-price promos + Financial Contract V3"
       category: "Wellness & Beauty",
       subcategories: ["Massage"],
     } as Parameters<typeof businessRepository.create>[0]);
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
+    });
     const staffUser = await userRepository.create({
       normalizedEmail: `staff-${new Types.ObjectId().toString()}@example.com`,
       passwordHash: "hash",

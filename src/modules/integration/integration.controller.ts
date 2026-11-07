@@ -16,7 +16,7 @@ import type { IntegrationService } from "./integration.service.js";
 function frontendSettingsUrl(status: "connected" | "error"): string {
   const origin = env.CORS_ORIGINS[0] ?? "http://localhost:3000";
 
-  return `${origin}/business-dashboard?settingsTab=Integration&googleCalendar=${status}`;
+  return `${origin}/business-dashboard?section=settings&settingsTab=Integration&googleCalendar=${status}`;
 }
 
 export class IntegrationController {

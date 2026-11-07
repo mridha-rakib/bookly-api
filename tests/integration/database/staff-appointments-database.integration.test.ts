@@ -372,7 +372,7 @@ describe("P4C-1 Staff read-only appointments", () => {
       ...doc.serviceLines[0]!,
       serviceSnapshot: { name: "Colour", pricingMode: "FIXED", durationMin: 60 },
       responsibleStaffMembershipId: colleague.membership._id,
-      staffSnapshot: { firstName: "Other", lastName: "Pro" },
+      staffSnapshot: { firstName: "ColleaguePrivateName", lastName: "Pro" },
     };
     doc.serviceLines[0]!.responsibleStaffMembershipId = me.membership._id;
     doc.serviceLines.push(second as never);
@@ -383,7 +383,7 @@ describe("P4C-1 Staff read-only appointments", () => {
     ]);
     expect(item.sharedWithOtherProfessionals).toBe(true);
     expect(JSON.stringify(item)).not.toContain("Colour");
-    expect(JSON.stringify(item)).not.toContain("Other");
+    expect(JSON.stringify(item)).not.toContain("ColleaguePrivateName");
   });
 
   it("deactivation, removal and reassignment take effect on the next request", async () => {

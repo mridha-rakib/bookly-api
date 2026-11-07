@@ -470,8 +470,12 @@ export class BookingFinancialTransactionRepository {
   public async listRecentForBusiness(
     businessId: Types.ObjectId | string,
     limit: number,
+    period?: { from: Date; to: Date },
   ): Promise<BookingFinancialTransactionDocument[]> {
-    return BookingFinancialTransactionModel.find({ businessId })
+    return BookingFinancialTransactionModel.find({
+      businessId,
+      ...(period ? { createdAt: { $gte: period.from, $lt: period.to } } : {}),
+    })
       .sort({ createdAt: -1 })
       .limit(limit)
       .exec();

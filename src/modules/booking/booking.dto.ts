@@ -41,6 +41,7 @@ export type BookingServiceLineDto = {
   packageProgressId?: string | undefined;
   packageItemId?: string | undefined;
   packageRole?: "PURCHASE" | "REDEMPTION" | undefined;
+  packageName?: string | undefined;
 };
 
 export type BookingDetailDto = {
@@ -359,6 +360,7 @@ const toServiceLineDto = (
     ? String(line.pricingInput.packageItemId)
     : undefined,
   packageRole: line.packageContext?.role,
+  packageName: line.packageContext?.packageName,
 });
 
 /** Deduped, presence-ordered display names across a Booking's service lines — a list/calendar

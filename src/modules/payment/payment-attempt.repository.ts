@@ -133,8 +133,15 @@ export class PaymentAttemptRepository {
     const allowedPrevious: Record<PaymentAttemptProviderStatus, PaymentAttemptProviderStatus[]> = {
       NOT_CREATED: ["NOT_CREATED"],
       CREATED: ["NOT_CREATED", "CREATED", "UNKNOWN"],
-      REQUIRES_ACTION: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN"],
-      PROCESSING: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN"],
+      REQUIRES_ACTION: [
+        "NOT_CREATED",
+        "CREATED",
+        "REQUIRES_ACTION",
+        "PROCESSING",
+        "UNKNOWN",
+        "FAILED",
+      ],
+      PROCESSING: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN", "FAILED"],
       SUCCEEDED: [
         "NOT_CREATED",
         "CREATED",
@@ -165,6 +172,12 @@ export class PaymentAttemptRepository {
       ...(input.providerStatus === "UNKNOWN" ? { reconciliationNeededAt: new Date() } : {}),
     };
     const options = { returnDocument: "after" as const, runValidators: true };
+    const correlation = {
+      $or: [
+        { providerPaymentIntentId: { $exists: false } },
+        { providerPaymentIntentId: input.providerPaymentIntentId },
+      ],
+    };
     // The FIRST transition into SUCCEEDED stamps `providerSucceededAt` in the same atomic write;
     // a duplicate SUCCEEDED can only match the SUCCEEDED-only filter below, which never touches
     // it (SUCCEEDED and CANCELED are terminal, so nothing can slip between the two filters).
@@ -173,6 +186,7 @@ export class PaymentAttemptRepository {
         ? ((await PaymentAttemptModel.findOneAndUpdate(
             {
               _id: id,
+              ...correlation,
               providerStatus: {
                 $in: allowedPrevious.SUCCEEDED.filter((status) => status !== "SUCCEEDED"),
               },
@@ -181,12 +195,16 @@ export class PaymentAttemptRepository {
             options,
           ).exec()) ??
           (await PaymentAttemptModel.findOneAndUpdate(
-            { _id: id, providerStatus: "SUCCEEDED" },
+            { _id: id, ...correlation, providerStatus: "SUCCEEDED" },
             { $set: fields },
             options,
           ).exec()))
         : await PaymentAttemptModel.findOneAndUpdate(
-            { _id: id, providerStatus: { $in: allowedPrevious[input.providerStatus] } },
+            {
+              _id: id,
+              ...correlation,
+              providerStatus: { $in: allowedPrevious[input.providerStatus] },
+            },
             { $set: fields },
             options,
           ).exec();
@@ -445,6 +463,8 @@ export class PaymentAttemptRepository {
             { providerStatus: "NOT_CREATED", createdAt: { $lte: staleUnsentCutoff } },
             { providerStatus: "UNKNOWN" },
             { providerStatus: "PROCESSING" },
+            // Off-session penalty authentication failures have their own convergence pass.
+            { providerStatus: "REQUIRES_ACTION", purpose: { $nin: PENALTY_PURPOSES } },
             {
               providerStatus: "SUCCEEDED",
               persistenceStatus: { $in: ["NOT_STARTED", "PERSISTING", "FAILED"] },
@@ -564,7 +584,7 @@ export class PaymentAttemptRepository {
   /**
    * P5 — penalty attempts whose provider outcome is a definitive failure but whose obligation has
    * not been converged yet (a crash between recording the provider result and settling the
-   * ledger). `listRecoverable` deliberately never scans FAILED/CANCELED/REQUIRES_ACTION.
+   * ledger). `listRecoverable` does not scan definitive FAILED/CANCELED outcomes.
    */
   public async listPenaltyFailureConvergencePending(
     limit: number,

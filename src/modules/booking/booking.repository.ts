@@ -27,6 +27,7 @@ export type BookingListFilter = {
   source?: BookingSource[] | undefined;
   staffMembershipId?: Types.ObjectId | string | undefined;
   businessClientId?: Types.ObjectId | string | undefined;
+  reference?: string | undefined;
   fromDate?: Date | undefined;
   toDate?: Date | undefined;
 };
@@ -281,6 +282,55 @@ export class BookingRepository {
       status: { $in: ["NO_SHOW_CHARGED", "NO_SHOW_WAIVED"] },
       "schedule.startAt": { $gte: from, $lt: to },
     }).exec();
+  }
+
+  public async getOverviewRangeTotals(
+    businessId: Types.ObjectId,
+    from: Date,
+    to: Date,
+    now: Date,
+    staffMembershipId?: Types.ObjectId,
+  ) {
+    const [row] = await BookingModel.aggregate<{
+      count: number;
+      remaining: number;
+      balanceDueCents: number;
+    }>([
+      {
+        $match: {
+          businessId,
+          "schedule.startAt": { $gte: from, $lt: to },
+          ...(staffMembershipId
+            ? { "serviceLines.responsibleStaffMembershipId": staffMembershipId }
+            : {}),
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          remaining: {
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ["$status", "UPCOMING"] }, { $gte: ["$schedule.startAt", now] }] },
+                1,
+                0,
+              ],
+            },
+          },
+          balanceDueCents: {
+            $sum: {
+              $cond: [
+                { $in: ["$status", ["UPCOMING", "PENDING"]] },
+                "$financials.balanceDueCents",
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]).exec();
+    return row ?? { count: 0, remaining: 0, balanceDueCents: 0 };
   }
 
   /** A Customer's own Booking detail read — deliberately scoped by BOTH `_id` and
@@ -1059,6 +1109,9 @@ export class BookingRepository {
     if (input.businessClientId) {
       query["customer.businessClientId"] = input.businessClientId;
     }
+    if (input.reference) {
+      query["reference"] = new RegExp(input.reference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    }
     if (input.fromDate || input.toDate) {
       query["schedule.startAt"] = {
         ...(input.fromDate ? { $gte: input.fromDate } : {}),
@@ -1078,7 +1131,7 @@ export class BookingRepository {
 
     const [bookings, total] = await Promise.all([
       BookingModel.find(query, { eventHistory: 0, rescheduleHistory: 0 })
-        .sort({ "schedule.startAt": sortDirection })
+        .sort({ "schedule.startAt": sortDirection, _id: sortDirection })
         .skip(skip)
         .limit(pagination.limit)
         .exec(),

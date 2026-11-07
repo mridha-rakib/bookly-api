@@ -98,6 +98,59 @@ async function app() {
   return server;
 }
 describe("P2D strict HTTP adapter behind synthetic authority", () => {
+  it.each([
+    { settlement: "PARTIAL" },
+    { settlement: "FULL", amountCents: 100 },
+    { settlement: "NOT_PAID", amountCents: 100 },
+    { settlement: "PARTIAL", amountCents: 0 },
+    { settlement: "PARTIAL", amountCents: 1.5 },
+  ])("rejects malformed venue attestation before any package lookup: %j", async (venuePayment) => {
+    const server = await app();
+    role = "BUSINESS_OWNER";
+    await request(server)
+      .post("/actions/settlement")
+      .send({ ...base, bookingId: String(booking), venuePayment })
+      .expect(400);
+    expect(PackageProgressV2Model.findOne).not.toHaveBeenCalled();
+    expect(businessCall).not.toHaveBeenCalled();
+  });
+  it("passes an exact positive partial amount and original operation key to the existing management service", async () => {
+    const server = await app();
+    role = "SUPERVISOR";
+    await request(server)
+      .post("/actions/settlement")
+      .send({
+        ...base,
+        bookingId: String(booking),
+        venuePayment: { settlement: "PARTIAL", amountCents: 1234 },
+      })
+      .expect(200);
+    expect(businessCall).toHaveBeenCalledWith(
+      actor,
+      "SUPERVISOR",
+      actor,
+      expect.objectContaining({
+        key: base.key,
+        action: "VENUE_SETTLEMENT",
+        venuePayment: { settlement: "PARTIAL", amountCents: 1234 },
+      }),
+    );
+  });
+  it.each(["complete", "complete-status", "settlement", "settlement-status"] as const)(
+    "%s shares the venue input contract",
+    (action) => {
+      const input = {
+        ...base,
+        bookingId: String(booking),
+        venuePayment: { settlement: "PARTIAL" },
+      };
+      expect(lifecycleHttpSchemas[action].safeParse(input).success).toBe(false);
+      expect(
+        lifecycleHttpSchemas[action].safeParse({ ...input, venuePayment: { settlement: "FULL" } })
+          .success,
+      ).toBe(true);
+    },
+  );
   it.each(["redeem", "reschedule", "cancel", "expire"])(
     "Customer %s maps to existing service without caller identity",
     async (action) => {

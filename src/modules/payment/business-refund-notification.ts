@@ -2,6 +2,11 @@ import mongoose, { type Types } from "mongoose";
 import { BookingModel } from "../booking/booking.model.js";
 import { BookingFinancialTransactionModel } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import { BusinessModel } from "../business/business.model.js";
+import {
+  CUSTOMER_EARLY_CANCELLATION,
+  restoreFirstAfterCustomerCancellation,
+} from "../client/customer-refund-first-restoration.js";
+import { buildCancellationEmailData } from "../email/templates/booking/cancellation-email-data.js";
 import { EmailOutboxModel } from "../email-outbox/email-outbox.model.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import {
@@ -21,9 +26,37 @@ import { RefundOperationModel } from "./refund-operation.model.js";
  * Any crash before that transaction leaves the operation discoverable for money recovery.
  * No provider call, historical promotion, email delivery, or new queue occurs here.
  */
+/** Opt-in refund causes with an exact-event final notification. */
+const NOTIFIED_REASONS = ["BUSINESS_CANCELLATION", CUSTOMER_EARLY_CANCELLATION] as const;
+const logicalKeyFor = (reason: string, bookingId: Types.ObjectId | string) =>
+  reason === CUSTOMER_EARLY_CANCELLATION
+    ? `customer-cancel-refund:${String(bookingId)}`
+    : `business-cancel-refund:${String(bookingId)}`;
+
+/**
+ * Also covers the approved v2 customer refund (more than 24 h ahead). For that cause:
+ *  - FIRST eligibility is evaluated first, from the same confirmed facts; while that cannot be
+ *    decided the marker is not written, so money recovery retries this exact step;
+ *  - a SUCCEEDED refund enqueues one BOOKING_REFUND_COMPLETED_CUSTOMER email (customer only);
+ *  - a FAILED refund records the marker without any email (no success is ever claimed).
+ */
 export async function ensureBusinessRefundNotification(
   operationId: Types.ObjectId | string,
 ): Promise<"NOT_APPLICABLE" | "ALREADY_RECORDED" | "RECORDED" | "NOT_READY"> {
+  const preflight = await RefundOperationModel.findById(operationId).exec();
+  if (
+    preflight?.reason === CUSTOMER_EARLY_CANCELLATION &&
+    preflight.finalNotificationProtocolVersion === 1 &&
+    !preflight.finalNotificationRecordedAt &&
+    preflight.providerStatus === "SUCCEEDED" &&
+    preflight.bookingId
+  ) {
+    const restoration = await restoreFirstAfterCustomerCancellation({
+      bookingId: preflight.bookingId,
+      refundOperationId: preflight._id,
+    });
+    if (restoration === "NOT_READY") return "NOT_READY";
+  }
   const session = await mongoose.startSession();
   let result: "NOT_APPLICABLE" | "ALREADY_RECORDED" | "RECORDED" | "NOT_READY" = "NOT_READY";
   try {
@@ -33,12 +66,13 @@ export async function ensureBusinessRefundNotification(
         if (
           !operation ||
           operation.finalNotificationProtocolVersion !== 1 ||
-          operation.reason !== "BUSINESS_CANCELLATION" ||
+          !(NOTIFIED_REASONS as readonly string[]).includes(operation.reason) ||
           operation.packageProgressId
         ) {
           result = "NOT_APPLICABLE";
           return;
         }
+        const customerRefund = operation.reason === CUSTOMER_EARLY_CANCELLATION;
         if (operation.finalNotificationRecordedAt) {
           result = "ALREADY_RECORDED";
           return;
@@ -50,7 +84,7 @@ export async function ensureBusinessRefundNotification(
           !operation.businessClientId ||
           !operation.sourceFinancialTransactionId ||
           operation.logicalIdempotencyKey !==
-            `business-cancel-refund:${String(operation.bookingId)}` ||
+            logicalKeyFor(operation.reason, operation.bookingId) ||
           !operation.providerRefundId ||
           (operation.providerStatus !== "SUCCEEDED" && operation.providerStatus !== "FAILED")
         ) {
@@ -62,7 +96,7 @@ export async function ensureBusinessRefundNotification(
           businessId: operation.businessId,
           "customer.customerUserId": operation.customerUserId,
           "customer.businessClientId": operation.businessClientId,
-          status: "CANCELLED_BY_BUSINESS",
+          status: customerRefund ? "CANCELLED_BY_CUSTOMER" : "CANCELLED_BY_BUSINESS",
           "cancellationOutcome.settlementStatus": operation.providerStatus,
           "cancellationOutcome.settlementProviderReference": operation.providerRefundId,
           "cancellationOutcome.refundOwedCents": operation.expectedRefundAmountCents,
@@ -148,6 +182,53 @@ export async function ensureBusinessRefundNotification(
           }
         }
         const status = operation.providerStatus as "SUCCEEDED" | "FAILED";
+        if (customerRefund) {
+          // One logical email per confirmed refund: the outbox dedupes on event + template +
+          // recipient, and the marker below is written in the same transaction.
+          if (status === "SUCCEEDED") {
+            const recipient = normalizeEmailRecipient(booking.customer.contact.normalizedEmail);
+            const eventKey = `CUSTOMER_REFUND:${String(booking._id)}:${String(operation._id)}:SUCCEEDED`;
+            await new EmailOutboxService().enqueue(
+              {
+                eventKey,
+                templateKey: "BOOKING_REFUND_COMPLETED_CUSTOMER",
+                recipient,
+                payload: buildCancellationEmailData(booking, {
+                  businessName: business.name,
+                  cancelledBy: "CUSTOMER",
+                  refundOverride: {
+                    succeeded: true,
+                    amountCents: operation.expectedRefundAmountCents,
+                    status: "SUCCEEDED",
+                  },
+                }) as unknown as Record<string, unknown>,
+              },
+              session,
+            );
+            const dedupeKey = buildEmailDedupeKey(
+              eventKey,
+              "BOOKING_REFUND_COMPLETED_CUSTOMER",
+              recipient,
+            );
+            if (!(await EmailOutboxModel.exists({ dedupeKey }).session(session)))
+              throw new Error("Refund completed outbox intent was not established");
+          }
+          const marked = await RefundOperationModel.updateOne(
+            {
+              _id: operation._id,
+              finalNotificationProtocolVersion: 1,
+              finalNotificationRecordedAt: { $exists: false },
+              providerStatus: status,
+              providerRefundId: operation.providerRefundId,
+            },
+            { $set: { finalNotificationRecordedAt: new Date() } },
+            { session },
+          ).exec();
+          if (marked.modifiedCount !== 1)
+            throw new Error("Refund notification marker lost exact CAS");
+          result = "RECORDED";
+          return;
+        }
         const eventKey = `BUSINESS_REFUND:${String(booking._id)}:${String(operation._id)}:${status}`;
         // The notifier propagates transactional enqueue failure, so the marker cannot commit
         // without the exact outbox row. Provider delivery happens later in the existing worker.
@@ -214,14 +295,14 @@ export async function convergeBusinessRefundSettlementProjection(
     !operation ||
     operation.finalNotificationProtocolVersion !== 1 ||
     operation.finalNotificationRecordedAt ||
-    operation.reason !== "BUSINESS_CANCELLATION" ||
+    !(NOTIFIED_REASONS as readonly string[]).includes(operation.reason) ||
     operation.packageProgressId ||
     !operation.bookingId ||
     !operation.businessId ||
     !operation.customerUserId ||
     !operation.businessClientId ||
     !operation.providerRefundId ||
-    operation.logicalIdempotencyKey !== `business-cancel-refund:${String(operation.bookingId)}`
+    operation.logicalIdempotencyKey !== logicalKeyFor(operation.reason, operation.bookingId)
   )
     return false;
   const status = operation.providerStatus;
@@ -233,7 +314,10 @@ export async function convergeBusinessRefundSettlementProjection(
       businessId: operation.businessId,
       "customer.customerUserId": operation.customerUserId,
       "customer.businessClientId": operation.businessClientId,
-      status: "CANCELLED_BY_BUSINESS",
+      status:
+        operation.reason === CUSTOMER_EARLY_CANCELLATION
+          ? "CANCELLED_BY_CUSTOMER"
+          : "CANCELLED_BY_BUSINESS",
       "cancellationOutcome.settlementStatus": "PENDING",
       "cancellationOutcome.refundOwedCents": operation.expectedRefundAmountCents,
       $or: [

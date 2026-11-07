@@ -57,6 +57,7 @@ const confirmations = new Set([
 const reschedules = new Set(["BOOKING_RESCHEDULED_CUSTOMER", "STAFF_BOOKING_SCHEDULE_CHANGED"]);
 const terminalNotices = new Set([
   "BOOKING_CANCELLED_CUSTOMER",
+  "BOOKING_REFUND_COMPLETED_CUSTOMER",
   "BOOKING_CANCELLED_OWNER",
   "STAFF_BOOKING_CANCELLED",
   "BOOKING_COMPLETED",
@@ -125,15 +126,21 @@ export class BookingEmailDeliveryEligibility {
         (await bookingDeliveryPurchaseVerified(booking))
       );
     }
-    if (record.eventKey.startsWith("BUSINESS_REFUND:")) {
+    const customerRefund = record.eventKey.startsWith("CUSTOMER_REFUND:");
+    if (record.eventKey.startsWith("BUSINESS_REFUND:") || customerRefund) {
+      // A confirmed customer refund has exactly one customer notice and never a FAILED one.
       if (
-        record.templateKey !== "BOOKING_CANCELLED_CUSTOMER" &&
-        record.templateKey !== "BOOKING_CANCELLED_OWNER"
+        customerRefund
+          ? record.templateKey !== "BOOKING_REFUND_COMPLETED_CUSTOMER"
+          : record.templateKey !== "BOOKING_CANCELLED_CUSTOMER" &&
+            record.templateKey !== "BOOKING_CANCELLED_OWNER"
       )
         return false;
-      const match = /^BUSINESS_REFUND:([a-f\d]{24}):([a-f\d]{24}):(SUCCEEDED|FAILED)$/.exec(
-        record.eventKey,
-      );
+      const match = (
+        customerRefund
+          ? /^CUSTOMER_REFUND:([a-f\d]{24}):([a-f\d]{24}):(SUCCEEDED)$/
+          : /^BUSINESS_REFUND:([a-f\d]{24}):([a-f\d]{24}):(SUCCEEDED|FAILED)$/
+      ).exec(record.eventKey);
       if (!match?.[1] || !match[2] || !match[3]) return false;
       const refundStatus = match[3];
       if (refundStatus !== "SUCCEEDED" && refundStatus !== "FAILED") return false;
@@ -150,9 +157,11 @@ export class BookingEmailDeliveryEligibility {
         | undefined;
       if (
         !refund ||
-        refund.reason !== "BUSINESS_CANCELLATION" ||
+        refund.reason !==
+          (customerRefund ? "CUSTOMER_EARLY_CANCELLATION" : "BUSINESS_CANCELLATION") ||
         refund.packageProgressId ||
-        refund.logicalIdempotencyKey !== `business-cancel-refund:${String(bookingId)}` ||
+        refund.logicalIdempotencyKey !==
+          `${customerRefund ? "customer-cancel-refund" : "business-cancel-refund"}:${String(bookingId)}` ||
         !refund.providerRefundId ||
         refund.finalNotificationProtocolVersion !== 1 ||
         !refund.finalNotificationRecordedAt ||
@@ -261,6 +270,7 @@ export class BookingEmailDeliveryEligibility {
       )
         return false;
     }
+    if (customerRefund && booking.status !== "CANCELLED_BY_CUSTOMER") return false;
     if (
       record.eventKey.startsWith("BOOKING_CANCELLED:") ||
       record.eventKey.startsWith("BUSINESS_REFUND:")
@@ -281,6 +291,7 @@ export class BookingEmailDeliveryEligibility {
     if (
       [
         "BOOKING_CANCELLED_CUSTOMER",
+        "BOOKING_REFUND_COMPLETED_CUSTOMER",
         "BOOKING_RESCHEDULED_CUSTOMER",
         "BOOKING_CUSTOMER_CONFIRMED",
         "BOOKING_COMPLETED",

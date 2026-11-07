@@ -36,6 +36,7 @@ import {
 import type { RegistrationSessionRepository } from "../registration-session/registration-session.repository.js";
 import type { ReviewRepository } from "../review/review.repository.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
+import type { StaffAvatarService } from "../staff-avatar/staff-avatar.service.js";
 import type { UserRepository } from "../user/user.repository.js";
 import {
   type AuthProvider,
@@ -129,6 +130,7 @@ export class AuthService {
     // `getMe` then returns `linkedAccounts: []` while the deletion cleanup step is a no-op.
     private readonly linkedAccountService?: LinkedAccountService,
     private readonly linkedAccountRepository?: LinkedAccountRepository,
+    private readonly staffAvatarService?: Pick<StaffAvatarService, "getAvatarUrlsByUserIds">,
   ) {}
 
   public async customerEntry(input: EntryBody) {
@@ -737,11 +739,15 @@ export class AuthService {
       user.role === "CUSTOMER"
         ? await this.userRepository.findCustomerProfileByUserId(user._id)
         : null;
-    // Ready-to-render URL for the Customer's uploaded avatar (undefined when none / when the
-    // avatar service is not wired). Storage stays the source of truth; nothing is cached here.
+    // Read only the authenticated identity's photo. Professional photos remain managed by
+    // the Business Owner through the existing StaffAvatar service; no upload permission changes.
     const avatarUrl = customerProfile
       ? await this.customerAvatarService?.resolveAvatarUrl(customerProfile)
-      : undefined;
+      : professionalRoles.includes(user.role)
+        ? (await this.staffAvatarService?.getAvatarUrlsByUserIds([String(user._id)]))?.get(
+            String(user._id),
+          )
+        : undefined;
 
     // Google account links are held by CUSTOMER (Phase 1), BUSINESS_OWNER (Phase 2C) and
     // SUPERVISOR / STAFF (Phase 2D — a staff member who accepted their invitation with Google,
@@ -1497,7 +1503,13 @@ export class AuthService {
 
     if (role === "SUPERVISOR" || role === "STAFF") {
       const membership = await this.staffRepository.findActiveByUserId(userId);
-      if (!membership) {
+      if (
+        !membership ||
+        membership.role !== role ||
+        membership.employmentActive !== true ||
+        membership.removedAt != null ||
+        !membership.userId.equals(userId)
+      ) {
         return null;
       }
       return this.businessRepository.findById(membership.businessId);
@@ -1531,7 +1543,10 @@ export class AuthService {
             lastName: session.personalProfile.lastName,
           }
         : {}),
-      ...(session.phone
+      // `phone` is a Mongoose nested path, so it is a truthy `{}` before the profile step. Only
+      // expose it once both parts exist; an empty object made the signup form overwrite its
+      // "+357" default with undefined and reject every valid number.
+      ...(session.phone?.countryCode && session.phone.nationalNumber
         ? {
             phone: {
               countryCode: session.phone.countryCode,

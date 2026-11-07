@@ -332,6 +332,7 @@ describe("StaffBookingNotifier", () => {
         templateKey: "STAFF_BOOKING_CANCELLED",
         recipient: "sam@example.com",
       }),
+      undefined,
     );
     expect(membershipId).toBeTruthy();
   });
@@ -398,6 +399,7 @@ describe("StaffBookingNotifier", () => {
         templateKey: "STAFF_BOOKING_SCHEDULE_CHANGED",
         recipient: "sam@example.com",
       }),
+      undefined,
     );
   });
 

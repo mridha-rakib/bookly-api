@@ -75,6 +75,7 @@ describe("P3B actual consent certification and genuine atomic completion", () =>
   beforeAll(connectIsolatedDatabase, 120000);
   beforeEach(async () => {
     await clearIsolatedDatabase();
+    vi.clearAllMocks();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(INTERNAL_TIME);
     vi.mocked(observeConsentHost).mockImplementation(async (witness) =>

@@ -34,10 +34,7 @@ export class SuperAdminSupportController {
   public listMessages = async (request: Request, response: Response): Promise<void> => {
     const params = request.validated?.params as SupportTicketIdParams;
     const query = request.validated?.query as ListSupportMessagesQuery;
-    const result = await this.service.listMessages(params.ticketId, {
-      page: query.page,
-      limit: query.limit,
-    });
+    const result = await this.service.listMessages(params.ticketId, query);
     sendSuccess(response, 200, "Support ticket conversation", result);
   };
 

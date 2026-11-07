@@ -4,6 +4,7 @@ import type { AddonServiceAssignmentRepository } from "../addons/addon-service-a
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { normalizeBusinessVisitType } from "../business/business.types.js";
+import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import {
   type CatalogAddonDto,
   type CatalogServiceDto,
@@ -76,6 +77,25 @@ export class BookingService {
       "findManyByIdsForCustomerAndBusiness"
     >,
   ) {}
+
+  /** Calendar presentation context shares the exact Owner/Supervisor authorization used
+   * for calendar Bookings. It grants no opening-hours mutation permission to Supervisors. */
+  public async getCalendarPresentation(
+    actorUserId: string,
+    actorRole: UserRole,
+    businessId: string,
+  ) {
+    const business = await this.requireBookingManagementAccess(actorUserId, actorRole, businessId);
+    const hours = await new BusinessHoursRepository().findByBusinessId(business._id);
+    return {
+      timezone: business.timezone,
+      openingHours: (hours?.days ?? []).map((day) => ({
+        dayOfWeek: day.dayOfWeek,
+        isOpen: day.isOpen,
+        slots: day.slots.map((slot) => ({ startTime: slot.startTime, endTime: slot.endTime })),
+      })),
+    };
+  }
 
   /** Read context for Business Booking Detail only. Normal Bookings perform no extra query.
    * Package ids are deduplicated and loaded in one business+customer-scoped query; origin

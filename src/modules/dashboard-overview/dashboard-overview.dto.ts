@@ -19,6 +19,7 @@ export const toDashboardOverviewDto = (overview: DashboardOverview) => ({
   scope: overview.scope,
   currency: overview.currency,
   todayDateStr: overview.todayDateStr,
+  period: overview.period,
   todayBookingsCount: overview.todayBookingsCount,
   todayRemainingCount: overview.todayRemainingCount,
   schedule: overview.schedule,

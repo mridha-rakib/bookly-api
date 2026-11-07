@@ -449,6 +449,14 @@ export const env = createEnv({
     STRIPE_SECRET_KEY: optionalProductionRequiredString("STRIPE_SECRET_KEY"),
     STRIPE_PUBLISHABLE_KEY: optionalProductionRequiredString("STRIPE_PUBLISHABLE_KEY"),
     STRIPE_WEBHOOK_SECRET: optionalProductionRequiredString("STRIPE_WEBHOOK_SECRET"),
+    // P0.6 — Super Admin withdrawals with a LIVE key stay disabled unless explicitly enabled.
+    CENTRAL_PAYOUTS_LIVE_ENABLED: booleanString,
+    // Unset disables 3DS cancellation. Approved maximum age from payment creation,
+    // unrelated to package consent expiry or browser sessions.
+    PAYMENT_AUTHENTICATION_MAX_AGE_MS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    ),
     NO_SHOW_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
     NO_SHOW_WORKER_BATCH_SIZE: z.coerce.number().int().positive().default(50),
     // Canonical public URL of the Bookly customer/business web app. Frontend and backend are

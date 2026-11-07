@@ -1,5 +1,6 @@
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import { BusinessRepository } from "../business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import { EmailOutboxService } from "../email-outbox/email-outbox.service.js";
 import { NoShowNotifier } from "../notification/no-show.notifier.js";
 import { PenaltySettlementNotifier } from "../notification/penalty-settlement.notifier.js";
@@ -25,6 +26,7 @@ export const createPenaltyCollectionService = (deps: {
     financialTransactionService: deps.financialTransactionService,
     bookingRepository: deps.bookingRepository ?? new BookingRepository(),
     businessRepository: deps.businessRepository ?? new BusinessRepository(),
+    businessTaxSettings: new BusinessBookingSettingsRepository(),
     settlementNotifier: new PenaltySettlementNotifier(
       new EmailOutboxService(),
       deps.userRepository ?? new UserRepository(),

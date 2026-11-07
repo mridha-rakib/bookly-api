@@ -37,6 +37,12 @@ export type FinancialContractProductKind = (typeof financialContractProductKinds
 export const relationshipClassifications = ["FIRST", "RETURNING"] as const;
 export type RelationshipClassification = (typeof relationshipClassifications)[number];
 
+/** Existing P3 rule for a NEW ordinary Booking/Legacy purchase. Not a redemption or a
+ * resumed historic operation; those must retain their own accepted financial contract. */
+export const newPurchaseReturningUpfrontCents = (
+  classification: RelationshipClassification,
+): 0 | undefined => (classification === "RETURNING" ? 0 : undefined);
+
 /** Which ledger type owns the upfront charge. FIRST is always Bookly's PLATFORM_FEE; RETURNING
  * keeps the pre-P3 Business-owned DEPOSIT. */
 export type UpfrontLedgerType = "PLATFORM_FEE" | "DEPOSIT";

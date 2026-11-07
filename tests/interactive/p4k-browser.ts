@@ -46,6 +46,9 @@ const stripeStub = () => `(() => {
   window.Stripe = function P4kSimulatedStripe() {
     return {
       _registerWrapper() {},
+      elements() { return { create() { return { mount() {}, on() {}, off() {}, update() {}, destroy() {}, unmount() {} }; }, getElement() { return null; } }; },
+      async createToken() { throw Error("Synthetic browser uses preseeded saved cards only"); },
+      async createPaymentMethod() { throw Error("Synthetic browser uses preseeded saved cards only"); },
       async confirmCardPayment(clientSecret) {
         const result = window.__p4k3ds || await challenge();
         if (!(await record(clientSecret, result))) return { error: { message: "P4K simulated authentication could not be recorded" } };
@@ -62,6 +65,8 @@ export type P4kPage = {
   waitFor: (expression: string, timeoutMs?: number) => Promise<void>;
   goto: (url: string) => Promise<void>;
   reload: () => Promise<void>;
+  /** BC-F06 deterministic Date only; timers and network remain real. */
+  setClock: (iso: string) => Promise<void>;
   click: (text: string, root?: string) => Promise<void>;
   select: (
     label: string,
@@ -83,7 +88,15 @@ export type P4kPage = {
   /** Lets the next request whose URL contains `fragment` reach the server, then drops its
    * response (connection reset): a real lost response after the server has processed it. */
   dropNextResponse: (fragment: string) => Promise<void>;
-  close: () => void;
+  /** Loopback response metadata plus synthetic Legacy package mutation bodies for recovery evidence. */
+  network: () => Array<{
+    url: string;
+    method: string;
+    status: number | null;
+    requestBody?: string;
+  }>;
+  browserErrors: () => unknown[];
+  close: () => Promise<void>;
 };
 
 /** In-page helpers. Exact visible text/aria-label selectors; no test ids were added to UI. */
@@ -191,6 +204,14 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
       { resolve: (v: unknown) => void; reject: (e: Error) => void }
     >();
     const errors: unknown[] = [];
+    const responses: Array<{
+      url: string;
+      method: string;
+      status: number | null;
+      requestBody?: string;
+    }> = [];
+    const requestMethods = new Map<string, { method: string; url: string; postData?: string }>();
+    const packageMutationRequests = new Map<string, number>();
     const command = (method: string, params: object = {}) =>
       new Promise<unknown>((resolve, reject) => {
         const id = ++sequence;
@@ -199,14 +220,23 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
       });
     const stub = Buffer.from(stripeStub()).toString("base64");
     let dropFragment: string | undefined;
+    const dispatch = (method: string, params: object) => {
+      void command(method, params).catch((error: unknown) => {
+        // Chrome may invalidate a paused request when navigation or tab shutdown wins the
+        // race. Record other control failures, and always consume the CDP rejection.
+        if (!String(error).includes("Invalid InterceptionId"))
+          errors.push({ cdpCommand: method, error: String(error) });
+      });
+    };
     ws.addEventListener("message", (event) => {
       const message = JSON.parse(String(event.data)) as {
         id?: number;
         method?: string;
         params?: {
           requestId: string;
-          request: { url: string };
+          request: { url: string; method: string; postData?: string };
           responseStatusCode?: number;
+          response?: { url: string; status: number };
           name?: string;
           payload?: string;
           executionContextId?: number;
@@ -222,6 +252,46 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
         return;
       }
       if (message.method === "Runtime.exceptionThrown") errors.push(message.params);
+      if (message.method === "Network.requestWillBeSent" && message.params) {
+        requestMethods.set(message.params.requestId, {
+          method: message.params.request.method,
+          url: message.params.request.url,
+          ...(message.params.request.postData ? { postData: message.params.request.postData } : {}),
+        });
+        if (
+          message.params.request.method === "POST" &&
+          message.params.request.url.startsWith("http://127.0.0.1:") &&
+          message.params.request.url.includes("/api/v1/businesses/") &&
+          message.params.request.url.includes("/bookings/packages/") &&
+          (message.params.request.url.endsWith("/sessions") ||
+            message.params.request.url.endsWith("/purchase"))
+        ) {
+          packageMutationRequests.set(message.params.requestId, responses.length);
+          responses.push({
+            url: message.params.request.url,
+            method: "POST",
+            status: null,
+            ...(message.params.request.postData
+              ? { requestBody: message.params.request.postData }
+              : {}),
+          });
+        }
+      }
+      if (message.method === "Network.responseReceived" && message.params?.response) {
+        const { url, status } = message.params.response;
+        if (url.startsWith("http://127.0.0.1:") && url.includes("/api/v1/")) {
+          const packageRequestIndex = packageMutationRequests.get(message.params.requestId);
+          if (packageRequestIndex !== undefined) responses[packageRequestIndex]!.status = status;
+          else
+            responses.push({
+              url,
+              status,
+              method: requestMethods.get(message.params.requestId)?.method ?? "UNKNOWN",
+            });
+          if (responses.length > 2000) responses.shift();
+        }
+        requestMethods.delete(message.params.requestId);
+      }
       if (message.method === "Runtime.bindingCalled" && message.params?.name === BINDING) {
         const { payload = "", executionContextId } = message.params;
         let id = "",
@@ -245,23 +315,26 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
           url = new URL(request.url);
         if (message.params.responseStatusCode !== undefined) {
           // Response stage: only armed by dropNextResponse() for one loopback API URL.
-          if (dropFragment && request.url.includes(dropFragment)) {
+          if (dropFragment && request.method === "POST" && request.url.includes(dropFragment)) {
             dropFragment = undefined;
             void command("Fetch.failRequest", { requestId, errorReason: "ConnectionReset" })
               .then(() => command("Fetch.enable", { patterns: [{ urlPattern: "*" }] }))
-              .catch(() => undefined);
-          } else void command("Fetch.continueRequest", { requestId });
+              .catch((error: unknown) => {
+                if (!String(error).includes("Invalid InterceptionId"))
+                  errors.push({ cdpCommand: "Fetch.failRequest", error: String(error) });
+              });
+          } else dispatch("Fetch.continueRequest", { requestId });
           return;
         }
-        if (url.hostname === "127.0.0.1") void command("Fetch.continueRequest", { requestId });
+        if (url.hostname === "127.0.0.1") dispatch("Fetch.continueRequest", { requestId });
         else if (url.hostname === "js.stripe.com")
-          void command("Fetch.fulfillRequest", {
+          dispatch("Fetch.fulfillRequest", {
             requestId,
             responseCode: 200,
             body: stub,
             responseHeaders: [{ name: "Content-Type", value: "application/javascript" }],
           });
-        else void command("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" });
+        else dispatch("Fetch.failRequest", { requestId, errorReason: "BlockedByClient" });
       }
     });
     await command("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
@@ -283,8 +356,8 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
       return reply.result.value as T;
     };
     const waitFor = async (expression: string, timeoutMs = 60000) => {
-      const end = Date.now() + timeoutMs;
-      while (Date.now() < end) {
+      const end = performance.now() + timeoutMs;
+      while (performance.now() < end) {
         try {
           if (await evaluate<boolean>(`Boolean(${expression})`)) return;
         } catch {
@@ -300,6 +373,16 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
     const page: P4kPage = {
       evaluate,
       waitFor,
+      setClock: async (iso) => {
+        if (!Number.isFinite(Date.parse(iso))) throw Error("Valid synthetic clock required");
+        const source = `(() => { const OriginalDate = Date; const fixed = ${JSON.stringify(iso)};
+          globalThis.Date = class extends OriginalDate {
+            constructor(...args) { super(...(args.length ? args : [fixed])); }
+            static now() { return new OriginalDate(fixed).getTime(); }
+          }; })();`;
+        await command("Page.addScriptToEvaluateOnNewDocument", { source });
+        await evaluate(source);
+      },
       goto: async (url) => {
         if (!url.startsWith("http://127.0.0.1:")) throw Error("Loopback URL required");
         await command("Page.navigate", { url });
@@ -365,7 +448,10 @@ export async function openP4kBrowser(input: P4kBrowserOptions): Promise<P4kPage>
           "(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} })()",
         );
       },
-      close: () => {
+      network: () => [...responses],
+      browserErrors: () => [...errors],
+      close: async () => {
+        await command("Fetch.disable").catch(() => undefined);
         ws.close();
         child.kill();
       },

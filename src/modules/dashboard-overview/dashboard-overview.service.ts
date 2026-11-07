@@ -18,6 +18,10 @@ import type { FinanceService } from "../finance/finance.service.js";
 import type { StaffRepository } from "../staff/staff.repository.js";
 import type { UserRole } from "../user/user.types.js";
 import { DashboardOverviewError } from "./dashboard-overview.errors.js";
+import {
+  type DashboardOverviewQuery,
+  dashboardOverviewQuerySchema,
+} from "./dashboard-overview.schema.js";
 import type {
   DashboardOverview,
   DashboardOverviewActivityEntry,
@@ -72,14 +76,21 @@ export class DashboardOverviewService {
     actorUserId: string,
     actorRole: UserRole,
     businessId: string,
+    selection?: DashboardOverviewQuery,
   ): Promise<DashboardOverview> {
     const scope = await this.resolveScope(actorUserId, actorRole, businessId);
     const business = scope.business;
     const now = new Date();
 
     const { dateStr } = utcToBusinessLocalDate(business.timezone, now);
-    const dayStart = businessLocalToUtc(business.timezone, dateStr, "00:00");
-    const dayEnd = businessLocalToUtc(business.timezone, addCalendarDays(dateStr, 1), "00:00");
+    const range = dashboardOverviewQuerySchema.parse(selection ?? {});
+    const fromDate =
+      range.range === "Custom"
+        ? (range.fromDate ?? dateStr)
+        : addCalendarDays(dateStr, range.range === "7D" ? -6 : range.range === "30D" ? -29 : 0);
+    const toDate = range.range === "Custom" ? (range.toDate ?? dateStr) : dateStr;
+    const dayStart = businessLocalToUtc(business.timezone, fromDate, "00:00");
+    const dayEnd = businessLocalToUtc(business.timezone, addCalendarDays(toDate, 1), "00:00");
 
     const staffMembershipId = scope.kind === "STAFF" ? scope.staffMembershipId : undefined;
     const todaysBookings = await this.bookingRepository.findScheduleForBusinessOnDate(
@@ -100,17 +111,37 @@ export class DashboardOverviewService {
     ).length;
 
     const financials =
-      scope.kind === "FULL" ? await this.buildFinancials(business, dateStr, todaysBookings) : null;
+      scope.kind === "FULL"
+        ? await this.buildFinancials(
+            business,
+            dateStr,
+            todaysBookings,
+            selection ? { from: dayStart, to: dayEnd } : undefined,
+          )
+        : null;
+    const totals = selection
+      ? await this.bookingRepository.getOverviewRangeTotals(
+          business._id,
+          dayStart,
+          dayEnd,
+          now,
+          staffMembershipId,
+        )
+      : undefined;
 
     return {
       scope: scope.kind === "FULL" ? "FULL" : "STAFF_SCOPED",
       currency: "EUR",
       todayDateStr: dateStr,
-      todayBookingsCount: todaysBookings.length,
-      todayRemainingCount,
+      period: { fromDate, toDate, timezone: business.timezone, scheduleLimit: 200 },
+      todayBookingsCount: totals?.count ?? todaysBookings.length,
+      todayRemainingCount: totals?.remaining ?? todayRemainingCount,
       schedule,
       timeline,
-      financials,
+      financials:
+        financials && totals
+          ? { ...financials, payAtVenueDueCents: totals.balanceDueCents }
+          : financials,
     };
   }
 
@@ -160,7 +191,13 @@ export class DashboardOverviewService {
 
     if (actorRole === "STAFF") {
       const membership = await this.staffRepository.findActiveByUserId(actorUserId);
-      if (membership?.role !== "STAFF" || !membership.businessId.equals(business._id)) {
+      if (
+        membership?.role !== "STAFF" ||
+        membership.employmentActive !== true ||
+        membership.removedAt != null ||
+        !membership.userId.equals(actorUserId) ||
+        !membership.businessId.equals(business._id)
+      ) {
         throw new DashboardOverviewError("DASHBOARD_OVERVIEW_BUSINESS_NOT_FOUND", 404);
       }
       return { kind: "STAFF", business, staffMembershipId: membership._id };
@@ -175,14 +212,14 @@ export class DashboardOverviewService {
     business: BusinessDocument,
     todayDateStr: string,
     todaysBookings: BookingDocument[],
+    period?: { from: Date; to: Date },
   ): Promise<DashboardOverviewFinancials> {
     const monthStartStr = `${todayDateStr.slice(0, 7)}-01`;
-    const monthStart = businessLocalToUtc(business.timezone, monthStartStr, "00:00");
-    const monthEnd = businessLocalToUtc(
-      business.timezone,
-      addCalendarMonths(monthStartStr, 1),
-      "00:00",
-    );
+    const monthStart =
+      period?.from ?? businessLocalToUtc(business.timezone, monthStartStr, "00:00");
+    const monthEnd =
+      period?.to ??
+      businessLocalToUtc(business.timezone, addCalendarMonths(monthStartStr, 1), "00:00");
 
     const [noShowMonthCount, noShowBuckets, monthlyRevenueCents, recentTransactions] =
       await Promise.all([
@@ -197,7 +234,11 @@ export class DashboardOverviewService {
           from: monthStart,
           to: monthEnd,
         }),
-        this.financialTransactionService.listRecentForBusiness(business._id, RECENT_ACTIVITY_LIMIT),
+        this.financialTransactionService.listRecentForBusiness(
+          business._id,
+          RECENT_ACTIVITY_LIMIT,
+          period,
+        ),
       ]);
 
     const noShowMonthChargedCents =
@@ -256,6 +297,7 @@ export class DashboardOverviewService {
     return {
       bookingId: String(booking._id),
       bookingReference: booking.reference,
+      date: utcToBusinessLocalDate(timezone, booking.schedule.startAt).dateStr,
       time: utcToBusinessLocalTime(timezone, booking.schedule.startAt),
       status: booking.status,
       customerName: this.fullName(booking),
@@ -284,6 +326,7 @@ export class DashboardOverviewService {
       time: utcToBusinessLocalTime(timezone, booking.schedule.startAt),
       customerName: this.fullName(booking),
       detail: firstLine?.serviceSnapshot.name ?? "—",
+      date: utcToBusinessLocalDate(timezone, booking.schedule.startAt).dateStr,
       durationMin,
       packageSessions: toBookingPackageSessionIdentityDtos(booking),
     };

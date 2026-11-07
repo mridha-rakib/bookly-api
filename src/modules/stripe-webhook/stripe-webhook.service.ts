@@ -10,6 +10,8 @@ import {
 } from "../booking/penalty-collection.service.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
+import type { CentralPayoutService } from "../central-payout/central-payout.service.js";
+import { toProviderPayout } from "../central-payout/stripe-central-payout-gateway.js";
 import type { FinancialRelationshipService } from "../client/financial-relationship.service.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import { ensureBusinessRefundNotification } from "../payment/business-refund-notification.js";
@@ -49,6 +51,8 @@ const HANDLED_EVENT_TYPES = new Set([
   "payment_intent.succeeded",
   "payment_intent.payment_failed",
   "payment_intent.canceled",
+  "payment_intent.requires_action",
+  "payment_intent.processing",
   "setup_intent.succeeded",
   "charge.refunded",
   // P6 — provider-originated reversals: the dispute lifecycle and refunds made outside Bookly.
@@ -58,6 +62,12 @@ const HANDLED_EVENT_TYPES = new Set([
   "charge.dispute.funds_withdrawn",
   "charge.dispute.funds_reinstated",
   "charge.refund.updated",
+  // P0.6 — Super Admin withdrawals from the central Stripe balance.
+  "payout.created",
+  "payout.updated",
+  "payout.paid",
+  "payout.failed",
+  "payout.canceled",
 ]);
 
 const DISPUTE_EVENT_TYPES = new Set([
@@ -126,6 +136,7 @@ export class StripeWebhookService {
       ProviderReversalService,
       "syncDispute" | "reconcileRefundsForPaymentIntent" | "alertWebhookFailed"
     >,
+    private readonly centralPayouts?: Pick<CentralPayoutService, "syncFromWebhook">,
   ) {}
 
   public isHandled(type: string): boolean {
@@ -183,10 +194,14 @@ export class StripeWebhookService {
           await this.handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent);
           break;
         case "payment_intent.payment_failed":
-          await this.handlePaymentIntentFailed(event.data.object as Stripe.PaymentIntent);
+          await this.handlePaymentIntentPending(event.data.object as Stripe.PaymentIntent, true);
           break;
         case "payment_intent.canceled":
           await this.handlePaymentIntentCanceled(event.data.object as Stripe.PaymentIntent);
+          break;
+        case "payment_intent.requires_action":
+        case "payment_intent.processing":
+          await this.handlePaymentIntentPending(event.data.object as Stripe.PaymentIntent);
           break;
         case "charge.refunded":
           await this.handleChargeRefunded(event.data.object as Stripe.Charge);
@@ -196,6 +211,18 @@ export class StripeWebhookService {
           break;
         case "setup_intent.succeeded":
           // Informational only — see this class's own doc comment.
+          break;
+        case "payout.created":
+        case "payout.updated":
+        case "payout.paid":
+        case "payout.failed":
+        case "payout.canceled":
+          // Withdrawals only; never touches booking/refund ledgers. The event id claim above makes
+          // a redelivery a no-op, and status ranking ignores older out-of-order states.
+          await this.centralPayouts?.syncFromWebhook(
+            toProviderPayout(event.data.object as Stripe.Payout),
+            event.id,
+          );
           break;
         default:
           if (DISPUTE_EVENT_TYPES.has(event.type)) {
@@ -269,7 +296,9 @@ export class StripeWebhookService {
     if (
       event.type === "payment_intent.succeeded" ||
       event.type === "payment_intent.payment_failed" ||
-      event.type === "payment_intent.canceled"
+      event.type === "payment_intent.canceled" ||
+      event.type === "payment_intent.requires_action" ||
+      event.type === "payment_intent.processing"
     ) {
       const paymentIntent = object as Stripe.PaymentIntent;
       return {
@@ -358,6 +387,32 @@ export class StripeWebhookService {
         },
       };
     }
+    if (event.type.startsWith("payout.")) {
+      const payout = object as Stripe.Payout;
+      return {
+        id: event.id,
+        type: event.type,
+        data: {
+          object: {
+            id: payout.id,
+            amount: payout.amount,
+            currency: payout.currency,
+            status: payout.status,
+            arrival_date: payout.arrival_date,
+            created: payout.created,
+            destination:
+              typeof payout.destination === "string"
+                ? payout.destination
+                : (payout.destination?.id ?? null),
+            failure_code: payout.failure_code,
+            failure_message: payout.failure_message,
+            livemode: payout.livemode,
+            automatic: payout.automatic,
+            metadata: payout.metadata,
+          },
+        },
+      };
+    }
     return { id: event.id, type: event.type, data: { object: {} } };
   }
 
@@ -385,6 +440,11 @@ export class StripeWebhookService {
     )
       throw new InvestigationWebhookError("Lifecycle metadata has no canonical attempt");
     if (!attempt) return undefined;
+    if (
+      (attempt.providerPaymentIntentId && attempt.providerPaymentIntentId !== paymentIntent.id) ||
+      (metadataAttemptId && metadataAttemptId !== String(attempt._id))
+    )
+      throw new InvestigationWebhookError("PaymentAttempt provider identity mismatch");
     if (hasLifecyclePaymentEvidence(attempt)) {
       assertLifecyclePaymentMetadata(
         assertLifecyclePaymentBinding(attempt),
@@ -457,9 +517,10 @@ export class StripeWebhookService {
       }
       const batch = await inspectBatchPaymentAuthority(attempt);
       if (batch && batch.kind !== "BATCH_PAYMENT_COMPLETE")
-        throw new InvestigationWebhookError(
-          "Canonical complete batch monetary proof is unresolved",
-        );
+        // Provider confirmation can precede the charge-first batch transaction. Missing
+        // completion is not contradictory proof: retain this exact event for bounded retry,
+        // without recording financial effects or adopting origin-only recovery authority.
+        throw new RetryableWebhookError("Canonical complete batch monetary proof is unresolved");
     }
     let metadata: ParsedPaymentIntentMetadata | undefined;
     try {
@@ -574,6 +635,41 @@ export class StripeWebhookService {
     }
     if (purpose === "CANCELLATION_FEE") return sourceType === "CANCELLATION_FEE";
     return sourceType === "NO_SHOW_FEE";
+  }
+
+  /** Pending events can arrive after settlement. Re-read Stripe rather than regress the
+   * attempt from a stale event; completion still uses the existing ledger/authority guards. */
+  private async handlePaymentIntentPending(
+    paymentIntent: Stripe.PaymentIntent,
+    failureEvent = false,
+  ): Promise<void> {
+    const attempt = await this.findCorrelatedAttempt(paymentIntent);
+    if (!attempt) {
+      if (failureEvent) await this.handlePaymentIntentFailed(paymentIntent);
+      return;
+    }
+    if (!this.gateway.retrievePaymentIntent)
+      throw new RetryableWebhookError("PaymentIntent retrieval is unavailable");
+    const snapshot = await this.gateway.retrievePaymentIntent(paymentIntent.id);
+    if (snapshot.paymentIntentId !== paymentIntent.id)
+      throw new InvestigationWebhookError("PaymentIntent retrieval identity mismatch");
+    const current = {
+      ...paymentIntent,
+      amount: snapshot.amountCents,
+      currency: snapshot.currency,
+      customer: snapshot.customerId ?? null,
+      metadata: snapshot.metadata,
+      cancellation_reason: snapshot.cancellationReason ?? null,
+    } as Stripe.PaymentIntent;
+    await this.findCorrelatedAttempt(current);
+    if (snapshot.status === "succeeded") return this.handlePaymentIntentSucceeded(current);
+    if (snapshot.status === "canceled") return this.handlePaymentIntentCanceled(current);
+    if (snapshot.status === "failed") return this.handlePaymentIntentFailed(current);
+    await this.paymentAttemptRepository?.recordProviderResult(attempt._id, {
+      providerPaymentIntentId: snapshot.paymentIntentId,
+      providerStatus: snapshot.status === "processing" ? "PROCESSING" : "REQUIRES_ACTION",
+      clientSecret: snapshot.clientSecret,
+    });
   }
 
   private async handlePaymentIntentFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {
@@ -782,9 +878,12 @@ export class StripeWebhookService {
       }
       if (
         operation.bookingId &&
-        ["BUSINESS_CANCELLATION", "BUSINESS_PACKAGE_TERMINATION", "PACKAGE_VOID"].includes(
-          operation.reason,
-        ) &&
+        [
+          "BUSINESS_CANCELLATION",
+          "BUSINESS_PACKAGE_TERMINATION",
+          "PACKAGE_VOID",
+          "CUSTOMER_EARLY_CANCELLATION",
+        ].includes(operation.reason) &&
         (effectiveStatus === "SUCCEEDED" || effectiveStatus === "FAILED")
       ) {
         await this.bookingRepository?.updateCancellationSettlement(

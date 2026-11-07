@@ -1,4 +1,5 @@
 import type { BookingDocument } from "../../../booking/booking.model.js";
+import { NORMAL_CANCELLATION_TERMS_VERSION } from "../../../business-cancellation-policy/cancellation-terms.js";
 import {
   durationMinutesBetween,
   formatDateInTimezone,
@@ -147,6 +148,14 @@ const POLICY_WINDOWS = [
   { tier: "UNDER_2_HOURS", from: 2, to: undefined },
 ] as const;
 
+/** Approved v2 Normal Booking windows (classifyNormalCancellationTier): >=24, [12,24), [2,12), <2. */
+const POLICY_WINDOWS_V2 = [
+  { tier: "MORE_THAN_24_HOURS", from: undefined, to: 24 },
+  { tier: "BETWEEN_12_AND_24_HOURS", from: 24, to: 12 },
+  { tier: "BETWEEN_2_AND_12_HOURS", from: 12, to: 2 },
+  { tier: "UNDER_2_HOURS", from: 2, to: undefined },
+] as const;
+
 /**
  * Mirrors buildCancellationOutcome / computeNoShowPenalty exactly: a missing tier rule is FREE;
  * PERCENTAGE applies to `eligiblePlatformFeeBasisCents` and nets against the succeeded upfront
@@ -167,7 +176,21 @@ const buildPolicyDisclosure = (
     booking.financials.currency,
   );
   const at = (hours: number) => formatDateTimeWithZone(new Date(start - hours * MS_PER_HOUR), tz);
+  const v2 = booking.cancellationTermsVersion === NORMAL_CANCELLATION_TERMS_VERSION;
+  // The deposit actually taken online (same field selection as `money.paidNowFormatted`).
+  const paidOnlineCents =
+    booking.source === "MANUAL"
+      ? 0
+      : (booking.promo?.chargeCents ?? booking.financials.depositCents);
   const feeFor = (tier: string): { text: string; percentage: boolean } => {
+    if (tier === "MORE_THAN_24_HOURS")
+      return {
+        text:
+          !packageLinked && paidOnlineCents > 0
+            ? `No fee; the ${formatMoney(paidOnlineCents, booking.financials.currency)} paid online is refunded in full`
+            : "No fee",
+        percentage: false,
+      };
     const rule = snapshot.tiers.find((entry) => entry.tier === tier);
     if (rule?.mode !== "PERCENTAGE" || rule.percentage === undefined)
       return { text: "No fee", percentage: false };
@@ -178,7 +201,7 @@ const buildPolicyDisclosure = (
 
   let anyPercentage = false;
   const windows: BookingEmailPolicyDisclosure["windows"] = [];
-  for (const window of POLICY_WINDOWS) {
+  for (const window of v2 ? POLICY_WINDOWS_V2 : POLICY_WINDOWS) {
     if (window.to !== undefined && start - window.to * MS_PER_HOUR <= createdAt) continue;
     const fee = feeFor(window.tier);
     anyPercentage ||= fee.percentage;

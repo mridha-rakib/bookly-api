@@ -228,6 +228,7 @@ export class BookingController {
         status: query.status,
         staffMembershipId: query.staffMembershipId,
         businessClientId: query.businessClientId,
+        reference: query.reference,
         fromDate: query.fromDate,
         toDate: query.toDate,
       },
@@ -253,7 +254,15 @@ export class BookingController {
       new Date(query.toDate),
     );
 
-    sendSuccess(response, 200, "Calendar", { bookings: bookings.map(toBookingCalendarEntryDto) });
+    const presentation = await this.bookingService.getCalendarPresentation(
+      userId,
+      role,
+      params.businessId,
+    );
+    sendSuccess(response, 200, "Calendar", {
+      bookings: bookings.map(toBookingCalendarEntryDto),
+      ...presentation,
+    });
   };
 
   public completeBooking = async (request: Request, response: Response): Promise<void> => {

@@ -77,6 +77,13 @@ export const superAdminListBookingsQuerySchema = paginationQuerySchema
 // --- Global Customers ----------------------------------------------------------------------
 
 export const superAdminUserIdParamsSchema = z.object({ userId: objectIdSchema }).strict();
+export const superAdminCustomerDetailQuerySchema = z
+  .object({
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+    relationshipsPage: z.coerce.number().int().min(1).default(1),
+  })
+  .strict();
 
 export const superAdminListCustomersQuerySchema = paginationQuerySchema
   .extend({

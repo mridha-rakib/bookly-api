@@ -115,8 +115,7 @@ export type UpdateStaffInput = {
 
 export type PutScheduleInput = {
   days: ScheduleDay[];
-  /** Explicit recurring weekly Weekend/Off days. Optional/defaults to [] — omitting it keeps
-   * exactly today's behavior (see putStaffScheduleBodySchema). */
+  /** Explicit recurring off-day replacement; omission merges the persisted set transactionally. */
   offDays?: DayOfWeek[] | undefined;
 };
 
@@ -812,7 +811,12 @@ export class StaffService {
     this.requireValidObjectId(businessId);
     const membership = await this.staffRepository.findActiveByUserId(actorUserId);
 
-    if (!membership?.businessId.equals(businessId)) {
+    if (
+      !membership?.businessId.equals(businessId) ||
+      !membership.userId.equals(actorUserId) ||
+      membership.employmentActive !== true ||
+      membership.removedAt != null
+    ) {
       throw new StaffError("STAFF_NOT_FOUND", 404);
     }
 
@@ -866,7 +870,11 @@ export class StaffService {
     const workingDaySet = new Set(
       days.filter((day) => day.intervals.length > 0).map((day) => day.dayOfWeek),
     );
-    const offDays = [...new Set(input.offDays ?? [])].filter((day) => !workingDaySet.has(day));
+    // Keep omission distinct until persistence can merge the latest state under its fence.
+    const offDays =
+      input.offDays === undefined
+        ? undefined
+        : [...new Set(input.offDays)].filter((day) => !workingDaySet.has(day));
 
     const schedule = await this.staffScheduleRepository.replace(
       membership._id,
@@ -1029,6 +1037,9 @@ export class StaffService {
     if (
       membership &&
       membership.role === "SUPERVISOR" &&
+      membership.userId.equals(actorUserId) &&
+      membership.employmentActive === true &&
+      membership.removedAt == null &&
       membership.businessId.equals(business._id)
     ) {
       return business;

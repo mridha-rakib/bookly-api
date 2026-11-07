@@ -176,7 +176,12 @@ export const toPackageProgressDto = (
       ? {
           mode: fulfilmentEntitlement.mode,
           ...(fulfilmentEntitlement.travelCities
-            ? { travelCities: fulfilmentEntitlement.travelCities.map((entry) => ({ ...entry })) }
+            ? {
+                travelCities: fulfilmentEntitlement.travelCities.map((entry) => ({
+                  city: entry.city,
+                  feeCents: entry.feeCents,
+                })),
+              }
             : {}),
         }
       : null,

@@ -666,8 +666,23 @@ describe("P5 durable penalty collection", () => {
         booklyPenaltyObligationId: String(obligation?._id),
         taxMode: "PRE_ACTIVATION",
         taxCents: "0",
+        // P0.4 — the €30 incremental fee is Business revenue: no VAT is calculated or implied,
+        // and nothing is collected as VAT; the €20 deposit's own tax record is untouched.
+        taxStatus: "NOT_CALCULATED",
+        taxNotCalculatedReason: "BUSINESS_SUPPLY_TAX_CONTEXT_UNAVAILABLE",
+        taxCollectedCents: "0",
+        preTaxChargeCents: "3000",
+        chargedAmountCents: "3000",
       });
+      expect(penaltyInputs[0]?.metadata["taxCalculationId"]).toBeUndefined();
       expect(penaltyInputs[0]?.metadata["booklyPaymentMethodId"]).toMatch(/^pm_fake_/);
+      const depositInputs = paymentGateway.paymentIntentInputs.filter(
+        (i) =>
+          i.metadata["purpose"] === "BOOKING_DEPOSIT" &&
+          i.metadata["bookingId"] === String(ctx.booking._id),
+      );
+      expect(depositInputs).toHaveLength(1);
+      expect(depositInputs[0]?.amountCents).toBe(2000);
     });
 
     it("3 RETURNING P3 (€0 upfront): the full gross fee is the shortfall", async () => {
@@ -678,6 +693,12 @@ describe("P5 durable penalty collection", () => {
       expect(
         await financialTransactionService.findSucceededUpfrontPayment(returning._id),
       ).toBeUndefined();
+      // Zero upfront: no PaymentIntent (so no upfront VAT) exists for the RETURNING booking.
+      expect(
+        paymentGateway.paymentIntentInputs.filter(
+          (i) => i.metadata["bookingId"] === String(returning._id),
+        ),
+      ).toHaveLength(0);
       await makeLate(returning._id);
 
       const cancelled = await lifecycleService.cancelByCustomer(
@@ -696,6 +717,77 @@ describe("P5 durable penalty collection", () => {
         amountCents: 5000,
         status: "SUCCEEDED",
       });
+    });
+
+    it("P0.5 fee tax reason follows ONLY this Business's tax settings; charge, deposit offset and idempotency unchanged", async () => {
+      const settings = new BusinessBookingSettingsRepository();
+      const collection = new PenaltyCollectionService({
+        ...penaltyDeps,
+        businessTaxSettings: settings,
+      });
+      // Business B's VAT registration must never leak into Business A's fee assessment.
+      const other = await setupBusiness({ cancellationPct: 50 });
+      await settings.upsertTaxByBusinessId(
+        other.business._id,
+        { status: "VAT_REGISTERED", countryCode: "CY", vatNumber: "CY10000000A" },
+        String(other.owner._id),
+      );
+      const ctx = await firstBooking({ cancellationPct: 50 }); // €50 gross − €20 = €30
+      await makeLate(ctx.booking._id);
+      const cancelFeeInputs = () =>
+        paymentGateway.paymentIntentInputs.filter(
+          (i) =>
+            i.metadata["purpose"] === "CANCELLATION_FEE" &&
+            i.metadata["bookingId"] === String(ctx.booking._id),
+        );
+
+      await lifecycleWith(collection).cancelByCustomer(
+        String(ctx.customer._id),
+        String(ctx.booking._id),
+        "late",
+      );
+
+      expect(cancelFeeInputs()).toHaveLength(1);
+      expect(cancelFeeInputs()[0]?.amountCents).toBe(3000);
+      expect(cancelFeeInputs()[0]?.metadata).toMatchObject({
+        taxStatus: "NOT_CALCULATED",
+        taxNotCalculatedReason: "BUSINESS_TAX_SETTINGS_NOT_CONFIGURED",
+        taxCents: "0",
+        taxCollectedCents: "0",
+        chargedAmountCents: "3000",
+      });
+      expect(cancelFeeInputs()[0]?.metadata["taxCalculationId"]).toBeUndefined();
+
+      // A declared registration still cannot be calculated under Bookly's own Stripe registration.
+      await settings.upsertTaxByBusinessId(
+        ctx.business._id,
+        { status: "VAT_REGISTERED", countryCode: "CY", vatNumber: "CY20000000B" },
+        String(ctx.owner._id),
+      );
+      await settings.upsertTaxByBusinessId(
+        other.business._id,
+        { status: "VAT_EXEMPT", countryCode: "CY" },
+        String(other.owner._id),
+      );
+      const [obligation] = await rows(ctx.booking._id, "CANCELLATION_FEE");
+      expect(obligation?.status).toBe("SUCCEEDED");
+      // Re-collecting a settled obligation sends nothing new (idempotent).
+      await collection.collect(obligation?._id as Types.ObjectId);
+      expect(cancelFeeInputs()).toHaveLength(1);
+      const reasons = await Promise.all(
+        [ctx.business._id, other.business._id].map(async (businessId) =>
+          (
+            collection as unknown as {
+              feeTaxReason(o: { businessId: Types.ObjectId }): Promise<string>;
+            }
+          ).feeTaxReason({ businessId }),
+        ),
+      );
+      expect(reasons).toEqual([
+        "BUSINESS_TAX_ACCOUNT_UNAVAILABLE",
+        "BUSINESS_DECLARED_NO_VAT_REGISTRATION",
+      ]);
+      expect((await settings.findByBusinessId(other.business._id))?.tax?.vatNumber).toBeUndefined();
     });
 
     it("4 zero fee (FREE tier): no obligation, no attempt", async () => {
@@ -1162,6 +1254,17 @@ describe("P5 durable penalty collection", () => {
       const charged = await outboxFor("NO_SHOW_CHARGED");
       expect(charged).toHaveLength(1);
       expect(renderEmailTemplate("NO_SHOW_CHARGED", charged[0]?.payload).text).toContain("€60.00");
+      const noShowInputs = paymentGateway.paymentIntentInputs.filter(
+        (i) => i.metadata["purpose"] === "NO_SHOW_FEE",
+      );
+      expect(noShowInputs).toHaveLength(1);
+      expect(noShowInputs[0]?.amountCents).toBe(6000);
+      expect(noShowInputs[0]?.metadata).toMatchObject({
+        taxCents: "0",
+        taxStatus: "NOT_CALCULATED",
+        taxNotCalculatedReason: "BUSINESS_SUPPLY_TAX_CONTEXT_UNAVAILABLE",
+        taxCollectedCents: "0",
+      });
     });
 
     it("23 RETURNING P3: the full gross no-show fee is charged", async () => {

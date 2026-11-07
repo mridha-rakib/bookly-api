@@ -56,6 +56,32 @@ export const toSupportMessageDto = (message: SupportMessageDocument): SupportMes
   createdAt: message.createdAt.toISOString(),
 });
 
+/** Message-list envelope shared by requester and Super Admin reads. Legacy page reads keep their
+ * exact `{ page, limit, total }` shape; P1.8 history reads report `{ limit, total }` plus the
+ * opaque `olderCursor` for the next older page (null when the oldest message is loaded). */
+export type SupportMessageListDto = {
+  messages: SupportMessageDto[];
+  pagination: { page?: number; limit: number; total: number };
+  history?: { hasOlder: boolean; olderCursor: string | null };
+};
+
+export const toSupportMessageListDto = (
+  result: {
+    messages: SupportMessageDocument[];
+    total: number;
+    history?: { hasOlder: boolean; olderCursor: string | null } | undefined;
+  },
+  query: { mode: "page"; page: number; limit: number } | { mode: "history"; limit: number },
+): SupportMessageListDto => ({
+  messages: result.messages.map(toSupportMessageDto),
+  ...(query.mode === "page"
+    ? { pagination: { page: query.page, limit: query.limit, total: result.total } }
+    : {
+        pagination: { limit: query.limit, total: result.total },
+        history: result.history ?? { hasOlder: false, olderCursor: null },
+      }),
+});
+
 /** Super Admin's global inbox row — enriched with batched Business/requester lookups (see
  * super-admin-support.service.ts), never a raw User/Business document. */
 export type SuperAdminSupportTicketRowDto = {

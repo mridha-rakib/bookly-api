@@ -98,7 +98,8 @@ export type BusinessClientFinancialRelationship = {
           | "PRE_DISPATCH_ABANDONED"
           | "PROVIDER_CANCELED"
           | "COMPENSATION_REFUNDED"
-          | "BUSINESS_CANCELLATION";
+          | "BUSINESS_CANCELLATION"
+          | "CUSTOMER_EARLY_CANCELLATION";
         paymentAttemptId?: Types.ObjectId | undefined;
         refundOperationId?: Types.ObjectId | undefined;
         releasedAt: Date;
@@ -253,6 +254,7 @@ const financialRelationshipSchema = new Schema<BusinessClientFinancialRelationsh
               "PROVIDER_CANCELED",
               "COMPENSATION_REFUNDED",
               "BUSINESS_CANCELLATION",
+              "CUSTOMER_EARLY_CANCELLATION",
             ],
             required: true,
           },
@@ -317,6 +319,9 @@ businessClientSchema.index(
 // to one business, so these are separate from the compound indexes above.
 businessClientSchema.index({ normalizedEmail: 1 });
 businessClientSchema.index({ "phone.e164": 1 });
+// Super Admin customer directory summaries and paginated cross-Business relationships.
+// Definition only; index creation follows the existing controlled index rollout.
+businessClientSchema.index({ linkedUserId: 1, linkState: 1, businessId: 1, _id: 1 });
 // Clients list / Archived Clients list — the one paginated list query in the whole API.
 // Trailing createdAt matches listByBusinessId's actual sort (client.repository.ts
 // `.sort({ createdAt: -1 })`) so the base (no tag/search) case never falls back to an

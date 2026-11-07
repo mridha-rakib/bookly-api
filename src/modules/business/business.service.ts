@@ -68,6 +68,8 @@ export type BusinessDetailDto = {
   address: BusinessAddress;
   location?: { lat: number; lng: number; searchQuery?: string | undefined } | undefined;
   briefDescription: string;
+  registrationNumber?: string | undefined;
+  additionalInformation?: string[] | undefined;
   category: string;
   subcategories: string[];
   instagramHandle?: string | undefined;
@@ -402,6 +404,10 @@ export class BusinessService {
     if (input.visitType !== undefined) update["visitType"] = input.visitType;
     if (input.timezone !== undefined) update["timezone"] = input.timezone;
     if (input.briefDescription !== undefined) update["briefDescription"] = input.briefDescription;
+    if (input.registrationNumber !== undefined)
+      update["registrationNumber"] = input.registrationNumber;
+    if (input.additionalInformation !== undefined)
+      update["additionalInformation"] = input.additionalInformation.filter(Boolean);
     if (input.category !== undefined) {
       update["category"] = input.category;
       // Keep the canonical key in sync with the display string whenever it can be safely
@@ -510,6 +516,12 @@ export class BusinessService {
       address: business.address,
       location: business.location,
       briefDescription: business.briefDescription,
+      ...(relationship === "OWNER"
+        ? {
+            registrationNumber: business.registrationNumber,
+            additionalInformation: business.additionalInformation ?? [],
+          }
+        : {}),
       category: business.category,
       subcategories: business.subcategories,
       instagramHandle: business.instagramHandle,

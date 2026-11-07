@@ -45,6 +45,9 @@ for (const key of Object.keys(process.env))
     delete process.env[key];
 // Disposable synthetic accounts only; journeys log several roles in repeatedly.
 process.env["AUTH_LOGIN_RATE_LIMIT_MAX"] = "500";
+// The whole suite reloads one loopback Customer session more than 30 times. Keep the
+// real limiter, with a synthetic-suite budget; shipped production defaults stay unchanged.
+process.env["AUTH_REFRESH_RATE_LIMIT_MAX"] = "500";
 process.env["EMAIL_PROVIDER"] = "smtp";
 process.env["OTP_PROVIDER"] = "dummy";
 

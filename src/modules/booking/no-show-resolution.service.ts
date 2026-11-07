@@ -2,6 +2,7 @@ import type { ClientSession, Types } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
 import {
   isPackageLinkedBooking,
@@ -98,6 +99,7 @@ export class NoShowResolutionService {
       businessRepository,
       noShowNotifier,
       packageProgressRepository,
+      businessTaxSettings: new BusinessBookingSettingsRepository(),
     }),
   ) {}
 
@@ -129,7 +131,10 @@ export class NoShowResolutionService {
    * ids via the index-backed `findManyOverdueNoShows`; this method re-fetches and re-verifies
    * the SINGLE document fresh, so a stale batch read never drives an action.
    */
-  public async autoResolve(bookingId: Types.ObjectId): Promise<NoShowResolutionOutcome> {
+  public async autoResolve(
+    bookingId: Types.ObjectId,
+    shouldStop: () => boolean = () => false,
+  ): Promise<NoShowResolutionOutcome | undefined> {
     const booking = await this.bookingRepository.findByIdOnly(bookingId);
     if (booking?.serviceLines.some((line) => line.pricingInput.packageItemId))
       await verifyPackageBatchActivation();
@@ -166,6 +171,7 @@ export class NoShowResolutionService {
     // possible charge amount, a MANUAL Booking (no Stripe integration by design — rule #8), or
     // no linked Customer identity to charge (should not happen for BOOKLY_MANAGED, defensive).
     if (!noShowPercentage || penalty.amountCents <= 0 || !isPenaltyCollectible(booking)) {
+      if (shouldStop()) return undefined;
       const waived = await this.transitionViaOwner(booking, "NO_SHOW_WAIVED", {
         note: isPackageLinkedBooking(booking)
           ? "Auto-resolved: Package base-service no-show — the forfeited session is the only penalty, no additional fee applies"
@@ -199,6 +205,7 @@ export class NoShowResolutionService {
     // `noShowChargeClaimedAt`, the PENDING NO_SHOW_FEE obligation and its single PaymentAttempt
     // are written. A concurrent worker, waiver or reversal either commits first (no charge) or
     // loses to this claim. The provider call happens only after commit.
+    if (shouldStop()) return undefined;
     const claim = await this.penaltyCollection.claimNoShowPenalty(booking, penalty);
     if (!claim) {
       return "skipped_already_resolved";
@@ -231,7 +238,10 @@ export class NoShowResolutionService {
 
   /** Bounded, index-backed batch entry point — see BookingRepository.findManyOverdueNoShows's
    * own comment for why this never scans the full collection. */
-  public async runOnce(batchSize: number): Promise<Record<NoShowResolutionOutcome, number>> {
+  public async runOnce(
+    batchSize: number,
+    shouldStop: () => boolean = () => false,
+  ): Promise<Record<NoShowResolutionOutcome, number>> {
     const now = new Date();
     const candidates = await this.bookingRepository.findManyOverdueNoShows(now, batchSize);
 
@@ -248,8 +258,10 @@ export class NoShowResolutionService {
     // P5 — per-item isolation: one booking that throws (provider, database or data problem) is
     // reported and skipped; every other eligible overdue no-show in the batch is still processed.
     for (const candidate of candidates) {
+      if (shouldStop()) break;
       try {
-        const outcome = await this.autoResolve(candidate._id);
+        const outcome = await this.autoResolve(candidate._id, shouldStop);
+        if (outcome === undefined) break;
         counts[outcome] += 1;
       } catch (error) {
         counts.error += 1;

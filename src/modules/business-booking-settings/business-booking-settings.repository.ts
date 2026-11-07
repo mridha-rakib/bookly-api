@@ -1,9 +1,10 @@
-import type { ClientSession, Types } from "mongoose";
+import { type ClientSession, Types } from "mongoose";
 
 import {
   type BusinessBookingSettingsDocument,
   BusinessBookingSettingsModel,
 } from "./business-booking-settings.model.js";
+import type { UpdateBusinessTaxSettingsBody } from "./business-tax-settings.js";
 
 export class BusinessBookingSettingsRepository {
   public async findByBusinessId(
@@ -28,6 +29,29 @@ export class BusinessBookingSettingsRepository {
         setDefaultsOnInsert: true,
         upsert: true,
       },
+    ).orFail();
+  }
+
+  /** Replaces only the tax sub-document; gap elimination is untouched (defaulted on insert). */
+  public async upsertTaxByBusinessId(
+    businessId: Types.ObjectId | string,
+    tax: UpdateBusinessTaxSettingsBody,
+    userId: string,
+  ): Promise<BusinessBookingSettingsDocument> {
+    return BusinessBookingSettingsModel.findOneAndUpdate(
+      { businessId },
+      {
+        $set: {
+          tax: {
+            status: tax.status,
+            countryCode: tax.countryCode,
+            ...(tax.status === "VAT_REGISTERED" ? { vatNumber: tax.vatNumber } : {}),
+            updatedAt: new Date(),
+            updatedByUserId: new Types.ObjectId(userId),
+          },
+        },
+      },
+      { new: true, runValidators: true, setDefaultsOnInsert: true, upsert: true },
     ).orFail();
   }
 }

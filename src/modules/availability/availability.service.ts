@@ -13,6 +13,10 @@ import type { BookingSlotReservationRepository } from "../booking-slot-reservati
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessCity } from "../business/business.types.js";
+import {
+  type AvailabilityRules,
+  permitsAppointment,
+} from "../business-booking-settings/business-availability.rules.js";
 import type { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
 import type { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import type { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
@@ -211,6 +215,7 @@ export class AvailabilityService {
 
     const staffContexts = this.buildStaffContexts(eligibleStaff, staffSchedules, staffTimeOffs);
     const gapEliminationEnabled = bookingSettings?.gapEliminationEnabled ?? false;
+    const now = new Date();
 
     const days = enumerateCalendarDates(input.fromDate, input.toDate).map((date) =>
       this.buildDay({
@@ -223,6 +228,8 @@ export class AvailabilityService {
         staffContexts,
         reservations,
         gapEliminationEnabled,
+        rules: bookingSettings?.availability,
+        now,
       }),
     );
 
@@ -265,6 +272,25 @@ export class AvailabilityService {
     this.requireValidPartySize(input.partySize, config);
 
     if (input.endAt <= input.startAt) {
+      throw new AvailabilityError("AVAILABILITY_SLOT_NOT_BOOKABLE", 409);
+    }
+
+    // Re-read in the admission transaction after the shared Business fence. Never trust a
+    // Customer preview, and never change an already-persisted appointment here.
+    const settings = await this.businessBookingSettingsRepository.findByBusinessId(
+      input.business._id,
+      session,
+    );
+    if (
+      !permitsAppointment(
+        settings?.availability,
+        input.business.timezone,
+        String(input.staffMembership._id),
+        input.startAt,
+        input.endAt,
+        new Date(),
+      )
+    ) {
       throw new AvailabilityError("AVAILABILITY_SLOT_NOT_BOOKABLE", 409);
     }
 
@@ -427,6 +453,19 @@ export class AvailabilityService {
         for (const index of order) {
           const line = lines[index]!;
           const endAt = new Date(startAt.getTime() + line.occupiedMilliseconds);
+          if (
+            !permitsAppointment(
+              settings?.availability,
+              business.timezone,
+              String(line.staffMembership._id),
+              startAt,
+              endAt,
+              new Date(),
+            )
+          ) {
+            valid = false;
+            break;
+          }
           const outcome = this.evaluateStaffForSlot({
             staffContext: staffContexts[index]!,
             date,
@@ -530,9 +569,17 @@ export class AvailabilityService {
     staffContexts: StaffContext[];
     reservations: BookingSlotReservationDocument[];
     gapEliminationEnabled: boolean;
+    rules?: AvailabilityRules | undefined;
+    now: Date;
   }): AvailabilityDay {
     const { date, business, service, config, partySize } = context;
     const dayOfWeek = dayOfWeekForDate(date);
+    if (
+      context.rules?.closedPeriods?.some(
+        (period) => period.startDate <= date && date <= period.endDate,
+      )
+    )
+      return { date, isOpen: false, slots: [] };
 
     const candidates =
       service.scheduleMode === "MANUAL"
@@ -557,6 +604,17 @@ export class AvailabilityService {
       let isBooked = false;
 
       for (const staffContext of context.staffContexts) {
+        if (
+          !permitsAppointment(
+            context.rules,
+            business.timezone,
+            String(staffContext.membership._id),
+            startAt,
+            endAt,
+            context.now,
+          )
+        )
+          continue;
         const outcome = this.evaluateStaffForSlot({
           staffContext,
           date,
@@ -774,19 +832,27 @@ export class AvailabilityService {
     reservations: BookingSlotReservationDocument[],
     date: string,
   ): void {
-    const occupiedBoundaries = reservations
-      .filter((doc) => doc.occupancyDate === date)
-      .flatMap((doc) => doc.intervals)
-      .flatMap((interval) => [interval.startAt.getTime(), interval.endAt.getTime()]);
-
-    if (occupiedBoundaries.length === 0) {
-      return;
+    const boundariesByStaff = new Map<string, Set<number>>();
+    for (const doc of reservations) {
+      if (doc.occupancyDate !== date) continue;
+      const staffId = String(doc.staffMembershipId);
+      const boundaries = boundariesByStaff.get(staffId) ?? new Set<number>();
+      for (const interval of doc.intervals) {
+        boundaries.add(interval.startAt.getTime());
+        boundaries.add(interval.endAt.getTime());
+      }
+      boundariesByStaff.set(staffId, boundaries);
     }
+    if (boundariesByStaff.size === 0) return;
 
-    const boundarySet = new Set(occupiedBoundaries);
-    const packsAgainstOccupancy = (slot: AvailabilitySlot): boolean =>
-      boundarySet.has(new Date(slot.startAt).getTime()) ||
-      boundarySet.has(new Date(slot.endAt).getTime());
+    const packsAgainstOccupancy = (slot: AvailabilitySlot): boolean => {
+      const start = new Date(slot.startAt).getTime(),
+        end = new Date(slot.endAt).getTime();
+      return slot.eligibleStaffMembershipIds.some((staffId) => {
+        const boundaries = boundariesByStaff.get(staffId);
+        return boundaries?.has(start) || boundaries?.has(end);
+      });
+    };
 
     // Stable sort: packed-against-occupancy slots first, preserving chronological order
     // within each group — never reorders in a way that would make the result look

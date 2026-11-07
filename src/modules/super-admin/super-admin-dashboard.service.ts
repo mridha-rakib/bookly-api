@@ -7,12 +7,25 @@ import type { BusinessPayoutRepository } from "../finance/business-payout.reposi
 import type { FinanceService } from "../finance/finance.service.js";
 import { BOOKLY_REVENUE_TYPES, combineBooklyOwnedBuckets } from "../finance/finance-ownership.js";
 import type { UserRepository } from "../user/user.repository.js";
+import {
+  aggregateOwnershipForPeriod,
+  resolveAnalyticsPeriod,
+} from "./super-admin-analytics.util.js";
 
 export type SuperAdminDashboardSummaryDto = {
+  /** P1.9 — the `[from, to)` window applied to the PERIOD metrics (`bookings`,
+   * `platformRevenueCents`). `isAllTime` when no period was requested. Every other field is
+   * current-state or all-time and is never affected by the period. */
+  period: { from: string; to: string; isAllTime: boolean };
+  /** Current state. */
   businesses: Record<BusinessStatus, number> & { total: number };
+  /** Current state. */
   customers: { total: number };
+  /** PERIOD: Bookings CREATED in the period, by current status (`createdAt`, the same meaning as
+   * /analytics/bookings). All-time when no period is given. */
   bookings: Record<BookingStatus, number> & { total: number };
-  /** All-time Bookly-owned net revenue (PLATFORM_FEE, less Bookly's own PROCESSING_FEE/REFUND
+  /** PERIOD: Bookly-owned net revenue for ledger rows in the period (all-time when none). Same
+   * ownership primitives as Finance/Analytics. Originally: all-time Bookly-owned net revenue (PLATFORM_FEE, less Bookly's own PROCESSING_FEE/REFUND
    * share) — same ownership primitives as the Finance tab's own summary
    * (BookingFinancialTransactionService.aggregateAllTimeOwnedBySource +
    * combineBooklyOwnedBuckets), never a separate calculator. */
@@ -40,7 +53,10 @@ export class SuperAdminDashboardService {
     private readonly businessPayoutRepository: BusinessPayoutRepository,
   ) {}
 
-  public async getSummary(): Promise<SuperAdminDashboardSummaryDto> {
+  public async getSummary(
+    query: { fromDate?: Date | undefined; toDate?: Date | undefined } = {},
+  ): Promise<SuperAdminDashboardSummaryDto> {
+    const period = resolveAnalyticsPeriod(query);
     const [
       businessCounts,
       customerTotal,
@@ -51,9 +67,12 @@ export class SuperAdminDashboardService {
     ] = await Promise.all([
       this.businessRepository.countByStatus(),
       this.userRepository.countByRole("CUSTOMER"),
-      this.bookingRepository.countAllByStatus(),
-      this.financialTransactionService.aggregateAllTimeOwnedBySource({
+      period.isAllTime
+        ? this.bookingRepository.countAllByStatus()
+        : this.bookingRepository.countByStatusInRange(period.from, period.to),
+      aggregateOwnershipForPeriod(this.financialTransactionService, {
         types: [...BOOKLY_REVENUE_TYPES],
+        period,
       }),
       this.financeService.listPendingPayouts(),
       this.businessPayoutRepository.sumPaidTotal(),
@@ -62,6 +81,11 @@ export class SuperAdminDashboardService {
     const bookly = combineBooklyOwnedBuckets(booklyBuckets);
 
     return {
+      period: {
+        from: period.from.toISOString(),
+        to: period.to.toISOString(),
+        isAllTime: period.isAllTime,
+      },
       businesses: {
         ...businessCounts,
         total:

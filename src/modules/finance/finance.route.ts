@@ -54,6 +54,19 @@ export const createFinanceRoute = (): Router => {
     asyncHandler(controller.getSummary),
   );
   router.get(
+    "/:businessId/finance/transactions/export.csv",
+    validateRequest({ params: financeBusinessParamsSchema, query: financeTransactionsQuerySchema }),
+    asyncHandler(controller.exportTransactions),
+  );
+  router.get(
+    "/:businessId/finance/payouts/export.csv",
+    validateRequest({
+      params: financeBusinessParamsSchema,
+      query: financePayoutHistoryQuerySchema,
+    }),
+    asyncHandler(controller.exportPayouts),
+  );
+  router.get(
     "/:businessId/finance/transactions",
     validateRequest({ params: financeBusinessParamsSchema, query: financeTransactionsQuerySchema }),
     asyncHandler(controller.listTransactions),

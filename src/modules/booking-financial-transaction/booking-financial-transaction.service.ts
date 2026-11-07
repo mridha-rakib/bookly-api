@@ -330,10 +330,12 @@ export class BookingFinancialTransactionService {
   public async listRecentForBusiness(
     businessId: Types.ObjectId | string,
     limit: number,
+    period?: { from: Date; to: Date },
   ): Promise<BookingFinancialTransactionDocument[]> {
     return this.transactionRepository.listRecentForBusiness(
       businessId,
       Math.min(Math.max(limit, 1), MAX_RECENT_ACTIVITY_LIMIT),
+      period,
     );
   }
 

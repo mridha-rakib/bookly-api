@@ -21,6 +21,28 @@ export const cancellationTiers = [
 
 export type CancellationTier = (typeof cancellationTiers)[number];
 
+/**
+ * Owner-approved Normal Booking cancellation terms, version 2 (Figma Payment & Cancellation
+ * Policy, approved 2026-11-05), for Normal Service and legacy Package Deal Bookings only:
+ *   - more than 24 hours before the start: free cancellation, and a customer cancellation
+ *     refunds the deposit actually paid (no Business may configure a fee here);
+ *   - 12–24 h, 2–12 h, under 2 h: the Business's own configured rule for that window;
+ *   - no-show: the Business's configured no-show percentage.
+ * A Booking records `cancellationTermsVersion: 2` when it is created under these terms; a
+ * Booking without it keeps the five-window terms it was created under (never rewritten).
+ * The stored Business policy keeps all five rows: First-Class Package quotes still read the
+ * 72 h and 24–72 h rows for their separately certified terms, which this version leaves alone.
+ */
+export { NORMAL_CANCELLATION_TERMS_VERSION } from "./cancellation-terms.js";
+export const normalCancellationFeeTiers = [
+  "BETWEEN_12_AND_24_HOURS",
+  "BETWEEN_2_AND_12_HOURS",
+  "UNDER_2_HOURS",
+] as const satisfies readonly CancellationTier[];
+/** Every window a Booking's cancellation can be classified into, across both term versions. */
+export const bookingCancellationTiers = ["MORE_THAN_24_HOURS", ...cancellationTiers] as const;
+export type BookingCancellationTier = (typeof bookingCancellationTiers)[number];
+
 export const cancellationFeeModes = ["FREE", "PERCENTAGE"] as const;
 export type CancellationFeeMode = (typeof cancellationFeeModes)[number];
 

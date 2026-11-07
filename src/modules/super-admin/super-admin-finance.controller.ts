@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 
+import { streamCsv } from "../../common/http/csv.js";
 import { sendSuccess } from "../../common/http/responses.js";
 import { AuthError } from "../auth/auth.errors.js";
 import type { BusinessPayoutService } from "../finance/business-payout.service.js";
@@ -20,10 +21,13 @@ import type {
   FinancePayoutHistoryQuery,
   FinanceSummaryQuery,
   FinanceTransactionsQuery,
+  PlatformTransactionsExportQuery,
   PlatformTransactionsQuery,
 } from "../finance/finance.schema.js";
 import type { FinanceService } from "../finance/finance.service.js";
 import type { PayoutDestinationService } from "../payout-destination/payout-destination.service.js";
+
+const EXPORT_PAGE_SIZE = 100;
 
 /**
  * Mounted under `/super-admin`, gated end-to-end by `requireRoles(["SUPER_ADMIN"])` (see
@@ -57,6 +61,163 @@ export class SuperAdminFinanceController {
       transactions: page.rows.map(toPlatformTransactionRowDto),
       pagination: { page: query.page, limit: query.limit, total: page.total },
     });
+  };
+
+  // --- P1.9 CSV exports ------------------------------------------------------------------------
+  // Super Admin-only (router-wide SUPER_ADMIN gate). Complete filtered exports streamed through
+  // the shared encoder in bounded 100-row server pages — never the browser's loaded page.
+  // Amounts are integer cents with an explicit currency column; timestamps are ISO 8601 UTC.
+
+  public exportPlatformTransactions = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const query = request.validated?.query as PlatformTransactionsExportQuery;
+    await streamCsv(
+      response,
+      "platform-transactions.csv",
+      [
+        "TRANSACTION ID",
+        "DATE",
+        "BUSINESS ID",
+        "BUSINESS",
+        "BOOKING ID",
+        "BOOKING REFERENCE",
+        "CUSTOMER",
+        "TYPE",
+        "REFUND ORIGIN",
+        "OWNER",
+        "GROSS CENTS",
+        "PROCESSING FEE CENTS",
+        "NET CENTS",
+        "CURRENCY",
+        "STATUS",
+        "PAYOUT ID",
+      ],
+      (page) =>
+        this.financeService.listPlatformTransactions(
+          { from: query.from, to: query.to },
+          { page, limit: EXPORT_PAGE_SIZE },
+          query.types,
+        ),
+      (row) => {
+        const dto = toPlatformTransactionRowDto(row);
+        return [
+          dto.id,
+          dto.date,
+          dto.businessId,
+          dto.businessName,
+          dto.bookingId,
+          dto.bookingReference,
+          dto.customerName,
+          dto.type,
+          dto.refundOrigin,
+          dto.owner,
+          dto.grossCents,
+          dto.stripeFeeCents,
+          dto.netCents,
+          dto.currency,
+          dto.status,
+          dto.payoutId,
+        ];
+      },
+    );
+  };
+
+  public exportPlatformPayouts = async (_request: Request, response: Response): Promise<void> => {
+    await streamCsv(
+      response,
+      "platform-payouts.csv",
+      [
+        "PAYOUT ID",
+        "BUSINESS ID",
+        "BUSINESS",
+        "PERIOD START",
+        "PERIOD END",
+        "GROSS BUSINESS-OWNED CENTS",
+        "PROCESSING FEES CENTS",
+        "DISPUTE ADJUSTMENTS CENTS",
+        "NET PAYOUT CENTS",
+        "CURRENCY",
+        "STATUS",
+        "PAID AT",
+        "PROVIDER REFERENCE",
+      ],
+      async (page) => {
+        const result = await this.financeService.listPlatformPayoutHistory({
+          page,
+          limit: EXPORT_PAGE_SIZE,
+        });
+        return { rows: result.items, total: result.total };
+      },
+      (row) => {
+        const dto = toPlatformPayoutHistoryItemDto(row);
+        return [
+          dto.id,
+          dto.businessId,
+          dto.businessName,
+          dto.periodStart,
+          dto.periodEnd,
+          dto.grossBusinessOwnedCents,
+          dto.processingFeesCents,
+          dto.disputeAdjustmentsCents,
+          dto.netPayoutCents,
+          dto.currency,
+          dto.status,
+          dto.paidAt,
+          dto.providerReference,
+        ];
+      },
+    );
+  };
+
+  /** The pending list is already one complete server read (every Business with an unclaimed
+   * balance); exported whole, stamped with the instant it was computed. */
+  public exportPendingPayouts = async (_request: Request, response: Response): Promise<void> => {
+    const asOf = new Date().toISOString();
+    await streamCsv(
+      response,
+      "pending-payouts.csv",
+      [
+        "BUSINESS ID",
+        "BUSINESS",
+        "CITY",
+        "CATEGORY",
+        "TRANSACTIONS",
+        "NO-SHOW CENTS",
+        "LATE CANCEL CENTS",
+        "DEPOSIT CENTS",
+        "GROSS CENTS",
+        "PROCESSING FEES CENTS",
+        "REFUNDS CENTS",
+        "DISPUTE ADJUSTMENTS CENTS",
+        "NET CENTS",
+        "CURRENCY",
+        "AS OF",
+      ],
+      async (page) => {
+        if (page > 1) return { rows: [], total: 0 };
+        const pending = await this.financeService.listPendingPayouts();
+        return { rows: pending.items, total: pending.items.length };
+      },
+      (row) => [
+        row.businessId,
+        row.businessName,
+        row.city,
+        row.category,
+        row.transactionCount,
+        row.noShowAmountCents,
+        row.cancellationAmountCents,
+        row.depositAmountCents,
+        row.grossCents,
+        row.processingFeesCents,
+        row.refundsCents,
+        row.disputeAdjustmentsCents,
+        row.netCents,
+        "EUR",
+        asOf,
+      ],
+    );
   };
 
   public listPendingPayouts = async (_request: Request, response: Response): Promise<void> => {

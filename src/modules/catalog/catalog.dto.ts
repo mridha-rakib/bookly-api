@@ -1,6 +1,10 @@
 import type { AddonDocument } from "../addons/addon.model.js";
 import type { BusinessAddress, BusinessDocument } from "../business/business.model.js";
 import type { BusinessVisitType } from "../business/business.types.js";
+import type {
+  BusinessCancellationPolicyDocument,
+  CancellationTierRule,
+} from "../business-cancellation-policy/business-cancellation-policy.model.js";
 import type { BusinessMediaRole } from "../business-media/business-media.model.js";
 import type {
   ServiceDocument,
@@ -66,7 +70,31 @@ export type CatalogBusinessDto = {
   /** Business Media (business-media module), PROFILE first then GALLERY by sortOrder — powers
    * both the hero banner and the Gallery tab; never a second, separately-uploaded set of images. */
   media: CatalogMediaDto[];
+  /** The Business's CURRENT cancellation/no-show policy, for display before a quote; `null` when
+   * none is configured, omitted when it was not read (cancellation and no-show then carry no fee). A Booking still snapshots
+   * the policy in effect when it is created, and the preview's own `cancellationPolicy` is the
+   * authoritative read for the Booking being made. Rates only — no customer data. */
+  cancellationPolicy?: CatalogCancellationPolicyDto | null;
 };
+
+export type CatalogCancellationPolicyDto = {
+  tiers: CancellationTierRule[];
+  noShowPercentage: number;
+};
+
+export const toCatalogCancellationPolicyDto = (
+  policy: BusinessCancellationPolicyDocument | null,
+): CatalogCancellationPolicyDto | null =>
+  policy
+    ? {
+        tiers: policy.tiers.map((tier) => ({
+          tier: tier.tier,
+          mode: tier.mode,
+          ...(tier.percentage !== undefined ? { percentage: tier.percentage } : {}),
+        })),
+        noShowPercentage: policy.noShowPercentage,
+      }
+    : null;
 
 /** A valid marker requires a finite lat/lng within real geographic ranges — never fabricated,
  * and never passed through as-is if the stored document happens to hold a malformed value. Same
@@ -98,6 +126,7 @@ export const toCatalogBusinessDto = (
     openStatus: CatalogOpenStatusDto;
     hours: CatalogBusinessHoursDayDto[];
     media: CatalogMediaDto[];
+    cancellationPolicy?: CatalogCancellationPolicyDto | null;
   },
 ): CatalogBusinessDto => ({
   id: String(business._id),
@@ -112,6 +141,9 @@ export const toCatalogBusinessDto = (
   openStatus: extra.openStatus,
   hours: extra.hours,
   media: extra.media,
+  ...(extra.cancellationPolicy !== undefined
+    ? { cancellationPolicy: extra.cancellationPolicy }
+    : {}),
 });
 
 export type CatalogServiceDto = {

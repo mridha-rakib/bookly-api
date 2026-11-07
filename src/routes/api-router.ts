@@ -9,6 +9,7 @@ import {
 } from "../modules/booking/booking.route.js";
 import { createPackageConsentRoute } from "../modules/booking/package-consent.route.js";
 import { createBusinessRoute } from "../modules/business/business.route.js";
+import { createBusinessAvailabilityRoute } from "../modules/business-booking-settings/business-availability.route.js";
 import { createCatalogRoute } from "../modules/catalog/catalog.route.js";
 import { createClientRoute } from "../modules/client/client.route.js";
 import { createPublicContentRoute } from "../modules/content/content.route.js";
@@ -59,6 +60,7 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Registering it after would be broken — createBusinessRoute()'s router-wide
   // requireRoles(["BUSINESS_OWNER"]) would reject SUPERVISOR before this router is ever reached.
   router.use("/businesses", createClientRoute());
+  router.use("/businesses", createBusinessAvailabilityRoute());
   // Same rationale as createClientRoute() above — Availability applies auth per-route
   // (Owner-or-Supervisor, not blanket Owner-only), so it must be registered before
   // createBusinessRoute()'s stricter router-wide gate.
@@ -67,6 +69,13 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // Customer-scoped preview endpoint), so it must be registered before createBusinessRoute()'s
   // stricter router-wide gate.
   router.use("/businesses", createBusinessBookingRoute());
+  // Staff self-service owns its exact paths and enforces its own role/membership guards.
+  // It must precede the review router's blanket Owner/Supervisor gate as well as the
+  // Business router; otherwise genuine First-Class members are unreachable to STAFF.
+  router.use("/businesses", createStaffScheduleRoute());
+  // Dashboard Overview also grants a STAFF-scoped read. Mount it before the review router's
+  // blanket Owner/Supervisor gate so Staff reaches its own-bookings scope without financials.
+  router.use("/businesses", createDashboardOverviewRoute());
   // Batch 19 — Business dashboard Reviews read (Owner/Supervisor), same per-route-auth-before-
   // stricter-router-wide-gate rationale as createClientRoute/createAvailabilityRoute/
   // createBusinessBookingRoute above — must be registered before createBusinessRoute()'s
@@ -76,7 +85,6 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // wide-gate rationale as the routers above (Staff in particular has no access at all under
   // createBusinessRoute()'s router-wide BUSINESS_OWNER-only gate, so this MUST be registered
   // before it).
-  router.use("/businesses", createDashboardOverviewRoute());
   // Phase 4A — Staff list read + schedule/time-off (Owner-or-Supervisor) plus Staff/Supervisor
   // self-service "my schedule"/"my assigned services" (Owner-or-Supervisor-or-Staff). Same
   // per-route-auth-before-stricter-router-wide-gate rationale as the routers above — Supervisor
@@ -84,7 +92,6 @@ export const createApiRouter = (databaseStateReader: DatabaseStateReader): Route
   // createBusinessRoute()'s router-wide BUSINESS_OWNER-only gate, so this MUST be registered
   // before it. createStaffRoute() (core staff identity: create/update/remove/invitations) stays
   // Owner-only and mounted inside createBusinessRoute() as before.
-  router.use("/businesses", createStaffScheduleRoute());
   router.use("/businesses", createBusinessRoute());
   // Customer self-service "My Bookings" surface — cross-business, never nested under
   // /businesses/:businessId (see createCustomerBookingRoute's own comment).

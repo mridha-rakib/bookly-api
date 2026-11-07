@@ -71,7 +71,8 @@ export class RefundRecoveryIncidentService {
       if (
         category !== "REFUND_RECOVERY_FAILED" &&
         evidence.finalNotificationProtocolVersion === 1 &&
-        evidence.reason === "BUSINESS_CANCELLATION" &&
+        evidence.reason !== undefined &&
+        ["BUSINESS_CANCELLATION", "CUSTOMER_EARLY_CANCELLATION"].includes(evidence.reason) &&
         !evidence.packageProgressId &&
         evidence.finalNotificationRecordedAt &&
         ["SUCCEEDED", "FAILED"].includes(evidence.providerStatus)
@@ -185,7 +186,8 @@ export class RefundRecoveryIncidentService {
           // resolving an evidence incident never asserts refund success.
           const optedIn =
             operation.finalNotificationProtocolVersion === 1 &&
-            operation.reason === "BUSINESS_CANCELLATION" &&
+            operation.reason !== undefined &&
+            ["BUSINESS_CANCELLATION", "CUSTOMER_EARLY_CANCELLATION"].includes(operation.reason) &&
             !operation.packageProgressId;
           let resolved =
             optedIn &&

@@ -48,6 +48,7 @@ import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-o
 import * as eligibility from "../../../src/modules/package-progress/package-eligibility.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { PackageProgressV2Repository } from "../../../src/modules/package-progress/package-progress-v2.repository.js";
+import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { MoneyRecoveryService } from "../../../src/modules/payment/money-recovery.service.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
@@ -55,6 +56,7 @@ import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attemp
 import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
@@ -62,6 +64,7 @@ import { UserModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import { INTERNAL_TIME, packageBatchFixture } from "../../helpers/package-batch-fixture.js";
 import {
   clearIsolatedDatabase,
@@ -244,6 +247,108 @@ describe("F2 preparation-only same-parent financial/delivery integration", () =>
     const replay = await t.writer.complete(t.scope);
     expect(replay.preparation.originBookingId).toEqual(result.preparation.originBookingId);
     expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+  });
+
+  // --- P0.4 informational VAT on the First-Class upfront charge --------------------------------
+  const withTax = (t: Awaited<ReturnType<typeof fixture>>, gateway: FakeTaxGateway) =>
+    new PackageBatchFinancialPersistence(
+      t.core,
+      t.relationships,
+      t.payments,
+      () => INTERNAL_TIME,
+      new CyprusTaxService(gateway),
+    );
+
+  it("P0.4 FIRST records the quote's Stripe Tax calculation on the unchanged pre-tax charge, once", async () => {
+    const t = await fixture(true);
+    const tax = new FakeTaxGateway();
+    tax.queueNextTax(152);
+    const writer = withTax(t, tax);
+    const result = await writer.complete(t.scope);
+    const contract = result.finance.contract;
+    expect(contract.classification).toBe("FIRST");
+    expect(contract.onlineChargeCents).toBeGreaterThan(0);
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    expect(tax.calls).toHaveLength(1);
+    expect(tax.calls[0]).toMatchObject({
+      amountCents: contract.onlineChargeCents,
+      idempotencyKey: `package-quote:${attempt.packageBatchBinding?.quoteId}:tax`,
+    });
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+    const input = t.gateway.paymentIntentInputs[0];
+    expect(input?.amountCents).toBe(contract.onlineChargeCents);
+    expect(input?.metadata).toMatchObject({
+      taxMode: "PRE_ACTIVATION",
+      taxStatus: "CALCULATED",
+      taxCents: "152",
+      taxCollectedCents: "0",
+      preTaxChargeCents: String(contract.onlineChargeCents),
+      chargedAmountCents: String(contract.onlineChargeCents),
+    });
+    expect(input?.metadata["taxCalculationId"]).toMatch(/^taxcalc_fake_/);
+    // The ledger records only the money actually charged; no tax posting is invented.
+    const ledger = await BookingFinancialTransactionModel.find().lean();
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({
+      type: "PLATFORM_FEE",
+      amountCents: contract.onlineChargeCents,
+    });
+    await writer.complete(t.scope);
+    expect(tax.calls).toHaveLength(1);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(1);
+  });
+
+  it("P0.4 an unavailable Stripe Tax calculation never blocks or zero-rates the FIRST purchase", async () => {
+    const t = await fixture(true);
+    const tax = new FakeTaxGateway();
+    tax.queueNextFailure(new Error("Stripe Tax down (test)"));
+    const result = await withTax(t, tax).complete(t.scope);
+    expect(result.finance.contract.classification).toBe("FIRST");
+    const metadata = t.gateway.paymentIntentInputs[0]?.metadata;
+    expect(metadata).toMatchObject({
+      taxStatus: "NOT_CALCULATED",
+      taxNotCalculatedReason: "TAX_CALCULATION_UNAVAILABLE",
+      taxCents: "0",
+    });
+    expect(metadata?.["taxCalculationId"]).toBeUndefined();
+  });
+
+  it("P0.4 RETURNING (no online charge) makes no Stripe Tax calculation and no PaymentIntent", async () => {
+    const t = await fixture();
+    const tax = new FakeTaxGateway();
+    expect((await withTax(t, tax).complete(t.scope)).finance.contract.classification).toBe(
+      "RETURNING",
+    );
+    expect(tax.calls).toHaveLength(0);
+    expect(t.gateway.paymentIntentInputs).toHaveLength(0);
+  });
+
+  it("BC-F05C FIRST pre-dispatch charge failure (no saved card) releases the unbound FIRST claim", async () => {
+    const t = await fixture(true, true);
+    await CustomerPaymentProfileModel.updateMany({}, { $unset: { defaultPaymentMethodId: 1 } });
+    await expect(t.writer.complete(t.scope)).rejects.toMatchObject({
+      statusCode: 402,
+      details: [expect.objectContaining({ code: "PAYMENT_METHOD_REQUIRED" })],
+    });
+    // No provider object, no attempt, no members: the claim never bound an attempt, so the
+    // Customer must not stay FIRST_PENDING (ordinary Booking releases the same way).
+    expect(t.gateway.paymentIntentInputs).toHaveLength(0);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+    expect(await BookingModel.countDocuments()).toBe(0);
+    expect(
+      (await BusinessClientModel.findById(t.scope.businessClientId))?.financialRelationship?.state,
+    ).toBe("ELIGIBLE");
+    // The original operation can still complete once a card exists (same key, FIRST once).
+    await CustomerPaymentProfileModel.updateMany(
+      {},
+      { $set: { defaultPaymentMethodId: "pm_f2_synthetic" } },
+    );
+    const result = await t.writer.complete(t.scope);
+    expect(result.finance.contract.classification).toBe("FIRST");
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(
+      (await BusinessClientModel.findById(t.scope.businessClientId))?.financialRelationship?.state,
+    ).toBe("CONSUMED");
   });
 
   for (const stage of ["ledger", "attempt", "email", "reminder"] as const) {

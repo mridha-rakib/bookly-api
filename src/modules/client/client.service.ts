@@ -337,7 +337,13 @@ export class ClientService {
     if (actorRole === "SUPERVISOR") {
       const membership = await this.staffRepository.findActiveByUserId(actorUserId);
 
-      if (membership?.role !== "SUPERVISOR" || !membership.businessId.equals(business._id)) {
+      if (
+        membership?.role !== "SUPERVISOR" ||
+        membership.employmentActive !== true ||
+        membership.removedAt != null ||
+        !membership.userId.equals(actorUserId) ||
+        !membership.businessId.equals(business._id)
+      ) {
         throw new ClientError("CLIENT_BUSINESS_NOT_FOUND", 404);
       }
       return business;

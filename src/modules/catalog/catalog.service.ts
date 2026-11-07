@@ -11,6 +11,7 @@ import type {
 import { ANY_STAFF } from "../availability/availability.types.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { BusinessCity } from "../business/business.types.js";
+import type { BusinessCancellationPolicyRepository } from "../business-cancellation-policy/business-cancellation-policy.repository.js";
 import type { BusinessOpeningHoursDay } from "../business-hours/business-hours.model.js";
 import type { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import type { BusinessMediaDocument } from "../business-media/business-media.model.js";
@@ -33,6 +34,7 @@ import {
   type CatalogStaffDto,
   toCatalogAddonDto,
   toCatalogBusinessDto,
+  toCatalogCancellationPolicyDto,
   toCatalogServiceDto,
 } from "./catalog.dto.js";
 import { CatalogError } from "./catalog.errors.js";
@@ -61,22 +63,24 @@ export class CatalogService {
     private readonly staffAvatarService: Pick<StaffAvatarService, "getAvatarUrlsByUserIds">,
     private readonly storageService: Pick<StorageService, "getObjectUrl">,
     private readonly packageProgressRepository?: PackageProgressRepository,
+    private readonly cancellationPolicyRepository?: Pick<
+      BusinessCancellationPolicyRepository,
+      "findByBusinessId"
+    >,
   ) {}
 
-  /** The venue page's single combined read: Business header + every bookable (ACTIVE) Service +
-   * every active Staff member's display name. No approval-status filter — see this method's own
-   * note: no Business in this codebase can ever be anything other than "PENDING" today (no
-   * approval workflow exists yet — confirmed during Batch 8's own investigation), so gating on
-   * an "APPROVED" status would hide every Business from every Customer. Once a real approval
-   * workflow exists, this is the place to add that filter. */
+  /** Direct-link catalog access remains available to unlisted Businesses. Super Admin
+   * approval/suspension remains authoritative independently of discovery visibility. */
   public async getBusinessCatalog(businessId: string): Promise<BusinessCatalogDto> {
     const business = await this.requireBusiness(businessId);
 
-    const [services, staffMemberships, hoursDoc, media] = await Promise.all([
+    const [services, staffMemberships, hoursDoc, media, policy] = await Promise.all([
       this.serviceRepository.listByBusinessId(business._id, { status: "ACTIVE" }),
       this.staffRepository.listActiveByBusinessId(business._id),
       this.businessHoursRepository.findByBusinessId(business._id),
       this.businessMediaRepository.listByBusinessId(business._id),
+      this.cancellationPolicyRepository?.findByBusinessId(business._id) ??
+        Promise.resolve(undefined),
     ]);
 
     const [profiles, avatarUrlByUserId] = await Promise.all([
@@ -105,7 +109,15 @@ export class CatalogService {
     const mediaDtos = await this.toMediaDtos(media);
 
     return {
-      business: toCatalogBusinessDto(business, { openStatus, hours, media: mediaDtos }),
+      business: toCatalogBusinessDto(business, {
+        openStatus,
+        hours,
+        media: mediaDtos,
+        // Without a wired repository the policy is unknown, not absent: omit rather than claim "none".
+        ...(policy !== undefined
+          ? { cancellationPolicy: toCatalogCancellationPolicyDto(policy) }
+          : {}),
+      }),
       services: services.map(toCatalogServiceDto),
       staff,
     };
@@ -286,7 +298,7 @@ export class CatalogService {
       throw new CatalogError("CATALOG_BUSINESS_NOT_FOUND", 404);
     }
     const business = await this.businessRepository.findById(businessId);
-    if (!business) {
+    if (!business || !["APPROVED", "WARNING"].includes(business.status)) {
       throw new CatalogError("CATALOG_BUSINESS_NOT_FOUND", 404);
     }
     return business;

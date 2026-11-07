@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
@@ -182,6 +182,12 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
       briefDescription: "A great business",
       category: "Barber",
       subcategories: ["Haircut"],
+    });
+    // Customer booking admission requires an approved venue, including at commit time.
+    await businessRepository.casUpdateStatus(business._id, ["PENDING"], "APPROVED", {
+      fromStatus: "PENDING",
+      actorUserId: business.ownerUserId,
+      changedAt: new Date(),
     });
     return { owner, business };
   };
@@ -386,17 +392,19 @@ describe("database-backed Booking DEPOSIT vs PLATFORM FEE correction (Batch 6.5)
     );
     expect(legacy.depositCents).toBe(2000);
 
-    // Force the second booking's schedule inside the UNDER_2_HOURS window.
-    await BookingModel.updateOne(
-      { _id: second.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
-
-    const cancelled = await lifecycleService.cancelByCustomer(
-      String(customer._id),
-      String(second.booking._id),
-      "Can't make it",
-    );
+    // Advance only the application Date clock; preserve Booking/claim/interval identity.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(second.booking.schedule.startAt.getTime() - 60 * 60 * 1000);
+    let cancelled: Awaited<ReturnType<BookingLifecycleService["cancelByCustomer"]>>;
+    try {
+      cancelled = await lifecycleService.cancelByCustomer(
+        String(customer._id),
+        String(second.booking._id),
+        "Can't make it",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
     expect(cancelled.status).toBe("LATE_CANCELLATION");
     // €100 basis * 40% = €40 gross fee. €20 already collected as DEPOSIT (not PLATFORM_FEE) ->
     // €20 additional charge.

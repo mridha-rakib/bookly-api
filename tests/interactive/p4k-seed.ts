@@ -40,6 +40,7 @@ const days = [
   "SUNDAY",
 ] as const;
 
+let syntheticPhoneSequence = 0;
 async function user(email: string, role: Role, firstName: string, hash: string) {
   const _id = new Types.ObjectId();
   await UserModel.create({
@@ -52,7 +53,14 @@ async function user(email: string, role: Role, firstName: string, hash: string) 
     emailVerifiedAt: new Date(),
     security: { passwordUpdatedAt: new Date() },
   });
-  await UserProfileModel.create({ userId: _id, firstName, lastName: "Synthetic", gender: "other" });
+  const nationalNumber = `99${String(++syntheticPhoneSequence).padStart(6, "0")}`;
+  await UserProfileModel.create({
+    userId: _id,
+    firstName,
+    lastName: "Synthetic",
+    gender: "other",
+    phone: { countryCode: "+357", nationalNumber, e164: `+357${nationalNumber}` },
+  });
   return _id;
 }
 
@@ -320,3 +328,16 @@ export async function seedP4k() {
   return { password: P4K_PASSWORD, accounts: P4K_ACCOUNTS, customer, otherCustomer, venue, travel };
 }
 export type P4kSeed = Awaited<ReturnType<typeof seedP4k>>;
+
+/** Each paid scenario needs a fresh Business/Customer relationship. A prior completed
+ * purchase correctly makes the original venue RETURNING, with zero purchase upfront. */
+export async function seedP4kPaymentVenue() {
+  const nonce = new Types.ObjectId().toHexString();
+  return business({
+    name: `P4K paid scenario ${nonce}`,
+    ownerEmail: `owner-${nonce}@p4k.invalid`,
+    travel: false,
+    hash: await new Argon2PasswordHasher().hash(P4K_PASSWORD),
+    staff: [{ email: `staff-${nonce}@p4k.invalid`, role: "STAFF", name: "Paid Staff" }],
+  });
+}

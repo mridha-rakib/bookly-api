@@ -35,6 +35,22 @@ const scope = z
   .object({ businessId: lifecycleHttpId, packageProgressId: lifecycleHttpId })
   .strict();
 const operation = scope.extend({ key: lifecycleIntentSchema.shape.key });
+// Validate the existing venue-attestation contract before retaining an operation. Database
+// admission still checks the live outstanding balance; HTTP input cannot supply that balance.
+const venuePayment = lifecycleIntentSchema.shape.venuePayment.unwrap().superRefine((value, ctx) => {
+  if (value.settlement === "PARTIAL" && value.amountCents === undefined)
+    ctx.addIssue({
+      code: "custom",
+      path: ["amountCents"],
+      message: "A partial settlement requires an amount in cents",
+    });
+  if (value.settlement !== "PARTIAL" && value.amountCents !== undefined)
+    ctx.addIssue({
+      code: "custom",
+      path: ["amountCents"],
+      message: "Only a partial settlement accepts an amount",
+    });
+});
 const redemption = operation.extend({
   packageItemId: lifecycleHttpId,
   staffMembershipId: lifecycleHttpId,
@@ -65,7 +81,7 @@ export const lifecycleHttpSchemas = {
   cancel: operation.extend({ bookingId: lifecycleHttpId }),
   complete: operation.extend({
     bookingId: lifecycleHttpId,
-    venuePayment: lifecycleIntentSchema.shape.venuePayment,
+    venuePayment: venuePayment.optional(),
   }),
   "mark-no-show": operation.extend({ bookingId: lifecycleHttpId }),
   "no-show": operation.extend({ bookingId: lifecycleHttpId }),
@@ -78,18 +94,18 @@ export const lifecycleHttpSchemas = {
   // P4K-5 management recovery (Owner/Supervisor): same wire shape as each management action.
   "complete-status": operation.extend({
     bookingId: lifecycleHttpId,
-    venuePayment: lifecycleIntentSchema.shape.venuePayment,
+    venuePayment: venuePayment.optional(),
   }),
   "mark-no-show-status": operation.extend({ bookingId: lifecycleHttpId }),
   "no-show-status": operation.extend({ bookingId: lifecycleHttpId }),
   "reverse-no-show-status": operation.extend({ bookingId: lifecycleHttpId }),
   "settlement-status": operation.extend({
     bookingId: lifecycleHttpId,
-    venuePayment: lifecycleIntentSchema.shape.venuePayment.unwrap(),
+    venuePayment,
   }),
   settlement: operation.extend({
     bookingId: lifecycleHttpId,
-    venuePayment: lifecycleIntentSchema.shape.venuePayment.unwrap(),
+    venuePayment,
   }),
   selection: scope.extend({
     packageItemId: lifecycleHttpId,

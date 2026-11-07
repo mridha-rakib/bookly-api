@@ -46,6 +46,8 @@ export const updateBusinessBodySchema = z
     floorUnit: z.string().trim().optional(),
     aptRoom: z.string().trim().optional(),
     briefDescription: z.string().trim().min(1).optional(),
+    registrationNumber: z.string().trim().max(100).optional(),
+    additionalInformation: z.array(z.string().trim().max(500)).max(3).optional(),
     category: z.string().trim().min(1).optional(),
     subcategories: z.array(z.string().trim().min(1)).min(1).max(5).optional(),
     instagramHandle: z

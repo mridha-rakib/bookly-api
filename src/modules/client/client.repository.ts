@@ -125,7 +125,11 @@ export class ClientRepository {
     const skip = (filter.page - 1) * filter.limit;
 
     const [clients, total] = await Promise.all([
-      BusinessClientModel.find(query).sort({ createdAt: -1 }).skip(skip).limit(filter.limit).exec(),
+      BusinessClientModel.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(filter.limit)
+        .exec(),
       BusinessClientModel.countDocuments(query).exec(),
     ]);
 

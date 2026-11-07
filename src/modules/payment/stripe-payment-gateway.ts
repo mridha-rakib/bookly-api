@@ -206,6 +206,17 @@ export class StripePaymentGateway implements PaymentGateway {
     return this.toPaymentIntentSnapshot(paymentIntent);
   }
 
+  public async cancelPaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot> {
+    const intent = await this.wrap(() =>
+      this.client.paymentIntents.cancel(
+        paymentIntentId,
+        { cancellation_reason: "abandoned" },
+        { idempotencyKey: `authentication-expiry:${paymentIntentId}` },
+      ),
+    );
+    return this.toPaymentIntentSnapshot(intent);
+  }
+
   public async findPaymentIntentByMetadata(
     paymentAttemptId: string,
   ): Promise<ProviderLookupResult<PaymentIntentSnapshot>> {

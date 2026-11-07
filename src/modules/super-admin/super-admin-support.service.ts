@@ -4,8 +4,11 @@ import {
   type SuperAdminSupportTicketDetailDto,
   type SuperAdminSupportTicketRowDto,
   type SupportMessageDto,
+  type SupportMessageListDto,
   toSupportMessageDto,
+  toSupportMessageListDto,
 } from "../support/support.dto.js";
+import type { ListSupportMessagesQuery } from "../support/support.schema.js";
 import type { SupportService } from "../support/support.service.js";
 import type { SupportTicketStatus } from "../support/support.types.js";
 import type { SupportTicketDocument } from "../support/support-ticket.model.js";
@@ -45,16 +48,10 @@ export class SuperAdminSupportService {
 
   public async listMessages(
     ticketId: string,
-    pagination: { page: number; limit: number },
-  ): Promise<{
-    messages: SupportMessageDto[];
-    pagination: { page: number; limit: number; total: number };
-  }> {
-    const result = await this.supportService.listMessagesForAdmin(ticketId, pagination);
-    return {
-      messages: result.messages.map(toSupportMessageDto),
-      pagination: { page: pagination.page, limit: pagination.limit, total: result.total },
-    };
+    query: ListSupportMessagesQuery,
+  ): Promise<SupportMessageListDto> {
+    const result = await this.supportService.listMessagesForAdmin(ticketId, query);
+    return toSupportMessageListDto(result, query);
   }
 
   public async reply(

@@ -22,6 +22,7 @@ import type { CustomerPaymentProfileRepository } from "../../src/modules/payment
 import type { RegistrationSessionRepository } from "../../src/modules/registration-session/registration-session.repository.js";
 import type { ReviewRepository } from "../../src/modules/review/review.repository.js";
 import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
+import type { StaffAvatarService } from "../../src/modules/staff-avatar/staff-avatar.service.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../src/modules/verification/phone-otp.provider.js";
 
@@ -228,6 +229,11 @@ const createAuthService = (overrides: Record<string, unknown> = {}) => {
     clientRepository as unknown as ClientRepository,
     customerPaymentProfileRepository as unknown as CustomerPaymentProfileRepository,
     emailOutboxService as unknown as EmailOutboxService,
+    undefined,
+    undefined,
+    overrides["staffAvatarService"] as
+      | Pick<StaffAvatarService, "getAvatarUrlsByUserIds">
+      | undefined,
   );
 
   return {
@@ -613,6 +619,70 @@ describe("AuthService.updateMyProfile", () => {
 });
 
 describe("AuthService.getMe", () => {
+  it.each(["STAFF", "SUPERVISOR"] as const)(
+    "does not restore business context for a deactivated %s",
+    async (role) => {
+      const userId = new Types.ObjectId();
+      const findBusiness = vi.fn();
+      const { service } = createAuthService({
+        businessRepository: { findById: findBusiness },
+        userRepository: {
+          findById: vi.fn().mockResolvedValue({ _id: userId, role, status: "ACTIVE" }),
+          findProfileByUserId: vi.fn().mockResolvedValue(null),
+        },
+        staffRepository: {
+          findActiveByUserId: vi.fn().mockResolvedValue({
+            userId,
+            businessId: new Types.ObjectId(),
+            role,
+            employmentActive: false,
+          }),
+        },
+      });
+      await expect(service.getMe(String(userId))).resolves.toMatchObject({ business: null });
+      expect(findBusiness).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["BUSINESS_OWNER", "SUPERVISOR", "STAFF"])(
+    "returns only the authenticated %s's persisted professional avatar",
+    async (role) => {
+      const userId = new Types.ObjectId();
+      const getAvatarUrlsByUserIds = vi.fn().mockResolvedValue(
+        new Map([
+          [String(userId), "https://media.example/own-photo.png"],
+          ["another-user", "https://media.example/foreign.png"],
+        ]),
+      );
+      const { service } = createAuthService({
+        userRepository: {
+          findById: vi.fn().mockResolvedValue({
+            _id: userId,
+            role,
+            status: "ACTIVE",
+            normalizedEmail: "professional@example.test",
+          }),
+          findProfileByUserId: vi.fn().mockResolvedValue({ firstName: "Sam", lastName: "Member" }),
+        },
+        staffAvatarService: { getAvatarUrlsByUserIds },
+      });
+      const result = await service.getMe(String(userId));
+      expect(result.profile?.avatarUrl).toBe("https://media.example/own-photo.png");
+      expect(getAvatarUrlsByUserIds).toHaveBeenCalledWith([String(userId)]);
+    },
+  );
+  it("does not resolve professional media for a Customer", async () => {
+    const userId = new Types.ObjectId(),
+      getAvatarUrlsByUserIds = vi.fn();
+    const { service } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({ _id: userId, role: "CUSTOMER", status: "ACTIVE" }),
+        findProfileByUserId: vi.fn().mockResolvedValue({ firstName: "Jane", lastName: "Customer" }),
+      },
+      staffAvatarService: { getAvatarUrlsByUserIds },
+    });
+    expect((await service.getMe(String(userId))).profile?.avatarUrl).toBeUndefined();
+    expect(getAvatarUrlsByUserIds).not.toHaveBeenCalled();
+  });
   it("echoes the stored defaultLanguage and defaults legacy profiles to EN", async () => {
     const userId = new Types.ObjectId();
     const withLanguage = createAuthService({

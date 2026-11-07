@@ -74,8 +74,11 @@ export class SupportTicketRepository {
     const filter = { requesterUserId };
     const skip = (pagination.page - 1) * pagination.limit;
     const [tickets, total] = await Promise.all([
+      // P1.8 — `_id` tie-breaker: two tickets sharing a createdAt can never swap between offset
+      // pages (duplicated on one, missing from the next). Filtered by the existing
+      // `{ requesterUserId, createdAt }` index; ties are ordered within one requester's rows.
       SupportTicketModel.find(filter)
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
         .limit(pagination.limit)
         .exec(),

@@ -16,6 +16,7 @@ import { DiscoveryController } from "./discovery.controller.js";
 import { DiscoveryRepository } from "./discovery.repository.js";
 import { homeSectionsQuerySchema, listDiscoveryBusinessesQuerySchema } from "./discovery.schema.js";
 import { DiscoveryService } from "./discovery.service.js";
+import { createNoDepositEligibilityRoute } from "./no-deposit-eligibility.js";
 
 /** Batch 16 — Explore's real backend. Genuinely public — no `authenticate` anywhere in this
  * chain — matching the real precedent `contact.route.ts` established (a genuinely anonymous GET/
@@ -24,6 +25,7 @@ import { DiscoveryService } from "./discovery.service.js";
  * on for abuse protection. */
 export const createDiscoveryRoute = (): Router => {
   const router = Router();
+  router.use(createNoDepositEligibilityRoute());
   const controller = new DiscoveryController(
     new DiscoveryService(
       new DiscoveryRepository(),

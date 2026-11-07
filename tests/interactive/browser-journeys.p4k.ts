@@ -29,6 +29,7 @@ import { openP4kBrowser, type P4kPage } from "./p4k-browser.js";
 import { type P4kClient, startP4kClient } from "./p4k-client.js";
 import { type P4kHarness, startP4kHarness } from "./p4k-harness.js";
 import { harnessGateway, setConsentClock, simulateAuthentication } from "./p4k-harness-state.js";
+import { seedP4kPaymentVenue } from "./p4k-seed.js";
 
 const artifacts = process.env["BOOKLY_P4K_BROWSER_ARTIFACTS"];
 const clientRoot = process.env["BOOKLY_P4K_CLIENT_ROOT"];
@@ -211,6 +212,9 @@ async function journey(name: string, body: () => Promise<void>) {
     results.push({ journey: name, result: "FAIL", detail: String(error).slice(0, 2000) });
     await page.screenshot(`${name.replace(/\W+/g, "-")}-failure.png`).catch(() => undefined);
     throw error;
+  } finally {
+    if (artifacts)
+      await writeFile(join(artifacts, "journey-progress.json"), JSON.stringify(results, null, 2));
   }
 }
 
@@ -222,6 +226,21 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
     if (readdirSync(artifacts).length) throw Error("Artifacts directory must be new and empty");
     h = await startP4kHarness();
     next = await startP4kClient({ clientRoot, apiOrigin: h.apiOrigin, uiOrigin: h.uiOrigin });
+    // Compile auth routes before the first redirect. A dev root-layout hot update during
+    // that redirect can leave the new Chrome document blank (same lane as consent Next E2E).
+    for (const route of [
+      `/customer/package-consent/${h.seed.venue.id}/${h.seed.venue.packages.finite12._id}`,
+      "/select-role",
+      "/customer",
+      "/customer/password",
+      `/venue?id=${h.seed.venue.id}`,
+      "/customer/bookings",
+      `/customer/packages/${new Types.ObjectId()}?kind=first-class`,
+    ]) {
+      const response = await fetch(`${h.uiOrigin}${route}`, { signal: AbortSignal.timeout(90000) });
+      expect(response.ok, `Next route compilation failed: ${route}`).toBe(true);
+      await response.text();
+    }
     page = await openP4kBrowser({
       artifacts,
       authenticate: (clientSecret, result) => simulateAuthentication({ clientSecret }, result),
@@ -261,6 +280,7 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
         await page.click("Purchase this Package");
         await purchaseText();
         expect(await page.text()).toContain("Package purchase verified by the server");
+        expect(await page.text()).not.toContain("No Package purchase has been made");
         const claim = await claimFor(firstOperation).orFail();
         expect(claim.packageBatchCompletion?.version).toBe(2);
         const progress = await PackageProgressV2Model.findById(
@@ -331,7 +351,12 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
         const filter =
           "Array.from(document.querySelectorAll('[aria-label=\"Service filters\"] button')).find(b => b.textContent.trim() === 'Packages')";
         await page.waitFor(filter, 180000);
-        await page.evaluate(`${filter}.click()`);
+        // SSR can expose the filter before hydration. Retry this read-only selection
+        // until the actual React state confirms it, rather than losing the first click.
+        await page.waitFor(
+          `(() => { const button = ${filter}; if (button.getAttribute('aria-pressed') === 'true') return true; button.click(); return false; })()`,
+          180000,
+        );
         const link = `document.querySelector('a[aria-label="View details of ${definition.name}"]')`;
         await page.waitFor(link, 180000);
         const card = await page.evaluate<string>(`${link}.closest('article').innerText`);
@@ -353,25 +378,16 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
   );
 
   it(
-    "2. simulated 3DS continuation resumes the original attempt",
+    "2. RETURNING FOREVER purchase creates ownership without a new upfront charge",
     async () =>
       journey("3ds-continuation", async () => {
         await page.goto(consentUrl(v().id, v().packages.forever._id));
         const operationId = await selectAndAccept([{ service: "Hair", dayOffset: 5 }]);
-        harnessGateway.queueNextChargeOutcome("requires_action");
         const before = harnessGateway.createdPaymentIntentIds().length;
         await page.click("Purchase this Package");
         await purchaseText();
-        expect(await page.text()).toContain("PAYMENT_PENDING");
-        // A fake 3DS acknowledgement is not success: nothing is committed yet.
-        expect((await claimFor(operationId).orFail()).packageBatchCompletion).toBeUndefined();
-        await page.set3ds("succeeded");
-        await page.click("Continue secure payment authentication");
-        await page.waitFor(
-          "document.body.innerText.includes('Package purchase verified by the server')",
-          120000,
-        );
-        expect(harnessGateway.createdPaymentIntentIds().length - before).toBe(1);
+        expect(await page.text()).toContain("Package purchase verified by the server");
+        expect(harnessGateway.createdPaymentIntentIds().length - before).toBe(0);
         const claim = await claimFor(operationId).orFail();
         expect(claim.packageBatchCompletion?.version).toBe(2);
         foreverProgress = String(claim.packageBatchPreparation?.packageProgressId);
@@ -380,33 +396,53 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
   );
 
   it(
-    "2b. manual in-page simulated 3DS challenge completes the same operation",
+    "2b. RETURNING FINITE6 purchase retains its original entitlement without a new charge",
     async () =>
       journey("3ds-manual-dialog", async () => {
         await page.goto(consentUrl(v().id, v().packages.finite6._id));
         const operationId = await selectAndAccept([{ service: "Facial", dayOffset: 16 }]);
+        const before = harnessGateway.createdPaymentIntentIds().length;
+        await page.click("Purchase this Package");
+        await purchaseText();
+        expect(await page.text()).toContain("Package purchase verified by the server");
+        expect(harnessGateway.createdPaymentIntentIds().length - before).toBe(0);
+        const claim = await claimFor(operationId).orFail();
+        expect(claim.packageBatchCompletion?.version).toBe(2);
+        finite6Progress = String(claim.packageBatchPreparation?.packageProgressId);
+        await page.set3ds("succeeded");
+      }),
+    900000,
+  );
+
+  it.each(["succeeded", "manual"] as const)(
+    "2c. fresh FIRST relationship exercises %s simulated 3DS on one original operation",
+    async (mode) =>
+      journey(`first-3ds-${mode}`, async () => {
+        const paid = await seedP4kPaymentVenue();
+        await page.goto(consentUrl(paid.id, paid.packages.finite6._id));
+        const operationId = await selectAndAccept([{ service: "Hair", dayOffset: 5 }]);
         harnessGateway.queueNextChargeOutcome("requires_action");
         const before = harnessGateway.createdPaymentIntentIds().length;
         await page.click("Purchase this Package");
         await purchaseText();
         expect(await page.text()).toContain("PAYMENT_PENDING");
-        await page.set3ds("manual");
-        await page.click("Continue secure payment authentication");
-        await page.waitFor(
-          "document.querySelector('[role=dialog][aria-label=\"Simulated 3DS challenge\"]')",
-        );
-        // The challenge alone changes nothing: no provider transition, no commit.
         expect((await claimFor(operationId).orFail()).packageBatchCompletion).toBeUndefined();
-        await page.screenshot("02b-simulated-3ds-challenge.png");
-        await page.click("Complete simulated authentication");
+        await page.set3ds(mode);
+        await page.click("Continue secure payment authentication");
+        if (mode === "manual") {
+          await page.waitFor(
+            "document.querySelector('[role=dialog][aria-label=\"Simulated 3DS challenge\"]')",
+          );
+          expect((await claimFor(operationId).orFail()).packageBatchCompletion).toBeUndefined();
+          await page.screenshot("02c-simulated-3ds-challenge.png");
+          await page.click("Complete simulated authentication");
+        }
         await page.waitFor(
           "document.body.innerText.includes('Package purchase verified by the server')",
           120000,
         );
         expect(harnessGateway.createdPaymentIntentIds().length - before).toBe(1);
-        const claim = await claimFor(operationId).orFail();
-        expect(claim.packageBatchCompletion?.version).toBe(2);
-        finite6Progress = String(claim.packageBatchPreparation?.packageProgressId);
+        expect((await claimFor(operationId).orFail()).packageBatchCompletion?.version).toBe(2);
         await page.set3ds("succeeded");
       }),
     900000,
@@ -416,7 +452,8 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
     "3. failed payment (decline and failed 3DS) leaves no usable entitlement",
     async () =>
       journey("failed-payment", async () => {
-        await page.goto(consentUrl(v().id, v().packages.finite6._id));
+        const paid = await seedP4kPaymentVenue();
+        await page.goto(consentUrl(paid.id, paid.packages.finite6._id));
         const declined = await selectAndAccept([{ service: "Facial", dayOffset: 6 }]);
         harnessGateway.queueNextChargeOutcome("failed");
         await page.click("Purchase this Package");
@@ -427,7 +464,8 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
         const progressId = claim.packageBatchPreparation?.packageProgressId;
         if (progressId)
           expect(await PackageProgressV2Model.countDocuments({ _id: progressId })).toBe(0);
-        await page.goto(consentUrl(v().id, v().packages.finite6._id));
+        const secondPaid = await seedP4kPaymentVenue();
+        await page.goto(consentUrl(secondPaid.id, secondPaid.packages.finite6._id));
         const failed3ds = await selectAndAccept([{ service: "Hair", dayOffset: 7 }]);
         harnessGateway.queueNextChargeOutcome("requires_action");
         await page.click("Purchase this Package");
@@ -494,7 +532,8 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
     "5. interrupted purchase (lost provider response) recovers the same operation after reload",
     async () =>
       journey("interrupted-recovery", async () => {
-        await page.goto(consentUrl(v().id, v().packages.finite6._id));
+        const paid = await seedP4kPaymentVenue();
+        await page.goto(consentUrl(paid.id, paid.packages.finite6._id));
         const operationId = await selectAndAccept([{ service: "Hair", dayOffset: 9 }]);
         harnessGateway.queueNextChargeLostResponse(Error("P4K simulated lost response"));
         const before = harnessGateway.createdPaymentIntentIds().length;
@@ -1311,14 +1350,15 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
     "11. unlink/relink invalidates pending Purchase-status recovery",
     async () =>
       journey("unlink-relink-denial", async () => {
-        await page.goto(consentUrl(v().id, v().packages.finite6._id));
+        const paid = await seedP4kPaymentVenue();
+        await page.goto(consentUrl(paid.id, paid.packages.finite6._id));
         const operationId = await selectAndAccept([{ service: "Hair", dayOffset: 13 }]);
         harnessGateway.queueNextChargeOutcome("requires_action");
         await page.click("Purchase this Package");
         await purchaseText();
         expect(await page.text()).toContain("PAYMENT_PENDING");
         const client = await BusinessClientModel.findOne({
-          businessId: v().id,
+          businessId: paid.id,
           linkedUserId: h.seed.customer,
         }).orFail();
         const clients = new ClientRepository();
@@ -1330,7 +1370,7 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
         const status = await api("/package-views/actions/purchase-status", {
           method: "POST",
           token: await token(h.seed.accounts.customer, "customer"),
-          body: { businessId: String(v().id), operationId },
+          body: { businessId: String(paid.id), operationId },
         });
         expect(status.status).toBe(409);
         expect(JSON.stringify(status.data)).not.toContain("clientSecret");

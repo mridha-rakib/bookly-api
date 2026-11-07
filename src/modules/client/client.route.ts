@@ -86,6 +86,12 @@ export const createClientRoute = (): Router => {
     asyncHandler(controller.create),
   );
   router.get(
+    "/:businessId/clients/export.csv",
+    ...requireClientAccess,
+    validateRequest({ params: clientBusinessParamsSchema, query: listClientsQuerySchema }),
+    asyncHandler(controller.exportCsv),
+  );
+  router.get(
     "/:businessId/clients/:clientId",
     ...requireClientAccess,
     validateRequest({ params: clientIdParamsSchema }),

@@ -3459,13 +3459,21 @@ describe("P1 — universal customer↔business financial relationship + Financia
             .exec();
           const piCount = paymentGateway.paymentIntentInputs.length;
 
+          // The package fixture intentionally represents an unbound pre-P3 operation. Current
+          // Legacy Package operations must carry BC-I1's canonical binding; an unbound retry
+          // cannot establish original request identity and is rejected as an idempotency
+          // conflict before the frozen financial contract is considered.
+          const expectedConflict =
+            kind === "package"
+              ? "BOOKING_IDEMPOTENCY_CONFLICT"
+              : "BOOKING_FINANCIAL_CONTRACT_CONFLICT";
           await expect(
             kind === "normal"
               ? finalizeNormal(fixture, customer._id, input as ReturnType<typeof normalInput>)
               : finalizePackage(fixture, customer._id, input as ReturnType<typeof packageInput>),
           ).rejects.toMatchObject({
             statusCode: 409,
-            details: [{ code: "BOOKING_FINANCIAL_CONTRACT_CONFLICT" }],
+            details: [{ code: expectedConflict }],
           });
 
           const after = await BookingCreationClaimModel.findOne({
@@ -3496,11 +3504,15 @@ describe("P1 — universal customer↔business financial relationship + Financia
           const relationshipBefore = (await relationshipOf(client._id)).financialRelationship;
           paymentGateway.succeedPaymentIntent(charge.paymentIntentId); // the customer finished 3DS
 
+          const expectedConflict =
+            kind === "package"
+              ? "BOOKING_IDEMPOTENCY_CONFLICT"
+              : "BOOKING_FINANCIAL_CONTRACT_CONFLICT";
           await expect(
             kind === "normal"
               ? finalizeNormal(fixture, customer._id, input as ReturnType<typeof normalInput>)
               : finalizePackage(fixture, customer._id, input as ReturnType<typeof packageInput>),
-          ).rejects.toMatchObject({ details: [{ code: "BOOKING_FINANCIAL_CONTRACT_CONFLICT" }] });
+          ).rejects.toMatchObject({ details: [{ code: expectedConflict }] });
 
           const attempt = await PaymentAttemptModel.findOne({
             logicalIdempotencyKey: input.idempotencyKey,
@@ -4168,10 +4180,73 @@ describe("P1 — universal customer↔business financial relationship + Financia
         expect(next.financialContract?.classification).toBe("FIRST");
       },
     );
-    it.each(["CUSTOMER", "NO_SHOW"] as const)("%s never reverses promo or FIRST", async (actor) => {
+    // Approved Decision A (2026-11-05) restores FIRST only for a refunded cancellation 24 h or
+    // more ahead; a LATE customer cancellation and a no-show still never reverse promo or FIRST.
+    it.each(["CUSTOMER", "NO_SHOW"] as const)(
+      "%s (late) never reverses promo or FIRST",
+      async (actor) => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, `p4-keep-${actor}`);
+        const code = `KEEP${new Types.ObjectId()}`;
+        const promo = await new PromoRepository().create({
+          code,
+          normalizedCode: code.toUpperCase(),
+          type: "PERCENTAGE",
+          value: 20,
+          scope: "ALL_BOOKINGS",
+          perUserUsageLimit: 1,
+          businessIds: [],
+          expiresAt: new Date("2040-01-01"),
+          createdByUserId: fixture.owner._id,
+        });
+        const booking = confirmed(
+          await creationService.finalizeCustomerBooking(
+            String(customer._id),
+            String(fixture.business._id),
+            { ...normalInput(fixture), promoCode: code },
+          ),
+        );
+        if (actor === "CUSTOMER") {
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(booking.schedule.startAt.getTime() - 60 * 60 * 1000));
+          try {
+            await lifecycleService.cancelByCustomer(
+              String(customer._id),
+              String(booking._id),
+              undefined,
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+          expect(await RefundOperationModel.countDocuments({ bookingId: booking._id })).toBe(0);
+        } else {
+          await lifecycleService.markNoShow(
+            String(fixture.owner._id),
+            "BUSINESS_OWNER",
+            String(fixture.business._id),
+            String(booking._id),
+          );
+          await lifecycleService.waiveFee(
+            String(fixture.owner._id),
+            "BUSINESS_OWNER",
+            String(fixture.business._id),
+            String(booking._id),
+            "test",
+            undefined,
+          );
+        }
+        expect(
+          (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.usageRestoredAt,
+        ).toBeUndefined();
+        expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(1);
+        expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(1);
+        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
+      },
+    );
+    it("a refunded customer cancellation 24 h or more ahead restores FIRST but not the promo", async () => {
       const fixture = await setupFixture();
-      const { customer, client } = await createLinkedCustomer(fixture, `p4-keep-${actor}`);
-      const code = `KEEP${new Types.ObjectId()}`;
+      const { customer, client } = await createLinkedCustomer(fixture, "p4-early-customer");
+      const code = `EARLY${new Types.ObjectId()}`;
       const promo = await new PromoRepository().create({
         code,
         normalizedCode: code.toUpperCase(),
@@ -4190,34 +4265,13 @@ describe("P1 — universal customer↔business financial relationship + Financia
           { ...normalInput(fixture), promoCode: code },
         ),
       );
-      if (actor === "CUSTOMER")
-        await lifecycleService.cancelByCustomer(
-          String(customer._id),
-          String(booking._id),
-          undefined,
-        );
-      else {
-        await lifecycleService.markNoShow(
-          String(fixture.owner._id),
-          "BUSINESS_OWNER",
-          String(fixture.business._id),
-          String(booking._id),
-        );
-        await lifecycleService.waiveFee(
-          String(fixture.owner._id),
-          "BUSINESS_OWNER",
-          String(fixture.business._id),
-          String(booking._id),
-          "test",
-          undefined,
-        );
-      }
-      expect(
-        (await PromoRedemptionModel.findOne({ bookingId: booking._id }))?.usageRestoredAt,
-      ).toBeUndefined();
-      expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(1);
+      await lifecycleService.cancelByCustomer(String(customer._id), String(booking._id), undefined);
+      expect((await relationshipOf(client._id)).financialRelationship).toMatchObject({
+        state: "ELIGIBLE",
+        lastRelease: { reason: "CUSTOMER_EARLY_CANCELLATION" },
+      });
+      // Promo usage restoration on a customer cancellation is not part of the approved rule.
       expect((await PromoUserUsageModel.findOne({ promoId: promo._id }))?.count).toBe(1);
-      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
     });
     it("unlimited promo restores only the counters it actually consumed", async () => {
       const fixture = await setupFixture();

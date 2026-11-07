@@ -118,6 +118,72 @@ describe("money recovery process lifecycle", () => {
     expect(events).toEqual(["stopping", "pass-finished", "disconnected"]);
   });
 
+  it("keeps repeated signals idempotent while the active pass drains", async () => {
+    const signals = new EventEmitter();
+    const active = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const events: string[] = [];
+    const running = withMoneyRecoveryLifecycle({
+      signals,
+      connect: async () => undefined,
+      disconnect: async () => {
+        events.push("disconnected");
+      },
+      execute: async () => {
+        active.resolve();
+        await release.promise;
+        events.push("pass-finished");
+      },
+      onStopping: () => events.push("stopping"),
+    });
+    await active.promise;
+    signals.emit("SIGTERM");
+    signals.emit("SIGTERM");
+    signals.emit("SIGINT");
+    expect(events).toEqual(["stopping"]);
+    release.resolve();
+    await running;
+    expect(events).toEqual(["stopping", "pass-finished", "disconnected"]);
+    expect(signals.listenerCount("SIGINT")).toBe(0);
+    expect(signals.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("calls the shutdown deadline handler only after the configured grace period", async () => {
+    vi.useFakeTimers();
+    try {
+      const signals = new EventEmitter();
+      const active = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const onShutdownTimeout = vi.fn();
+      const disconnect = vi.fn(async () => undefined);
+      const running = withMoneyRecoveryLifecycle({
+        signals,
+        connect: async () => undefined,
+        disconnect,
+        execute: async () => {
+          active.resolve();
+          await release.promise;
+        },
+        onStopping: vi.fn(),
+        shutdownTimeoutMs: 5_000,
+        onShutdownTimeout,
+      });
+      await active.promise;
+      signals.emit("SIGTERM");
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(onShutdownTimeout).not.toHaveBeenCalled();
+      expect(disconnect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onShutdownTimeout).toHaveBeenCalledOnce();
+      expect(disconnect).not.toHaveBeenCalled();
+      release.resolve();
+      await running;
+      expect(disconnect).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("interrupts the polling wait on stop", async () => {
     const signals = new EventEmitter();
     const waiting = Promise.withResolvers<void>();

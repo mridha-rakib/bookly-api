@@ -4,6 +4,8 @@ import type { BookingFinancialTransactionDocument } from "../booking-financial-t
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import type { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import { assessBusinessFeeTax } from "../business-booking-settings/business-tax-settings.js";
 import type { NoShowNotificationPort } from "../notification/no-show.notifier.js";
 import type { PenaltySettlementNotificationPort } from "../notification/penalty-settlement.notifier.js";
 import type { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
@@ -13,7 +15,10 @@ import {
 } from "../package-progress/package-progress.rules.js";
 import type { PaymentService } from "../payment/payment.service.js";
 import type { PaymentAttemptDocument } from "../payment/payment-attempt.model.js";
-import { buildPaymentIntentMetadata } from "../payment/payment-intent-metadata.js";
+import {
+  buildPaymentIntentMetadata,
+  type PaymentTaxNotCalculatedReason,
+} from "../payment/payment-intent-metadata.js";
 import {
   isDefinitivePenaltyFailure,
   isPenaltyPurpose,
@@ -158,6 +163,9 @@ export type PenaltyCollectionDeps = {
     "findByIdOnly" | "casUpdate" | "settleCancellationPenalty" | "claimNoShowCharge"
   >;
   businessRepository: Pick<BusinessRepository, "findById">;
+  /** P0.5 — the Business's declared VAT position, read only to record WHY fee VAT is not
+   * calculated. Absent in directly constructed suites (legacy reason recorded). */
+  businessTaxSettings?: Pick<BusinessBookingSettingsRepository, "findByBusinessId"> | undefined;
   settlementNotifier?: PenaltySettlementNotificationPort | undefined;
   noShowNotifier?: Pick<NoShowNotificationPort, "notifyNoShowCharged"> | undefined;
   packageProgressRepository?:
@@ -323,7 +331,11 @@ export class PenaltyCollectionService {
             await this.deps.paymentService.dispatchPenaltyAttempt(attempt._id, {
               stripeCustomerId: source.stripeCustomerId,
               paymentMethodId: source.paymentMethodId,
-              metadata: this.providerMetadata(obligation, source.paymentMethodId),
+              metadata: this.providerMetadata(
+                obligation,
+                source.paymentMethodId,
+                await this.feeTaxReason(obligation),
+              ),
             });
           } catch (error) {
             logger.warn(
@@ -699,9 +711,27 @@ export class PenaltyCollectionService {
     }
   }
 
+  /**
+   * Fees are Business-owned revenue, and the only Stripe Tax context is Bookly's own registration,
+   * so no fee VAT is ever calculated here (assessBusinessFeeTax). The Business's settings only
+   * refine the recorded reason. A settings read failure never blocks or alters the charge.
+   */
+  private async feeTaxReason(
+    obligation: BookingFinancialTransactionDocument,
+  ): Promise<PaymentTaxNotCalculatedReason> {
+    if (!this.deps.businessTaxSettings) return "BUSINESS_SUPPLY_TAX_CONTEXT_UNAVAILABLE";
+    try {
+      const settings = await this.deps.businessTaxSettings.findByBusinessId(obligation.businessId);
+      return assessBusinessFeeTax(settings?.tax).blocker;
+    } catch {
+      return "BUSINESS_SUPPLY_TAX_CONTEXT_UNAVAILABLE";
+    }
+  }
+
   private providerMetadata(
     obligation: BookingFinancialTransactionDocument,
     paymentMethodId: string,
+    taxNotCalculatedReason: PaymentTaxNotCalculatedReason,
   ): Record<string, string> {
     return {
       ...buildPaymentIntentMetadata({
@@ -713,6 +743,8 @@ export class PenaltyCollectionService {
         taxCents: 0,
         chargedAmountCents: obligation.amountCents,
         taxMode: "PRE_ACTIVATION",
+        // No calculation is made and none is implied (see feeTaxReason).
+        taxNotCalculatedReason,
       }),
       booklyPenaltyObligationId: String(obligation._id),
       booklyPaymentMethodId: paymentMethodId,

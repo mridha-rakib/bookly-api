@@ -124,9 +124,8 @@ export const putStaffScheduleBodySchema = z
     // there are 7 days in a week.
     days: z.array(scheduleDaySchema).max(7),
     // Explicit recurring weekly Weekend/Off days — distinct from a weekday simply not yet
-    // configured. Defaults to [] so every existing caller (every current test included) that
-    // only sends `days` keeps behaving exactly as before this field existed.
-    offDays: z.array(z.enum(daysOfWeek)).max(7).default([]),
+    // configured. Omission preserves persisted off-days; an explicit [] clears them.
+    offDays: z.array(z.enum(daysOfWeek)).max(7).optional(),
   })
   .strict()
   .superRefine((value, context) => {
@@ -154,7 +153,7 @@ export const putStaffScheduleBodySchema = z
 
     const seenOff = new Set<string>();
 
-    for (const [index, dayOfWeek] of value.offDays.entries()) {
+    for (const [index, dayOfWeek] of (value.offDays ?? []).entries()) {
       if (seenOff.has(dayOfWeek)) {
         context.addIssue({
           code: "custom",

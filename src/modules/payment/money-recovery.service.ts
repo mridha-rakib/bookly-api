@@ -64,6 +64,7 @@ export class MoneyRecoveryService {
     // disputes / external refunds, missing processing fees). Accounting only; optional trailing dep.
     private readonly providerReversals?: Pick<ProviderReversalService, "runBackstop">,
     private readonly refundIncidents?: Pick<RefundRecoveryIncidentService, "observe" | "poll">,
+    private readonly authenticationMaximumAgeMs?: number,
   ) {}
 
   public async runOnce(limit = 50): Promise<{
@@ -138,7 +139,7 @@ export class MoneyRecoveryService {
               businessClientId: authority.binding.businessClientId,
             });
           } else {
-            await this.paymentService.reconcilePaymentAttempt(candidate._id);
+            await this.reconcileAuthentication(candidate._id);
             await this.paymentAttemptRepository.scheduleRecoveryRetry(
               candidate._id,
               "Complete lifecycle result unresolved; original operation remains pinned",
@@ -177,16 +178,18 @@ export class MoneyRecoveryService {
               businessClientId: batch.binding.businessClientId,
             });
             await this.relationshipService?.reconcileForPaymentAttempt(candidate._id);
-          } else
+          } else {
+            // Keep the original package payment current while complete batch proof is pending.
+            // Provider state alone never materializes or confirms the package.
+            await this.reconcileAuthentication(candidate._id);
             await this.paymentAttemptRepository.scheduleRecoveryRetry(
               candidate._id,
               "Canonical complete batch monetary proof is unresolved",
             );
+          }
           continue;
         }
-        const { attempt, snapshot } = await this.paymentService.reconcilePaymentAttempt(
-          candidate._id,
-        );
+        const { attempt, snapshot } = await this.reconcileAuthentication(candidate._id);
         paymentAttempts += 1;
         // P5 — a penalty attempt is never checkout: it has no booking-persistence step and is
         // NEVER compensation-refunded. Its recorded provider state is converged by the penalty
@@ -216,7 +219,17 @@ export class MoneyRecoveryService {
           );
           continue;
         }
-        if (snapshot.status !== "succeeded" || !attempt.bookingId) continue;
+        if (snapshot.status !== "succeeded") {
+          if (snapshot.status === "canceled" || snapshot.status === "failed")
+            await this.relationshipService?.reconcileForPaymentAttempt(attempt._id);
+          else
+            await this.paymentAttemptRepository.scheduleRecoveryRetry(
+              attempt._id,
+              "Original PaymentIntent is awaiting authentication or processing",
+            );
+          continue;
+        }
+        if (!attempt.bookingId) continue;
 
         const booking = attempt.businessId
           ? await this.bookingRepository.findById(attempt.businessId, attempt.bookingId)
@@ -365,9 +378,12 @@ export class MoneyRecoveryService {
         }
         if (
           operation.bookingId &&
-          ["BUSINESS_CANCELLATION", "BUSINESS_PACKAGE_TERMINATION", "PACKAGE_VOID"].includes(
-            operation.reason,
-          ) &&
+          [
+            "BUSINESS_CANCELLATION",
+            "BUSINESS_PACKAGE_TERMINATION",
+            "PACKAGE_VOID",
+            "CUSTOMER_EARLY_CANCELLATION",
+          ].includes(operation.reason) &&
           result.status !== "pending"
         ) {
           await this.bookingRepository.updateCancellationSettlement(
@@ -763,6 +779,12 @@ export class MoneyRecoveryService {
       }
     }
     return { reconciled, errors };
+  }
+
+  private reconcileAuthentication(id: PaymentAttemptDocument["_id"]) {
+    return this.authenticationMaximumAgeMs === undefined
+      ? this.paymentService.reconcilePaymentAttempt(id)
+      : this.paymentService.reconcileAuthenticationExpiry(id, this.authenticationMaximumAgeMs);
   }
 
   private async ensureRefundLedger(

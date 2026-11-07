@@ -42,12 +42,46 @@ export function packageCheckoutHttpView(retention: PackageCheckoutRetention) {
       name: i.serviceName,
       quantity: i.totalSessions,
     })),
-    appointments: q.appointments.map((a) => ({
-      selectionId: String(a.selectionId),
-      serviceId: String(a.serviceId),
-      staffMembershipId: String(a.staffMembershipId),
-      startAt: a.startAt,
-      endAt: a.endAt,
-    })),
+    // Read-only restoration of the original selections, straight from the retained (signed)
+    // payload. Only the authorised owning Customer reaches this view; no coordinates are exposed.
+    appointments: q.appointments.map((a) => {
+      const money = q.financials.appointments.find((row) => row.bookingId.equals(a.bookingId));
+      return {
+        selectionId: String(a.selectionId),
+        definitionItemId: String(a.definitionItemId),
+        serviceId: String(a.serviceId),
+        serviceName: q.items.find((i) => i.packageItemId.equals(a.packageItemId))?.serviceName,
+        staffMembershipId: String(a.staffMembershipId),
+        startAt: a.startAt,
+        endAt: a.endAt,
+        durationMin: a.timing.baseDurationMin,
+        addons: a.addons.map((addon) => ({
+          id: String(addon.addonId),
+          name: addon.name,
+          priceCents: addon.priceCents,
+        })),
+        location:
+          a.location.mode === "TRAVEL_TO_CUSTOMER"
+            ? { mode: a.location.mode, address: withoutCoordinates(a.location.travelAddress) }
+            : { mode: a.location.mode, address: withoutCoordinates(a.location.businessLocation) },
+        travelFeeCents: a.travelFeeCents,
+        ...(money
+          ? {
+              financials: {
+                includedBaseCents: money.includedBaseCents,
+                addonsCents: money.addonsCents,
+                travelCents: money.travelCents,
+                upfrontCents: money.upfrontCents,
+                manualVenueDuesCents: money.manualVenueDuesCents,
+              },
+            }
+          : {}),
+      };
+    }),
   };
 }
+
+const withoutCoordinates = <T extends { location?: unknown }>({
+  location: _location,
+  ...rest
+}: T) => rest;

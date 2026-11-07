@@ -35,6 +35,8 @@ export type BusinessDocument = {
     e164: string;
   };
   status: BusinessStatus;
+  /** Owner-controlled discovery visibility, independent of Super Admin lifecycle status. */
+  publicVisible?: boolean | undefined;
   visitType: BusinessVisitType;
   /**
    * IANA time zone identifier (e.g. "Europe/Nicosia") — the source of truth for interpreting
@@ -56,6 +58,9 @@ export type BusinessDocument = {
       }
     | undefined;
   briefDescription: string;
+  /** Owner profile metadata, separate from declared VAT identity. Never public catalog data. */
+  registrationNumber?: string | undefined;
+  additionalInformation?: string[] | undefined;
   category: string;
   /**
    * Canonical machine identity for the display `category` string, used by platform business
@@ -117,6 +122,7 @@ const businessSchema = new Schema<BusinessDocument>(
       e164: { type: String, required: true },
     },
     status: { type: String, enum: businessStatuses, required: true, default: "PENDING" },
+    publicVisible: { type: Boolean, default: true },
     visitType: {
       type: String,
       enum: [...businessVisitTypes, "location", "travel"],
@@ -145,6 +151,12 @@ const businessSchema = new Schema<BusinessDocument>(
       searchQuery: { type: String },
     },
     briefDescription: { type: String, required: true, trim: true },
+    registrationNumber: { type: String, trim: true, maxlength: 100 },
+    additionalInformation: {
+      type: [{ type: String, trim: true, maxlength: 500 }],
+      default: undefined,
+      validate: (value: string[] | undefined) => !value || value.length <= 3,
+    },
     category: { type: String, required: true, trim: true },
     categoryKey: { type: String, enum: businessCategoryKeys, required: false },
     subcategories: { type: [String], required: true },

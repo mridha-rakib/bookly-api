@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { retrievePaymentIntent, listPaymentIntents } = vi.hoisted(() => ({
+const { retrievePaymentIntent, listPaymentIntents, cancelPaymentIntent } = vi.hoisted(() => ({
   retrievePaymentIntent: vi.fn(),
   listPaymentIntents: vi.fn(),
+  cancelPaymentIntent: vi.fn(),
 }));
 
 vi.mock("../../src/modules/payment/stripe-client.js", () => ({
   getStripeClient: () => ({
-    paymentIntents: { retrieve: retrievePaymentIntent, list: listPaymentIntents },
+    paymentIntents: {
+      retrieve: retrievePaymentIntent,
+      list: listPaymentIntents,
+      cancel: cancelPaymentIntent,
+    },
   }),
 }));
 
@@ -43,6 +48,22 @@ describe("StripePaymentGateway — P1.1 PaymentIntent lifecycle mapping", () => 
       cancellationReason: "abandoned",
     });
     expect(snapshot.clientSecret).toBeUndefined();
+  });
+
+  it("cancels the original intent with a stable key and maps provider confirmation", async () => {
+    cancelPaymentIntent.mockResolvedValue(
+      paymentIntent({ status: "canceled", cancellation_reason: "abandoned" }),
+    );
+    expect(await new StripePaymentGateway().cancelPaymentIntent("pi_lifecycle")).toMatchObject({
+      paymentIntentId: "pi_lifecycle",
+      status: "canceled",
+      cancellationReason: "abandoned",
+    });
+    expect(cancelPaymentIntent).toHaveBeenCalledWith(
+      "pi_lifecycle",
+      { cancellation_reason: "abandoned" },
+      { idempotencyKey: "authentication-expiry:pi_lifecycle" },
+    );
   });
 
   it("keeps requires_payment_method as the re-confirmable `failed` status (never `canceled`)", async () => {

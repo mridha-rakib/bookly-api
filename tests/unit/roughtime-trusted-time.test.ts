@@ -573,11 +573,14 @@ describe("dual authority → P1A verifier (still inert)", () => {
   });
 
   it("issuance anchors at the earlier of both lower bounds (never later than retained issuedAt)", () => {
-    const result = assessCommitWithDualAuthority(input(D - 3_000, D - 600_000), [
+    const result = assessCommitWithDualAuthority(input(D - 2_000, D - 600_000), [
       DUAL_AUTHORITY_ID,
     ]);
-    // Roughtime issuance lower bound Q−2000 shortens the window: D−3000 is no longer < D−2000.
+    // Roughtime issuance lower bound Q−2000 shortens the window: equality is not timely.
     expect(result).toEqual({ kind: "UNRESOLVED", reason: "COMMIT_NOT_PROVEN_BEFORE_DEADLINE" });
+    expect(
+      assessCommitWithDualAuthority(input(D - 2_001, D - 600_000), [DUAL_AUTHORITY_ID]),
+    ).toEqual({ kind: "CERTIFIED", deadlineMs: D - 2_000, commitLatestMs: D - 2_001 });
   });
 });
 

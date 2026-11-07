@@ -2,7 +2,11 @@ import { isDeepStrictEqual } from "node:util";
 import type { Types } from "mongoose";
 import { AppError } from "../../common/errors/app-error.js";
 import { BusinessClientModel } from "../client/client.model.js";
-import { PaymentAttemptModel } from "../payment/payment-attempt.model.js";
+import type { PaymentService } from "../payment/payment.service.js";
+import {
+  type PaymentAttemptDocument,
+  PaymentAttemptModel,
+} from "../payment/payment-attempt.model.js";
 import { assertPaymentBatchBinding } from "../payment/payment-batch-binding.js";
 import {
   BookingCreationClaimModel,
@@ -29,6 +33,7 @@ export class PackagePurchaseService {
   constructor(
     private readonly authority: PackageCheckoutCustomerAuthority,
     private readonly financial: Pick<PackageBatchFinancialPersistence, "complete">,
+    private readonly payments?: Pick<PaymentService, "reconcilePaymentAttempt">,
   ) {}
 
   private async owned(
@@ -119,10 +124,11 @@ export class PackagePurchaseService {
         state: "COMPLETE" as const,
         purchaseCompletion: "VERIFIED" as const,
         packageProgressId: String(completion.progress._id),
+        primaryBookingId: String(completion.progress.originBookingId),
         bookingIds: completion.bookings.map((b) => String(b._id)),
       };
     }
-    const attempt = await PaymentAttemptModel.findOne({
+    let attempt: PaymentAttemptDocument | null = await PaymentAttemptModel.findOne({
       logicalIdempotencyKey: scope.idempotencyKey,
       customerUserId: row.actorUserId,
       businessId: scope.businessId,
@@ -152,6 +158,14 @@ export class PackagePurchaseService {
       };
       if (!isDeepStrictEqual(assertPaymentBatchBinding(attempt), expected))
         throw new PackageCheckoutConflictError("Payment binding changed");
+      // Reopening an interrupted purchase reads the original Stripe intent only AFTER all
+      // customer/session/consent/batch fences above. No re-quote, dispatch, or confirmation.
+      let recoverySecret = attempt.clientSecret;
+      if (this.payments && attempt.providerPaymentIntentId) {
+        const observed = await this.payments.reconcilePaymentAttempt(attempt._id);
+        attempt = observed.attempt;
+        recoverySecret = observed.snapshot?.clientSecret;
+      }
       const refund = attempt.compensationStatus;
       return {
         ...common,
@@ -162,8 +176,8 @@ export class PackagePurchaseService {
         // Recovery secret is scoped to the actual Customer/quote/batch and never cached in the UI.
         ...(refund === "NOT_REQUIRED" &&
         ["REQUIRES_ACTION", "FAILED"].includes(attempt.providerStatus) &&
-        attempt.clientSecret
-          ? { clientSecret: attempt.clientSecret }
+        recoverySecret
+          ? { clientSecret: recoverySecret }
           : {}),
       };
     }
