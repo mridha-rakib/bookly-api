@@ -1,9 +1,10 @@
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { UserRepository } from "../user/user.repository.js";
 import { resolveAnalyticsPeriod, resolveSeriesWindow } from "./super-admin-analytics.util.js";
 
 export type SuperAdminCustomerAnalyticsDto = {
-  period: { from: string; to: string };
+  period: { from: string; to: string; timezone: string };
   registeredOverTime: Array<{ year: number; month: number; count: number }>;
   registeredTotal: number;
   /** Platform Users (role=CUSTOMER) who have EVER had a real booking with a linked account —
@@ -33,13 +34,22 @@ export class SuperAdminCustomerAnalyticsService {
     const series = resolveSeriesWindow(period);
 
     const [registeredOverTime, registeredTotal, activity] = await Promise.all([
-      this.userRepository.countCreatedByMonth("CUSTOMER", series.from, series.to),
+      this.userRepository.countCreatedByMonth(
+        "CUSTOMER",
+        series.from,
+        series.to,
+        PLATFORM_REPORTING_TIMEZONE,
+      ),
       this.userRepository.countByRole("CUSTOMER"),
       this.bookingRepository.aggregateCustomerActivity(),
     ]);
 
     return {
-      period: { from: from.toISOString(), to: to.toISOString() },
+      period: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        timezone: PLATFORM_REPORTING_TIMEZONE,
+      },
       registeredOverTime,
       registeredTotal,
       activatedCount: activity.activatedCount,

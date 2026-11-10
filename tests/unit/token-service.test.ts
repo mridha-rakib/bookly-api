@@ -1,13 +1,25 @@
 import { SignJWT } from "jose";
 import { Types } from "mongoose";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { UserModel } from "../../src/modules/user/user.model.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 import { env } from "../../src/config/env.js";
+import { AuthError } from "../../src/modules/auth/auth.errors.js";
 import { TokenService } from "../../src/modules/auth/token.service.js";
 import type { SessionDocument } from "../../src/modules/session/session.model.js";
 
 class InMemorySessionRepository {
   public sessions: SessionDocument[] = [];
+  public suspended = false;
+  public async administrativeRevocationError(): Promise<AuthError> {
+    return new AuthError(
+      this.suspended ? "USER_SUSPENDED" : "SESSION_EXPIRED",
+      this.suspended ? 403 : 401,
+    );
+  }
 
   public async create(input: Omit<SessionDocument, "_id" | "createdAt">): Promise<SessionDocument> {
     const session = {
@@ -65,9 +77,13 @@ class InMemorySessionRepository {
     }
   }
 
-  public async revokeFamily(tokenFamilyId: string): Promise<void> {
+  public async revokeFamily(
+    tokenFamilyId: string,
+    reason: SessionDocument["revocationReason"] = "TOKEN_REUSE",
+  ): Promise<void> {
     for (const session of this.sessions) {
       if (session.tokenFamilyId === tokenFamilyId) {
+        session.revocationReason = reason;
         session.revokedAt = new Date();
       }
     }
@@ -76,6 +92,7 @@ class InMemorySessionRepository {
   public async revokeAllForUser(userId: Types.ObjectId): Promise<void> {
     for (const session of this.sessions) {
       if (session.userId.equals(userId)) {
+        session.revocationReason = "REVOKE_ALL";
         session.revokedAt = new Date();
       }
     }
@@ -87,6 +104,7 @@ class InMemorySessionRepository {
   ): Promise<void> {
     for (const session of this.sessions) {
       if (session.userId.equals(userId) && !session._id.equals(exceptSessionId)) {
+        session.revocationReason = "REVOKE_ALL";
         session.revokedAt = new Date();
       }
     }
@@ -117,9 +135,7 @@ describe("TokenService", () => {
 
     await service.revokeAllSessionsForUser(userId);
 
-    await expect(service.rotateRefreshToken(mine.refreshToken)).rejects.toThrow(
-      "REFRESH_TOKEN_REUSED",
-    );
+    await expect(service.rotateRefreshToken(mine.refreshToken)).rejects.toThrow("SESSION_EXPIRED");
     await expect(service.rotateRefreshToken(theirs.refreshToken)).resolves.toMatchObject({
       userId: otherUserId,
     });
@@ -144,10 +160,10 @@ describe("TokenService", () => {
       });
       // The others are revoked (reuse-detection on rotate).
       await expect(service.rotateRefreshToken(other1.refreshToken)).rejects.toThrow(
-        "REFRESH_TOKEN_REUSED",
+        "SESSION_EXPIRED",
       );
       await expect(service.rotateRefreshToken(other2.refreshToken)).rejects.toThrow(
-        "REFRESH_TOKEN_REUSED",
+        "SESSION_EXPIRED",
       );
     });
 
@@ -176,10 +192,10 @@ describe("TokenService", () => {
       await service.revokeOtherSessionsForUser(userId, undefined);
 
       await expect(service.rotateRefreshToken(current.refreshToken)).rejects.toThrow(
-        "REFRESH_TOKEN_REUSED",
+        "SESSION_EXPIRED",
       );
       await expect(service.rotateRefreshToken(other.refreshToken)).rejects.toThrow(
-        "REFRESH_TOKEN_REUSED",
+        "SESSION_EXPIRED",
       );
     });
 
@@ -192,7 +208,7 @@ describe("TokenService", () => {
       await service.revokeOtherSessionsForUser(userId, "a-stale-or-unknown-refresh-token");
 
       await expect(service.rotateRefreshToken(other.refreshToken)).rejects.toThrow(
-        "REFRESH_TOKEN_REUSED",
+        "SESSION_EXPIRED",
       );
     });
   });
@@ -331,6 +347,9 @@ describe("TokenService — Phase 1A session-bound access tokens", () => {
   });
 
   it("legacy tokens without sid: rejected by default, accepted only under grace and only if issued before the cutoff", async () => {
+    vi.spyOn(UserModel, "exists").mockReturnValue({
+      read: () => ({ exec: async () => null }),
+    } as never);
     const repository = new InMemorySessionRepository();
     const sub = String(new Types.ObjectId());
     const legacy = await signRaw({ role: "CUSTOMER" }, sub);
@@ -366,5 +385,88 @@ describe("TokenService — Phase 1A session-bound access tokens", () => {
         sid: "f",
       }),
     ).rejects.toThrow("database unavailable");
+  });
+});
+
+describe("P2.2.6.1 all-device credentials", () => {
+  it("denies every password/OAuth family and refresh ancestor, preserves other users, and requires a new family", async () => {
+    const repository = new InMemorySessionRepository();
+    const tokens = new TokenService(repository);
+    const customer = new Types.ObjectId();
+    const other = new Types.ObjectId();
+    const devices = await Promise.all(
+      ["PASSWORD", "GOOGLE", "FACEBOOK", "APPLE"].map(() =>
+        tokens.createRefreshSession({ userId: customer }),
+      ),
+    );
+    const access = await Promise.all(
+      devices.map(async (device) =>
+        tokens.verifyAccessToken(
+          await tokens.createAccessToken({
+            userId: customer,
+            role: "CUSTOMER",
+            sessionFamilyId: device.tokenFamilyId,
+          }),
+        ),
+      ),
+    );
+    const firstDevice = devices[0];
+    if (!firstDevice) throw new Error("Missing session fixture");
+    const rotated = await tokens.rotateRefreshToken(firstDevice.refreshToken);
+    const unrelated = await tokens.createRefreshSession({ userId: other });
+    await repository.revokeAllForUser(customer);
+    for (const row of repository.sessions.filter((row) => row.userId.equals(customer)))
+      row.revocationReason = "ADMIN_SUSPENSION";
+    repository.suspended = true;
+    for (const claims of access) expect(await tokens.isAccessTokenSessionLive(claims)).toBe(false);
+    for (const device of [...devices, rotated])
+      await expect(tokens.rotateRefreshToken(device.refreshToken)).rejects.toMatchObject({
+        statusCode: 403,
+      });
+    repository.suspended = false;
+    for (const claims of access) expect(await tokens.isAccessTokenSessionLive(claims)).toBe(false);
+    for (const device of [...devices, rotated])
+      await expect(tokens.rotateRefreshToken(device.refreshToken)).rejects.toMatchObject({
+        statusCode: 401,
+      });
+    await expect(tokens.rotateRefreshToken(unrelated.refreshToken)).resolves.toMatchObject({
+      userId: other,
+    });
+    const fresh = await tokens.createRefreshSession({ userId: customer });
+    expect(devices.map((device) => device.tokenFamilyId)).not.toContain(fresh.tokenFamilyId);
+    expect(
+      await tokens.isAccessTokenSessionLive({
+        sub: String(customer),
+        role: "CUSTOMER",
+        sid: fresh.tokenFamilyId,
+      }),
+    ).toBe(true);
+  });
+
+  it("normal logout returns expiry without replay classification", async () => {
+    const repository = new InMemorySessionRepository();
+    const tokens = new TokenService(repository);
+    const device = await tokens.createRefreshSession({ userId: new Types.ObjectId() });
+    await tokens.revokeRefreshToken(device.refreshToken);
+    const revoke = vi.spyOn(repository, "revokeFamily");
+    await expect(tokens.rotateRefreshToken(device.refreshToken)).rejects.toThrow("SESSION_EXPIRED");
+    expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it("legacy sid-less grace cannot restore access after an administrative transition", async () => {
+    vi.spyOn(UserModel, "exists").mockReturnValue({
+      read: () => ({ exec: async () => ({ _id: "user" }) }),
+    } as never);
+    const tokens = new TokenService(new InMemorySessionRepository(), {
+      legacyAccessTokenGrace: true,
+      legacyCutoff: new Date(),
+    });
+    expect(
+      await tokens.isAccessTokenSessionLive({
+        sub: String(new Types.ObjectId()),
+        role: "CUSTOMER",
+        iat: 1,
+      }),
+    ).toBe(false);
   });
 });

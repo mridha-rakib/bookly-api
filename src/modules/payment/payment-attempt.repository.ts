@@ -100,6 +100,19 @@ export class PaymentAttemptRepository {
     }
   }
 
+  /** P2.2.5 — does this Customer have a payment that is not settled yet (not sent, sent,
+   * awaiting 3DS, processing, or with an unknown provider result)? Such a payment may still need
+   * the saved card, so the card must not be removed. */
+  public async hasUnsettledForCustomer(customerUserId: Types.ObjectId | string): Promise<boolean> {
+    const found = await PaymentAttemptModel.exists({
+      customerUserId,
+      providerStatus: {
+        $in: ["NOT_CREATED", "CREATED", "REQUIRES_ACTION", "PROCESSING", "UNKNOWN"],
+      },
+    }).exec();
+    return Boolean(found);
+  }
+
   public async findById(id: Types.ObjectId | string): Promise<PaymentAttemptDocument | null> {
     return PaymentAttemptModel.findById(id).exec();
   }

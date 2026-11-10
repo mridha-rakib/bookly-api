@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CustomerPaymentProfileRepository } from "../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../src/modules/payment/payment.service.js";
 import type {
@@ -10,6 +10,8 @@ import type { PaymentAttemptDocument } from "../../src/modules/payment/payment-a
 import { PaymentAttemptModel } from "../../src/modules/payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../../src/modules/payment/payment-attempt.repository.js";
 import type { UserRepository } from "../../src/modules/user/user.repository.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 function fixture(status: PaymentIntentSnapshot["status"] = "requires_action") {
   const attempt = {
@@ -54,6 +56,41 @@ function fixture(status: PaymentIntentSnapshot["status"] = "requires_action") {
 }
 
 describe("Original PaymentIntent authentication recovery", () => {
+  it("does not infer expiry from an invalid payment creation timestamp", async () => {
+    const f = fixture();
+    f.attempt.createdAt = new Date(Number.NaN);
+    const result = await f.service.reconcileAuthenticationExpiry(f.attempt._id, 60_000);
+    expect(result.snapshot?.status).toBe("requires_action");
+    expect(f.retrieve).toHaveBeenCalledWith("pi_original");
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.create).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel when the clock cannot establish an age", async () => {
+    const f = fixture();
+    vi.spyOn(Date, "now").mockReturnValue(Number.NaN);
+    await f.service.reconcileAuthenticationExpiry(f.attempt._id, 60_000);
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [-1, false],
+    [59_999, false],
+    [60_000, true],
+  ])(
+    "uses the approved age boundary for elapsed age %s without inventing a grace period",
+    async (elapsed, expires) => {
+      const f = fixture();
+      const now = new Date("2026-11-08T12:00:00Z").getTime();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      f.attempt.createdAt = new Date(now - elapsed);
+      await f.service.reconcileAuthenticationExpiry(f.attempt._id, 60_000);
+      expect(f.cancel).toHaveBeenCalledTimes(expires ? 1 : 0);
+      expect(f.create).not.toHaveBeenCalled();
+    },
+  );
+
   it("recovers the original operation and secret without cancellation when policy is unset", async () => {
     const f = fixture();
     const result = await f.service.reconcileAuthenticationExpiry(f.attempt._id);

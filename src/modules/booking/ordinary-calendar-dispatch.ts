@@ -21,6 +21,12 @@ import {
 } from "./ordinary-calendar-journal.model.js";
 import { verifyOrdinaryCalendarDeliveryAuthority } from "./ordinary-calendar-journal-authority.js";
 import {
+  ORDINARY_CALENDAR_RETRY_LIMIT_REASON,
+  type OrdinaryCalendarRetryKind,
+  ordinaryCalendarRetryDelayMs,
+  ordinaryCalendarRetryExhausted,
+} from "./ordinary-calendar-retry.js";
+import {
   type PackageCalendarOwner,
   readVerifiedCalendarOwner,
 } from "./package-calendar-authority.js";
@@ -164,8 +170,6 @@ export async function consumeOrdinaryCalendarSendPermission(
 
 export type OrdinaryCalendarDeliveryOutcome = "DONE" | "RETRY" | "BLOCKED" | "SKIPPED";
 
-const RETRY_DELAY_MS = 2 * 60_000;
-const UNKNOWN_DELAY_MS = 15 * 60_000;
 const KEEPS_PRESENT_EVENT = new Set([
   "COMPLETED",
   "PENDING",
@@ -181,18 +185,44 @@ type BookingAuthority =
 
 const classify = (error: unknown) =>
   error instanceof PackageCalendarProviderError
-    ? { state: error.kind as OrdinaryCalendarJournalState, noEffect: error.definitiveNoEffect }
-    : { state: "UNKNOWN_OUTCOME" as const, noEffect: false };
+    ? {
+        state: error.kind as OrdinaryCalendarJournalState,
+        noEffect: error.definitiveNoEffect,
+        retryAfterMs: error.retryAfterMs,
+      }
+    : { state: "UNKNOWN_OUTCOME" as const, noEffect: false, retryAfterMs: undefined };
 
 export class OrdinaryCalendarDispatch {
   constructor(
     private readonly provider: OrdinaryCalendarProvider,
     private readonly clock: () => Date = () => new Date(),
     private readonly repository = new OrdinaryCalendarJournalRepository(clock),
+    /** Jitter source; injectable for deterministic tests. */
+    private readonly random: () => number = Math.random,
   ) {}
 
-  private later(ms: number) {
-    return new Date(this.clock().getTime() + ms);
+  /** P2.2.9 — exponential backoff (bounded jitter, Retry-After honoured) from the durable count. */
+  private retryAt(
+    journal: OrdinaryCalendarJournalDocument,
+    kind: OrdinaryCalendarRetryKind,
+    retryAfterMs?: number,
+  ) {
+    return new Date(
+      this.clock().getTime() +
+        ordinaryCalendarRetryDelayMs({
+          previousFailures: journal.retryableFailures ?? 0,
+          kind,
+          retryAfterMs,
+          random: this.random,
+        }),
+    );
+  }
+
+  /** P2.2.9 — the failure being recorded would exhaust the budget: stop and surface it. */
+  private async stopIfExhausted(journal: OrdinaryCalendarJournalDocument): Promise<boolean> {
+    if (!ordinaryCalendarRetryExhausted(journal.retryableFailures ?? 0)) return false;
+    await this.repository.block(journal, "BLOCKED_AUTHORITY", ORDINARY_CALENDAR_RETRY_LIMIT_REASON);
+    return true;
   }
 
   /** The committed Booking is the authority; the journal must describe its current revision. */
@@ -253,16 +283,16 @@ export class OrdinaryCalendarDispatch {
     try {
       return await port.read();
     } catch (error) {
-      const { state } = classify(error);
+      const { state, retryAfterMs } = classify(error);
       if (state === "BLOCKED_AUTHORITY")
         await this.repository.block(journal, state, "PROVIDER_READ_DENIED");
-      else {
+      else if (!(await this.stopIfExhausted(journal))) {
         const uncertain = journal.state === "REQUEST_ISSUED" || journal.state === "UNKNOWN_OUTCOME";
         await this.repository.block(
           journal,
           uncertain ? "UNKNOWN_OUTCOME" : "RETRYABLE_FAILURE",
           "PROVIDER_READ_FAILED",
-          this.later(uncertain ? UNKNOWN_DELAY_MS : RETRY_DELAY_MS),
+          this.retryAt(journal, uncertain ? "UNCERTAIN" : "RETRYABLE", retryAfterMs),
         );
       }
       return undefined;
@@ -285,11 +315,13 @@ export class OrdinaryCalendarDispatch {
     const step = planOrdinaryCalendarStep(journal, observation, true);
     if (step.action === "CONFIRM") return this.confirmCurrent(journal);
     if (step.action === "BLOCK") {
+      if (step.state === "UNKNOWN_OUTCOME" && (await this.stopIfExhausted(journal)))
+        return "BLOCKED" as const;
       await this.repository.block(
         journal,
         step.state,
         step.reason,
-        step.state === "UNKNOWN_OUTCOME" ? this.later(UNKNOWN_DELAY_MS) : undefined,
+        step.state === "UNKNOWN_OUTCOME" ? this.retryAt(journal, "UNCERTAIN") : undefined,
       );
       return "BLOCKED" as const;
     }
@@ -375,11 +407,13 @@ export class OrdinaryCalendarDispatch {
     if (step.action === "NONE") return "SKIPPED";
     if (step.action === "CONFIRM") return this.confirmCurrent(journal);
     if (step.action === "BLOCK") {
+      if (step.state === "UNKNOWN_OUTCOME" && (await this.stopIfExhausted(journal)))
+        return "BLOCKED";
       await this.repository.block(
         journal,
         step.state,
         step.reason,
-        step.state === "UNKNOWN_OUTCOME" ? this.later(UNKNOWN_DELAY_MS) : undefined,
+        step.state === "UNKNOWN_OUTCOME" ? this.retryAt(journal, "UNCERTAIN") : undefined,
       );
       return "BLOCKED";
     }
@@ -426,17 +460,30 @@ export class OrdinaryCalendarDispatch {
       else throw new PackageCalendarProviderError("PERMANENT_FAILURE", true);
     } catch (error) {
       const outcome = classify(error);
+      const transient =
+        outcome.state === "RETRYABLE_FAILURE" || outcome.state === "UNKNOWN_OUTCOME";
       await this.repository.acknowledge(journal._id, requestId, {
         state: outcome.state,
         definitiveNoEffect: outcome.noEffect,
         reason: `PROVIDER_${outcome.state}`,
-        nextAttemptAt: this.later(
-          outcome.state === "UNKNOWN_OUTCOME" ? UNKNOWN_DELAY_MS : RETRY_DELAY_MS,
+        nextAttemptAt: this.retryAt(
+          journal,
+          outcome.state === "UNKNOWN_OUTCOME" ? "UNCERTAIN" : "RETRYABLE",
+          outcome.retryAfterMs,
         ),
       });
-      return outcome.state === "RETRYABLE_FAILURE" || outcome.state === "UNKNOWN_OUTCOME"
-        ? "RETRY"
-        : "BLOCKED";
+      if (transient && ordinaryCalendarRetryExhausted(journal.retryableFailures ?? 0)) {
+        // Budget spent: an unresolved request stays unsettled, so recovery still has to name it.
+        const fresh = await this.repository.findById(journal._id);
+        if (fresh)
+          await this.repository.block(
+            fresh,
+            "BLOCKED_AUTHORITY",
+            ORDINARY_CALENDAR_RETRY_LIMIT_REASON,
+          );
+        return "BLOCKED";
+      }
+      return transient ? "RETRY" : "BLOCKED";
     }
 
     // 412 and a PATCH 404 are definitive "not applied" answers. Everything else (including a

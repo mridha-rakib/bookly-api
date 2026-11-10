@@ -127,7 +127,10 @@ export async function refreshGoogleAccessToken(refreshToken: string): Promise<Go
   let credentials: Credentials;
   try {
     ({ credentials } = await client.refreshAccessToken());
-  } catch {
+  } catch (error) {
+    // P2.2.9 — a revoked/expired grant is permanent: only the Owner reconnecting can fix it.
+    if (isRevokedGrantError(error))
+      throw new IntegrationError("GOOGLE_CALENDAR_RECONNECT_REQUIRED", 409);
     throw new IntegrationError("GOOGLE_CALENDAR_OAUTH_FAILED", 502);
   }
 
@@ -141,6 +144,21 @@ export async function refreshGoogleAccessToken(refreshToken: string): Promise<Go
     refreshToken: credentials.refresh_token ?? refreshToken,
     expiresAt: new Date(credentials.expiry_date),
   };
+}
+
+/**
+ * P2.2.9 — Google's token endpoint answers `invalid_grant` when the refresh token was revoked,
+ * expired, or the account's password/security settings changed. Reads only the OAuth error code
+ * (never the token or the raw payload).
+ */
+export function isRevokedGrantError(error: unknown): boolean {
+  const candidate = error as {
+    response?: { data?: { error?: unknown } };
+    message?: unknown;
+  } | null;
+  const code = candidate?.response?.data?.error;
+  if (code === "invalid_grant") return true;
+  return typeof candidate?.message === "string" && /\binvalid_grant\b/u.test(candidate.message);
 }
 
 /** Bounded, single-attempt calls only (see rate-limit ground rule) — no retry/backoff loop. */
@@ -227,7 +245,8 @@ export async function patchGoogleCalendarEventSchedule(
   }
 
   if (conditional && response.status === 412) return "PRECONDITION_FAILED";
-  if (conditional && !response.ok) throwPackageCalendarFailure(response.status, true);
+  if (conditional && !response.ok)
+    throwPackageCalendarFailure(response.status, true, retryAfterHeader(response));
   if (!response.ok) {
     throw new IntegrationError("GOOGLE_CALENDAR_OAUTH_FAILED", 502);
   }
@@ -285,7 +304,7 @@ export async function insertGoogleCalendarEventWithId(
     },
   );
   if (response.status === 409) return "ALREADY_EXISTS";
-  if (!response.ok) throwPackageCalendarFailure(response.status, true);
+  if (!response.ok) throwPackageCalendarFailure(response.status, true, retryAfterHeader(response));
   return "CREATED";
 }
 
@@ -301,7 +320,7 @@ export async function getGoogleCalendarEvent(
     { method: "GET", signal: AbortSignal.timeout(10_000) },
   );
   if (response.status === 404 || response.status === 410) return { outcome: "NOT_FOUND" };
-  if (!response.ok) throwPackageCalendarFailure(response.status, false);
+  if (!response.ok) throwPackageCalendarFailure(response.status, false, retryAfterHeader(response));
   const body = (await response.json()) as {
     status?: unknown;
     etag?: unknown;
@@ -339,7 +358,7 @@ export async function resolveGoogleCalendarDestination(accessToken: string, cale
     `/calendars/${encodeURIComponent(calendarId)}`,
     { method: "GET", signal: AbortSignal.timeout(10_000) },
   );
-  if (!response.ok) throwPackageCalendarFailure(response.status, false);
+  if (!response.ok) throwPackageCalendarFailure(response.status, false, retryAfterHeader(response));
   const body = (await response.json()) as { id?: unknown };
   if (typeof body.id !== "string" || !body.id || body.id === "primary")
     throw new PackageCalendarProviderError("BLOCKED_AUTHORITY");
@@ -364,17 +383,46 @@ export async function deleteGoogleCalendarEventConditionally(
   );
   if (response.status === 412) return "PRECONDITION_FAILED";
   if (response.status === 404 || response.status === 410) return "DELETED";
-  if (!response.ok) throwPackageCalendarFailure(response.status, true);
+  if (!response.ok) throwPackageCalendarFailure(response.status, true, retryAfterHeader(response));
   return "DELETED";
 }
 
-function throwPackageCalendarFailure(status: number, mutation: boolean): never {
+/**
+ * P2.2.9 — Retry-After as milliseconds: delta-seconds or an HTTP-date. Anything unparsable, in
+ * the past or absurd is ignored (the caller's own backoff applies). Capped at 24 hours.
+ */
+export function parseRetryAfterMs(
+  header: string | null | undefined,
+  now: number = Date.now(),
+): number | undefined {
+  if (!header) return undefined;
+  const value = header.trim();
+  const ms = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, 24 * 60 * 60_000);
+}
+
+/** Defensive: test doubles and some fetch polyfills omit `headers`. */
+const retryAfterHeader = (response: Response): string | null =>
+  typeof response.headers?.get === "function" ? response.headers.get("retry-after") : null;
+
+function throwPackageCalendarFailure(
+  status: number,
+  mutation: boolean,
+  retryAfter?: string | null,
+): never {
   if (status === 401 || status === 403)
     throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
   if (status === 400 || status === 422)
     throw new PackageCalendarProviderError("PERMANENT_FAILURE", true);
-  if (status === 429) throw new PackageCalendarProviderError("RETRYABLE_FAILURE", true);
-  throw new PackageCalendarProviderError(mutation ? "UNKNOWN_OUTCOME" : "RETRYABLE_FAILURE");
+  const retryAfterMs = parseRetryAfterMs(retryAfter);
+  if (status === 429)
+    throw new PackageCalendarProviderError("RETRYABLE_FAILURE", true, retryAfterMs);
+  throw new PackageCalendarProviderError(
+    mutation ? "UNKNOWN_OUTCOME" : "RETRYABLE_FAILURE",
+    false,
+    retryAfterMs,
+  );
 }
 
 export async function deleteGoogleCalendarEvent(

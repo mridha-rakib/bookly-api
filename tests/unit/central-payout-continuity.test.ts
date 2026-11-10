@@ -14,10 +14,10 @@ import {
 
 afterEach(() => vi.restoreAllMocks());
 
-function fixture() {
+function fixture(mode: "TEST" | "LIVE" = "TEST") {
   const op = {
     _id: new Types.ObjectId(),
-    mode: "TEST",
+    mode,
     state: "UNKNOWN",
     amountCents: 1000,
     currency: "eur",
@@ -33,7 +33,7 @@ function fixture() {
     currency: "eur",
     destinationId: "ba_central",
     status: "pending",
-    livemode: false,
+    livemode: mode === "LIVE",
     automatic: false,
     arrivalDate: null,
     created: new Date(),
@@ -67,18 +67,84 @@ function fixture() {
   const list = vi.fn(async () => [payout]);
   const service = new CentralPayoutService({
     gateway: {
-      mode: () => "TEST",
+      mode: () => mode,
       createPayout: create,
       listRecentPayouts: list,
       retrievePayout: async () => payout,
     } as unknown as CentralPayoutGateway,
-    policy: { liveExecutionEnabled: false },
+    policy: { liveExecutionEnabled: mode === "LIVE" },
     verifyStepUp: vi.fn(),
   });
   return { op, payout, updates, create, list, service };
 }
 
 describe("Central withdrawal continuity", () => {
+  it.each(["invalid", "future"])("does not resend when operation age is %s", async (kind) => {
+    const f = fixture();
+    f.op.createdAt = new Date(kind === "invalid" ? Number.NaN : Date.now() + 60_000);
+    f.list.mockResolvedValue([]);
+    await f.service.refresh(String(f.op._id));
+    expect(f.list).toHaveBeenCalledExactlyOnceWith({ limit: 100 });
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.op.state).toBe("UNKNOWN");
+    expect(f.op.audit.at(-1)?.kind).toBe("REQUIRES_REVIEW");
+  });
+
+  it("requires review rather than resending when the clock cannot establish operation age", async () => {
+    const f = fixture();
+    f.list.mockResolvedValue([]);
+    vi.spyOn(Date, "now").mockReturnValue(Number.NaN);
+    await f.service.refresh(String(f.op._id));
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.op.state).toBe("UNKNOWN");
+    expect(f.op.audit.at(-1)?.kind).toBe("REQUIRES_REVIEW");
+  });
+
+  it("still reconciles matching provider evidence when local operation age is invalid", async () => {
+    const f = fixture();
+    f.op.createdAt = new Date(Number.NaN);
+    expect((await f.service.refresh(String(f.op._id))).providerPayoutId).toBe("po_original");
+    expect(f.create).not.toHaveBeenCalled();
+  });
+
+  it("refreshes a provider-failed operation without dispatching another payout", async () => {
+    const f = fixture();
+    f.op.state = "SUBMITTED";
+    f.op.providerStatus = "failed";
+    f.op.providerPayoutId = f.payout.id;
+    f.payout.status = "failed";
+    await f.service.refresh(String(f.op._id));
+    await f.service.refresh(String(f.op._id));
+    expect(f.op.providerStatus).toBe("failed");
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.list).not.toHaveBeenCalled();
+  });
+
+  it("reconciles existing LIVE evidence while new execution remains denied", async () => {
+    const f = fixture("LIVE");
+    expect((await f.service.refresh(String(f.op._id))).providerPayoutId).toBe("po_original");
+    expect(f.create).not.toHaveBeenCalled();
+  });
+
+  it("never resends an uncertain LIVE payout while reserve authority is denied", async () => {
+    const f = fixture("LIVE");
+    f.list.mockResolvedValue([]);
+    await f.service.refresh(String(f.op._id));
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.op.state).toBe("UNKNOWN");
+    expect(f.op.audit.at(-1)?.kind).toBe("BLOCKED");
+  });
+
+  it("accepts provider-confirmed paid-to-failed transitions without another payout", async () => {
+    const f = fixture();
+    f.op.state = "SUBMITTED";
+    f.op.providerStatus = "paid";
+    f.op.providerPayoutId = f.payout.id;
+    f.payout.status = "failed";
+    await f.service.syncFromWebhook(f.payout, "evt_failed");
+    expect(f.op.providerStatus).toBe("failed");
+    expect(f.create).not.toHaveBeenCalled();
+  });
   it("recovers the original payout after a lost response without sending another", async () => {
     const f = fixture();
     expect((await f.service.refresh(String(f.op._id))).providerPayoutId).toBe("po_original");

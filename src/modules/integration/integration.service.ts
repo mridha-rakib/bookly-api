@@ -10,6 +10,11 @@ import {
   type OrdinaryCalendarProvider,
   sameOrdinaryCalendarDestination,
 } from "../booking/ordinary-calendar-dispatch.js";
+import { describeOrdinaryCalendarSync } from "../booking/ordinary-calendar-incident.js";
+import {
+  ORDINARY_CALENDAR_ISSUER_WINDOW_MS,
+  OrdinaryCalendarJournalRepository,
+} from "../booking/ordinary-calendar-journal.js";
 import type { OrdinaryCalendarDestination } from "../booking/ordinary-calendar-journal.model.js";
 import { verifyOrdinaryCalendarDeliveryAuthority } from "../booking/ordinary-calendar-journal-authority.js";
 import { PackageCalendarRepository } from "../booking/package-calendar.repository.js";
@@ -48,21 +53,60 @@ import {
 import type { GoogleCalendarIntegrationDocument } from "./integration.model.js";
 import type { IntegrationRepository } from "./integration.repository.js";
 import { signOAuthState, verifyOAuthState } from "./integration.state.js";
+import type { GoogleCalendarIntegrationStatus } from "./integration.types.js";
+
+const isReconnectRequired = (error: unknown) =>
+  error instanceof IntegrationError &&
+  error.details?.some((detail) => detail.code === "GOOGLE_CALENDAR_RECONNECT_REQUIRED") === true;
 
 // Refresh a little before actual expiry so a sync call never races token expiry mid-request.
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 
+/**
+ * P2.2.9 — Owner-facing integration status. Every field is derived from durable server state;
+ * no token, integration id, raw provider error or other Business's data is ever included.
+ */
 export type GoogleCalendarStatusDto = {
   connected: boolean;
   googleAccountEmail?: string;
-  status?: "CONNECTED" | "ERROR";
+  status?: GoogleCalendarIntegrationStatus;
   connectedAt?: string;
+  /** Google revoked/expired access: syncing is paused until the Owner reconnects. */
+  needsReconnection: boolean;
+  /** Fixed category of the most recent unresolved problem (never the raw provider message). */
+  lastSyncProblem?: "SYNC_FAILED" | "RECONNECT_REQUIRED";
+  lastSyncFailedAt?: string;
+  lastSuccessfulSyncAt?: string;
+  delivery: GoogleCalendarDeliveryStatusDto;
+};
+
+export type GoogleCalendarDeliveryStatusDto = {
+  /**
+   * RELIABLE: the durable journal (retry, recovery, duplicate protection) is activated.
+   * BEST_EFFORT: one attempt per Booking change; failures are recorded but not retried.
+   */
+  mode: "BEST_EFFORT" | "RELIABLE";
+  /** False when the journal summary could not be read right now (counts are then omitted). */
+  available: boolean;
+  pending: number;
+  retrying: number;
+  recoveryRequired: number;
+  /** P2.2.9.1 — subsets of `recoveryRequired`, so the Owner can tell causes apart. */
+  retryLimitReached: number;
+  permanentFailure: number;
+  notConnected: number;
+  /** More unsettled rows exist than were counted. */
+  truncated: boolean;
 };
 
 export class IntegrationService {
   public constructor(
     private readonly integrationRepository: IntegrationRepository,
     private readonly businessRepository: BusinessRepository,
+    private readonly journalRepository: Pick<
+      OrdinaryCalendarJournalRepository,
+      "summarizeForBusiness"
+    > = new OrdinaryCalendarJournalRepository(),
   ) {}
 
   /** Only the Business Owner who owns `businessId` may start a Connect flow for it — mirrors
@@ -111,18 +155,98 @@ export class IntegrationService {
   public async getStatus(userId: string, businessId: string): Promise<GoogleCalendarStatusDto> {
     await this.requireOwnedBusiness(userId, businessId);
 
-    const integration = await this.integrationRepository.findByBusinessId(businessId);
+    const [integration, journal] = await Promise.all([
+      this.integrationRepository.findByBusinessId(businessId),
+      this.deliveryStatus(businessId),
+    ]);
 
     if (!integration) {
-      return { connected: false };
+      return {
+        connected: false,
+        needsReconnection: false,
+        delivery: journal.delivery,
+        ...(journal.lastConfirmedAt
+          ? { lastSuccessfulSyncAt: journal.lastConfirmedAt.toISOString() }
+          : {}),
+      };
     }
+
+    const lastSuccess = [integration.lastSyncSucceededAt, journal.lastConfirmedAt]
+      .filter((value): value is Date => value instanceof Date)
+      .sort((a, b) => b.getTime() - a.getTime())[0];
+    const lastSyncProblem =
+      integration.status === "RECONNECT_REQUIRED"
+        ? ("RECONNECT_REQUIRED" as const)
+        : integration.status === "ERROR"
+          ? ("SYNC_FAILED" as const)
+          : undefined;
 
     return {
       connected: true,
       googleAccountEmail: integration.googleAccountEmail,
       status: integration.status,
       connectedAt: integration.connectedAt.toISOString(),
+      needsReconnection: integration.status === "RECONNECT_REQUIRED",
+      ...(lastSyncProblem ? { lastSyncProblem } : {}),
+      ...(lastSyncProblem && integration.lastSyncFailedAt
+        ? { lastSyncFailedAt: integration.lastSyncFailedAt.toISOString() }
+        : {}),
+      ...(lastSuccess ? { lastSuccessfulSyncAt: lastSuccess.toISOString() } : {}),
+      delivery: journal.delivery,
     };
+  }
+
+  /** P2.2.9 — this Business's journal-owned Bookings, bucketed exactly like the per-Booking
+   * status route. Read-only; a read failure degrades to `available: false`, never to "synced". */
+  private async deliveryStatus(businessId: string): Promise<{
+    delivery: GoogleCalendarDeliveryStatusDto;
+    lastConfirmedAt?: Date | undefined;
+  }> {
+    let mode: GoogleCalendarDeliveryStatusDto["mode"] = "BEST_EFFORT";
+    try {
+      await verifyOrdinaryCalendarDeliveryAuthority();
+      mode = "RELIABLE";
+    } catch {
+      mode = "BEST_EFFORT";
+    }
+    const empty = {
+      pending: 0,
+      retrying: 0,
+      recoveryRequired: 0,
+      retryLimitReached: 0,
+      permanentFailure: 0,
+      notConnected: 0,
+    };
+    // While reliable delivery is not activated no Booking can become journal-owned (rows are
+    // written only when both rollout authorities allow), so there is nothing to read.
+    if (mode === "BEST_EFFORT")
+      return { delivery: { mode, available: true, ...empty, truncated: false } };
+    try {
+      const summary = await this.journalRepository.summarizeForBusiness(businessId);
+      const counts = { ...empty };
+      const now = new Date();
+      for (const row of summary.rows) {
+        if (String(row.businessId) !== businessId) continue;
+        const status = describeOrdinaryCalendarSync(row, now, ORDINARY_CALENDAR_ISSUER_WINDOW_MS);
+        if (status.status === "SYNC_PENDING") counts.pending += 1;
+        else if (status.status === "RETRYING") counts.retrying += 1;
+        else if (status.status === "RECOVERY_REQUIRED") {
+          counts.recoveryRequired += 1;
+          if (status.incident === "PROVIDER_RETRY_LIMIT_REACHED") counts.retryLimitReached += 1;
+          if (status.incident === "PROVIDER_PERMANENT_FAILURE") counts.permanentFailure += 1;
+        } else if (status.status === "NOT_CONNECTED") counts.notConnected += 1;
+      }
+      return {
+        delivery: { mode, available: true, ...counts, truncated: summary.truncated },
+        lastConfirmedAt: summary.lastConfirmedAt,
+      };
+    } catch (error) {
+      logger.warn(
+        { businessId, error: error instanceof Error ? error.name : "unknown" },
+        "Google Calendar delivery summary unavailable",
+      );
+      return { delivery: { mode, available: false, ...empty, truncated: false } };
+    }
   }
 
   public async disconnect(userId: string, businessId: string): Promise<void> {
@@ -143,14 +267,17 @@ export class IntegrationService {
   ): Promise<string | undefined> {
     const integration = await this.integrationRepository.findByBusinessId(businessId);
 
-    if (!integration) {
+    // P2.2.9 — revoked access: no Google call at all until the Owner reconnects.
+    if (!integration || integration.status === "RECONNECT_REQUIRED") {
       return undefined;
     }
 
     try {
       const accessToken = await this.getValidAccessToken(integration);
 
-      return await createGoogleCalendarEvent(accessToken, integration.calendarId, event);
+      const eventId = await createGoogleCalendarEvent(accessToken, integration.calendarId, event);
+      await this.recordSyncSuccess(businessId, integration);
+      return eventId;
     } catch (error) {
       await this.recordSyncFailure(businessId, error);
 
@@ -172,7 +299,7 @@ export class IntegrationService {
   ): Promise<void> {
     const integration = await this.integrationRepository.findByBusinessId(businessId);
 
-    if (!integration) {
+    if (!integration || integration.status === "RECONNECT_REQUIRED") {
       return;
     }
 
@@ -190,6 +317,8 @@ export class IntegrationService {
           { businessId: String(businessId) },
           "Google Calendar event no longer exists — skipping reschedule sync (not recreating it)",
         );
+      } else {
+        await this.recordSyncSuccess(businessId, integration);
       }
     } catch (error) {
       await this.recordSyncFailure(businessId, error);
@@ -203,13 +332,14 @@ export class IntegrationService {
   ): Promise<void> {
     const integration = await this.integrationRepository.findByBusinessId(businessId);
 
-    if (!integration) {
+    if (!integration || integration.status === "RECONNECT_REQUIRED") {
       return;
     }
 
     try {
       const accessToken = await this.getValidAccessToken(integration);
       await deleteGoogleCalendarEvent(accessToken, integration.calendarId, googleCalendarEventId);
+      await this.recordSyncSuccess(businessId, integration);
     } catch (error) {
       await this.recordSyncFailure(businessId, error);
     }
@@ -574,8 +704,27 @@ export class IntegrationService {
       return decryptSecret(integration.encryptedAccessToken);
     }
 
+    if (integration.status === "RECONNECT_REQUIRED")
+      throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
     const refreshToken = decryptSecret(integration.encryptedRefreshToken);
-    const refreshed = await refreshGoogleAccessToken(refreshToken);
+    let refreshed: Awaited<ReturnType<typeof refreshGoogleAccessToken>>;
+    try {
+      refreshed = await refreshGoogleAccessToken(refreshToken);
+    } catch (error) {
+      if (isReconnectRequired(error)) {
+        // P2.2.9 — permanent: pause every path for this connection until the Owner reconnects.
+        await this.integrationRepository.markReconnectRequired(
+          integration._id,
+          integration.connectionGeneration,
+        );
+        logger.warn(
+          { businessId: String(integration.businessId) },
+          "Google Calendar access revoked or expired — reconnection required",
+        );
+        throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
+      }
+      throw error;
+    }
 
     const updated = await this.integrationRepository.updateTokens(
       integration._id,
@@ -589,6 +738,24 @@ export class IntegrationService {
     if (updated === false) throw new PackageCalendarProviderError("BLOCKED_AUTHORITY", true);
 
     return refreshed.accessToken;
+  }
+
+  private async recordSyncSuccess(
+    businessId: Types.ObjectId | string,
+    integration: GoogleCalendarIntegrationDocument,
+  ): Promise<void> {
+    try {
+      await this.integrationRepository.markSyncSucceeded(
+        businessId,
+        integration.connectionGeneration,
+      );
+    } catch (error) {
+      // Status bookkeeping only; the Calendar write itself already succeeded.
+      logger.warn(
+        { businessId: String(businessId), error: error instanceof Error ? error.name : "unknown" },
+        "Could not record Google Calendar sync success",
+      );
+    }
   }
 
   private async recordSyncFailure(

@@ -1,9 +1,11 @@
+import { isBoundedPlatformFinanceWindow } from "../../common/time/platform-reporting.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
+import { aggregateOwnershipForPeriod } from "../super-admin/super-admin-analytics.util.js";
 import type { BusinessPayoutRepository } from "./business-payout.repository.js";
 import { FinanceError } from "./finance.errors.js";
 import {
@@ -161,11 +163,11 @@ export class FinanceService {
     from: Date;
     to: Date;
   }): Promise<PlatformFinanceSummary> {
-    const periodBuckets = await this.financialTransactionService.aggregateOwnedBySource({
+    if (!isBoundedPlatformFinanceWindow(period.from, period.to))
+      throw new FinanceError("FINANCE_RANGE_TOO_WIDE", 400);
+    const periodBuckets = await aggregateOwnershipForPeriod(this.financialTransactionService, {
       types: [...BOOKLY_REVENUE_TYPES, "NO_SHOW_FEE", "CANCELLATION_FEE"],
-      unclaimedOnly: false,
-      from: period.from,
-      to: period.to,
+      period: { ...period, isAllTime: false },
     });
 
     const bookly = combineBooklyOwnedBuckets(periodBuckets);

@@ -5,6 +5,7 @@ import { type ClientSession, Types } from "mongoose";
 
 import { env } from "../../config/env.js";
 import type { SessionRepository } from "../session/session.repository.js";
+import { UserModel } from "../user/user.model.js";
 import { type UserRole, userRoles } from "../user/user.types.js";
 import { AuthError } from "./auth.errors.js";
 import { addDays, addMinutes, createOpaqueToken, sha256 } from "./auth.utils.js";
@@ -41,7 +42,7 @@ export class TokenService {
   private readonly legacyCutoffSeconds: number;
 
   public constructor(
-    private readonly sessionRepository: SessionRepository,
+    private readonly sessionRepository: Pick<SessionRepository, keyof SessionRepository>,
     options: TokenServiceOptions = {},
   ) {
     this.legacyAccessTokenGrace =
@@ -109,13 +110,25 @@ export class TokenService {
     return (
       this.legacyAccessTokenGrace &&
       claims.iat !== undefined &&
-      claims.iat <= this.legacyCutoffSeconds
+      claims.iat <= this.legacyCutoffSeconds &&
+      !(await UserModel.exists({
+        _id: claims.sub,
+        $or: [
+          { "statusHistory.0": { $exists: true } },
+          { twoFactorEnabled: true },
+          { twoFactorVersion: { $gt: 0 } },
+        ],
+      })
+        .read("primary")
+        .exec())
     );
   }
 
   public async createRefreshSession(
     input: {
       userId: Types.ObjectId;
+      authenticatedAt?: Date;
+      twoFactorVersion?: number;
       userAgent?: string;
       ipAddress?: string;
     },
@@ -127,6 +140,8 @@ export class TokenService {
 
     const createInput = {
       userId: input.userId,
+      authenticatedAt: input.authenticatedAt ?? new Date(),
+      ...(input.twoFactorVersion === undefined ? {} : { twoFactorVersion: input.twoFactorVersion }),
       refreshTokenHash: sha256(refreshToken),
       tokenFamilyId,
       expiresAt,
@@ -151,6 +166,12 @@ export class TokenService {
       throw new Error("SESSION_EXPIRED");
     }
 
+    if (existing.revokedAt && existing.revocationReason === "ADMIN_SUSPENSION") {
+      throw await this.sessionRepository.administrativeRevocationError(existing.userId);
+    }
+    if (existing.revokedAt && ["LOGOUT", "REVOKE_ALL"].includes(existing.revocationReason ?? "")) {
+      throw new Error("SESSION_EXPIRED");
+    }
     if (existing.revokedAt) {
       await this.sessionRepository.revokeFamily(existing.tokenFamilyId);
       throw new Error("REFRESH_TOKEN_REUSED");
@@ -185,7 +206,7 @@ export class TokenService {
 
     if (existing) {
       // Logout is local to the cookie's device session, including all rotated successors.
-      await this.sessionRepository.revokeFamily(existing.tokenFamilyId);
+      await this.sessionRepository.revokeFamily(existing.tokenFamilyId, "LOGOUT");
     }
   }
 
@@ -203,7 +224,7 @@ export class TokenService {
     if (existing.tokenFamilyId !== expectedFamilyId) {
       throw new AuthError("LOGOUT_FAMILY_MISMATCH", 409);
     }
-    await this.sessionRepository.revokeFamily(existing.tokenFamilyId);
+    await this.sessionRepository.revokeFamily(existing.tokenFamilyId, "LOGOUT");
   }
 
   public async revokeAllSessionsForUser(userId: Types.ObjectId): Promise<void> {
@@ -227,7 +248,7 @@ export class TokenService {
       ? await this.sessionRepository.findByRefreshTokenHash(sha256(currentRefreshToken))
       : null;
 
-    if (!current || !current.userId.equals(userId) || current.revokedAt) {
+    if (!current?.userId.equals(userId) || current.revokedAt) {
       await this.sessionRepository.revokeAllForUser(userId);
       return;
     }

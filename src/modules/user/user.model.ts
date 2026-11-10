@@ -1,5 +1,7 @@
 import { model, Schema, type Types } from "mongoose";
 
+import type { EncryptedSecret } from "../../common/crypto/aes-256-gcm-secret.js";
+
 import {
   type AuthProvider,
   authProviders,
@@ -14,6 +16,15 @@ import {
   userRoles,
   userStatuses,
 } from "./user.types.js";
+
+export type TwoFactorState = {
+  secret?: EncryptedSecret;
+  pending?: { secret: EncryptedSecret; id: string; expiresAt: Date; identityStamp: string };
+  recoveryHashes?: string[];
+  lastStep?: number;
+  rateAttempts?: number;
+  rateResetAt?: Date;
+};
 
 export type UserDocument = {
   _id: Types.ObjectId;
@@ -33,6 +44,11 @@ export type UserDocument = {
   authProviders: AuthProvider[];
   role: UserRole;
   status: UserStatus;
+  /** Serializes session issuance/rotation with administrative status transitions. */
+  authSessionVersion?: number;
+  twoFactorEnabled?: boolean;
+  twoFactorVersion?: number;
+  twoFactor?: TwoFactorState;
   emailVerifiedAt?: Date | undefined;
   phoneVerifiedAt?: Date | undefined;
   security: {
@@ -48,12 +64,64 @@ export type UserDocument = {
   deletedAt?: Date | undefined;
   deletedBy?: { actorUserId: Types.ObjectId; actorRole: UserRole } | undefined;
   deletionReason?: string | undefined;
+  /**
+   * P2.2.6 — append-only audit of Super Admin account-status actions (suspend / reactivate).
+   * Written in the same atomic compare-and-set as the status change, so a row exists exactly
+   * when the transition happened. Absent on legacy rows (read as empty).
+   */
+  statusHistory?: UserStatusHistoryEntry[] | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
 
+export const userStatusActions = ["SUSPEND", "REACTIVATE"] as const;
+export type UserStatusAction = (typeof userStatusActions)[number];
+
+export type UserStatusHistoryEntry = {
+  action: UserStatusAction;
+  fromStatus: UserStatus;
+  toStatus: UserStatus;
+  actorUserId: Types.ObjectId;
+  actorRole: UserRole;
+  reason?: string | undefined;
+  requestId?: string | undefined;
+  changedAt: Date;
+};
+
+const userStatusHistorySchema = new Schema<UserStatusHistoryEntry>(
+  {
+    action: { type: String, enum: userStatusActions, required: true },
+    fromStatus: { type: String, enum: userStatuses, required: true },
+    toStatus: { type: String, enum: userStatuses, required: true },
+    actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    actorRole: { type: String, enum: userRoles, required: true },
+    reason: { type: String, trim: true, maxlength: 500 },
+    requestId: { type: String, trim: true, maxlength: 200 },
+    changedAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const userSchema = new Schema<UserDocument>(
   {
+    authSessionVersion: { type: Number },
+    twoFactorEnabled: { type: Boolean },
+    twoFactorVersion: { type: Number },
+    twoFactor: {
+      type: new Schema<TwoFactorState>(
+        {
+          secret: { type: Object },
+          pending: { type: Object },
+          recoveryHashes: { type: [String], default: undefined },
+          lastStep: Number,
+          rateAttempts: Number,
+          rateResetAt: Date,
+        },
+        { _id: false },
+      ),
+      select: false,
+      default: undefined,
+    },
     normalizedEmail: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: false, select: false },
     // Non-empty by construction (repository default + assertUserAuthProvidersConsistent). The
@@ -87,6 +155,8 @@ const userSchema = new Schema<UserDocument>(
       default: undefined,
     },
     deletionReason: { type: String, trim: true, maxlength: 500 },
+    // P2.2.6 — no `default`, so legacy rows and new registrations are untouched; `$push` creates it.
+    statusHistory: { type: [userStatusHistorySchema], default: undefined },
   },
   { timestamps: true },
 );
@@ -125,9 +195,39 @@ export type UserProfileDocument = {
   marketingEmailConsent?: MarketingEmailConsent | undefined;
   termsAcceptedAt?: Date | undefined;
   termsVersion?: string | undefined;
+  /**
+   * Historical audit of Super Admin profile edits made while P2.2.8.2 was live (field names,
+   * actor, time — never values). P2.2.8.2.1 Owner policy: Super Admin no longer edits personal
+   * profiles, so nothing writes this any more; it is retained unchanged and only read for display.
+   */
+  adminEditHistory?: UserProfileAdminEdit[] | undefined;
   createdAt: Date;
   updatedAt: Date;
 };
+
+export const adminEditableProfileFields = ["firstName", "lastName"] as const;
+export type AdminEditableProfileField = (typeof adminEditableProfileFields)[number];
+
+export type UserProfileAdminEdit = {
+  action: "PROFILE_UPDATE";
+  fields: AdminEditableProfileField[];
+  actorUserId: Types.ObjectId;
+  actorRole: UserRole;
+  requestId?: string | undefined;
+  changedAt: Date;
+};
+
+const userProfileAdminEditSchema = new Schema<UserProfileAdminEdit>(
+  {
+    action: { type: String, enum: ["PROFILE_UPDATE"], required: true },
+    fields: { type: [String], enum: adminEditableProfileFields, required: true },
+    actorUserId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    actorRole: { type: String, enum: userRoles, required: true },
+    requestId: { type: String, trim: true, maxlength: 200 },
+    changedAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
 
 const userProfileSchema = new Schema<UserProfileDocument>(
   {
@@ -171,6 +271,8 @@ const userProfileSchema = new Schema<UserProfileDocument>(
     },
     termsAcceptedAt: { type: Date },
     termsVersion: { type: String },
+    // P2.2.8.2 — no `default`: untouched rows stay as they are; `$push` creates it.
+    adminEditHistory: { type: [userProfileAdminEditSchema], default: undefined },
   },
   { timestamps: true },
 );

@@ -42,11 +42,22 @@ const resolveAccessToken = async (
     throw new AuthError("AUTHENTICATION_UNAVAILABLE", 503);
   }
 
-  if (!user || !sessionLive) {
+  // Preserve the restriction explanation even when suspension has revoked the family.
+  if (user?.status === "SUSPENDED") throw new AuthError("USER_SUSPENDED", 403);
+  if (
+    !user ||
+    !sessionLive ||
+    (claims.sid === undefined && (user.statusHistory?.length || user.twoFactorEnabled))
+  ) {
     throw new AuthError("SESSION_EXPIRED", 401);
   }
 
-  return { userId: String(user._id), role: user.role, status: user.status };
+  return {
+    userId: String(user._id),
+    role: user.role,
+    status: user.status,
+    ...(claims.sid ? { sessionFamilyId: claims.sid } : {}),
+  };
 };
 
 export const createAuthenticateAccessTokenMiddleware =

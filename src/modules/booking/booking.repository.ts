@@ -1,4 +1,8 @@
 import { type ClientSession, Types } from "mongoose";
+import {
+  type PlatformReportingScope,
+  reportingScopeMatch,
+} from "../../common/reporting/platform-reporting-scope.js";
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
 import {
   type BookingDocument,
@@ -687,6 +691,17 @@ export class BookingRepository {
   /** Batch 11 — Super Admin dashboard's platform-wide booking-status counts, ONE reduced
    * `$group` over the whole collection (bounded by nothing since it's a small, fixed-cardinality
    * group-by, never a per-document scan result set). */
+  /** P2.2.5 — an UPCOMING or PENDING booking whose terms let the Business charge a late
+   * cancellation / no-show fee off-session to the Customer's saved card. Uses the
+   * `{ customer.customerUserId, schedule.startAt }` index. */
+  public async hasActiveForCustomer(customerUserId: Types.ObjectId | string): Promise<boolean> {
+    const found = await BookingModel.exists({
+      "customer.customerUserId": customerUserId,
+      status: { $in: ["UPCOMING", "PENDING"] },
+    }).exec();
+    return Boolean(found);
+  }
+
   public async countAllByStatus(): Promise<Record<BookingStatus, number>> {
     const rows = await BookingModel.aggregate<{ _id: BookingStatus; count: number }>([
       { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -710,11 +725,14 @@ export class BookingRepository {
     from: Date,
     to: Date,
     businessId?: Types.ObjectId | string,
+    scope?: PlatformReportingScope,
   ): Promise<Record<BookingStatus, number>> {
     const match: Record<string, unknown> = { createdAt: { $gte: from, $lt: to } };
     if (businessId) {
       match["businessId"] = businessId;
     }
+    // P2.2.4 — Super Admin City (registered Business city) / Day (Cyprus day of createdAt).
+    Object.assign(match, reportingScopeMatch(scope));
     const rows = await BookingModel.aggregate<{ _id: BookingStatus; count: number }>([
       { $match: match },
       { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -736,22 +754,30 @@ export class BookingRepository {
   public async countCreatedByMonth(
     from: Date,
     to: Date,
+    timezone?: string,
+    scope?: PlatformReportingScope,
   ): Promise<Array<{ year: number; month: number; count: number }>> {
     const rows = await BookingModel.aggregate<{
       _id: { year: number; month: number };
       count: number;
     }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: { createdAt: { $gte: from, $lt: to }, ...reportingScopeMatch(scope) } },
       {
         $group: {
-          _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
+          // P2.2.1 — local calendar months when a zone is given (Super Admin: Europe/Nicosia).
+          _id: timezone
+            ? {
+                year: { $year: { date: "$createdAt", timezone } },
+                month: { $month: { date: "$createdAt", timezone } },
+              }
+            : { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
           count: { $sum: 1 },
         },
       },
     ]).exec();
 
     const countByKey = new Map(rows.map((row) => [`${row._id.year}-${row._id.month}`, row.count]));
-    return zeroFilledMonths(from, to).map(({ year, month }) => ({
+    return zeroFilledMonths(from, to, timezone).map(({ year, month }) => ({
       year,
       month,
       count: countByKey.get(`${year}-${month}`) ?? 0,
@@ -765,12 +791,13 @@ export class BookingRepository {
   public async aggregateClientTypeSplit(
     from: Date,
     to: Date,
+    scope?: PlatformReportingScope,
   ): Promise<{ manual: number; newBooking: number; returning: number }> {
     const rows = await BookingModel.aggregate<{
       _id: "MANUAL" | "NEW" | "RETURNING";
       count: number;
     }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: { createdAt: { $gte: from, $lt: to }, ...reportingScopeMatch(scope) } },
       {
         $group: {
           _id: {
@@ -800,9 +827,10 @@ export class BookingRepository {
   public async aggregateFulfilmentSplit(
     from: Date,
     to: Date,
+    scope?: PlatformReportingScope,
   ): Promise<{ premises: number; mobile: number }> {
     const rows = await BookingModel.aggregate<{ _id: string; count: number }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      { $match: { createdAt: { $gte: from, $lt: to }, ...reportingScopeMatch(scope) } },
       { $group: { _id: "$fulfilment.mode", count: { $sum: 1 } } },
     ]).exec();
 
@@ -823,6 +851,7 @@ export class BookingRepository {
     from: Date,
     to: Date,
     businessId?: Types.ObjectId | string,
+    scope?: PlatformReportingScope,
   ): Promise<
     Array<{
       businessId: string;
@@ -838,6 +867,7 @@ export class BookingRepository {
     if (businessId) {
       match["businessId"] = businessId;
     }
+    Object.assign(match, reportingScopeMatch(scope));
     const rows = await BookingModel.aggregate<{
       _id: Types.ObjectId;
       totalCount: number;
@@ -911,11 +941,13 @@ export class BookingRepository {
     to: Date,
     limit: number,
     businessId?: Types.ObjectId | string,
+    scope?: PlatformReportingScope,
   ): Promise<Array<{ serviceId: string; name: string; businessId: string; count: number }>> {
     const match: Record<string, unknown> = { createdAt: { $gte: from, $lt: to } };
     if (businessId) {
       match["businessId"] = businessId;
     }
+    Object.assign(match, reportingScopeMatch(scope));
     const rows = await BookingModel.aggregate<{
       _id: Types.ObjectId;
       name: string;

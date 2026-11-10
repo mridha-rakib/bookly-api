@@ -1,8 +1,8 @@
 import type { Request, Response } from "express";
-
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { setRefreshCookie } from "../auth/auth.cookies.js";
+import { setChallengeCookie, TwoFactorRequired } from "../two-factor/two-factor.http.js";
 import { isProfessionalGoogleAuthConfigured } from "./professional-google-auth.client.js";
 import {
   clearOAuthNonceCookie,
@@ -28,7 +28,7 @@ type CallbackStatus = "success" | "onboarding" | "account_exists" | "error";
 export class ProfessionalGoogleAuthController {
   public constructor(private readonly service: ProfessionalGoogleAuthService) {}
 
-  public start = async (request: Request, response: Response): Promise<void> => {
+  public start = async (_request: Request, response: Response): Promise<void> => {
     if (!isProfessionalGoogleAuthConfigured()) {
       response.redirect(this.frontendRedirect("error"));
       return;
@@ -58,6 +58,11 @@ export class ProfessionalGoogleAuthController {
         this.requestContext(request),
       );
     } catch (error) {
+      if (error instanceof TwoFactorRequired) {
+        setChallengeCookie(response, error);
+        response.redirect(`${env.FRONTEND_BASE_URL}/professional/two-factor`);
+        return;
+      }
       logger.warn({ err: error }, "Business Owner Google auth callback failed");
       response.redirect(this.frontendRedirect("error"));
       return;

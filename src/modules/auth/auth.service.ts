@@ -176,8 +176,19 @@ export class AuthService {
       throw new AuthError("USER_SUSPENDED", 403);
     }
 
-    await this.userRepository.updateLastLogin(user._id);
-    return this.issueAuthResult(user._id, user.normalizedEmail, user.role, user.status, context);
+    if (portal !== "PROFESSIONAL" || !user.twoFactorEnabled)
+      await this.userRepository.updateLastLogin(user._id);
+    return issueAuthSession(
+      this.tokenService,
+      {
+        userId: user._id,
+        email: user.normalizedEmail,
+        role: user.role,
+        status: user.status,
+        twoFactorEnabled: user.twoFactorEnabled,
+      },
+      context,
+    );
   }
 
   public async sendEmailOtp(input: {

@@ -8,8 +8,18 @@ import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
 import { createOptionalAuthenticateAccessTokenMiddleware } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import { AvailabilityService } from "../availability/availability.service.js";
+import { BookingSlotReservationRepository } from "../booking-slot-reservation/booking-slot-reservation.repository.js";
+import { BusinessRepository } from "../business/business.repository.js";
+import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
+import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
+import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
+import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
+import { StaffRepository } from "../staff/staff.repository.js";
+import { StaffScheduleRepository } from "../staff/staff-schedule.repository.js";
+import { StaffTimeOffRepository } from "../staff/staff-time-off.repository.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
 import { UserRepository } from "../user/user.repository.js";
 import { DiscoveryController } from "./discovery.controller.js";
@@ -26,11 +36,26 @@ import { createNoDepositEligibilityRoute } from "./no-deposit-eligibility.js";
 export const createDiscoveryRoute = (): Router => {
   const router = Router();
   router.use(createNoDepositEligibilityRoute());
+  // P2.2.3 — the existing booking availability engine, read-only, for the Explore filter.
+  const serviceRepository = new ServiceRepository();
+  const availabilityService = new AvailabilityService(
+    new BusinessRepository(),
+    serviceRepository,
+    new StaffRepository(),
+    new StaffScheduleRepository(),
+    new StaffTimeOffRepository(),
+    new BusinessHoursRepository(),
+    new BusinessBookingSettingsRepository(),
+    new BusinessTravelSettingsRepository(),
+    new BookingSlotReservationRepository(),
+  );
   const controller = new DiscoveryController(
     new DiscoveryService(
       new DiscoveryRepository(),
       new BusinessMediaRepository(),
       createDeferredStorageServiceFromEnv(),
+      availabilityService,
+      serviceRepository,
     ),
   );
 
@@ -56,6 +81,7 @@ export const createDiscoveryRoute = (): Router => {
   router.get(
     "/businesses",
     discoveryLimiter,
+    optionalAuthenticate,
     validateRequest({ query: listDiscoveryBusinessesQuerySchema }),
     asyncHandler(controller.search),
   );

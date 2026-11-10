@@ -95,6 +95,13 @@ export const createCentralPayoutRouter = (service: CentralPayoutService): Router
   const router = Router();
 
   router.get(
+    "/finance/withdrawals/bank-account",
+    asyncHandler(async (_request: Request, response: Response) => {
+      sendSuccess(response, 200, "Platform bank account", await service.getBankAccountSummary());
+    }),
+  );
+
+  router.get(
     "/finance/withdrawals/overview",
     asyncHandler(async (_request: Request, response: Response) => {
       sendSuccess(response, 200, "Central Stripe balance", await service.getOverview());

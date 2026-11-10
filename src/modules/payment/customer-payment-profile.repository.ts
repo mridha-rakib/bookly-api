@@ -92,6 +92,51 @@ export class CustomerPaymentProfileRepository {
     ).exec();
   }
 
+  /** P2.2.5 — removes the saved card from Bookly only if it is still exactly this card (CAS), so
+   * a concurrent new card is never cleared. Returns the profile as it was before, or null. */
+  public async clearPaymentMethodIfCurrent(
+    userId: Types.ObjectId | string,
+    paymentMethodId: string,
+  ): Promise<CustomerPaymentProfileDocument | null> {
+    return CustomerPaymentProfileModel.findOneAndUpdate(
+      { userId, defaultPaymentMethodId: paymentMethodId },
+      {
+        $unset: {
+          defaultPaymentMethodId: "",
+          cardBrand: "",
+          cardLast4: "",
+          cardExpMonth: "",
+          cardExpYear: "",
+        },
+      },
+      { returnDocument: "before" },
+    ).exec();
+  }
+
+  /** P2.2.5 — puts a card back after a removal that must not proceed, only if no other card was
+   * saved meanwhile (CAS on "no default"). */
+  public async restorePaymentMethodIfEmpty(
+    userId: Types.ObjectId | string,
+    previous: Pick<
+      CustomerPaymentProfileDocument,
+      "defaultPaymentMethodId" | "cardBrand" | "cardLast4" | "cardExpMonth" | "cardExpYear"
+    >,
+  ): Promise<void> {
+    if (!previous.defaultPaymentMethodId) return;
+    await CustomerPaymentProfileModel.updateOne(
+      { userId, defaultPaymentMethodId: { $exists: false } },
+      {
+        $set: {
+          defaultPaymentMethodId: previous.defaultPaymentMethodId,
+          ...(previous.cardBrand ? { cardBrand: previous.cardBrand } : {}),
+          ...(previous.cardLast4 ? { cardLast4: previous.cardLast4 } : {}),
+          ...(previous.cardExpMonth ? { cardExpMonth: previous.cardExpMonth } : {}),
+          ...(previous.cardExpYear ? { cardExpYear: previous.cardExpYear } : {}),
+        },
+      },
+    ).exec();
+  }
+
   public async findByStripeCustomerId(
     stripeCustomerId: string,
   ): Promise<CustomerPaymentProfileDocument | null> {

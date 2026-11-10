@@ -34,15 +34,18 @@ export type CentralBankDestination = {
   currency: string;
   country: string;
   status: string;
-  defaultForCurrency: boolean;
+  defaultForCurrency: boolean | null;
 };
 
 export type CentralAccountPayoutState = {
-  payoutsEnabled: boolean;
+  payoutsEnabled: boolean | null;
   /** Stripe `settings.payouts.schedule.interval`: manual | daily | weekly | monthly. */
   scheduleInterval: string | null;
   /** False when Stripe did not expose the account's external accounts to this key. */
   destinationsReadable: boolean;
+  /** False means the returned destinations are only a partial/uncertain inventory. */
+  destinationsComplete?: boolean;
+  destinationReadIssue?: "PERMISSIONS" | "PROVIDER" | "INCOMPLETE";
   destinations: CentralBankDestination[];
 };
 

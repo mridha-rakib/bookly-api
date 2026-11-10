@@ -493,7 +493,22 @@ describe("IntegrationService (Google Calendar)", () => {
 
       const status = await service.getStatus(String(business.ownerUserId), String(business._id));
 
-      expect(status).toEqual({ connected: false });
+      // P2.2.9 — additive status fields; best-effort delivery while not activated.
+      expect(status).toEqual({
+        connected: false,
+        needsReconnection: false,
+        delivery: {
+          mode: "BEST_EFFORT",
+          available: true,
+          pending: 0,
+          retrying: 0,
+          recoveryRequired: 0,
+          retryLimitReached: 0,
+          permanentFailure: 0,
+          notConnected: 0,
+          truncated: false,
+        },
+      });
     });
 
     it("never exposes tokens in the status DTO", async () => {
@@ -519,6 +534,18 @@ describe("IntegrationService (Google Calendar)", () => {
         googleAccountEmail: integration.googleAccountEmail,
         status: "CONNECTED",
         connectedAt: integration.connectedAt.toISOString(),
+        needsReconnection: false,
+        delivery: {
+          mode: "BEST_EFFORT",
+          available: true,
+          pending: 0,
+          retrying: 0,
+          recoveryRequired: 0,
+          retryLimitReached: 0,
+          permanentFailure: 0,
+          notConnected: 0,
+          truncated: false,
+        },
       });
     });
 

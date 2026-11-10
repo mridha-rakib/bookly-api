@@ -60,7 +60,7 @@ export class ProfessionalAppleAuthService {
     private readonly userRepository: UserRepository,
     private readonly linkedAccountRepository: LinkedAccountRepository,
     private readonly registrationSessionRepository: RegistrationSessionRepository,
-    private readonly businessOnboardingService: BusinessOnboardingService,
+    _businessOnboardingService: BusinessOnboardingService,
     private readonly tokenService: TokenService,
   ) {}
 
@@ -137,7 +137,13 @@ export class ProfessionalAppleAuthService {
 
     const auth = await issueAuthSession(
       this.tokenService,
-      { userId: user._id, email: user.normalizedEmail, role: user.role, status: user.status },
+      {
+        userId: user._id,
+        email: user.normalizedEmail,
+        role: user.role,
+        status: user.status,
+        twoFactorEnabled: user.twoFactorEnabled,
+      },
       context,
     );
 

@@ -2,12 +2,21 @@ import type { BookingListItemDto } from "../booking/booking.dto.js";
 import { toBookingListItemDto } from "../booking/booking.dto.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import { bookingPaymentSummary } from "../booking/booking-payment-summary.js";
-import type { UserDocument, UserProfileDocument } from "../user/user.model.js";
+import type {
+  AdminEditableProfileField,
+  UserDocument,
+  UserProfileAdminEdit,
+  UserProfileDocument,
+} from "../user/user.model.js";
 import type { UserRepository } from "../user/user.repository.js";
 import type { UserStatus } from "../user/user.types.js";
 import { resolveNotificationPreferences } from "../user/user.types.js";
 import { SuperAdminError } from "./super-admin.errors.js";
 import { SuperAdminCustomerRepository } from "./super-admin-customer.repository.js";
+import {
+  type CustomerStatusChangeDto,
+  toCustomerStatusChangeDto,
+} from "./super-admin-customer-status.service.js";
 
 export type SuperAdminCustomerListItemDto = {
   id: string;
@@ -35,7 +44,25 @@ export type SuperAdminCustomerDetailDto = SuperAdminCustomerListItemDto & {
     ReturnType<SuperAdminCustomerRepository["listRelationships"]>
   >["relationships"];
   relationshipPagination: { page: number; limit: number; total: number };
+  /** P2.2.6 — latest account-status actions, newest first (Super Admin view only). */
+  statusHistory: CustomerStatusChangeDto[];
+  /** Historical Super Admin profile edits (P2.2.8.2, field names only), newest first. Read-only. */
+  profileEditHistory: CustomerProfileEditDto[];
 };
+
+export type CustomerProfileEditDto = {
+  action: "PROFILE_UPDATE";
+  fields: AdminEditableProfileField[];
+  actorUserId: string;
+  changedAt: string;
+};
+
+const toCustomerProfileEditDto = (entry: UserProfileAdminEdit): CustomerProfileEditDto => ({
+  action: entry.action,
+  fields: [...entry.fields],
+  actorUserId: String(entry.actorUserId),
+  changedAt: entry.changedAt.toISOString(),
+});
 
 export type CustomerHistoryItem = BookingListItemDto & {
   businessName: string;
@@ -115,6 +142,11 @@ export class SuperAdminCustomerService {
       statistics,
       relationships: relationships.relationships,
       relationshipPagination: relationships.pagination,
+      statusHistory: (user.statusHistory ?? []).slice(-10).reverse().map(toCustomerStatusChangeDto),
+      profileEditHistory: (profile?.adminEditHistory ?? [])
+        .slice(-10)
+        .reverse()
+        .map(toCustomerProfileEditDto),
     };
   }
 

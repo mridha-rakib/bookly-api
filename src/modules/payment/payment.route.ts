@@ -8,14 +8,19 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import { BookingRepository } from "../booking/booking.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { CustomerPaymentProfileRepository } from "./customer-payment-profile.repository.js";
 import { PaymentController } from "./payment.controller.js";
-import { confirmSavedPaymentMethodBodySchema } from "./payment.schema.js";
+import {
+  confirmSavedPaymentMethodBodySchema,
+  savedPaymentMethodParamsSchema,
+} from "./payment.schema.js";
 import { PaymentService } from "./payment.service.js";
 import { PaymentAttemptRepository } from "./payment-attempt.repository.js";
 import { RefundOperationRepository } from "./refund-operation.repository.js";
+import { SavedCardRemovalService } from "./saved-card-removal.service.js";
 import { StripePaymentGateway } from "./stripe-payment-gateway.js";
 
 /** Customer-only, cross-business (a saved card belongs to the Customer identity, never one
@@ -36,7 +41,16 @@ export const createPaymentRoute = (): Router => {
     new PaymentAttemptRepository(),
     new RefundOperationRepository(),
   );
-  const controller = new PaymentController(paymentService);
+  const gateway = new StripePaymentGateway();
+  const profileRepository = new CustomerPaymentProfileRepository();
+  // P2.2.5 — saved-card removal (Stripe detach + Bookly projection), Customer-only.
+  const savedCardRemovalService = new SavedCardRemovalService(
+    gateway,
+    profileRepository,
+    new PaymentAttemptRepository(),
+    new BookingRepository(),
+  );
+  const controller = new PaymentController(paymentService, savedCardRemovalService);
 
   router.post(
     "/setup-intent",
@@ -61,6 +75,15 @@ export const createPaymentRoute = (): Router => {
     requireActiveUser(),
     requireRoles(["CUSTOMER"]),
     asyncHandler(controller.getSavedCardStatus),
+  );
+
+  router.delete(
+    "/payment-methods/:paymentMethodId",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({ params: savedPaymentMethodParamsSchema }),
+    asyncHandler(controller.removeSavedPaymentMethod),
   );
 
   return router;

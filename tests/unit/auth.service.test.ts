@@ -1,6 +1,5 @@
 import mongoose, { Types } from "mongoose";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
 import { env } from "../../src/config/env.js";
 import type { AppointmentReminderRepository } from "../../src/modules/appointment-reminder/appointment-reminder.repository.js";
 import { AuthService } from "../../src/modules/auth/auth.service.js";
@@ -23,6 +22,8 @@ import type { RegistrationSessionRepository } from "../../src/modules/registrati
 import type { ReviewRepository } from "../../src/modules/review/review.repository.js";
 import type { StaffRepository } from "../../src/modules/staff/staff.repository.js";
 import type { StaffAvatarService } from "../../src/modules/staff-avatar/staff-avatar.service.js";
+import { TwoFactorRequired } from "../../src/modules/two-factor/two-factor.http.js";
+import { TwoFactorService } from "../../src/modules/two-factor/two-factor.service.js";
 import type { EmailOtpProvider } from "../../src/modules/verification/email-otp.provider.js";
 import type { PhoneOtpProvider } from "../../src/modules/verification/phone-otp.provider.js";
 
@@ -52,6 +53,8 @@ const createRegistrationSession = (overrides: Record<string, unknown> = {}) => (
 
 const createAuthService = (overrides: Record<string, unknown> = {}) => {
   const userRepository = {
+    transitionCustomerStatus: vi.fn(),
+    ensureCustomerSessionsRevoked: vi.fn(),
     findByEmail: vi.fn().mockResolvedValue(null),
     findByEmailWithPassword: vi.fn(),
     findByIdWithPassword: vi.fn(),
@@ -432,6 +435,40 @@ describe("AuthService.updateMyProfile", () => {
       address: "Nicosia, Cyprus",
     });
     expect(result.profile).toMatchObject({ address: "Limassol, Cyprus" });
+  });
+
+  it("persists a customer's language preference and restores it on a fresh getMe read", async () => {
+    const userId = new Types.ObjectId();
+    const profile = {
+      _id: new Types.ObjectId(),
+      firstName: "Jane",
+      lastName: "Doe",
+      gender: "female",
+      defaultLanguage: "EN",
+    };
+    const { service, userRepository } = createAuthService({
+      userRepository: {
+        findById: vi.fn().mockResolvedValue({
+          _id: userId,
+          role: "CUSTOMER",
+          status: "ACTIVE",
+          normalizedEmail: "customer@example.com",
+        }),
+        findProfileByUserId: vi.fn(async () => ({ ...profile })),
+        updateProfile: vi.fn(async (_id: unknown, input: { defaultLanguage: string }) => {
+          profile.defaultLanguage = input.defaultLanguage;
+        }),
+      },
+    });
+    expect(
+      (await service.updateMyProfile(userId.toHexString(), { defaultLanguage: "GR" })).profile
+        ?.defaultLanguage,
+    ).toBe("GR");
+    expect((await service.getMe(userId.toHexString())).profile?.defaultLanguage).toBe("GR");
+    expect(userRepository.updateProfile).toHaveBeenCalledWith(profile._id, {
+      defaultLanguage: "GR",
+    });
+    expect(userRepository.upsertCustomerProfile).not.toHaveBeenCalled();
   });
 
   it("rejects updates for a user with no session-backed profile", async () => {
@@ -1596,3 +1633,33 @@ describe("AuthService.deleteMyAccount", () => {
     expect(call.tombstoneEmail).toBe(expectedTombstoneEmail);
   });
 });
+
+it.each(["BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const)(
+  "password login for 2FA-enabled %s cannot issue credentials before the challenge",
+  async (role) => {
+    const user = {
+      _id: new Types.ObjectId(),
+      role,
+      status: "ACTIVE",
+      normalizedEmail: "owner@example.test",
+      passwordHash: "hash",
+      twoFactorEnabled: true,
+    };
+    const { service, tokenService, userRepository } = createAuthService({
+      userRepository: { findByEmailWithPassword: vi.fn().mockResolvedValue(user) },
+    });
+    const gate = vi
+      .spyOn(TwoFactorService.prototype, "requireSecondFactor")
+      .mockRejectedValue(new TwoFactorRequired("a".repeat(64)));
+    try {
+      await expect(
+        service.login("PROFESSIONAL", { email: user.normalizedEmail, password: "password" }, {}),
+      ).rejects.toBeInstanceOf(TwoFactorRequired);
+      expect(tokenService.createRefreshSession).not.toHaveBeenCalled();
+      expect(tokenService.createAccessToken).not.toHaveBeenCalled();
+      expect(userRepository.updateLastLogin).not.toHaveBeenCalled();
+    } finally {
+      gate.mockRestore();
+    }
+  },
+);

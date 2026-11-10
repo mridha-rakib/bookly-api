@@ -279,3 +279,37 @@ describe("ProfessionalAppleAuthService", () => {
     expect(tokenService.createRefreshSession).not.toHaveBeenCalled();
   });
 });
+
+const { TwoFactorService } = await import("../../src/modules/two-factor/two-factor.service.js");
+const { TwoFactorRequired } = await import("../../src/modules/two-factor/two-factor.http.js");
+
+it.each(["BUSINESS_OWNER", "SUPERVISOR", "STAFF"] as const)(
+  "2FA-enabled %s receives a challenge with no OAuth session issued",
+  async (role) => {
+    const user = buildOwner({ role, twoFactorEnabled: true });
+    const { service } = makeService({
+      user: { findById: vi.fn(async () => user) },
+      link: { findByProviderAccount: vi.fn(async () => buildLink({ userId: user._id })) },
+    });
+    resolveProfessionalAppleIdentity.mockResolvedValue({
+      providerAccountId: "provider-sub",
+      email: "owner@example.test",
+      emailVerified: true,
+    });
+    const gate = vi
+      .spyOn(TwoFactorService.prototype, "requireSecondFactor")
+      .mockRejectedValue(new TwoFactorRequired("a".repeat(64)));
+    try {
+      await expect(service.completeCallback(await validInput(), context)).rejects.toBeInstanceOf(
+        TwoFactorRequired,
+      );
+      expect(gate).toHaveBeenCalledWith(
+        expect.objectContaining({ _id: user._id, role, twoFactorEnabled: true }),
+      );
+      expect(tokenService.createRefreshSession).not.toHaveBeenCalled();
+      expect(tokenService.createAccessToken).not.toHaveBeenCalled();
+    } finally {
+      gate.mockRestore();
+    }
+  },
+);

@@ -1,3 +1,8 @@
+import {
+  hasReportingScope,
+  type PlatformReportingScope,
+} from "../../common/reporting/platform-reporting-scope.js";
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingStatus } from "../booking/booking.types.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
@@ -13,10 +18,12 @@ import {
 } from "./super-admin-analytics.util.js";
 
 export type SuperAdminDashboardSummaryDto = {
+  /** P2.2.4 — the City/Day actually applied (null = all). */
+  filters: { city: string | null; day: string | null };
   /** P1.9 — the `[from, to)` window applied to the PERIOD metrics (`bookings`,
    * `platformRevenueCents`). `isAllTime` when no period was requested. Every other field is
    * current-state or all-time and is never affected by the period. */
-  period: { from: string; to: string; isAllTime: boolean };
+  period: { from: string; to: string; isAllTime: boolean; timezone: string };
   /** Current state. */
   businesses: Record<BusinessStatus, number> & { total: number };
   /** Current state. */
@@ -53,10 +60,17 @@ export class SuperAdminDashboardService {
     private readonly businessPayoutRepository: BusinessPayoutRepository,
   ) {}
 
+  /** P2.2.4 — `scope` (resolved City/Day) narrows: Bookings + No-shows/Cancellations (City +
+   * Day of `createdAt`), Platform Revenue (City via the ledger row's Business + Day of ledger
+   * `createdAt`), Businesses and Pending payouts (City only: current state). Customers and
+   * Completed payouts (E16) stay platform-wide and unscoped. */
   public async getSummary(
     query: { fromDate?: Date | undefined; toDate?: Date | undefined } = {},
+    scope?: PlatformReportingScope,
+    filters: { city: string | null; day: string | null } = { city: null, day: null },
   ): Promise<SuperAdminDashboardSummaryDto> {
     const period = resolveAnalyticsPeriod(query);
+    const scoped = hasReportingScope(scope);
     const [
       businessCounts,
       customerTotal,
@@ -65,26 +79,37 @@ export class SuperAdminDashboardService {
       pendingPayouts,
       paidPayouts,
     ] = await Promise.all([
-      this.businessRepository.countByStatus(),
+      this.businessRepository.countByStatus(scope),
       this.userRepository.countByRole("CUSTOMER"),
-      period.isAllTime
+      // Unscoped all-time keeps the original read; a scoped all-time read uses the same
+      // createdAt-window query over the all-time window.
+      period.isAllTime && !scoped
         ? this.bookingRepository.countAllByStatus()
-        : this.bookingRepository.countByStatusInRange(period.from, period.to),
+        : this.bookingRepository.countByStatusInRange(period.from, period.to, undefined, scope),
       aggregateOwnershipForPeriod(this.financialTransactionService, {
         types: [...BOOKLY_REVENUE_TYPES],
         period,
+        scope,
       }),
       this.financeService.listPendingPayouts(),
       this.businessPayoutRepository.sumPaidTotal(),
     ]);
 
     const bookly = combineBooklyOwnedBuckets(booklyBuckets);
+    const cityBusinessIds = scope?.businessIds ? new Set(scope.businessIds.map(String)) : null;
+    const pendingCents = cityBusinessIds
+      ? pendingPayouts.items
+          .filter((item) => cityBusinessIds.has(String(item.businessId)))
+          .reduce((sum, item) => sum + item.netCents, 0)
+      : pendingPayouts.totalPendingCents;
 
     return {
+      filters,
       period: {
         from: period.from.toISOString(),
         to: period.to.toISOString(),
         isAllTime: period.isAllTime,
+        timezone: PLATFORM_REPORTING_TIMEZONE,
       },
       businesses: {
         ...businessCounts,
@@ -100,7 +125,7 @@ export class SuperAdminDashboardService {
         total: Object.values(bookingCounts).reduce((sum, count) => sum + count, 0),
       },
       platformRevenueCents: bookly.netCents,
-      pendingBusinessPayableCents: pendingPayouts.totalPendingCents,
+      pendingBusinessPayableCents: pendingCents,
       completedPayoutsAllTimeCents: paidPayouts.totalCents,
     };
   }

@@ -620,6 +620,12 @@ export const env = createEnv({
     ),
     // 32-byte AES-256-GCM key, hex-encoded (64 hex chars) — encrypts Google OAuth
     // access/refresh tokens at rest. Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+    // Enrollment rollout only. Turning this off never skips existing-account verification.
+    TWO_FACTOR_ENROLLMENT_ENABLED: booleanString,
+    TOTP_ENCRYPTION_KEY_V1: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/i, "must be 32 bytes encoded as 64 hex characters")
+      .optional(),
     GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY: z
       .string()
       .regex(/^[0-9a-f]{64}$/i, "must be a 64-character hex string (32 bytes)")

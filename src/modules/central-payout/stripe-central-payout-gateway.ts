@@ -19,6 +19,11 @@ const DEFINITIVE_ERROR_TYPES = new Set([
   "StripeRateLimitError",
   "StripeCardError",
 ]);
+const isReadPermissionsError = (error: unknown): boolean => {
+  const type = (error as { type?: unknown } | null)?.type;
+  return type === "StripePermissionError" || type === "StripeAuthenticationError";
+};
+const BANK_STATUSES = new Set(["new", "validated", "verified", "verification_failed", "errored"]);
 
 /** Shared with the webhook handler so both read a Stripe payout identically. */
 export const toProviderPayout = (payout: Stripe.Payout): ProviderPayout => ({
@@ -38,16 +43,20 @@ export const toProviderPayout = (payout: Stripe.Payout): ProviderPayout => ({
 });
 
 const toDestination = (account: Stripe.ExternalAccount): CentralBankDestination | null => {
-  if (account.object !== "bank_account") return null;
+  if (account?.object !== "bank_account") return null;
   const bank = account as Stripe.BankAccount;
   return {
-    id: bank.id,
-    bankName: bank.bank_name,
-    last4: bank.last4,
-    currency: bank.currency,
-    country: bank.country,
-    status: bank.status,
-    defaultForCurrency: Boolean(bank.default_for_currency),
+    id: typeof bank.id === "string" ? bank.id : "",
+    bankName:
+      typeof bank.bank_name === "string" && bank.bank_name.trim() ? bank.bank_name.trim() : null,
+    last4: typeof bank.last4 === "string" && /^[a-z0-9]{4}$/i.test(bank.last4) ? bank.last4 : "",
+    currency:
+      typeof bank.currency === "string" && /^[a-z]{3}$/.test(bank.currency) ? bank.currency : "",
+    country:
+      typeof bank.country === "string" && /^[A-Z]{2}$/.test(bank.country) ? bank.country : "",
+    status: typeof bank.status === "string" && BANK_STATUSES.has(bank.status) ? bank.status : "",
+    defaultForCurrency:
+      typeof bank.default_for_currency === "boolean" ? bank.default_for_currency : null,
   };
 };
 
@@ -94,26 +103,69 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
     try {
       account = await this.client.accounts.retrieveCurrent();
     } catch (error) {
+      if (isReadPermissionsError(error))
+        return {
+          payoutsEnabled: null,
+          scheduleInterval: null,
+          destinationsReadable: false,
+          destinationsComplete: false,
+          destinationReadIssue: "PERMISSIONS",
+          destinations: [],
+        };
       throw providerError(error);
     }
-    let external = account.external_accounts?.data;
-    if (!external) {
-      // Not every key/account type embeds external accounts; ask once more, read-only.
+    // Embedded accounts are a page, not the full inventory. All follow-up reads are
+    // bound to the account returned by retrieveCurrent(), never an application Business ID.
+    if (!account || typeof account.id !== "string" || !/^acct_[a-z0-9]+$/i.test(account.id))
+      throw new CentralPayoutProviderError("Platform account response is incomplete", true);
+    let external = Array.isArray(account.external_accounts?.data)
+      ? account.external_accounts.data
+      : undefined;
+    let complete = Boolean(external && account.external_accounts?.has_more === false);
+    let issue: CentralAccountPayoutState["destinationReadIssue"];
+    if (!complete) {
+      const pages: Stripe.ExternalAccount[] = [];
+      let cursor: string | undefined;
+      const seen = new Set<string>();
       try {
-        external = (
-          await this.client.accounts.listExternalAccounts(account.id, {
+        // A hard request cap prevents an unbounded provider walk. Partial data remains
+        // visible but cannot authorize default selection or a payout.
+        for (let pageNumber = 0; pageNumber < 3; pageNumber++) {
+          const page = await this.client.accounts.listExternalAccounts(account.id, {
             object: "bank_account",
-            limit: 20,
-          })
-        ).data;
-      } catch {
-        external = undefined;
+            limit: 100,
+            ...(cursor ? { starting_after: cursor } : {}),
+          });
+          if (!Array.isArray(page.data)) {
+            issue = "INCOMPLETE";
+            break;
+          }
+          pages.push(...page.data);
+          if (page.has_more === false) {
+            complete = true;
+            break;
+          }
+          const next = page.data.at(-1)?.id;
+          if (page.has_more !== true || !next || seen.has(next)) {
+            issue = "INCOMPLETE";
+            break;
+          }
+          seen.add(next);
+          cursor = next;
+        }
+        external = pages.length || complete ? pages : external;
+        if (!complete) issue = "INCOMPLETE";
+      } catch (error) {
+        if (pages.length) external = pages;
+        issue = isReadPermissionsError(error) ? "PERMISSIONS" : "PROVIDER";
       }
     }
     return {
-      payoutsEnabled: Boolean(account.payouts_enabled),
+      payoutsEnabled: typeof account.payouts_enabled === "boolean" ? account.payouts_enabled : null,
       scheduleInterval: account.settings?.payouts?.schedule?.interval ?? null,
       destinationsReadable: Boolean(external),
+      destinationsComplete: complete,
+      ...(issue ? { destinationReadIssue: issue } : {}),
       destinations: (external ?? [])
         .map(toDestination)
         .filter((d): d is CentralBankDestination => d !== null),

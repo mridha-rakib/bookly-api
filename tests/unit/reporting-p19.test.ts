@@ -287,7 +287,12 @@ describe("G5 — Super Admin summary period contract", () => {
       toDate: "2027-01-01T00:00:00.000Z",
     });
     const summary = await service.getSummary(query);
-    expect(deps.countByStatusInRange).toHaveBeenCalledWith(query.fromDate, query.toDate);
+    expect(deps.countByStatusInRange).toHaveBeenCalledWith(
+      query.fromDate,
+      query.toDate,
+      undefined,
+      undefined, // no City/Day scope
+    );
     expect(deps.countAllByStatus).not.toHaveBeenCalled();
     // A year is walked in <=90-day ledger chunks covering exactly [from, to).
     const chunks = deps.aggregateOwnedBySource.mock.calls.map(
@@ -307,12 +312,16 @@ describe("G5 — Super Admin summary period contract", () => {
       pendingBusinessPayableCents: 700,
       completedPayoutsAllTimeCents: 900,
     });
-    expect(deps.countByStatus).toHaveBeenCalledWith();
+    expect(deps.countByStatus).toHaveBeenCalledWith(undefined);
     expect(
       superAdminAnalyticsPeriodQuerySchema.safeParse({ fromDate: "2026-01-01T00:00:00.000Z" })
         .success,
     ).toBe(false);
-    expect(superAdminAnalyticsPeriodQuerySchema.safeParse({ city: "Larnaca" }).success).toBe(false);
+    // P2.2.4 — `city`/`day` are now accepted; unknown fields and invalid days are still rejected.
+    expect(superAdminAnalyticsPeriodQuerySchema.safeParse({ region: "Larnaca" }).success).toBe(
+      false,
+    );
+    expect(superAdminAnalyticsPeriodQuerySchema.safeParse({ day: "FUNDAY" }).success).toBe(false);
   });
 });
 

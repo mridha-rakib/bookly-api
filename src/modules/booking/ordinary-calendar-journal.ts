@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import type { ClientSession, Types } from "mongoose";
 import { logger } from "../../config/logger.js";
 import { GoogleCalendarIntegrationModel } from "../integration/integration.model.js";
 import type { BookingDocument } from "./booking.model.js";
+import {
+  diagnoseOrdinaryCalendarIndexes,
+  type OrdinaryCalendarIndexDescription,
+} from "./ordinary-calendar-activation.js";
 import {
   type OrdinaryCalendarDesired,
   type OrdinaryCalendarDestination,
@@ -102,7 +105,7 @@ export const ORDINARY_CALENDAR_REQUIRED_INDEXES = [
   { key: { mode: 1, state: 1, nextAttemptAt: 1 }, unique: false },
 ] as const;
 
-type IndexDescription = { key?: Record<string, unknown>; unique?: boolean };
+type IndexDescription = OrdinaryCalendarIndexDescription;
 
 /**
  * P4B-2C — journal persistence readiness. Production disables autoIndex and some servers cannot
@@ -130,13 +133,9 @@ export class OrdinaryCalendarJournalReadiness {
     if (now < this.notReadyUntil) return false;
     let ready = false;
     try {
-      const indexes = await this.listIndexes();
-      ready = ORDINARY_CALENDAR_REQUIRED_INDEXES.every((required) =>
-        indexes.some(
-          (index) =>
-            isDeepStrictEqual(index.key, required.key) && Boolean(index.unique) === required.unique,
-        ),
-      );
+      // P2.2.9.1 — exact key and uniqueness, and no partial/sparse/collation/TTL/hidden
+      // lookalike (those would let duplicates through or skip rows).
+      ready = diagnoseOrdinaryCalendarIndexes(await this.listIndexes()).ready;
     } catch {
       ready = false;
     }
@@ -506,7 +505,8 @@ export class OrdinaryCalendarJournalRepository {
           ...(journal.request ? { "request.settled": true } : {}),
         },
         $push: { recoveries: input.record },
-        $unset: { lease: 1 },
+        // P2.2.9 — an explicit Owner recovery starts a fresh retry budget.
+        $unset: { lease: 1, retryableFailures: 1 },
       },
       { runValidators: true },
     ).exec();
@@ -637,6 +637,7 @@ export class OrdinaryCalendarJournalRepository {
           state: "CONFIRMED",
           confirmedSequence: journal.latest.sequence,
           confirmedRevision: journal.latest.revision,
+          confirmedAt: this.clock(),
           ...(request ? { "request.settled": true } : {}),
         },
         $unset: { lease: 1, nextAttemptAt: 1, reason: 1, retryableFailures: 1 },
@@ -662,11 +663,51 @@ export class OrdinaryCalendarJournalRepository {
           reason,
           ...(!terminal ? { nextAttemptAt: nextAttemptAt ?? this.clock() } : {}),
         },
-        ...(state === "RETRYABLE_FAILURE" ? { $inc: { retryableFailures: 1 } } : {}),
+        // P2.2.9 — an unresolved uncertain observation counts toward the retry cap as well.
+        ...(state === "RETRYABLE_FAILURE" || state === "UNKNOWN_OUTCOME"
+          ? { $inc: { retryableFailures: 1 } }
+          : {}),
         $unset: { lease: 1, ...(terminal ? { nextAttemptAt: 1 } : {}) },
       },
     ).exec();
     return blocked.modifiedCount === 1;
+  }
+
+  /**
+   * P2.2.9 — bounded, read-only per-Business view for the Owner's integration status: the
+   * Business's not-yet-confirmed journal-owned rows (at most `limit`) and its latest
+   * confirmation time. Never selects SHADOW/legacy rows; time-boxed so a status read can never
+   * become an expensive scan. (Index `{businessId: 1, state: 1, confirmedAt: -1}` is the
+   * documented activation prerequisite for large journals; it is not required for correctness.)
+   */
+  async summarizeForBusiness(businessId: Types.ObjectId | string, limit = 200) {
+    const bounded = Math.max(1, Math.min(limit, 500));
+    const [open, lastConfirmed] = await Promise.all([
+      OrdinaryCalendarJournalModel.find({
+        businessId,
+        mode: "AUTHORITATIVE",
+        state: { $ne: "CONFIRMED" },
+      })
+        .limit(bounded + 1)
+        .maxTimeMS(2000)
+        .read("primary")
+        .exec(),
+      OrdinaryCalendarJournalModel.findOne({
+        businessId,
+        mode: "AUTHORITATIVE",
+        confirmedAt: { $exists: true },
+      })
+        .sort({ confirmedAt: -1 })
+        .select({ confirmedAt: 1 })
+        .maxTimeMS(2000)
+        .read("primary")
+        .exec(),
+    ]);
+    return {
+      rows: open.slice(0, bounded),
+      truncated: open.length > bounded,
+      lastConfirmedAt: lastConfirmed?.confirmedAt,
+    };
   }
 
   /** P4B-2C — bounded incident scan for monitoring. Uses the `{mode, state, nextAttemptAt}`

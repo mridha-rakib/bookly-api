@@ -10,7 +10,9 @@ import {
 import { resolveBusinessCategoryKey } from "../platform-settings/business-category.js";
 import type { ServicePricingMode } from "../services/service.types.js";
 import {
+  DISCOVERY_EARTH_RADIUS_KM,
   type DiscoverySortOption,
+  discoveryTrendingBookingStatuses,
   HOME_POPULAR_WEIGHT_COMPLETED_BOOKING,
   HOME_POPULAR_WEIGHT_FAVORITE,
   HOME_POPULAR_WEIGHT_REVIEW,
@@ -28,6 +30,18 @@ export type DiscoveryFilter = {
   visitType?: BusinessVisitType | undefined;
   category?: string[] | undefined;
   minRating?: number | undefined;
+  /** P2.2.3 — explicit visitor origin; enables straight-line distance on every card. */
+  origin?: { lat: number; lng: number } | undefined;
+  /** P2.2.3 — only Businesses with a usable stored location within this straight-line radius. */
+  radiusKm?: number | undefined;
+};
+
+/** P2.2.3 — inputs for the ranking-only sort modes, resolved by DiscoveryService. */
+export type DiscoveryRankingContext = {
+  /** `sort=recommended`: the Customer's own booked categories/cities (empty = public ranking). */
+  affinity?: CustomerAffinity | undefined;
+  /** `sort=trending`: confirmed Bookings created at or after this instant are counted. */
+  trendingSince?: Date | undefined;
 };
 
 export type DiscoveryPagination = { page: number; limit: number };
@@ -47,6 +61,9 @@ export type DiscoveryAggregateRow = {
   /** Real persisted `Business.location`, never fabricated — undefined when the Business has no
    * stored coordinate. */
   location: { lat: number; lng: number } | undefined;
+  /** P2.2.3 — straight-line km from the request's origin; absent without an origin or a usable
+   * stored location. */
+  distanceKm?: number | undefined;
 };
 
 export type FoundingPartnerRow = {
@@ -68,6 +85,7 @@ type RawAggregateRow = {
   startingPriceCents: number | null;
   startingPricingMode: ServicePricingMode | null;
   location?: { lat: number; lng: number } | undefined;
+  distanceKm?: number | null | undefined;
 };
 
 /** The rating + cheapest-Service lookup stages shared by both `search` (Explore) and
@@ -225,6 +243,9 @@ const toAggregateRow = (row: RawAggregateRow): DiscoveryAggregateRow => ({
     row.status as (typeof PUBLICLY_VISIBLE_STATUSES)[number],
   ),
   location: validLocation(row.location),
+  ...(typeof row.distanceKm === "number"
+    ? { distanceKm: Math.round(row.distanceKm * 10) / 10 }
+    : {}),
 });
 
 // The Business statuses a Customer-facing surface may ever see — matches
@@ -246,11 +267,141 @@ const sortStageFor = (sort: DiscoverySortOption): Record<string, 1 | -1> => {
       return { hasNoStartingPrice: 1, startingPriceSortValue: 1, _id: 1 };
     case "priceHighToLow":
       return { hasNoStartingPrice: 1, startingPriceSortValue: -1, _id: 1 };
+    case "recommended":
+      // Home "Recommended": affinity tier (category > city), then quality; every tie to `_id`.
+      return {
+        affinityRank: -1,
+        qualityScore: -1,
+        reviewCountSortValue: -1,
+        averageRatingSortValue: -1,
+        _id: 1,
+      };
+    case "trending":
+      // Most recent confirmed Bookings; no activity falls back to quality, then `_id`.
+      return { recentBookings: -1, qualityScore: -1, reviewCountSortValue: -1, _id: 1 };
+    case "distance":
+      // Nearest first; Businesses without a usable location last.
+      return { hasNoDistance: 1, distanceSortValue: 1, _id: 1 };
     default:
       // No ranking formula exists for "relevance" (confirmed — nothing invented here); falls
       // back to a stable, deterministic order.
       return { name: 1, _id: 1 };
   }
+};
+
+/** P2.2.3 — great-circle (haversine) distance from `origin` to the Business's stored
+ * `location`, in km, as an aggregation expression; `null` when the stored location is missing or
+ * out of range (never treated as "near"). Straight-line only — not driving distance. */
+export const distanceKmExpression = (origin: { lat: number; lng: number }) => {
+  const toRad = (degrees: number) => (degrees * Math.PI) / 180;
+  const lat2 = { $degreesToRadians: "$location.lat" };
+  const halfDLat = { $divide: [{ $subtract: [lat2, toRad(origin.lat)] }, 2] };
+  const halfDLng = {
+    $divide: [{ $subtract: [{ $degreesToRadians: "$location.lng" }, toRad(origin.lng)] }, 2],
+  };
+  const a = {
+    $add: [
+      { $pow: [{ $sin: halfDLat }, 2] },
+      {
+        $multiply: [Math.cos(toRad(origin.lat)), { $cos: lat2 }, { $pow: [{ $sin: halfDLng }, 2] }],
+      },
+    ],
+  };
+  const usable = {
+    $and: [
+      { $isNumber: "$location.lat" },
+      { $isNumber: "$location.lng" },
+      { $gte: ["$location.lat", -90] },
+      { $lte: ["$location.lat", 90] },
+      { $gte: ["$location.lng", -180] },
+      { $lte: ["$location.lng", 180] },
+    ],
+  };
+  return {
+    $cond: [
+      usable,
+      { $multiply: [2 * DISCOVERY_EARTH_RADIUS_KM, { $asin: { $sqrt: { $min: [1, a] } } }] },
+      null,
+    ],
+  };
+};
+
+/** Shared quality score (the Home "Recommended"/"Popular" definition): avg(rating) *
+ * log10(reviewCount + 1), with a null-safe review-count sort field. */
+const qualityScoreStage: PipelineStage = {
+  $addFields: {
+    qualityScore: {
+      $multiply: [
+        { $ifNull: ["$averageRating", 0] },
+        { $log10: { $add: [{ $ifNull: ["$reviewCount", 0] }, 1] } },
+      ],
+    },
+    reviewCountSortValue: { $ifNull: ["$reviewCount", 0] },
+  },
+};
+
+const rankingStagesFor = (
+  sort: DiscoverySortOption,
+  context: DiscoveryRankingContext,
+): PipelineStage[] => {
+  if (sort === "recommended") {
+    const affinity = context.affinity ?? { categories: [], cities: [] };
+    return [
+      qualityScoreStage,
+      {
+        $addFields: {
+          affinityRank: {
+            $add: [
+              {
+                $cond: [
+                  { $in: ["$category", affinity.categories] },
+                  HOME_RECOMMENDED_AFFINITY_CATEGORY_RANK,
+                  0,
+                ],
+              },
+              {
+                $cond: [
+                  { $in: ["$address.city", affinity.cities] },
+                  HOME_RECOMMENDED_AFFINITY_CITY_RANK,
+                  0,
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ];
+  }
+  if (sort === "trending") {
+    if (!context.trendingSince) throw new Error("trendingSince is required for sort=trending");
+    return [
+      qualityScoreStage,
+      {
+        // localField/foreignField uses the existing { businessId, status } Booking index.
+        $lookup: {
+          from: "bookings",
+          localField: "_id",
+          foreignField: "businessId",
+          pipeline: [
+            {
+              $match: {
+                status: { $in: [...discoveryTrendingBookingStatuses] },
+                createdAt: { $gte: context.trendingSince },
+              },
+            },
+            { $count: "count" },
+          ],
+          as: "recentBookingAgg",
+        },
+      },
+      {
+        $addFields: {
+          recentBookings: { $ifNull: [{ $arrayElemAt: ["$recentBookingAgg.count", 0] }, 0] },
+        },
+      },
+    ];
+  }
+  return [];
 };
 
 /**
@@ -266,6 +417,7 @@ export class DiscoveryRepository {
     filter: DiscoveryFilter,
     sort: DiscoverySortOption,
     pagination: DiscoveryPagination,
+    context: DiscoveryRankingContext = {},
   ): Promise<{ rows: DiscoveryAggregateRow[]; total: number }> {
     const match: Record<string, unknown> = {
       status: { $in: PUBLICLY_VISIBLE_STATUSES },
@@ -280,9 +432,28 @@ export class DiscoveryRepository {
     }
 
     const skip = (pagination.page - 1) * pagination.limit;
+    const distanceStages: PipelineStage[] = filter.origin
+      ? [
+          { $addFields: { distanceKm: distanceKmExpression(filter.origin) } },
+          ...(filter.radiusKm !== undefined
+            ? [
+                {
+                  $match: { distanceKm: { $ne: null, $lte: filter.radiusKm } },
+                } satisfies PipelineStage,
+              ]
+            : []),
+          {
+            $addFields: {
+              hasNoDistance: { $cond: [{ $eq: [{ $type: "$distanceKm" }, "null"] }, 1, 0] },
+              distanceSortValue: { $ifNull: ["$distanceKm", Number.MAX_SAFE_INTEGER] },
+            },
+          },
+        ]
+      : [];
 
     const pipeline: PipelineStage[] = [
       { $match: match },
+      ...distanceStages,
       ...ratingAndPriceLookupStages,
       ...(filter.minRating !== undefined
         ? [{ $match: { averageRating: { $gte: filter.minRating } } }]
@@ -299,13 +470,14 @@ export class DiscoveryRepository {
           hasNoStartingPrice: { $cond: [{ $eq: [{ $size: "$cheapestService" }, 0] }, 1, 0] },
         },
       },
+      ...rankingStagesFor(sort, context),
       {
         $facet: {
           data: [
             { $sort: sortStageFor(sort) },
             { $skip: skip },
             { $limit: pagination.limit },
-            { $project: cardProjection },
+            { $project: { ...cardProjection, ...(filter.origin ? { distanceKm: 1 } : {}) } },
           ],
           totalCount: [{ $count: "count" }],
         },

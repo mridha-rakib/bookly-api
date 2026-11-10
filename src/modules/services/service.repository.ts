@@ -63,6 +63,22 @@ export class ServiceRepository {
     return ServiceModel.find({ _id: { $in: serviceIds }, businessId }).exec();
   }
 
+  /** P2.2.3 — Explore availability filter: the Normal-bookable Services (ACTIVE, not a package)
+   * of a bounded set of Businesses, in one query, using the `{ businessId, status, createdAt }`
+   * index. Only id/business/name are read; AvailabilityService re-loads and re-checks each one. */
+  public async listActiveBookableByBusinessIds(
+    businessIds: Array<Types.ObjectId | string>,
+  ): Promise<Array<Pick<ServiceDocument, "_id" | "businessId" | "name">>> {
+    if (businessIds.length === 0) return [];
+    return ServiceModel.find(
+      { businessId: { $in: businessIds }, status: "ACTIVE", isPackageDeal: false },
+      { _id: 1, businessId: 1, name: 1 },
+    )
+      .sort({ businessId: 1, createdAt: 1, _id: 1 })
+      .lean<Array<Pick<ServiceDocument, "_id" | "businessId" | "name">>>()
+      .exec();
+  }
+
   public async listByBusinessId(
     businessId: Types.ObjectId | string,
     filter: ServiceListFilter,

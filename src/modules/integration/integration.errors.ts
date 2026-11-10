@@ -8,6 +8,8 @@ const defaultMessages: Record<string, string> = {
     "This Google Calendar connection link has expired. Please try connecting again",
   GOOGLE_CALENDAR_OAUTH_FAILED:
     "Couldn't complete the Google Calendar connection. Please try again",
+  GOOGLE_CALENDAR_RECONNECT_REQUIRED:
+    "Google Calendar access was revoked or expired. Reconnect Google Calendar to resume syncing",
 };
 
 export class IntegrationError extends AppError {

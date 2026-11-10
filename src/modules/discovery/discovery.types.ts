@@ -62,7 +62,44 @@ export const discoverySortOptions = [
   "ratingHighToLow",
   "priceLowToHigh",
   "priceHighToLow",
+  // P2.2.3 — Explore quick actions / location sort (see DiscoveryRepository.search).
+  "recommended",
+  "trending",
+  "distance",
 ] as const;
 export type DiscoverySortOption = (typeof discoverySortOptions)[number];
 
 export const DISCOVERY_SEARCH_MAX_LENGTH = 100;
+
+// --- P2.2.3: Explore Recommended / Trending / distance / availability ----------------------------
+
+/** Trending = confirmed Booking activity: Bookings CREATED in the last N Cyprus calendar days
+ * (today included) whose current status is one of these. PENDING (not yet confirmed), every
+ * cancellation and every no-show outcome are excluded. */
+export const DISCOVERY_TRENDING_WINDOW_DAYS = 30;
+export const discoveryTrendingBookingStatuses = ["UPCOMING", "COMPLETED"] as const;
+
+/** Straight-line (great-circle) distance in kilometres; mean Earth radius (IUGG). */
+export const DISCOVERY_EARTH_RADIUS_KM = 6371.0088;
+export const DISCOVERY_MIN_RADIUS_KM = 1;
+export const DISCOVERY_MAX_RADIUS_KM = 200;
+
+/** Availability filter bounds: one Business-local date, a bounded candidate set (best matches of
+ * the other filters/sort first), a bounded number of Services per Business and bounded
+ * concurrency against the AvailabilityService. */
+export const DISCOVERY_AVAILABILITY_CANDIDATE_LIMIT = 60;
+export const DISCOVERY_AVAILABILITY_SERVICE_LIMIT = 8;
+export const DISCOVERY_AVAILABILITY_CONCURRENCY = 6;
+export const DISCOVERY_AVAILABILITY_MAX_DAYS_AHEAD = 180;
+
+/** Time windows on the Business's own local clock: [start, end) "HH:mm". */
+export const discoveryAvailabilityWindows = {
+  ANY: { start: "00:00", end: "24:00" },
+  MORNING: { start: "06:00", end: "12:00" },
+  AFTERNOON: { start: "12:00", end: "17:00" },
+  EVENING: { start: "17:00", end: "24:00" },
+} as const;
+export type DiscoveryAvailabilityWindow = keyof typeof discoveryAvailabilityWindows;
+export const discoveryAvailabilityWindowKeys = Object.keys(
+  discoveryAvailabilityWindows,
+) as DiscoveryAvailabilityWindow[];

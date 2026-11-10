@@ -11,6 +11,8 @@ import type {
   PaymentGateway,
   PaymentIntentResult,
   PaymentIntentSnapshot,
+  PaymentMethodDetachOutcome,
+  PaymentMethodOwnerLookup,
   PaymentMethodSummary,
   ProviderLookupResult,
   RefundResult,
@@ -28,6 +30,33 @@ import { getStripeClient } from "./stripe-client.js";
  * customer — never a dump of the raw Stripe error object (which can contain the request's own
  * parameters).
  */
+/** P2.2.5 — maps a Stripe detach error to a definite or uncertain outcome. Only an
+ * invalid-request/card/permission/auth/rate-limit error proves Stripe did not act; anything else
+ * (connection, API 5xx, unknown) is UNCERTAIN and must be re-read, never assumed. */
+export const classifyDetachError = (error: unknown): PaymentMethodDetachOutcome => {
+  if (typeof error !== "object" || error === null) return "UNCERTAIN";
+  const { type, code, message } = error as { type?: unknown; code?: unknown; message?: unknown };
+  if (type === "StripeInvalidRequestError") {
+    if (code === "resource_missing") return "NOT_FOUND";
+    if (
+      code === "payment_method_unexpected_state" ||
+      (typeof message === "string" && /not attached/i.test(message))
+    ) {
+      return "NOT_ATTACHED";
+    }
+    return "REJECTED";
+  }
+  if (
+    type === "StripeCardError" ||
+    type === "StripePermissionError" ||
+    type === "StripeAuthenticationError" ||
+    type === "StripeRateLimitError"
+  ) {
+    return "REJECTED";
+  }
+  return "UNCERTAIN";
+};
+
 export class StripePaymentGateway implements PaymentGateway {
   private get client(): Stripe {
     return getStripeClient();
@@ -120,6 +149,41 @@ export class StripePaymentGateway implements PaymentGateway {
       expMonth: paymentMethod.card.exp_month,
       expYear: paymentMethod.card.exp_year,
     };
+  }
+
+  /** P2.2.5 — classified, never throws a provider error: resource_missing => NOT_FOUND;
+   * connection/API/unknown failures => UNCERTAIN. */
+  public async lookupPaymentMethodOwner(
+    paymentMethodId: string,
+  ): Promise<PaymentMethodOwnerLookup> {
+    try {
+      const paymentMethod = await this.client.paymentMethods.retrieve(paymentMethodId);
+      return {
+        outcome: "FOUND",
+        customerId:
+          typeof paymentMethod.customer === "string"
+            ? paymentMethod.customer
+            : (paymentMethod.customer?.id ?? null),
+        isCard: Boolean(paymentMethod.card),
+      };
+    } catch (error) {
+      return this.isMissingStripeCustomer(error)
+        ? { outcome: "NOT_FOUND" }
+        : { outcome: "UNCERTAIN" };
+    }
+  }
+
+  /** P2.2.5 — Stripe `paymentMethods.detach`. A detached PaymentMethod cannot be reused; the
+   * Customer adds a card again through the SetupIntent flow. */
+  public async detachPaymentMethod(
+    paymentMethodId: string,
+  ): Promise<{ outcome: PaymentMethodDetachOutcome }> {
+    try {
+      await this.client.paymentMethods.detach(paymentMethodId);
+      return { outcome: "DETACHED" };
+    } catch (error) {
+      return { outcome: classifyDetachError(error) };
+    }
   }
 
   public async setDefaultPaymentMethod(input: {

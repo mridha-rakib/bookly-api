@@ -342,6 +342,7 @@ describe("authorization and tenant isolation", () => {
 describe("G3 — requester ticket list pagination", () => {
   it("pages one requester's tickets with a stable tie-broken order and accurate total", async () => {
     const chain = {
+      maxTimeMS: vi.fn().mockReturnThis(),
       sort: vi.fn().mockReturnThis(),
       skip: vi.fn().mockReturnThis(),
       limit: vi.fn().mockReturnThis(),
@@ -350,7 +351,7 @@ describe("G3 — requester ticket list pagination", () => {
     const find = vi.spyOn(SupportTicketModel, "find").mockReturnValue(chain as never);
     const count = vi
       .spyOn(SupportTicketModel, "countDocuments")
-      .mockReturnValue({ exec: async () => 51 } as never);
+      .mockReturnValue({ maxTimeMS: () => ({ exec: async () => 51 }) } as never);
     const requester = new Types.ObjectId();
     const query = listSupportTicketsQuerySchema.parse({ page: "3", limit: "20" });
     const result = await new SupportTicketRepository().listByRequester(requester, query);

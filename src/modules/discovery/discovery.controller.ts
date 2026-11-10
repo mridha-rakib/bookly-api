@@ -15,6 +15,14 @@ export class DiscoveryController {
   public search = async (request: Request, response: Response): Promise<void> => {
     const query = request.validated?.query as ListDiscoveryBusinessesQuery;
 
+    // P2.2.3 — optional auth: only a signed-in CUSTOMER's own history personalizes
+    // `sort=recommended`; every other caller gets the public ranking.
+    const auth = request.auth;
+    const customerUserId =
+      auth?.role === "CUSTOMER" && Types.ObjectId.isValid(auth.userId)
+        ? new Types.ObjectId(auth.userId)
+        : undefined;
+
     const result = await this.discoveryService.search(
       {
         q: query.q,
@@ -22,10 +30,15 @@ export class DiscoveryController {
         visitType: query.visitType,
         category: query.category,
         minRating: query.minRating,
+        origin: query.origin,
+        radiusKm: query.radiusKm,
       },
       query.sort,
       { page: query.page, limit: query.limit },
+      { customerUserId, availability: query.availability },
     );
+    // Personalized and location-dependent results must never be shared by caches.
+    if (customerUserId || query.origin) response.setHeader("Cache-Control", "private, no-store");
 
     sendSuccess(response, 200, "Businesses", result);
   };

@@ -1,4 +1,5 @@
 import type { OrdinaryCalendarJournalDocument } from "./ordinary-calendar-journal.model.js";
+import { ORDINARY_CALENDAR_RETRY_LIMIT_REASON } from "./ordinary-calendar-retry.js";
 
 /**
  * P4B-2C — durable incident classification for ordinary Calendar monitoring, and the Owner's
@@ -17,6 +18,8 @@ export const ordinaryCalendarIncidentCategories = [
   "CALENDAR_NOT_CONNECTED",
   "BOOKING_AUTHORITY_CHECK_FAILED",
   "PROVIDER_PERMANENT_FAILURE",
+  // P2.2.9 — consecutive transient failures exhausted the retry budget.
+  "PROVIDER_RETRY_LIMIT_REACHED",
 ] as const;
 export type OrdinaryCalendarIncidentCategory = (typeof ordinaryCalendarIncidentCategories)[number];
 
@@ -85,6 +88,8 @@ export function classifyOrdinaryCalendarIncident(
         return incident("CALENDAR_NOT_CONNECTED", true);
       if (BOOKING_AUTHORITY_REASONS.has(reason))
         return incident("BOOKING_AUTHORITY_CHECK_FAILED", true);
+      if (reason === ORDINARY_CALENDAR_RETRY_LIMIT_REASON)
+        return incident("PROVIDER_RETRY_LIMIT_REACHED", true);
       return incident("CONNECTION_OR_DESTINATION_MISMATCH", true);
     case "PERMANENT_FAILURE":
       return BOOKING_AUTHORITY_REASONS.has(reason)

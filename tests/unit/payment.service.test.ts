@@ -169,7 +169,14 @@ describe("PaymentService", () => {
 
     const status = await service.getSavedCardStatus("u1");
     expect(status.hasSavedCard).toBe(true);
-    expect(status.card).toEqual({ brand: "visa", last4: "4242", expMonth: 12, expYear: 2030 });
+    // P2.2.5 — the PaymentMethod id is included so the Customer can address a removal.
+    expect(status.card).toEqual({
+      paymentMethodId: "pm_1",
+      brand: "visa",
+      last4: "4242",
+      expMonth: 12,
+      expYear: 2030,
+    });
   });
 
   it("chargeBookingDeposit throws PAYMENT_METHOD_REQUIRED when no card is saved", async () => {

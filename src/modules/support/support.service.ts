@@ -20,6 +20,7 @@ import type { SupportMessageDocument } from "./support-message.model.js";
 import type { SupportMessageRepository } from "./support-message.repository.js";
 import type { SupportTicketDocument } from "./support-ticket.model.js";
 import type {
+  SupportRequesterListOptions,
   SupportTicketPagination,
   SupportTicketRepository,
 } from "./support-ticket.repository.js";
@@ -103,7 +104,7 @@ export class SupportService {
 
   public async listOwnTickets(
     actorUserId: string,
-    pagination: SupportTicketPagination,
+    pagination: SupportRequesterListOptions,
   ): Promise<{ tickets: SupportTicketDocument[]; total: number }> {
     return this.ticketRepository.listByRequester(actorUserId, pagination);
   }

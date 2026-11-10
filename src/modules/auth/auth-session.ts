@@ -1,5 +1,6 @@
 import type { ClientSession, Types } from "mongoose";
 
+import { TwoFactorService } from "../two-factor/two-factor.service.js";
 import type { UserRole } from "../user/user.types.js";
 import type { TokenService } from "./token.service.js";
 
@@ -35,15 +36,30 @@ export type AuthResult = {
  */
 export async function issueAuthSession(
   tokenService: TokenService,
-  user: { userId: Types.ObjectId; email: string; role: UserRole; status: string },
+  user: {
+    userId: Types.ObjectId;
+    email: string;
+    role: UserRole;
+    status: string;
+    twoFactorEnabled?: boolean | undefined;
+  },
   context: RequestContext,
   session?: ClientSession,
+  verifiedFactorVersion?: number,
 ): Promise<AuthResult> {
+  if (verifiedFactorVersion === undefined && user.twoFactorEnabled) {
+    await new TwoFactorService().requireSecondFactor({
+      _id: user.userId,
+      role: user.role,
+      twoFactorEnabled: true,
+    });
+  }
   // The refresh family comes first: the access token is bound to it (`sid`), so revoking the
   // family (logout, reuse detection, credential changes) also ends this access token.
   const refreshSession = await tokenService.createRefreshSession(
     {
       userId: user.userId,
+      ...(verifiedFactorVersion === undefined ? {} : { twoFactorVersion: verifiedFactorVersion }),
       ...(context.userAgent ? { userAgent: context.userAgent } : {}),
       ...(context.ipAddress ? { ipAddress: context.ipAddress } : {}),
     },

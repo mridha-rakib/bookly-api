@@ -1,4 +1,8 @@
 import type { ClientSession, Types } from "mongoose";
+import {
+  type PlatformReportingScope,
+  reportingScopeMatch,
+} from "../../common/reporting/platform-reporting-scope.js";
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
 import { BookingError } from "../booking/booking.errors.js";
 import { BookingModel } from "../booking/booking.model.js";
@@ -225,8 +229,15 @@ export class BusinessRepository {
 
   /** Batch 11 — Businesses-tab counts (All/Approved/Pending/Warning/Suspended), one reduced
    * `$group` over the `{status:1}` index rather than N separate `countDocuments` calls. */
-  public async countByStatus(): Promise<Record<BusinessStatus, number>> {
+  public async countByStatus(
+    scope?: PlatformReportingScope,
+  ): Promise<Record<BusinessStatus, number>> {
     const rows = await BusinessModel.aggregate<{ _id: BusinessStatus; count: number }>([
+      {
+        $match: reportingScopeMatch(scope ? { businessIds: scope.businessIds } : undefined, {
+          businessField: "_id",
+        }),
+      },
       { $group: { _id: "$status", count: { $sum: 1 } } },
     ]).exec();
 
@@ -247,35 +258,66 @@ export class BusinessRepository {
   public async countCreatedByMonth(
     from: Date,
     to: Date,
+    timezone?: string,
+    scope?: PlatformReportingScope,
   ): Promise<Array<{ year: number; month: number; count: number }>> {
     const rows = await BusinessModel.aggregate<{
       _id: { year: number; month: number };
       count: number;
     }>([
-      { $match: { createdAt: { $gte: from, $lt: to } } },
+      {
+        $match: {
+          createdAt: { $gte: from, $lt: to },
+          ...reportingScopeMatch(scope, { businessField: "_id" }),
+        },
+      },
       {
         $group: {
-          _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
+          _id: timezone
+            ? {
+                year: { $year: { date: "$createdAt", timezone } },
+                month: { $month: { date: "$createdAt", timezone } },
+              }
+            : { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
           count: { $sum: 1 },
         },
       },
     ]).exec();
 
     const countByKey = new Map(rows.map((row) => [`${row._id.year}-${row._id.month}`, row.count]));
-    return zeroFilledMonths(from, to).map(({ year, month }) => ({
+    return zeroFilledMonths(from, to, timezone).map(({ year, month }) => ({
       year,
       month,
       count: countByKey.get(`${year}-${month}`) ?? 0,
     }));
   }
 
-  /** Batch 12 — City Coverage: `address.city` is enum-validated at the registration entry point
-   * (auth.schema.ts) even though the Mongoose field itself is a loose string, so grouping by its
-   * raw value is safe (no free-text drift to normalize). Splits Premises (AT_BUSINESS_LOCATION)
-   * vs Mobile (TRAVEL_TO_CUSTOMER) — tolerates the legacy `"location"`/`"travel"` aliases the
-   * schema still accepts (see normalizeBusinessVisitType), never assumes only the canonical
-   * values were ever written. All-time, not period-bounded — "where are our Businesses" is a
-   * current-state question, not a period metric. */
+  /** P2.2.4 — the Super Admin City options: every distinct registered city (trimmed, exact
+   * value — distinct spellings are never merged), alphabetical. Names only. */
+  public async listRegisteredCities(): Promise<string[]> {
+    const rows = await BusinessModel.aggregate<{ _id: string }>([
+      { $project: { city: { $trim: { input: { $ifNull: ["$address.city", ""] } } } } },
+      { $match: { city: { $ne: "" } } },
+      { $group: { _id: "$city" } },
+      { $sort: { _id: 1 } },
+    ]).exec();
+    return rows.map((row) => row._id);
+  }
+
+  /** P2.2.4 — ids of every Business (any status: past activity still belongs to its city)
+   * registered in exactly this trimmed city. */
+  public async findIdsByRegisteredCity(city: string): Promise<Types.ObjectId[]> {
+    const rows = await BusinessModel.find(
+      { $expr: { $eq: [{ $trim: { input: { $ifNull: ["$address.city", ""] } } }, city] } },
+      { _id: 1 },
+    )
+      .lean<Array<{ _id: Types.ObjectId }>>()
+      .exec();
+    return rows.map((row) => row._id);
+  }
+
+  /** Current-state coverage, with the same trimmed city authority as the selector.
+   * Empty/missing cities remain unassigned. Legacy visit-type aliases retain their meaning. */
   public async aggregateCityCoverage(): Promise<
     Array<{ city: string; premisesCount: number; mobileCount: number; approvedCount: number }>
   > {
@@ -287,7 +329,7 @@ export class BusinessRepository {
     }>([
       {
         $group: {
-          _id: "$address.city",
+          _id: { $trim: { input: { $ifNull: ["$address.city", ""] } } },
           premisesCount: {
             $sum: { $cond: [{ $in: ["$visitType", ["AT_BUSINESS_LOCATION", "location"]] }, 1, 0] },
           },

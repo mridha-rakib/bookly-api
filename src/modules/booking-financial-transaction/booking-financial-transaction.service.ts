@@ -1,4 +1,6 @@
 import type { ClientSession, Types } from "mongoose";
+import type { PlatformReportingScope } from "../../common/reporting/platform-reporting-scope.js";
+import { isBoundedPlatformFinanceWindow } from "../../common/time/platform-reporting.js";
 
 import { BookingFinancialTransactionError } from "./booking-financial-transaction.errors.js";
 import type { BookingFinancialTransactionDocument } from "./booking-financial-transaction.model.js";
@@ -278,6 +280,7 @@ export class BookingFinancialTransactionService {
     from?: Date;
     to?: Date;
     groupByBusiness?: boolean;
+    scope?: PlatformReportingScope;
   }): Promise<OwnershipAggregateBucket[]> {
     if (!input.unclaimedOnly) {
       if (!input.from || !input.to) {
@@ -302,11 +305,13 @@ export class BookingFinancialTransactionService {
      * of collapsing to one platform-wide total per (type, source). Read-only pass-through — no
      * effect on the aggregation itself. */
     groupByBusiness?: boolean;
+    scope?: PlatformReportingScope;
   }): Promise<OwnershipAggregateBucket[]> {
     return this.transactionRepository.aggregateBusinessOwnedBySource({
       types: input.types,
       unclaimedOnly: false,
       ...(input.groupByBusiness === undefined ? {} : { groupByBusiness: input.groupByBusiness }),
+      ...(input.scope ? { scope: input.scope } : {}),
     });
   }
 
@@ -318,7 +323,13 @@ export class BookingFinancialTransactionService {
     page: number;
     limit: number;
   }): Promise<{ rows: BookingFinancialTransactionDocument[]; total: number }> {
-    this.requireBoundedRange(input.from, input.to);
+    // Global Finance keeps one globally ordered page across the full bounded calendar
+    // window (at most 92 days + the autumn hour). Per-Business elapsed limits stay unchanged.
+    if (!isBoundedPlatformFinanceWindow(input.from, input.to))
+      throw new BookingFinancialTransactionError(
+        "BOOKING_FINANCIAL_TRANSACTION_RANGE_TOO_WIDE",
+        400,
+      );
     return this.transactionRepository.listGlobalPage(input);
   }
 

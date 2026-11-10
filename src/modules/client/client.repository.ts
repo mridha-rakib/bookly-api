@@ -1,4 +1,8 @@
 import { type ClientSession, Types } from "mongoose";
+import {
+  type PlatformReportingScope,
+  reportingScopeMatch,
+} from "../../common/reporting/platform-reporting-scope.js";
 
 import { type BusinessClientDocument, BusinessClientModel } from "./client.model.js";
 import type { ClientLinkState, ClientTag } from "./client.types.js";
@@ -282,9 +286,16 @@ export class ClientRepository {
   public async aggregateNewActivationsByBusiness(
     from: Date,
     to: Date,
+    scope?: PlatformReportingScope,
   ): Promise<Map<string, number>> {
     const rows = await BusinessClientModel.aggregate<{ _id: Types.ObjectId; count: number }>([
-      { $match: { activatedAt: { $gte: from, $lt: to } } },
+      {
+        $match: {
+          activatedAt: { $gte: from, $lt: to },
+          // P2.2.4 — activation day of week, in Cyprus.
+          ...reportingScopeMatch(scope, { timestampField: "activatedAt" }),
+        },
+      },
       { $group: { _id: "$businessId", count: { $sum: 1 } } },
     ]).exec();
 

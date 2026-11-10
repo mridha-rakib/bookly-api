@@ -22,6 +22,8 @@ export class PackageCalendarProviderError extends IntegrationError {
       | "PERMANENT_FAILURE"
       | "UNKNOWN_OUTCOME",
     readonly definitiveNoEffect = false,
+    /** P2.2.9 — provider retry guidance (Retry-After), when Google supplied one. */
+    readonly retryAfterMs?: number,
   ) {
     super("GOOGLE_CALENDAR_OAUTH_FAILED", 502);
     this.name = "PackageCalendarProviderError";

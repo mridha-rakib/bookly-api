@@ -1,6 +1,6 @@
 import type { ClientSession, Types } from "mongoose";
-
 import { zeroFilledMonths } from "../../common/time/analytics-buckets.js";
+import { SessionRepository } from "../session/session.repository.js";
 import {
   type CustomerAvatarMetadata,
   type CustomerProfileDocument,
@@ -9,6 +9,7 @@ import {
   UserModel,
   type UserProfileDocument,
   UserProfileModel,
+  type UserStatusHistoryEntry,
 } from "./user.model.js";
 import {
   type AuthProvider,
@@ -205,13 +206,20 @@ export class UserRepository {
     role: UserRole,
     from: Date,
     to: Date,
+    timezone?: string,
   ): Promise<Array<{ year: number; month: number; count: number }>> {
     const rows = await UserModel.aggregate<{ _id: { year: number; month: number }; count: number }>(
       [
         { $match: { role, createdAt: { $gte: from, $lt: to } } },
         {
           $group: {
-            _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
+            // P2.2.1 — local calendar months when a zone is given (Super Admin: Europe/Nicosia).
+            _id: timezone
+              ? {
+                  year: { $year: { date: "$createdAt", timezone } },
+                  month: { $month: { date: "$createdAt", timezone } },
+                }
+              : { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
             count: { $sum: 1 },
           },
         },
@@ -219,7 +227,7 @@ export class UserRepository {
     ).exec();
 
     const countByKey = new Map(rows.map((row) => [`${row._id.year}-${row._id.month}`, row.count]));
-    return zeroFilledMonths(from, to).map(({ year, month }) => ({
+    return zeroFilledMonths(from, to, timezone).map(({ year, month }) => ({
       year,
       month,
       count: countByKey.get(`${year}-${month}`) ?? 0,
@@ -432,6 +440,50 @@ export class UserRepository {
     );
 
     return { matchedCount: result.matchedCount ?? 0 };
+  }
+
+  /**
+   * P2.2.6 — Super Admin account-status transition for a CUSTOMER. One atomic compare-and-set:
+   * matches only while the row is still a CUSTOMER in exactly `expectedStatus`, then sets the new
+   * status and appends the audit entry together. Returns null when the precondition no longer
+   * holds (concurrent change, wrong role, deleted) — the caller re-reads to classify.
+   */
+  public async transitionCustomerStatus(
+    userId: Types.ObjectId | string,
+    expectedStatus: UserStatus,
+    entry: UserStatusHistoryEntry,
+  ): Promise<UserDocument | null> {
+    return UserModel.db.transaction(
+      async (session) => {
+        const updated = await UserModel.findOneAndUpdate(
+          { _id: userId, role: "CUSTOMER", status: expectedStatus },
+          { $set: { status: entry.toStatus }, $push: { statusHistory: entry } },
+          { new: true, session },
+        ).exec();
+        // Reactivation also reconciles legacy suspensions before unlocking the account.
+        if (updated)
+          await new SessionRepository().revokeAllForUser(userId, session, "ADMIN_SUSPENSION");
+        return updated;
+      },
+      { writeConcern: { w: "majority" } },
+    );
+  }
+
+  /** Idempotent reconciliation for pre-policy or incomplete suspensions; no audit append. */
+  public async ensureCustomerSessionsRevoked(userId: Types.ObjectId | string): Promise<boolean> {
+    return UserModel.db.transaction(
+      async (session) => {
+        const locked = await UserModel.findOneAndUpdate(
+          { _id: userId, role: "CUSTOMER", status: "SUSPENDED" },
+          { $inc: { authSessionVersion: 1 } },
+          { session, new: true },
+        ).exec();
+        if (locked)
+          await new SessionRepository().revokeAllForUser(userId, session, "ADMIN_SUSPENSION");
+        return locked !== null;
+      },
+      { writeConcern: { w: "majority" } },
+    );
   }
 
   /**

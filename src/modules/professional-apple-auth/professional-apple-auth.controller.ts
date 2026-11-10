@@ -1,8 +1,8 @@
 import type { Request, Response } from "express";
-
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { setRefreshCookie } from "../auth/auth.cookies.js";
+import { setChallengeCookie, TwoFactorRequired } from "../two-factor/two-factor.http.js";
 import { isProfessionalAppleAuthConfigured } from "./professional-apple-auth.client.js";
 import type { ProfessionalAppleCallbackBody } from "./professional-apple-auth.schema.js";
 import type {
@@ -19,7 +19,7 @@ type CallbackStatus = "success" | "onboarding" | "account_exists" | "error";
 export class ProfessionalAppleAuthController {
   public constructor(private readonly service: ProfessionalAppleAuthService) {}
 
-  public start = async (request: Request, response: Response): Promise<void> => {
+  public start = async (_request: Request, response: Response): Promise<void> => {
     if (!isProfessionalAppleAuthConfigured()) {
       response.redirect(this.frontendRedirect("error"));
       return;
@@ -44,6 +44,11 @@ export class ProfessionalAppleAuthController {
         this.requestContext(request),
       );
     } catch (error) {
+      if (error instanceof TwoFactorRequired) {
+        setChallengeCookie(response, error);
+        response.redirect(`${env.FRONTEND_BASE_URL}/professional/two-factor`);
+        return;
+      }
       logger.warn({ err: error }, "Business Owner Apple auth callback failed");
       response.redirect(this.frontendRedirect("error"));
       return;

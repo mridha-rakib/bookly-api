@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { reportingDays } from "../../common/reporting/platform-reporting-scope.js";
+import { platformRangeFrom, platformRangeTo } from "../../common/time/platform-reporting.js";
 
 import { bookingStatuses } from "../booking/booking.types.js";
 import { businessStatuses, businessVisitTypes } from "../business/business.types.js";
@@ -77,6 +79,12 @@ export const superAdminListBookingsQuerySchema = paginationQuerySchema
 // --- Global Customers ----------------------------------------------------------------------
 
 export const superAdminUserIdParamsSchema = z.object({ userId: objectIdSchema }).strict();
+/** P2.2.6 — optional internal note recorded in the Customer's status audit. */
+export const superAdminCustomerStatusBodySchema = z
+  .object({ reason: z.string().trim().max(500).optional() })
+  .strict();
+export type SuperAdminCustomerStatusBody = z.infer<typeof superAdminCustomerStatusBodySchema>;
+
 export const superAdminCustomerDetailQuerySchema = z
   .object({
     page: z.coerce.number().int().min(1).default(1),
@@ -105,9 +113,22 @@ export const superAdminListCustomersQuerySchema = paginationQuerySchema
  * 365-day window ending now — the same "no real selectable value yet, default to a sane bounded
  * window" precedent BusinessFinanceTab.tsx's own last-90-days default already established; never
  * a fabricated data value, only a query boundary. `toDate` must be strictly after `fromDate`. */
+/** P2.2.1 (E17) — a boundary is either a Cyprus calendar date `YYYY-MM-DD` (the client's form:
+ * inclusive dates converted HERE, in Europe/Nicosia, to a half-open `[from, to)` UTC window) or
+ * an exact ISO instant (kept for compatibility, used as given). */
+const reportingBoundarySchema = z.string().date().or(isoDateTimeSchema);
+const toReportingFrom = (value: string | undefined): Date | undefined =>
+  value === undefined ? undefined : platformRangeFrom(value);
+const toReportingTo = (value: string | undefined): Date | undefined =>
+  value === undefined ? undefined : platformRangeTo(value);
+
 const analyticsPeriodShape = {
-  fromDate: isoDateTimeSchema.optional(),
-  toDate: isoDateTimeSchema.optional(),
+  fromDate: reportingBoundarySchema.optional(),
+  toDate: reportingBoundarySchema.optional(),
+  // P2.2.4 — registered Business city (validated against real data by the resolver) and the
+  // Cyprus day of week of each metric's own event timestamp.
+  city: z.string().trim().min(1).max(100).optional(),
+  day: z.enum(reportingDays).optional(),
 };
 
 const validatePeriodShape = (value: {
@@ -122,8 +143,10 @@ export const superAdminAnalyticsPeriodQuerySchema = z
   .strict()
   .refine(validatePeriodShape, periodMessage)
   .transform((value) => ({
-    fromDate: value.fromDate ? new Date(value.fromDate) : undefined,
-    toDate: value.toDate ? new Date(value.toDate) : undefined,
+    fromDate: toReportingFrom(value.fromDate),
+    toDate: toReportingTo(value.toDate),
+    city: value.city,
+    day: value.day,
   }))
   .refine((value) => !(value.fromDate && value.toDate && value.fromDate >= value.toDate), {
     message: "fromDate must be before toDate",
@@ -134,8 +157,10 @@ export const superAdminTopServicesQuerySchema = z
   .strict()
   .refine(validatePeriodShape, periodMessage)
   .transform((value) => ({
-    fromDate: value.fromDate ? new Date(value.fromDate) : undefined,
-    toDate: value.toDate ? new Date(value.toDate) : undefined,
+    fromDate: toReportingFrom(value.fromDate),
+    toDate: toReportingTo(value.toDate),
+    city: value.city,
+    day: value.day,
     limit: value.limit ? Math.min(50, Math.max(1, Number(value.limit))) : 10,
   }))
   .refine((value) => !(value.fromDate && value.toDate && value.fromDate >= value.toDate), {

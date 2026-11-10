@@ -1,3 +1,5 @@
+import type { PlatformReportingScope } from "../../common/reporting/platform-reporting-scope.js";
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingStatus } from "../booking/booking.types.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
@@ -9,7 +11,7 @@ import {
 } from "./super-admin-analytics.util.js";
 
 export type SuperAdminBookingAnalyticsDto = {
-  period: { from: string; to: string };
+  period: { from: string; to: string; timezone: string };
   totalCount: number;
   statusCounts: Record<BookingStatus, number>;
   /** createdAt-bucketed, zero-filled per month in range — see BookingRepository.countCreatedByMonth. */
@@ -38,23 +40,32 @@ export class SuperAdminBookingAnalyticsService {
     private readonly financialTransactionService: BookingFinancialTransactionService,
   ) {}
 
-  public async getAnalytics(query: {
-    fromDate?: Date | undefined;
-    toDate?: Date | undefined;
-  }): Promise<SuperAdminBookingAnalyticsDto> {
+  public async getAnalytics(
+    query: {
+      fromDate?: Date | undefined;
+      toDate?: Date | undefined;
+    },
+    scope?: PlatformReportingScope,
+  ): Promise<SuperAdminBookingAnalyticsDto> {
     const period = resolveAnalyticsPeriod(query);
     const { from, to } = period;
     const series = resolveSeriesWindow(period);
 
     const [statusCounts, monthlySeries, clientTypeSplit, fulfilmentSplit, revenueBuckets] =
       await Promise.all([
-        this.bookingRepository.countByStatusInRange(from, to),
-        this.bookingRepository.countCreatedByMonth(series.from, series.to),
-        this.bookingRepository.aggregateClientTypeSplit(from, to),
-        this.bookingRepository.aggregateFulfilmentSplit(from, to),
+        this.bookingRepository.countByStatusInRange(from, to, undefined, scope),
+        this.bookingRepository.countCreatedByMonth(
+          series.from,
+          series.to,
+          PLATFORM_REPORTING_TIMEZONE,
+          scope,
+        ),
+        this.bookingRepository.aggregateClientTypeSplit(from, to, scope),
+        this.bookingRepository.aggregateFulfilmentSplit(from, to, scope),
         aggregateOwnershipForPeriod(this.financialTransactionService, {
           types: [...BOOKLY_REVENUE_TYPES],
           period,
+          scope,
         }),
       ]);
 
@@ -62,7 +73,11 @@ export class SuperAdminBookingAnalyticsService {
     const totalCount = Object.values(statusCounts).reduce((sum, count) => sum + count, 0);
 
     return {
-      period: { from: from.toISOString(), to: to.toISOString() },
+      period: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        timezone: PLATFORM_REPORTING_TIMEZONE,
+      },
       totalCount,
       statusCounts,
       monthlySeries,

@@ -45,7 +45,14 @@ export type PaymentAttemptContractCorrelation = {
 
 export type SavedCardStatus = {
   hasSavedCard: boolean;
-  card?: { brand: string; last4: string; expMonth: number; expYear: number };
+  card?: {
+    /** P2.2.5 — Stripe PaymentMethod id, used only to address a removal request. */
+    paymentMethodId: string;
+    brand: string;
+    last4: string;
+    expMonth: number;
+    expYear: number;
+  };
 };
 
 /**
@@ -176,6 +183,7 @@ export class PaymentService {
     return {
       hasSavedCard: true,
       card: {
+        paymentMethodId: profile.defaultPaymentMethodId,
         brand: profile.cardBrand ?? "unknown",
         last4: profile.cardLast4 ?? "0000",
         expMonth: profile.cardExpMonth ?? 0,
@@ -590,11 +598,15 @@ export class PaymentService {
   ) {
     const current = await this.reconcilePaymentAttempt(paymentAttemptId);
     const { attempt, snapshot } = current;
+    // An invalid/missing timestamp or clock reading is not evidence of expiry.
+    const ageMs =
+      Date.now() - (attempt.createdAt instanceof Date ? attempt.createdAt.getTime() : Number.NaN);
     if (
       maximumAgeMs === undefined ||
       !Number.isSafeInteger(maximumAgeMs) ||
       maximumAgeMs <= 0 ||
-      Date.now() - attempt.createdAt.getTime() < maximumAgeMs ||
+      !Number.isSafeInteger(ageMs) ||
+      ageMs < maximumAgeMs ||
       snapshot?.status !== "requires_action" ||
       attempt.providerStatus !== "REQUIRES_ACTION" ||
       attempt.persistenceStatus !== "NOT_STARTED" ||

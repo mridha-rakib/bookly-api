@@ -217,3 +217,9 @@ pm2 stop bookly-api
 ```
 
 PM2 runs `dist/app/server.js` and is intended for non-Docker production deployments.
+
+## Professional 2FA on existing free infrastructure
+
+New authenticator enrollment defaults off (`TWO_FACTOR_ENROLLMENT_ENABLED=false`). Existing enabled accounts continue to require their second factor. No paid MFA, SMS, KMS, QR or database feature is required by the 2FA module.
+
+Follow the [free-tier deployment and backup runbook](docs/2fa-free-tier-runbook.md) before enabling enrollment. The runtime gate checks the dedicated key, secure production settings, transaction-capable topology and the ordinary unique/TTL challenge indexes using read-only metadata. It does not deploy resources or verify hosting plans. [Zero-factor recovery is a draft manual policy](docs/2fa-manual-recovery-policy.md); no factor reset or bypass is authorized.

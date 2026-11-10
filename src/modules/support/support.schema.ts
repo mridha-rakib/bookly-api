@@ -29,10 +29,30 @@ const paginationQuerySchema = z.object({
   limit: z.string().regex(/^\d+$/, "Invalid limit").optional(),
 });
 
-export const listSupportTicketsQuerySchema = paginationQuerySchema.strict().transform((value) => ({
-  page: value.page ? Math.max(1, Number(value.page)) : 1,
-  limit: value.limit ? Math.min(50, Math.max(1, Number(value.limit))) : 20,
-}));
+export const listSupportTicketsQuerySchema = paginationQuerySchema
+  .extend({
+    q: z.string().trim().max(100).optional(),
+    status: z.enum(supportTicketStatuses).optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      [value.page, value.limit].every(
+        (number) => number === undefined || Number.isSafeInteger(Number(number)),
+      ),
+    "Invalid pagination",
+  )
+  .refine(
+    (value) =>
+      value.page === undefined || Number(value.page) <= Math.floor(Number.MAX_SAFE_INTEGER / 50),
+    "Invalid page",
+  )
+  .transform((value) => ({
+    page: value.page ? Math.max(1, Number(value.page)) : 1,
+    limit: value.limit ? Math.min(50, Math.max(1, Number(value.limit))) : 20,
+    ...(value.q ? { q: value.q } : {}),
+    ...(value.status ? { status: value.status } : {}),
+  }));
 
 /** P1.8 — opaque older-history cursor: `<createdAt epoch ms>_<message ObjectId>`, the exact
  * `(createdAt, _id)` sort key of the oldest message the caller already holds. */

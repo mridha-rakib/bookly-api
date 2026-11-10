@@ -59,6 +59,7 @@ import { createStaffInvitationRoute } from "../staff-invitation/staff-invitation
 import { StaffInvitationService } from "../staff-invitation/staff-invitation.service.js";
 import { StaffInvitationAcceptService } from "../staff-invitation/staff-invitation-accept.service.js";
 import { createDeferredStorageServiceFromEnv } from "../storage/storage.service.js";
+import { createTwoFactorRoute } from "../two-factor/two-factor.route.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
 import { createPhoneOtpProvider } from "../verification/phone-otp.provider.js";
@@ -302,6 +303,11 @@ export const createAuthRoute = (): Router => {
   );
   const controller = new AuthController(authService);
   const authenticate = createAuthenticateAccessTokenMiddleware(tokenService, userRepository);
+
+  router.use(
+    "/two-factor",
+    createTwoFactorRoute(tokenService, authenticate, authRateLimit("auth-two-factor", 60)),
+  );
 
   const entryLimiter = authRateLimit("auth-entry", env.AUTH_ENTRY_RATE_LIMIT_MAX);
   const loginLimiter = authRateLimit("auth-login", env.AUTH_LOGIN_RATE_LIMIT_MAX);

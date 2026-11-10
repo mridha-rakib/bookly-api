@@ -24,6 +24,9 @@ export type GoogleCalendarIntegrationDocument = {
   tokenExpiresAt: Date;
   status: GoogleCalendarIntegrationStatus;
   lastSyncError?: string | undefined;
+  /** P2.2.9 — last confirmed best-effort write / last recorded failure (status display only). */
+  lastSyncSucceededAt?: Date | undefined;
+  lastSyncFailedAt?: Date | undefined;
   connectedAt: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -46,6 +49,8 @@ const googleCalendarIntegrationSchema = new Schema<GoogleCalendarIntegrationDocu
       default: "CONNECTED",
     },
     lastSyncError: { type: String },
+    lastSyncSucceededAt: { type: Date },
+    lastSyncFailedAt: { type: Date },
     connectedAt: { type: Date, required: true },
   },
   { timestamps: true },

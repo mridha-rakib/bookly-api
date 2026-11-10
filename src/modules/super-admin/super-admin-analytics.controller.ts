@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
-
 import { sendSuccess } from "../../common/http/responses.js";
+import type { PlatformReportingScopeResolver } from "./platform-reporting-scope.resolver.js";
 import type {
   SuperAdminAnalyticsPeriodQuery,
   SuperAdminRecentActivityQuery,
@@ -24,30 +24,47 @@ export class SuperAdminAnalyticsController {
     private readonly serviceAnalyticsService: SuperAdminServiceAnalyticsService,
     private readonly cityAnalyticsService: SuperAdminCityAnalyticsService,
     private readonly activityService: SuperAdminActivityService,
+    private readonly scopeResolver: PlatformReportingScopeResolver,
   ) {}
 
   public getBookingAnalytics = async (request: Request, response: Response): Promise<void> => {
     const query = request.validated?.query as SuperAdminAnalyticsPeriodQuery;
-    const result = await this.bookingAnalyticsService.getAnalytics(query);
-    sendSuccess(response, 200, "Booking analytics", result);
+    const { scope, filters } = await this.scopeResolver.resolve(query);
+    const result = await this.bookingAnalyticsService.getAnalytics(query, scope);
+    sendSuccess(response, 200, "Booking analytics", { ...result, filters });
   };
 
   public getBusinessAnalytics = async (request: Request, response: Response): Promise<void> => {
     const query = request.validated?.query as SuperAdminAnalyticsPeriodQuery;
-    const result = await this.businessAnalyticsService.getAnalytics(query);
-    sendSuccess(response, 200, "Business analytics", result);
+    const { scope, filters } = await this.scopeResolver.resolve(query);
+    const result = await this.businessAnalyticsService.getAnalytics(query, scope);
+    sendSuccess(response, 200, "Business analytics", { ...result, filters });
   };
 
+  /** Customer analytics are platform-wide User facts (registration, all-time activity) with no
+   * Business-city attribution: City/Day are validated but not applied, and reported as such. */
   public getCustomerAnalytics = async (request: Request, response: Response): Promise<void> => {
     const query = request.validated?.query as SuperAdminAnalyticsPeriodQuery;
+    const { filters } = await this.scopeResolver.resolve(query);
     const result = await this.customerAnalyticsService.getAnalytics(query);
-    sendSuccess(response, 200, "Customer analytics", result);
+    sendSuccess(response, 200, "Customer analytics", {
+      ...result,
+      filters,
+      scope: "PLATFORM_WIDE_NOT_CITY_OR_DAY_FILTERED",
+    });
   };
 
   public getTopServices = async (request: Request, response: Response): Promise<void> => {
     const query = request.validated?.query as SuperAdminTopServicesQuery;
-    const result = await this.serviceAnalyticsService.getTopServices(query);
-    sendSuccess(response, 200, "Top services", result);
+    const { scope, filters } = await this.scopeResolver.resolve(query);
+    const result = await this.serviceAnalyticsService.getTopServices(query, scope);
+    sendSuccess(response, 200, "Top services", { ...result, filters });
+  };
+
+  /** P2.2.4 — City options: distinct registered Business cities (names only). */
+  public listReportingCities = async (_request: Request, response: Response): Promise<void> => {
+    const cities = await this.scopeResolver.listCities();
+    sendSuccess(response, 200, "Reporting cities", { cities });
   };
 
   public getCityCoverage = async (_request: Request, response: Response): Promise<void> => {

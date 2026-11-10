@@ -1,3 +1,5 @@
+import type { PlatformReportingScope } from "../../common/reporting/platform-reporting-scope.js";
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -33,7 +35,7 @@ export type SuperAdminTopBusinessRow = {
 };
 
 export type SuperAdminBusinessAnalyticsDto = {
-  period: { from: string; to: string };
+  period: { from: string; to: string; timezone: string };
   createdOverTime: Array<{ year: number; month: number; count: number }>;
   statusCounts: Record<BusinessStatus, number> & { total: number };
   topByBookings: SuperAdminTopBusinessRow[];
@@ -56,24 +58,36 @@ export class SuperAdminBusinessAnalyticsService {
     private readonly financialTransactionService: BookingFinancialTransactionService,
   ) {}
 
-  public async getAnalytics(query: {
-    fromDate?: Date | undefined;
-    toDate?: Date | undefined;
-  }): Promise<SuperAdminBusinessAnalyticsDto> {
+  /** P2.2.4 — City narrows everything to Businesses registered there; Day applies to each
+   * event's own timestamp (Business `createdAt`, Booking `createdAt`, client `activatedAt`,
+   * ledger `createdAt`). Status counts are current state: City only. */
+  public async getAnalytics(
+    query: {
+      fromDate?: Date | undefined;
+      toDate?: Date | undefined;
+    },
+    scope?: PlatformReportingScope,
+  ): Promise<SuperAdminBusinessAnalyticsDto> {
     const period = resolveAnalyticsPeriod(query);
     const { from, to } = period;
     const series = resolveSeriesWindow(period);
 
     const [createdOverTime, statusCounts, bookingStats, newCustomersByBusiness, revenueBuckets] =
       await Promise.all([
-        this.businessRepository.countCreatedByMonth(series.from, series.to),
-        this.businessRepository.countByStatus(),
-        this.bookingRepository.aggregateBusinessBookingStats(from, to),
-        this.clientRepository.aggregateNewActivationsByBusiness(from, to),
+        this.businessRepository.countCreatedByMonth(
+          series.from,
+          series.to,
+          PLATFORM_REPORTING_TIMEZONE,
+          scope,
+        ),
+        this.businessRepository.countByStatus(scope),
+        this.bookingRepository.aggregateBusinessBookingStats(from, to, undefined, scope),
+        this.clientRepository.aggregateNewActivationsByBusiness(from, to, scope),
         aggregateOwnershipForPeriod(this.financialTransactionService, {
           types: [...BOOKLY_REVENUE_TYPES],
           period,
           groupByBusiness: true,
+          scope,
         }),
       ]);
 
@@ -105,7 +119,11 @@ export class SuperAdminBusinessAnalyticsService {
     });
 
     return {
-      period: { from: from.toISOString(), to: to.toISOString() },
+      period: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        timezone: PLATFORM_REPORTING_TIMEZONE,
+      },
       createdOverTime,
       statusCounts: {
         ...statusCounts,

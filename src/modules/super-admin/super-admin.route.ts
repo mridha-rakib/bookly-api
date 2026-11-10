@@ -63,6 +63,7 @@ import {
   financeTransactionsQuerySchema,
   platformTransactionsExportQuerySchema,
   platformTransactionsQuerySchema,
+  superAdminFinanceSummaryQuerySchema,
 } from "../finance/finance.schema.js";
 import { FinanceService } from "../finance/finance.service.js";
 import { MarketingAudienceService } from "../marketing/marketing-audience.service.js";
@@ -131,11 +132,13 @@ import { SupportMessageRepository } from "../support/support-message.repository.
 import { SupportTicketRepository } from "../support/support-ticket.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { createEmailOtpProvider } from "../verification/email-otp.provider.js";
+import { PlatformReportingScopeResolver } from "./platform-reporting-scope.resolver.js";
 import {
   superAdminAnalyticsPeriodQuerySchema,
   superAdminBookingIdParamsSchema,
   superAdminBusinessIdParamsSchema,
   superAdminCustomerDetailQuerySchema,
+  superAdminCustomerStatusBodySchema,
   superAdminListBookingsQuerySchema,
   superAdminListBusinessesQuerySchema,
   superAdminListCustomersQuerySchema,
@@ -159,6 +162,7 @@ import { SuperAdminContentController } from "./super-admin-content.controller.js
 import { SuperAdminCustomerController } from "./super-admin-customer.controller.js";
 import { SuperAdminCustomerService } from "./super-admin-customer.service.js";
 import { SuperAdminCustomerAnalyticsService } from "./super-admin-customer-analytics.service.js";
+import { SuperAdminCustomerStatusService } from "./super-admin-customer-status.service.js";
 import { SuperAdminDashboardController } from "./super-admin-dashboard.controller.js";
 import { SuperAdminDashboardService } from "./super-admin-dashboard.service.js";
 import { SuperAdminFinanceController } from "./super-admin-finance.controller.js";
@@ -272,7 +276,10 @@ export const createSuperAdminRoute = (): Router => {
   );
   const customerController = new SuperAdminCustomerController(
     new SuperAdminCustomerService(userRepository, bookingRepository),
+    new SuperAdminCustomerStatusService(userRepository),
   );
+  // P2.2.4 — one City/Day resolver shared by Overview and Analytics.
+  const reportingScopeResolver = new PlatformReportingScopeResolver(businessRepository);
   const dashboardController = new SuperAdminDashboardController(
     new SuperAdminDashboardService(
       businessRepository,
@@ -282,6 +289,7 @@ export const createSuperAdminRoute = (): Router => {
       financeService,
       businessPayoutRepository,
     ),
+    reportingScopeResolver,
   );
 
   const clientRepository = new ClientRepository();
@@ -297,6 +305,7 @@ export const createSuperAdminRoute = (): Router => {
     new SuperAdminServiceAnalyticsService(bookingRepository, businessRepository),
     new SuperAdminCityAnalyticsService(businessRepository),
     new SuperAdminActivityService(businessRepository, userRepository, businessPayoutRepository),
+    reportingScopeResolver,
   );
 
   const promoRedemptionRepository = new PromoRedemptionRepository();
@@ -500,6 +509,25 @@ export const createSuperAdminRoute = (): Router => {
     }),
     asyncHandler(customerController.getById),
   );
+  // P2.2.6 — account restriction. Router-wide SUPER_ADMIN gate; CUSTOMER targets only.
+  router.post(
+    "/customers/:userId/suspend",
+    validateRequest({
+      params: superAdminUserIdParamsSchema,
+      body: superAdminCustomerStatusBodySchema,
+    }),
+    asyncHandler(customerController.suspend),
+  );
+  router.post(
+    "/customers/:userId/reactivate",
+    validateRequest({
+      params: superAdminUserIdParamsSchema,
+      body: superAdminCustomerStatusBodySchema,
+    }),
+    asyncHandler(customerController.reactivate),
+  );
+  // P2.2.8.2.1 — Owner policy: Super Admin never edits a user's personal profile. There is
+  // deliberately no profile mutation route here (the P2.2.8.2 PATCH .../profile was removed).
 
   // --- Dashboard ---
   // P1.9 — optional period: the same `[fromDate, toDate)` contract as /analytics/*.
@@ -531,6 +559,7 @@ export const createSuperAdminRoute = (): Router => {
     asyncHandler(analyticsController.getTopServices),
   );
   router.get("/analytics/cities", asyncHandler(analyticsController.getCityCoverage));
+  router.get("/analytics/reporting-cities", asyncHandler(analyticsController.listReportingCities));
   router.get(
     "/analytics/recent-activity",
     validateRequest({ query: superAdminRecentActivityQuerySchema }),
@@ -716,7 +745,7 @@ export const createSuperAdminRoute = (): Router => {
   // --- Platform-wide ---
   router.get(
     "/finance/summary",
-    validateRequest({ query: financeSummaryQuerySchema }),
+    validateRequest({ query: superAdminFinanceSummaryQuerySchema }),
     asyncHandler(controller.getPlatformSummary),
   );
   router.get(
@@ -734,7 +763,7 @@ export const createSuperAdminRoute = (): Router => {
   router.get("/finance/payouts/export.csv", asyncHandler(controller.exportPlatformPayouts));
   router.get(
     "/finance/promo-discounts",
-    validateRequest({ query: financeSummaryQuerySchema }),
+    validateRequest({ query: superAdminFinanceSummaryQuerySchema }),
     asyncHandler(promoController.getDiscountedMoney),
   );
   router.get(

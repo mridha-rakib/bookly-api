@@ -19,6 +19,11 @@ export type CreateSupportTicketInput = {
 
 export type SupportTicketPagination = { page: number; limit: number };
 
+export type SupportRequesterListOptions = SupportTicketPagination & {
+  q?: string | undefined;
+  status?: SupportTicketStatus | undefined;
+};
+
 export type SupportAdminListFilter = {
   status?: SupportTicketStatus | undefined;
   q?: string | undefined;
@@ -69,20 +74,29 @@ export class SupportTicketRepository {
 
   public async listByRequester(
     requesterUserId: Types.ObjectId | string,
-    pagination: SupportTicketPagination,
+    pagination: SupportRequesterListOptions,
   ): Promise<{ tickets: SupportTicketDocument[]; total: number }> {
-    const filter = { requesterUserId };
+    // Ownership stays outside the OR: every searchable field is scoped to this requester.
+    const filter: Record<string, unknown> = { requesterUserId };
+    if (pagination.status) filter["status"] = pagination.status;
+    const search = pagination.q?.trim();
+    if (search) {
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(escaped, "i");
+      filter["$or"] = [{ subject: pattern }, { reference: pattern }];
+    }
     const skip = (pagination.page - 1) * pagination.limit;
     const [tickets, total] = await Promise.all([
       // P1.8 — `_id` tie-breaker: two tickets sharing a createdAt can never swap between offset
       // pages (duplicated on one, missing from the next). Filtered by the existing
       // `{ requesterUserId, createdAt }` index; ties are ordered within one requester's rows.
       SupportTicketModel.find(filter)
+        .maxTimeMS(3_000)
         .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
         .limit(pagination.limit)
         .exec(),
-      SupportTicketModel.countDocuments(filter).exec(),
+      SupportTicketModel.countDocuments(filter).maxTimeMS(3_000).exec(),
     ]);
     return { tickets, total };
   }

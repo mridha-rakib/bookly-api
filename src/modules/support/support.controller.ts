@@ -41,6 +41,8 @@ export class SupportController {
     const result = await this.supportService.listOwnTickets(userId, {
       page: query.page,
       limit: query.limit,
+      ...(query.q ? { q: query.q } : {}),
+      ...(query.status ? { status: query.status } : {}),
     });
 
     sendSuccess(response, 200, "Support tickets", {

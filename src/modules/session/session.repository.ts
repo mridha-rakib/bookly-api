@@ -1,11 +1,16 @@
 import type { ClientSession, Types } from "mongoose";
 
+import { AuthError } from "../auth/auth.errors.js";
+import { UserModel } from "../user/user.model.js";
+
 import { type SessionDocument, SessionModel } from "./session.model.js";
 
 type CreateSessionInput = {
   userId: Types.ObjectId;
   refreshTokenHash: string;
   tokenFamilyId: string;
+  authenticatedAt?: Date | undefined;
+  twoFactorVersion?: number | undefined;
   expiresAt: Date;
   userAgent?: string | undefined;
   ipAddress?: string | undefined;
@@ -16,7 +21,15 @@ export class SessionRepository {
     input: CreateSessionInput,
     session?: ClientSession,
   ): Promise<SessionDocument> {
-    return new SessionModel(input).save(session ? { session } : undefined);
+    const insert = async (transaction: ClientSession) => {
+      await this.lockActiveUser(input.userId, transaction, input.twoFactorVersion);
+      return new SessionModel(input).save({ session: transaction });
+    };
+    return session
+      ? insert(session)
+      : SessionModel.db.transaction(insert, {
+          writeConcern: { w: "majority" },
+        });
   }
 
   public async findByRefreshTokenHash(refreshTokenHash: string): Promise<SessionDocument | null> {
@@ -48,14 +61,20 @@ export class SessionRepository {
     );
   }
 
-  public async revokeFamily(tokenFamilyId: string): Promise<void> {
+  public async revokeFamily(
+    tokenFamilyId: string,
+    reason: SessionDocument["revocationReason"] = "TOKEN_REUSE",
+  ): Promise<void> {
     await SessionModel.db.transaction(
       async (session) => {
         // Include consumed ancestors: writing the row rotation consumes forces a conflict
         // and retry, so a successor cannot be inserted after revocation's snapshot.
         await SessionModel.updateMany(
-          { tokenFamilyId },
-          { $set: { revokedAt: new Date() }, $inc: { revocationVersion: 1 } },
+          { tokenFamilyId, revocationReason: { $ne: "ADMIN_SUSPENSION" } },
+          {
+            $set: { revokedAt: new Date(), revocationReason: reason },
+            $inc: { revocationVersion: 1 },
+          },
           { session },
         );
       },
@@ -63,13 +82,59 @@ export class SessionRepository {
     );
   }
 
-  /** Batch 18 — used after a verified email change to force re-login everywhere. Access tokens
-   * are stateless JWTs and remain valid until their own short TTL naturally expires; this only
-   * blocks future refreshes. */
-  public async revokeAllForUser(userId: Types.ObjectId): Promise<void> {
+  /** Includes consumed ancestors to serialize with rotation and classify old credentials. */
+  public async revokeAllForUser(
+    userId: Types.ObjectId | string,
+    session?: ClientSession,
+    reason: SessionDocument["revocationReason"] = "REVOKE_ALL",
+  ): Promise<void> {
     await SessionModel.updateMany(
-      { userId, revokedAt: { $exists: false } },
-      { $set: { revokedAt: new Date() } },
+      { userId },
+      { $set: { revokedAt: new Date(), revocationReason: reason }, $inc: { revocationVersion: 1 } },
+      session ? { session } : { writeConcern: { w: "majority" } },
+    );
+  }
+
+  /** A real User write is required: a read alone would permit transaction write skew. */
+  private async lockActiveUser(
+    userId: Types.ObjectId,
+    session: ClientSession,
+    factorVersion?: number,
+  ): Promise<void> {
+    const user = await UserModel.findOneAndUpdate(
+      {
+        _id: userId,
+        status: { $nin: ["SUSPENDED", "DELETED"] },
+        $or: [
+          { twoFactorEnabled: { $ne: true } },
+          ...(factorVersion === undefined
+            ? []
+            : [{ twoFactorEnabled: true, twoFactorVersion: factorVersion }]),
+        ],
+      },
+      { $inc: { authSessionVersion: 1 } },
+      { session, new: true },
+    ).exec();
+    if (!user) {
+      const current = await UserModel.findById(userId).session(session).exec();
+      if (
+        current?.twoFactorEnabled &&
+        current.status !== "SUSPENDED" &&
+        current.status !== "DELETED"
+      )
+        throw new AuthError("TWO_FACTOR_CONFLICT", 409);
+      throw new AuthError(
+        current?.status === "SUSPENDED" ? "USER_SUSPENDED" : "SESSION_EXPIRED",
+        current?.status === "SUSPENDED" ? 403 : 401,
+      );
+    }
+  }
+
+  public async administrativeRevocationError(userId: Types.ObjectId): Promise<AuthError> {
+    const user = await UserModel.findById(userId).read("primary").exec();
+    return new AuthError(
+      user?.status === "SUSPENDED" ? "USER_SUSPENDED" : "SESSION_EXPIRED",
+      user?.status === "SUSPENDED" ? 403 : 401,
     );
   }
 
@@ -83,7 +148,7 @@ export class SessionRepository {
   ): Promise<void> {
     await SessionModel.updateMany(
       { userId, _id: { $ne: exceptSessionId }, revokedAt: { $exists: false } },
-      { $set: { revokedAt: new Date() } },
+      { $set: { revokedAt: new Date(), revocationReason: "REVOKE_ALL" } },
     );
   }
 
@@ -94,6 +159,7 @@ export class SessionRepository {
   ): Promise<SessionDocument> {
     return SessionModel.db.transaction(
       async (session) => {
+        await this.lockActiveUser(oldSession.userId, session, oldSession.twoFactorVersion);
         const consumed = await SessionModel.findOneAndUpdate(
           {
             _id: oldSession._id,
@@ -104,18 +170,33 @@ export class SessionRepository {
             $set: {
               revokedAt: new Date(),
               lastUsedAt: new Date(),
+              revocationReason: "ROTATED",
             },
           },
           { returnDocument: "after", session },
         ).exec();
 
         if (!consumed) {
-          throw new Error("REFRESH_TOKEN_REUSED");
+          const current = await SessionModel.findById(oldSession._id).session(session).exec();
+          if (
+            current?.revocationReason &&
+            current.revocationReason !== "ROTATED" &&
+            current.revocationReason !== "TOKEN_REUSE"
+          ) {
+            throw new Error("SESSION_EXPIRED");
+          }
+          throw new Error(
+            !current || current.expiresAt <= new Date()
+              ? "SESSION_EXPIRED"
+              : "REFRESH_TOKEN_REUSED",
+          );
         }
 
         const newSession = await this.create(
           {
             userId: oldSession.userId,
+            authenticatedAt: oldSession.authenticatedAt,
+            twoFactorVersion: oldSession.twoFactorVersion,
             refreshTokenHash,
             tokenFamilyId: oldSession.tokenFamilyId,
             expiresAt,

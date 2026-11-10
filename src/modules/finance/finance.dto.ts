@@ -1,3 +1,4 @@
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BusinessPayoutDocument } from "./business-payout.model.js";
 import type {
   BusinessPayableSummary,
@@ -102,7 +103,12 @@ export const toPendingPayoutsDto = (page: PendingPayoutsPage) => ({
 
 export const toPlatformSummaryDto = (summary: PlatformFinanceSummary) => ({
   currency: summary.currency,
-  period: { from: summary.period.from.toISOString(), to: summary.period.to.toISOString() },
+  // P2.2.2 — Super Admin platform periods are Cyprus calendar windows (Europe/Nicosia).
+  period: {
+    from: summary.period.from.toISOString(),
+    to: summary.period.to.toISOString(),
+    timezone: PLATFORM_REPORTING_TIMEZONE,
+  },
   bookly: summary.bookly,
   collectedForBusinesses: summary.collectedForBusinesses,
   sentToBusinesses: summary.sentToBusinesses,

@@ -1,3 +1,5 @@
+import type { PlatformReportingScope } from "../../common/reporting/platform-reporting-scope.js";
+import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import { resolveAnalyticsPeriod } from "./super-admin-analytics.util.js";
@@ -11,7 +13,7 @@ export type SuperAdminTopServiceRow = {
 };
 
 export type SuperAdminTopServicesDto = {
-  period: { from: string; to: string };
+  period: { from: string; to: string; timezone: string };
   services: SuperAdminTopServiceRow[];
 };
 
@@ -25,20 +27,33 @@ export class SuperAdminServiceAnalyticsService {
     private readonly businessRepository: BusinessRepository,
   ) {}
 
-  public async getTopServices(query: {
-    fromDate?: Date | undefined;
-    toDate?: Date | undefined;
-    limit: number;
-  }): Promise<SuperAdminTopServicesDto> {
+  public async getTopServices(
+    query: {
+      fromDate?: Date | undefined;
+      toDate?: Date | undefined;
+      limit: number;
+    },
+    scope?: PlatformReportingScope,
+  ): Promise<SuperAdminTopServicesDto> {
     const { from, to } = resolveAnalyticsPeriod(query);
-    const rows = await this.bookingRepository.aggregateTopServices(from, to, query.limit);
+    const rows = await this.bookingRepository.aggregateTopServices(
+      from,
+      to,
+      query.limit,
+      undefined,
+      scope,
+    );
 
     const businessIds = [...new Set(rows.map((row) => row.businessId))];
     const businesses = await this.businessRepository.findManyByIds(businessIds);
     const businessNameById = new Map(businesses.map((b) => [String(b._id), b.name]));
 
     return {
-      period: { from: from.toISOString(), to: to.toISOString() },
+      period: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        timezone: PLATFORM_REPORTING_TIMEZONE,
+      },
       services: rows.map((row) => ({
         ...row,
         businessName: businessNameById.get(row.businessId) ?? "—",

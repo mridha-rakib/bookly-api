@@ -1,4 +1,8 @@
 import type { ClientSession, Types } from "mongoose";
+import {
+  type PlatformReportingScope,
+  reportingScopeMatch,
+} from "../../common/reporting/platform-reporting-scope.js";
 
 import {
   type BookingFinancialTransactionDocument,
@@ -392,6 +396,9 @@ export class BookingFinancialTransactionRepository {
     from?: Date;
     to?: Date;
     groupByBusiness?: boolean;
+    /** P2.2.4 — Super Admin City (the row's own required `businessId`) / Day (Cyprus day of the
+     * ledger `createdAt`). Absent = unchanged. */
+    scope?: PlatformReportingScope;
   }): Promise<OwnershipAggregateBucket[]> {
     const match: Record<string, unknown> = {
       type: { $in: input.types },
@@ -399,6 +406,7 @@ export class BookingFinancialTransactionRepository {
       ...(input.businessId ? { businessId: input.businessId } : {}),
       ...(input.unclaimedOnly ? { payoutId: { $exists: false } } : {}),
       ...(input.from && input.to ? { createdAt: { $gte: input.from, $lt: input.to } } : {}),
+      ...reportingScopeMatch(input.scope),
     };
 
     const groupId: Record<string, unknown> = {
@@ -452,7 +460,7 @@ export class BookingFinancialTransactionRepository {
     const skip = (input.page - 1) * input.limit;
     const [rows, total] = await Promise.all([
       BookingFinancialTransactionModel.find(filter)
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
         .limit(input.limit)
         .exec(),

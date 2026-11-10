@@ -29,11 +29,43 @@ export type DiscoveryBusinessCardDto = {
    * Favorite must never be an automatic side effect of something else) — the frontend uses this
    * to degrade the card (e.g. disable "View") without pretending it's normally bookable. */
   isAvailable: boolean;
+  /** P2.2.3 — straight-line km from the visitor-supplied origin to this Business's stored
+   * location (one decimal). Only present when an origin was sent and a location is stored. */
+  distanceKm?: number | undefined;
+  /** P2.2.3 — present only under the availability filter: the earliest bookable start found by
+   * the AvailabilityService for the chosen date/window, and the Service it belongs to. A
+   * discovery-time indication only; booking still runs final admission. */
+  availability?: { serviceId: string; serviceName: string; firstSlotStartAt: string } | undefined;
+};
+
+/** P2.2.3 — how the result set was produced, so the client can label it truthfully. */
+export type DiscoveryListMeta = {
+  sort: string;
+  /** `sort=recommended`: true when ranked by the signed-in Customer's own booking history. */
+  personalized?: boolean | undefined;
+  trending?: { from: string; to: string; timezone: string; statuses: string[] } | undefined;
+  distance?:
+    | { unit: "km"; measure: "STRAIGHT_LINE_TO_BUSINESS_LOCATION"; radiusKm: number | null }
+    | undefined;
+  availability?:
+    | {
+        date: string;
+        window: string;
+        serviceQuery: string | null;
+        candidatesChecked: number;
+        /** More Businesses matched the other filters than were checked (best-ranked first). */
+        candidateLimitReached: boolean;
+        /** Mobile (travel-to-customer) Businesses skipped because exactly one city is needed to
+         * check where they travel. */
+        travelBusinessesNeedCity: number;
+      }
+    | undefined;
 };
 
 export type DiscoveryListResult = {
   businesses: DiscoveryBusinessCardDto[];
   pagination: { page: number; limit: number; total: number };
+  meta?: DiscoveryListMeta | undefined;
 };
 
 /**

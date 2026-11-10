@@ -1,3 +1,5 @@
+import type { PlatformReportingScope } from "../../common/reporting/platform-reporting-scope.js";
+import { platformMonthStartUtc } from "../../common/time/platform-reporting.js";
 import type { OwnershipAggregateBucket } from "../booking-financial-transaction/booking-financial-transaction.repository.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingFinancialTransactionType } from "../booking-financial-transaction/booking-financial-transaction.types.js";
@@ -53,9 +55,8 @@ export const resolveSeriesWindow = (period: ResolvedAnalyticsPeriod): { from: Da
     return { from: period.from, to: period.to };
   }
   const to = period.to;
-  const from = new Date(
-    Date.UTC(to.getUTCFullYear(), to.getUTCMonth() - (ALL_TIME_SERIES_MONTHS - 1), 1),
-  );
+  // P2.2.1 — trailing months are Cyprus calendar months (Europe/Nicosia).
+  const from = platformMonthStartUtc(to, -(ALL_TIME_SERIES_MONTHS - 1));
   return { from, to };
 };
 
@@ -108,10 +109,14 @@ export const aggregateOwnershipForPeriod = async (
     types: BookingFinancialTransactionType[];
     period: ResolvedAnalyticsPeriod;
     groupByBusiness?: boolean;
+    /** P2.2.4 — City (row `businessId`) / Day (Cyprus day of ledger `createdAt`). */
+    scope?: PlatformReportingScope | undefined;
   },
 ): Promise<OwnershipAggregateBucket[]> => {
-  const groupByBusiness =
-    input.groupByBusiness === undefined ? {} : { groupByBusiness: input.groupByBusiness };
+  const groupByBusiness = {
+    ...(input.groupByBusiness === undefined ? {} : { groupByBusiness: input.groupByBusiness }),
+    ...(input.scope ? { scope: input.scope } : {}),
+  };
 
   if (input.period.isAllTime) {
     return financialTransactionService.aggregateAllTimeOwnedBySource({

@@ -1,9 +1,9 @@
 import type { ErrorRequestHandler } from "express";
 import mongoose from "mongoose";
 import { ZodError } from "zod";
-
 import { env } from "../../config/env.js";
 import { logger as defaultLogger } from "../../config/logger.js";
+import { setChallengeCookie, TwoFactorRequired } from "../../modules/two-factor/two-factor.http.js";
 import { AppError, type ErrorDetail } from "../errors/app-error.js";
 import { RequestValidationError } from "../errors/validation-error.js";
 import { buildErrorResponse } from "../http/responses.js";
@@ -76,6 +76,15 @@ export const createErrorHandler = (options: ErrorHandlerOptions = {}): ErrorRequ
   const logger = options.logger ?? defaultLogger;
 
   return (error, request, response, _next) => {
+    if (error instanceof TwoFactorRequired) {
+      setChallengeCookie(response, error);
+      response.status(428).json(
+        buildErrorResponse("Additional verification is required", {
+          errors: [{ code: "TWO_FACTOR_REQUIRED", message: "Additional verification is required" }],
+        }),
+      );
+      return;
+    }
     const normalizedError = normalizeError(error);
     const statusCode = normalizedError.statusCode;
     const requestId = request.id ? String(request.id) : undefined;

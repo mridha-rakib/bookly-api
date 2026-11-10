@@ -4,6 +4,20 @@ import pino from "pino";
 import { env } from "./env.js";
 
 const redactPaths = [
+  "req.body.code",
+  "request.body.code",
+  "req.body.recoveryCode",
+  "request.body.recoveryCode",
+  "twoFactor",
+  "*.twoFactor",
+  "recoveryCodes",
+  "*.recoveryCodes",
+  "manualKey",
+  "*.manualKey",
+  "qrDataUrl",
+  "*.qrDataUrl",
+  "TOTP_ENCRYPTION_KEY_V1",
+  "*.TOTP_ENCRYPTION_KEY_V1",
   "req.headers.authorization",
   "headers.authorization",
   "*.headers.authorization",

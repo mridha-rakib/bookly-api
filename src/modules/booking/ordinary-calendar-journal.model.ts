@@ -87,6 +87,8 @@ export type OrdinaryCalendarJournalDocument = {
   lease?: { token: string; expiresAt: Date } | undefined;
   confirmedSequence?: number | undefined;
   confirmedRevision?: string | undefined;
+  /** P2.2.9 — when the latest sequence was last confirmed in Google (status display only). */
+  confirmedAt?: Date | undefined;
   nextAttemptAt?: Date | undefined;
   reason?: string | undefined;
   /** P4B-2C — consecutive retryable/unknown provider answers since the last confirmation. */
@@ -194,6 +196,7 @@ const schema = new Schema<OrdinaryCalendarJournalDocument>(
     },
     confirmedSequence: { type: Number },
     confirmedRevision: { type: String },
+    confirmedAt: { type: Date },
     nextAttemptAt: { type: Date },
     reason: { type: String, maxlength: 200 },
     retryableFailures: { type: Number, min: 0 },

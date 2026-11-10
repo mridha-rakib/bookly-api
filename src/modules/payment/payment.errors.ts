@@ -6,6 +6,13 @@ const defaultMessages: Record<string, string> = {
   PAYMENT_CUSTOMER_NOT_FOUND: "No payment profile found for this customer",
   PAYMENT_METHOD_REQUIRED: "A saved payment method is required to complete this booking",
   PAYMENT_METHOD_INVALID: "This payment method could not be saved — please try a different card",
+  // P2.2.5 — saved-card removal.
+  PAYMENT_METHOD_NOT_FOUND: "This saved card was not found",
+  PAYMENT_METHOD_IN_USE:
+    "This card can't be removed yet: it secures an active booking or a payment in progress",
+  PAYMENT_METHOD_REMOVAL_FAILED: "The card could not be removed right now — please try again",
+  PAYMENT_METHOD_REMOVAL_UNCONFIRMED:
+    "We couldn't confirm the card removal with the payment provider. It won't be used for new payments; please try again to finish",
   PAYMENT_REQUIRES_ACTION: "This payment requires additional authentication",
   PAYMENT_FAILED: "The payment could not be completed",
   PAYMENT_ALREADY_PROCESSED: "This payment has already been processed",

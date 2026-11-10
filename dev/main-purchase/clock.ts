@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   appendFileSync,
@@ -9,7 +10,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { z } from "zod";
 import { hashCanonicalPackageCheckoutContent as digest } from "../../src/modules/booking/package-checkout-binding.js";
 import type { HostObservation } from "../../src/modules/booking/trusted-time/host-clock.js";
@@ -45,6 +46,34 @@ const same = (a: string, b: string) =>
   /^[a-f0-9]{64}$/.test(a) &&
   /^[a-f0-9]{64}$/.test(b) &&
   timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
+
+function lockOwnerIsRunning(pid: number) {
+  if (process.platform === "win32") {
+    // Windows can reuse a stale PID for a protected service, for which kill(pid, 0)
+    // throws EPERM. Enumerate without signalling it. Only reclaim a missing PID or
+    // one belonging to a different executable; another Node process stays locked.
+    const output = execFileSync("tasklist.exe", ["/FO", "CSV", "/NH"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 10000,
+    });
+    const rows = output.trim().split(/\r?\n/);
+    for (const row of rows) {
+      const match = /^"([^"]+)","(\d+)",/.exec(row);
+      if (!match) throw Error("Cannot establish development authority lock ownership");
+      if (Number(match[2]) === pid)
+        return match[1]?.toLowerCase() === basename(process.execPath).toLowerCase();
+    }
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    return false;
+  }
+}
 
 /** A host-relative clock. A discontinuity poisons the process; no re-anchor or validity extension.
  * Every issued sample is fsynced before use. Each restart has a fresh epoch, so partial consent
@@ -82,13 +111,8 @@ export class DevelopmentClock {
     if (existsSync(this.lock)) {
       const pid = Number(readFileSync(this.lock, "utf8"));
       if (!Number.isSafeInteger(pid) || pid < 1) throw Error("Invalid development authority lock");
-      try {
-        process.kill(pid, 0);
-        throw Error("Development authority is already running");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        unlinkSync(this.lock);
-      }
+      if (lockOwnerIsRunning(pid)) throw Error("Development authority is already running");
+      unlinkSync(this.lock);
     }
     writeFileSync(this.lock, String(process.pid), { flag: "wx", mode: 0o600 });
     try {

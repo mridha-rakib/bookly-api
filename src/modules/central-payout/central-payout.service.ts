@@ -42,7 +42,7 @@ const isProviderStatus = (value: string): value is ProviderPayoutStatus =>
   (providerPayoutStatuses as readonly string[]).includes(value);
 
 export type CentralPayoutPolicy = {
-  /** LIVE payout execution. Off unless explicitly enabled by deployment configuration. */
+  /** Necessary deployment flag only; the independent reserve-policy denial still applies. */
   liveExecutionEnabled: boolean;
 };
 
@@ -75,6 +75,59 @@ export type CentralPayoutDeps = {
 export class CentralPayoutService {
   public constructor(private readonly deps: CentralPayoutDeps) {}
 
+  /** Independent read: a balance/history outage must not imply that no bank is configured.
+   * Only provider-owned masked metadata crosses this boundary; no local bank record exists. */
+  public async getBankAccountSummary() {
+    const mode = this.deps.gateway.mode() ?? null;
+    const base = { mode, managedBy: "STRIPE" as const };
+    if (!mode)
+      return { ...base, state: "NOT_CONFIGURED" as const, payoutsEnabled: null, destinations: [] };
+    try {
+      const account = await this.deps.gateway.retrieveAccountPayoutState();
+      if (!account.destinationsReadable)
+        return {
+          ...base,
+          state: "UNAVAILABLE" as const,
+          payoutsEnabled: account.payoutsEnabled,
+          inventoryComplete: false,
+          unavailableReason: account.destinationReadIssue ?? "INCOMPLETE",
+          destinations: [],
+        };
+      const destinations = account.destinations.map((bank) => ({
+        bankName: bank.bankName,
+        last4: /^[a-z0-9]{4}$/i.test(bank.last4) ? bank.last4 : null,
+        currency: bank.currency || null,
+        country: bank.country || null,
+        status: bank.status || null,
+        defaultForCurrency: bank.defaultForCurrency,
+      }));
+      return {
+        ...base,
+        state: destinations.length
+          ? ("CONFIGURED" as const)
+          : account.destinationsComplete === false
+            ? ("UNAVAILABLE" as const)
+            : ("NO_DESTINATION" as const),
+        payoutsEnabled: account.payoutsEnabled,
+        inventoryComplete: account.destinationsComplete !== false,
+        ...(account.destinationReadIssue
+          ? { unavailableReason: account.destinationReadIssue }
+          : {}),
+        destinations,
+      };
+    } catch {
+      // Do not echo provider errors: they may contain request data or credentials.
+      return {
+        ...base,
+        state: "UNAVAILABLE" as const,
+        payoutsEnabled: null,
+        inventoryComplete: false,
+        unavailableReason: "PROVIDER" as const,
+        destinations: [],
+      };
+    }
+  }
+
   // --- Read ---------------------------------------------------------------------------------
 
   public async getOverview(): Promise<CentralPayoutOverview> {
@@ -97,7 +150,7 @@ export class CentralPayoutService {
         );
     return {
       mode,
-      liveExecutionEnabled: this.deps.policy.liveExecutionEnabled,
+      liveExecutionEnabled: false, // No approved reserve authority exists, even if the deployment flag is set.
       balances: currencies.map((currency) => ({
         currency,
         availableCents: balance.available.find((b) => b.currency === currency)?.amountCents ?? 0,
@@ -107,7 +160,10 @@ export class CentralPayoutService {
         currency,
         amountCents,
       })),
-      destinations: account.destinations.map((d) => ({ ...d, eligible: this.isEligible(d) })),
+      destinations: account.destinations.map((d) => ({
+        ...d,
+        eligible: this.isEligible(d, account),
+      })),
       scheduleInterval: account.scheduleInterval,
       restrictions: [
         ...this.executionRestrictions(mode, balance.livemode),
@@ -176,7 +232,7 @@ export class CentralPayoutService {
     if (blocking[0]) throw new CentralPayoutError(blocking[0].code, blocking[0].message, 409);
 
     const destination = account.destinations.find((d) => d.id === input.destinationId);
-    if (!destination || !this.isEligible(destination))
+    if (!destination || !this.isEligible(destination, account))
       throw new CentralPayoutError(
         "CENTRAL_PAYOUT_DESTINATION_INVALID",
         "Choose the bank account linked to Bookly's Stripe account",
@@ -252,21 +308,32 @@ export class CentralPayoutService {
       return this.applyProviderPayout(op, payout, "REFRESH");
     }
     // PREPARED or UNKNOWN: first look for a payout Stripe already created for this operation.
+    const createdAtMs = op.createdAt instanceof Date ? op.createdAt.getTime() : Number.NaN;
+    const observedNow = Date.now();
+    const since = new Date(createdAtMs - 5 * 60 * 1000);
     const recent = await this.provider(() =>
       this.deps.gateway.listRecentPayouts({
-        createdGte: new Date(op.createdAt.getTime() - 5 * 60 * 1000),
+        ...(Number.isFinite(since.getTime()) &&
+        Number.isFinite(observedNow) &&
+        createdAtMs <= observedNow
+          ? { createdGte: since }
+          : {}),
         limit: 100,
       }),
     );
     const found = recent.find((p) => p.metadata[METADATA_KEY] === String(op._id));
     if (found) return this.applyProviderPayout(op, found, "RECOVERY");
-    if (Date.now() - op.createdAt.getTime() >= RESEND_WINDOW_MS) {
+    const ageMs = Date.now() - createdAtMs;
+    const ageKnown = Number.isSafeInteger(ageMs) && ageMs >= 0;
+    if (!ageKnown || ageMs >= RESEND_WINDOW_MS) {
       return this.audit(
         op,
         this.entry(
           "REQUIRES_REVIEW",
           "RECOVERY",
-          "No matching Stripe payout found and the idempotency window has passed; not resent",
+          ageKnown
+            ? "No matching Stripe payout found and the idempotency window has passed; not resent"
+            : "Operation age could not be established; idempotency window is unproven, not resent",
         ),
       );
     }
@@ -520,8 +587,20 @@ export class CentralPayoutService {
     return op;
   }
 
-  private isEligible(d: CentralBankDestination): boolean {
-    return d.defaultForCurrency && SENDABLE_DESTINATION_STATUSES.has(d.status);
+  private isEligible(d: CentralBankDestination, account: CentralAccountPayoutState): boolean {
+    return (
+      account.destinationsReadable &&
+      account.destinationsComplete !== false &&
+      d.defaultForCurrency === true &&
+      SENDABLE_DESTINATION_STATUSES.has(d.status) &&
+      /^ba_[a-z0-9]+$/i.test(d.id) &&
+      /^[a-z0-9]{4}$/i.test(d.last4) &&
+      /^[a-z]{3}$/.test(d.currency) &&
+      /^[A-Z]{2}$/.test(d.country) &&
+      account.destinations.filter(
+        (bank) => bank.currency === d.currency && bank.defaultForCurrency === true,
+      ).length === 1
+    );
   }
 
   private executionRestrictions(
@@ -549,6 +628,14 @@ export class CentralPayoutService {
           message: "LIVE withdrawals are disabled in this deployment",
         },
       ];
+    if (mode === "LIVE")
+      return [
+        {
+          code: "CENTRAL_PAYOUT_RESERVE_POLICY_UNAPPROVED",
+          message:
+            "LIVE withdrawals remain disabled until the Owner approves a reserve policy and its financial controls are implemented and reviewed",
+        },
+      ];
     return [];
   }
 
@@ -557,19 +644,31 @@ export class CentralPayoutService {
     if (!account.payoutsEnabled)
       restrictions.push({
         code: "CENTRAL_PAYOUT_PAYOUTS_DISABLED",
-        message: "Stripe reports that payouts are not enabled for this account",
+        message:
+          account.payoutsEnabled === false
+            ? "Stripe reports that payouts are not enabled for this account"
+            : "Stripe payout-enabled status could not be confirmed",
       });
     if (account.scheduleInterval !== "manual")
       restrictions.push({
         code: "CENTRAL_PAYOUT_AUTOMATIC_SCHEDULE",
-        message: `The Stripe account pays out automatically (${account.scheduleInterval ?? "unknown"} schedule). Manual withdrawals need a manual payout schedule; Bookly does not change this setting.`,
+        message:
+          account.scheduleInterval === null
+            ? "Stripe payout schedule could not be confirmed; manual withdrawals require a confirmed manual schedule"
+            : `The Stripe account pays out automatically (${account.scheduleInterval} schedule). Manual withdrawals need a manual payout schedule; Bookly does not change this setting.`,
       });
     if (!account.destinationsReadable)
       restrictions.push({
         code: "CENTRAL_PAYOUT_DESTINATION_UNREADABLE",
         message: "Stripe did not return the account's bank accounts to this API key",
       });
-    else if (!account.destinations.some((d) => this.isEligible(d)))
+    else if (account.destinationsComplete === false)
+      restrictions.push({
+        code: "CENTRAL_PAYOUT_DESTINATION_INCOMPLETE",
+        message:
+          "Stripe bank-account inventory is incomplete; no withdrawal can select a destination",
+      });
+    else if (!account.destinations.some((d) => this.isEligible(d, account)))
       restrictions.push({
         code: "CENTRAL_PAYOUT_DESTINATION_REQUIRED",
         message: "No usable default bank account is linked to the Stripe account",

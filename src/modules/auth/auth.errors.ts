@@ -23,6 +23,15 @@ const defaultMessages: Record<string, string> = {
   BUSINESS_SUSPENDED: "Business is suspended",
   SESSION_EXPIRED: "Session has expired",
   AUTHENTICATION_UNAVAILABLE: "Authentication is temporarily unavailable. Please try again",
+  TWO_FACTOR_REQUIRED: "Additional verification is required",
+  TWO_FACTOR_INVALID:
+    "Verification failed. Check the code or sign in again if the challenge expired.",
+  TWO_FACTOR_RATE_LIMITED: "Too many verification attempts. Try again in five minutes.",
+  TWO_FACTOR_ENROLLMENT_UNAVAILABLE:
+    "New authenticator setup is unavailable until deployment readiness is confirmed. Existing two-factor sign-in remains required.",
+  TWO_FACTOR_UNAVAILABLE: "Two-factor authentication is temporarily unavailable",
+  TWO_FACTOR_REAUTH_REQUIRED: "Sign in again, then return to Security within five minutes.",
+  TWO_FACTOR_CONFLICT: "Security settings changed. Reload and try again.",
   REFRESH_TOKEN_REUSED: "Refresh token reuse detected",
   PROVIDER_NOT_CONFIGURED: "Verification provider is not configured",
   REGISTRATION_COMPLETION_FAILED: "Registration completion failed",

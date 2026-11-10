@@ -6,6 +6,7 @@ declare global {
       id?: string;
       auth?: {
         userId: string;
+        sessionFamilyId?: string;
         role: import("../../modules/user/user.types.js").UserRole;
         status: import("../../modules/user/user.types.js").UserStatus;
       };

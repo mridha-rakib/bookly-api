@@ -1,8 +1,9 @@
+import * as childProcess from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { basename, join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import { DevelopmentClock } from "../../dev/main-purchase/clock.js";
 import { requireDevelopmentContract } from "../../dev/main-purchase/configuration.js";
 import { CONTRACT, fingerprint, validateEnvironment } from "../../dev/main-purchase/guards.js";
@@ -10,6 +11,8 @@ import { verifyPackageBatchActivation } from "../../src/modules/booking/package-
 import { assessConsentCommitDeadline } from "../../src/modules/booking/package-consent-commit-deadline.js";
 import { shippedPackageConsentHttpActivation } from "../../src/modules/booking/package-consent-http-activation.js";
 import { verifyConsentHostObservation } from "../../src/modules/booking/trusted-time/host-clock.js";
+
+vi.mock("node:child_process", { spy: true });
 
 const environment = () => ({
   NODE_ENV: "development",
@@ -122,6 +125,53 @@ describe("main development environment boundary", () => {
   });
 });
 describe("development host-relative consent evidence", () => {
+  it.skipIf(process.platform !== "win32").each(["reused", "missing"])(
+    "recovers a Windows lock with a %s PID without signalling the process",
+    (kind) => {
+      const f = fixture();
+      writeFileSync(join(f.dir, "runtime.lock"), "3480");
+      const list = vi
+        .spyOn(childProcess, "execFileSync")
+        .mockReturnValue(
+          kind === "reused"
+            ? '"spoolsv.exe","3480","Services","0","100 K"\r\n'
+            : '"System","4","Services","0","100 K"\r\n',
+        );
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+        throw Object.assign(Error("Access denied"), { code: "EPERM" });
+      });
+      let clock: DevelopmentClock | undefined;
+      try {
+        clock = f.open();
+        expect(readFileSync(join(f.dir, "runtime.lock"), "utf8")).toBe(String(process.pid));
+        expect(kill).not.toHaveBeenCalled();
+      } finally {
+        clock?.close();
+        list.mockRestore();
+        kill.mockRestore();
+      }
+    },
+  );
+  it.skipIf(process.platform !== "win32").each(["node", "malformed", "unavailable"])(
+    "preserves the Windows lock when process evidence is %s",
+    (kind) => {
+      const f = fixture();
+      writeFileSync(join(f.dir, "runtime.lock"), "3480");
+      const list = vi.spyOn(childProcess, "execFileSync").mockImplementation(() => {
+        if (kind === "unavailable") throw Error("tasklist unavailable");
+        return kind === "node"
+          ? `"${basename(process.execPath)}","3480","Console","1","100 K"\r\n`
+          : "unexpected process listing";
+      });
+      try {
+        expect(() => f.open()).toThrow();
+        expect(readFileSync(join(f.dir, "runtime.lock"), "utf8")).toBe("3480");
+        expect(existsSync(join(f.dir, "clock.journal"))).toBe(false);
+      } finally {
+        list.mockRestore();
+      }
+    },
+  );
   it("seals exact witnesses, rejects tampering, and remains rejected by shipped production", async () => {
     const f = fixture(),
       clock = f.open(),

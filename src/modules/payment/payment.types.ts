@@ -146,6 +146,24 @@ export type TaxAssociationResult = {
   terminalErrorReason?: string | undefined;
 };
 
+/** P2.2.5 — who a PaymentMethod is attached to, as reported by the provider. */
+export type PaymentMethodOwnerLookup =
+  | { outcome: "FOUND"; customerId: string | null; isCard: boolean }
+  | { outcome: "NOT_FOUND" }
+  /** Network/timeout/provider failure: the answer is unknown. */
+  | { outcome: "UNCERTAIN" };
+
+/** P2.2.5 — result of detaching a saved PaymentMethod.
+ * DETACHED: done. NOT_FOUND / NOT_ATTACHED: nothing attached any more (idempotent success).
+ * REJECTED: the provider definitely did not detach it (e.g. rate limited, invalid request).
+ * UNCERTAIN: no reliable answer (timeout/connection/5xx); state must be re-read. */
+export type PaymentMethodDetachOutcome =
+  | "DETACHED"
+  | "NOT_FOUND"
+  | "NOT_ATTACHED"
+  | "REJECTED"
+  | "UNCERTAIN";
+
 export interface PaymentGateway {
   getOrCreateCustomer(input: {
     existingStripeCustomerId: string | undefined;
@@ -166,6 +184,12 @@ export interface PaymentGateway {
     stripeCustomerId: string;
     paymentMethodId: string;
   }): Promise<void>;
+
+  /** P2.2.5 — classified ownership read (never throws a provider error). */
+  lookupPaymentMethodOwner?(paymentMethodId: string): Promise<PaymentMethodOwnerLookup>;
+
+  /** P2.2.5 — classified detach (never throws a provider error). */
+  detachPaymentMethod?(paymentMethodId: string): Promise<{ outcome: PaymentMethodDetachOutcome }>;
 
   createAndConfirmPaymentIntent(input: CreatePaymentIntentInput): Promise<PaymentIntentResult>;
 
