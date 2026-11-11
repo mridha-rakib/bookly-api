@@ -1,8 +1,9 @@
 import { type RequestHandler, Router } from "express";
-
+import { requireAppleOAuth } from "../../common/middleware/apple-oauth-availability.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { requireActiveUser, requireRoles } from "../auth/auth.middleware.js";
+import { isAppleAccountLinkConfigured } from "./apple-oauth.client.js";
 import type { LinkedAccountController } from "./linked-account.controller.js";
 import {
   appleLinkCallbackBodySchema,
@@ -95,6 +96,7 @@ export const createLinkedAccountRoute = (deps: LinkedAccountRouteDeps): Router =
   // --- Apple (linking only) ---
   router.get(
     "/me/linked-accounts/apple/authorize-url",
+    requireAppleOAuth(isAppleAccountLinkConfigured),
     authenticate,
     requireActiveUser(),
     requireRoles([...LINKABLE_ROLES]),
@@ -117,6 +119,7 @@ export const createLinkedAccountRoute = (deps: LinkedAccountRouteDeps): Router =
   // `nonce` claim, never a session or a nonce cookie.
   router.post(
     "/oauth/apple/callback",
+    requireAppleOAuth(isAppleAccountLinkConfigured),
     validateRequest({ body: appleLinkCallbackBodySchema }),
     asyncHandler(controller.handleAppleCallback),
   );

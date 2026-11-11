@@ -1,7 +1,8 @@
 import { type RequestHandler, Router } from "express";
-
+import { requireAppleOAuth } from "../../common/middleware/apple-oauth-availability.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
+import { isProfessionalAppleAuthConfigured } from "./professional-apple-auth.client.js";
 import type { ProfessionalAppleAuthController } from "./professional-apple-auth.controller.js";
 import {
   professionalAppleCallbackBodySchema,
@@ -25,6 +26,7 @@ export const createProfessionalAppleAuthRoute = (deps: ProfessionalAppleAuthRout
 
   router.get(
     "/professional/oauth/apple/start",
+    requireAppleOAuth(isProfessionalAppleAuthConfigured),
     startLimiter,
     validateRequest({ query: professionalAppleStartQuerySchema }),
     asyncHandler(controller.start),
@@ -32,6 +34,7 @@ export const createProfessionalAppleAuthRoute = (deps: ProfessionalAppleAuthRout
 
   router.post(
     "/professional/oauth/apple/callback",
+    requireAppleOAuth(isProfessionalAppleAuthConfigured),
     callbackLimiter,
     validateRequest({ body: professionalAppleCallbackBodySchema }),
     asyncHandler(controller.callback),

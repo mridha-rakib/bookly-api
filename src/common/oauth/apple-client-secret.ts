@@ -31,7 +31,11 @@ export class AppleClientSecretError extends Error {
 /** True only when every credential needed to sign the client secret is present. */
 export function isAppleClientSecretConfigured(): boolean {
   return Boolean(
-    env.APPLE_CLIENT_ID && env.APPLE_TEAM_ID && env.APPLE_KEY_ID && env.APPLE_PRIVATE_KEY,
+    env.APPLE_OAUTH_ENABLED !== false &&
+      env.APPLE_CLIENT_ID &&
+      env.APPLE_TEAM_ID &&
+      env.APPLE_KEY_ID &&
+      env.APPLE_PRIVATE_KEY,
   );
 }
 
@@ -60,6 +64,7 @@ export function __resetAppleClientSecretCache(): void {
  * {@link AppleClientSecretError} — the private key material is never included in the error.
  */
 export async function getAppleClientSecret(): Promise<string> {
+  if (!isAppleClientSecretConfigured()) throw new AppleClientSecretError();
   const nowSeconds = Math.floor(Date.now() / 1000);
 
   if (cached && cached.expEpochSeconds - nowSeconds > RENEW_SKEW_SECONDS) {

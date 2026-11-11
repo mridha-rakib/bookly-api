@@ -1,7 +1,8 @@
 import { type RequestHandler, Router } from "express";
-
+import { requireAppleOAuth } from "../../common/middleware/apple-oauth-availability.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
+import { isCustomerAppleAuthConfigured } from "./customer-apple-auth.client.js";
 import type { CustomerAppleAuthController } from "./customer-apple-auth.controller.js";
 import { customerAppleCallbackBodySchema } from "./customer-apple-auth.schema.js";
 
@@ -22,10 +23,16 @@ export const createCustomerAppleAuthRoute = (deps: CustomerAppleAuthRouteDeps): 
   const router = Router();
   const { controller, startLimiter, callbackLimiter } = deps;
 
-  router.get("/customer/oauth/apple/start", startLimiter, asyncHandler(controller.start));
+  router.get(
+    "/customer/oauth/apple/start",
+    requireAppleOAuth(isCustomerAppleAuthConfigured),
+    startLimiter,
+    asyncHandler(controller.start),
+  );
 
   router.post(
     "/customer/oauth/apple/callback",
+    requireAppleOAuth(isCustomerAppleAuthConfigured),
     callbackLimiter,
     validateRequest({ body: customerAppleCallbackBodySchema }),
     asyncHandler(controller.callback),

@@ -30,6 +30,14 @@ const rawStorageProvider = storageProviderSchema.parse(
   process.env["STORAGE_PROVIDER"] || undefined,
 );
 
+// Production remains enabled/strict by default. An explicit disabled state is
+// permitted only for the named private staging deployment, validated below.
+const rawAppleOAuthEnabled = z
+  .enum(["true", "false", "1", "0"])
+  .default("true")
+  .transform((value) => value === "true" || value === "1")
+  .parse(process.env["APPLE_OAUTH_ENABLED"] || undefined);
+
 const booleanString = z
   .enum(["true", "false", "1", "0"])
   .default("false")
@@ -344,22 +352,10 @@ export const env = createEnv({
     SMTP_SECURE: booleanString,
     SMTP_USER: optionalProviderRequiredString(["smtp"], "SMTP_USER"),
     SMTP_PASS: optionalProviderRequiredString(["smtp"], "SMTP_PASS"),
-    RESEND_API_KEY:
-      rawEmailProvider === "resend"
-        ? optionalProviderRequiredString(["resend"], "RESEND_API_KEY")
-        : optionalProductionRequiredString("RESEND_API_KEY"),
-    RESEND_FROM_EMAIL:
-      rawEmailProvider === "resend"
-        ? optionalProviderRequiredString(["resend"], "RESEND_FROM_EMAIL")
-        : optionalProductionRequiredString("RESEND_FROM_EMAIL"),
-    RESEND_FROM_NAME:
-      rawEmailProvider === "resend"
-        ? optionalProviderRequiredString(["resend"], "RESEND_FROM_NAME")
-        : optionalProductionRequiredString("RESEND_FROM_NAME"),
-    SENDGRID_API_KEY:
-      rawEmailProvider === "sendgrid"
-        ? optionalProviderRequiredString(["sendgrid"], "SENDGRID_API_KEY")
-        : optionalProductionRequiredString("SENDGRID_API_KEY"),
+    RESEND_API_KEY: optionalProviderRequiredString(["resend"], "RESEND_API_KEY"),
+    RESEND_FROM_EMAIL: optionalProviderRequiredString(["resend"], "RESEND_FROM_EMAIL"),
+    RESEND_FROM_NAME: optionalProviderRequiredString(["resend"], "RESEND_FROM_NAME"),
+    SENDGRID_API_KEY: optionalProviderRequiredString(["sendgrid"], "SENDGRID_API_KEY"),
     OTP_PROVIDER: phoneOtpProviderSchema.superRefine((value, context) => {
       if (rawNodeEnv === "production" && value === "dummy") {
         context.addIssue({
@@ -692,14 +688,34 @@ export const env = createEnv({
     //   APPLE_KEY_ID        = 10-char Key ID of the "Sign in with Apple" key; JWT header `kid`
     //   APPLE_PRIVATE_KEY   = the .p8 PEM, base64-encoded to a single line (decoded in the helper);
     //                         never logged, never echoed, no example value in .env.example
-    APPLE_CLIENT_ID: optionalProductionRequiredString("APPLE_CLIENT_ID"),
-    APPLE_TEAM_ID: optionalProductionRequiredString("APPLE_TEAM_ID"),
-    APPLE_KEY_ID: optionalProductionRequiredString("APPLE_KEY_ID"),
+    APPLE_OAUTH_ENABLED: optionalBooleanString.default(true).superRefine((enabled, context) => {
+      if (
+        !enabled &&
+        rawNodeEnv === "production" &&
+        (process.env["FRONTEND_BASE_URL"] !== "https://staging.bookly.cy" ||
+          process.env["PUBLIC_API_BASE_URL"] !== "https://api-staging.bookly.cy/api/v1")
+      ) {
+        context.addIssue({
+          code: "custom",
+          message:
+            "Apple OAuth may be disabled in production mode only on the explicit private staging origins",
+        });
+      }
+    }),
+    APPLE_CLIENT_ID: rawAppleOAuthEnabled
+      ? optionalProductionRequiredString("APPLE_CLIENT_ID")
+      : z.string().optional(),
+    APPLE_TEAM_ID: rawAppleOAuthEnabled
+      ? optionalProductionRequiredString("APPLE_TEAM_ID")
+      : z.string().optional(),
+    APPLE_KEY_ID: rawAppleOAuthEnabled
+      ? optionalProductionRequiredString("APPLE_KEY_ID")
+      : z.string().optional(),
     APPLE_PRIVATE_KEY: z
       .string()
       .optional()
       .superRefine((value, context) => {
-        if (rawNodeEnv === "production" && !value) {
+        if (rawAppleOAuthEnabled && rawNodeEnv === "production" && !value) {
           context.addIssue({
             code: "custom",
             message: "APPLE_PRIVATE_KEY is required in production",
@@ -726,17 +742,17 @@ export const env = createEnv({
         }
       }),
     // Settings → Link Apple. e.g. https://api.bookly.cy/api/v1/auth/oauth/apple/callback
-    APPLE_ACCOUNT_LINK_REDIRECT_URI: optionalProductionRequiredUrl(
-      "APPLE_ACCOUNT_LINK_REDIRECT_URI",
-    ),
+    APPLE_ACCOUNT_LINK_REDIRECT_URI: rawAppleOAuthEnabled
+      ? optionalProductionRequiredUrl("APPLE_ACCOUNT_LINK_REDIRECT_URI")
+      : z.string().url().optional(),
     // Customer "Continue with Apple". e.g. https://api.bookly.cy/api/v1/auth/customer/oauth/apple/callback
-    APPLE_CUSTOMER_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
-      "APPLE_CUSTOMER_OAUTH_REDIRECT_URI",
-    ),
+    APPLE_CUSTOMER_OAUTH_REDIRECT_URI: rawAppleOAuthEnabled
+      ? optionalProductionRequiredUrl("APPLE_CUSTOMER_OAUTH_REDIRECT_URI")
+      : z.string().url().optional(),
     // Business Owner "Continue with Apple". e.g. https://api.bookly.cy/api/v1/auth/professional/oauth/apple/callback
-    APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI: optionalProductionRequiredUrl(
-      "APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI",
-    ),
+    APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI: rawAppleOAuthEnabled
+      ? optionalProductionRequiredUrl("APPLE_PROFESSIONAL_OAUTH_REDIRECT_URI")
+      : z.string().url().optional(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

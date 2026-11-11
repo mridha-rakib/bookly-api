@@ -46,6 +46,8 @@ export class DatabaseManager implements DatabaseStateReader {
     this.connectPromise = mongoose
       .connect(env.MONGODB_URI, {
         autoIndex: env.NODE_ENV !== "production",
+        // Production schemas are provisioned only by a separately approved operation.
+        autoCreate: env.NODE_ENV !== "production",
         maxPoolSize: 10,
         serverSelectionTimeoutMS: 10_000,
       })

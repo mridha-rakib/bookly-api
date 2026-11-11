@@ -65,6 +65,10 @@ export class S3CompatibleStorageService implements StorageService {
     try {
       await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
     } catch (error) {
+      // Production may use only an already provisioned, authorized bucket.
+      if (env.NODE_ENV === "production") {
+        throw new StorageError("STORAGE_OPERATION_FAILED", 503, undefined, error);
+      }
       try {
         await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
       } catch (createError) {

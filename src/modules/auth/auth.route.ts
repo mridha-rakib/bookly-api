@@ -2,7 +2,6 @@ import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-
 import { buildErrorResponse } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { attributeRateLimitRejections } from "../../common/middleware/rate-limit-attribution.js";
@@ -91,6 +90,7 @@ import {
   visitTypeBodySchema,
 } from "./auth.schema.js";
 import { AuthService } from "./auth.service.js";
+import { createAuthProviderRoute } from "./auth-provider.route.js";
 import { Argon2PasswordHasher } from "./password-hasher.js";
 import { TokenService } from "./token.service.js";
 
@@ -138,6 +138,7 @@ const authRateLimit = (name: string, limit: number, windowMs = 15 * 60 * 1000) =
 
 export const createAuthRoute = (): Router => {
   const router = Router();
+  router.use(createAuthProviderRoute());
   const userRepository = new UserRepository();
   const registrationSessionRepository = new RegistrationSessionRepository();
   const businessRepository = new BusinessRepository();
