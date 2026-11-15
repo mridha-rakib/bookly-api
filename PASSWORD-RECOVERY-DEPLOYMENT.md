@@ -11,7 +11,7 @@ The model intentionally has `autoIndex: false`; this work does not apply indexes
 
 API (under `/api/v1/auth/{customer|professional}/password-recovery`):
 
-- `POST /request` `{ email, previousChallenge? }` returns `{ challenge }` with the same response message for eligible and ineligible addresses. During cooldown it returns the caller’s previous challenge only if it is still active; otherwise the challenge is an empty string and the UI asks the user to wait. Delivery is asynchronous and failures are masked; the provider logs only its safe failure category.
+- `POST /request` `{ email, previousChallenge? }` returns `{ challenge }` with the same response message for eligible and ineligible addresses. During cooldown it returns the callerâ€™s previous challenge only if it is still active; otherwise the challenge is an empty string and the UI asks the user to wait. Delivery is asynchronous and failures are masked; the provider logs only its safe failure category.
 - `POST /resend` `{ challenge }` returns the same generic message. Cooldown and rolling hourly limits are enforced per portal/address; throttled requests do not issue a new code.
 - `POST /verify` `{ challenge, code }` returns `{ resetToken }` only after the code is accepted. Codes are single-use, expire according to the existing OTP setting and have bounded attempts.
 - `POST /complete` `{ resetToken, newPassword }` changes the password only once, within a 10-minute reset authorization window, and revokes all sessions in the same transaction.
