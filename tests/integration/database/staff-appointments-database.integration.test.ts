@@ -6,6 +6,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
+import { createBusinessBookingRoute } from "../../../src/modules/booking/booking.route.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -587,6 +589,46 @@ describe("P4C-1 Staff read-only appointments", () => {
         .send({});
       expect(response.status).toBe(404);
     }
+    const management = express();
+    management.use(express.json());
+    management.use("/businesses", createStaffScheduleRoute());
+    management.use("/businesses", createBusinessBookingRoute());
+    management.use("/businesses", createBusinessRoute());
+    management.use(createErrorHandler({ isProduction: true }));
+    for (const suffix of ["cancel", "reschedule", "complete", "no-show", "waive-fee"]) {
+      await request(management)
+        .post(`/businesses/${businessA}/bookings/${mine._id}/${suffix}`)
+        .set("Authorization", me.bearer)
+        .send({})
+        .expect(403);
+    }
+    for (const suffix of ["summary", "transactions", "payouts"]) {
+      await request(management)
+        .get(`/businesses/${businessA}/finance/${suffix}`)
+        .set("Authorization", me.bearer)
+        .expect(403);
+    }
+    for (const suffix of ["preview", "purchase"]) {
+      await request(management)
+        .post(`/businesses/${businessA}/bookings/packages/${suffix}`)
+        .set("Authorization", me.bearer)
+        .send({})
+        .expect(403);
+    }
+    await request(management)
+      .post(`/businesses/${businessA}/bookings/packages/${new Types.ObjectId()}/sessions`)
+      .set("Authorization", me.bearer)
+      .send({})
+      .expect(403);
+    await request(management)
+      .get(`/businesses/${businessA}/staff/${me.membership._id}/time-off`)
+      .set("Authorization", me.bearer)
+      .expect(403);
+    await request(management)
+      .post(`/businesses/${businessA}/staff/${me.membership._id}/time-off`)
+      .set("Authorization", me.bearer)
+      .send({})
+      .expect(403);
     expect(await BookingModel.collection.findOne({ _id: mine._id })).toEqual(before);
     void mongoose;
   });

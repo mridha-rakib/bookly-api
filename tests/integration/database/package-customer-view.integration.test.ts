@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import express from "express";
 import mongoose, { Types } from "mongoose";
 import request from "supertest";
@@ -5,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { verifyPackageBatchActivation } from "../../../src/modules/booking/package-batch-authority.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { createPackageViewRoute } from "../../../src/modules/package-progress/package-view.route.js";
@@ -204,10 +206,13 @@ describe("S6 authenticated customer/management transport with disposable records
     const booking = await BookingModel.findOne().orFail();
     const url = `/package-views/settlement/${booking.businessId}/${booking._id}`;
     const owner = await other(t, "BUSINESS_OWNER", t.f.business.ownerUserId);
-    expect(
-      (await request(app).get(url).set("Authorization", owner).expect(200)).body.data
-        .actionsAvailable,
-    ).toBe(false);
+    const ownerView = (await request(app).get(url).set("Authorization", owner).expect(200)).body
+      .data;
+    expect(ownerView.actionsAvailable).toBe(false);
+    expect(ownerView).toHaveProperty("purchaseFinancials");
+    expect(ownerView).toHaveProperty("operations");
+    expect(ownerView).toHaveProperty("payments");
+    expect(ownerView.session.booking).toHaveProperty("outstandingBalanceCents");
     await request(app)
       .get(url)
       .set("Authorization", await other(t, "STAFF"))
@@ -272,6 +277,55 @@ describe("S6 authenticated customer/management transport with disposable records
       { $set: { employmentActive: false } },
     );
     await request(app).get(url).set("Authorization", bearer).expect(403);
+  });
+  it("7B Supervisor package reads are linked to their business and cannot use Customer purchase surfaces", async () => {
+    const t = await fixture(true);
+    const booking = await BookingModel.findOne().orFail();
+    const progress = await PackageProgressV2Model.findOne().orFail();
+    const membership = t.f.providers.find((p) => p.role === "SUPERVISOR");
+    if (!membership) throw Error("Missing supervisor fixture");
+    const bearer = await other(t, "SUPERVISOR", membership.userId);
+    const url = `/package-views/settlement/${booking.businessId}/${booking._id}`;
+    const before = await BookingModel.find().lean();
+    const attemptsBefore = await PaymentAttemptModel.find().lean();
+    const ledgerBefore = await BookingFinancialTransactionModel.find().lean();
+    const progressBefore = await PackageProgressV2Model.find().lean();
+    const view = await request(app).get(url).set("Authorization", bearer).expect(200);
+    expect(view.body.data.packageProgressId).toBe(String(progress._id));
+    expect(view.body.data.session.bookingId).toBe(String(booking._id));
+    for (const field of ["purchaseFinancials", "operations", "payments", "historyLimit"])
+      expect(view.body.data).not.toHaveProperty(field);
+    for (const field of [
+      "travelFeeCents",
+      "addonsSubtotalCents",
+      "depositCents",
+      "outstandingBalanceCents",
+      "venueAttestedCents",
+      "balanceSettled",
+    ])
+      expect(view.body.data.session.booking).not.toHaveProperty(field);
+    expect(view.body.data.session.booking).toHaveProperty("status");
+    expect(await BookingModel.find().lean()).toEqual(before);
+    expect(await PaymentAttemptModel.find().lean()).toEqual(attemptsBefore);
+    expect(await BookingFinancialTransactionModel.find().lean()).toEqual(ledgerBefore);
+    expect(await PackageProgressV2Model.find().lean()).toEqual(progressBefore);
+    await request(app)
+      .get(`/package-views/settlement/${new Types.ObjectId()}/${booking._id}`)
+      .set("Authorization", bearer)
+      .expect(403);
+    await request(app)
+      .get(`/package-views/owned/${progress._id}`)
+      .set("Authorization", bearer)
+      .expect(403);
+    await request(app)
+      .get(`/package-views/catalog/${booking.businessId}`)
+      .set("Authorization", bearer)
+      .expect(403);
+    await request(app)
+      .post("/package-views/actions/purchase")
+      .set("Authorization", bearer)
+      .send({ businessId: String(booking.businessId), operationId: randomUUID() })
+      .expect(403);
   });
   it("safe payment projection distinguishes action-required and unknown without secrets or foreign money", async () => {
     const t = await fixture(true);

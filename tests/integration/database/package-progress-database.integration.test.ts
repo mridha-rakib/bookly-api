@@ -1,13 +1,20 @@
 import { createServer } from "node:http";
+import express from "express";
 import mongoose, { Types } from "mongoose";
+import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
+import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import {
+  createBusinessBookingRoute,
+  createCustomerBookingRoute,
+} from "../../../src/modules/booking/booking.route.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
@@ -21,6 +28,7 @@ import { BookingSlotReservationRepository } from "../../../src/modules/booking-s
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { cancellationTiers } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.model.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
@@ -29,6 +37,8 @@ import { BusinessHoursService } from "../../../src/modules/business-hours/busine
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { createClientRoute } from "../../../src/modules/client/client.route.js";
+import { createDashboardOverviewRoute } from "../../../src/modules/dashboard-overview/dashboard-overview.route.js";
 import { renderBookingCancelledCustomerEmail } from "../../../src/modules/email/templates/booking/booking-cancelled-customer.template.js";
 import { renderBookingCancelledOwnerEmail } from "../../../src/modules/email/templates/booking/booking-cancelled-owner.template.js";
 import type { CancellationEmailData } from "../../../src/modules/email/templates/booking/cancellation-email-data.js";
@@ -49,10 +59,15 @@ import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-rede
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
+import { SessionRepository } from "../../../src/modules/session/session.repository.js";
+import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
+import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import { legacyPackageHttp } from "../../helpers/legacy-package-http.js";
@@ -986,6 +1001,252 @@ describe("database-backed Package Deal integration", () => {
     if (result.status !== "confirmed") throw new Error("expected confirmed redemption");
     return result.booking;
   };
+
+  it("7D cancels future legacy sessions and revokes a removed supervisor's existing token", async () => {
+    expect(mongoose.connection.name).toMatch(/^bookly_auth_\d+_[a-f\d]{32}$/);
+    expect(mongoose.connection.name).not.toBe("bookly_DB");
+    const f = await setUpSettledPackage();
+    const future = await redeemConfirmed(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      redeemInput(f.staff[0]!.membership._id),
+    );
+    const supervisor = await userRepository.create({
+      normalizedEmail: `supervisor-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+    });
+    await userRepository.createProfile({
+      userId: supervisor._id,
+      firstName: "Synthetic",
+      lastName: "Supervisor",
+      gender: "other",
+    });
+    const membership = await staffRepository.create({
+      userId: supervisor._id,
+      businessId: f.business._id,
+      role: "SUPERVISOR",
+      createdByUserId: f.owner._id,
+    });
+    const foreign = await createBusiness(`foreign-${new Types.ObjectId()}@example.com`, "Foreign");
+    const app = express();
+    app.use(express.json());
+    app.use("/businesses", createDashboardOverviewRoute());
+    app.use("/businesses", createClientRoute());
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use("/businesses", createBusinessBookingRoute());
+    app.use("/businesses", createBusinessRoute());
+    app.use("/me", createCustomerBookingRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const tokenService = new TokenService(new SessionRepository());
+    const bearer = async (
+      userId: Types.ObjectId,
+      role: "SUPERVISOR" | "BUSINESS_OWNER" | "CUSTOMER",
+    ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
+    const auth = await bearer(supervisor._id, "SUPERVISOR");
+    const ownerAuth = await bearer(f.owner._id, "BUSINESS_OWNER");
+    const customerAuth = await bearer(f.customer._id, "CUSTOMER");
+    const base = `/businesses/${f.business._id}`;
+    const packagePath = `${base}/bookings/packages/${f.progress._id}`;
+    const client = await BusinessClientModel.findOne({
+      businessId: f.business._id,
+      linkedUserId: f.customer._id,
+    }).orFail();
+    const reads = [
+      `${base}/dashboard/overview`,
+      `${base}/bookings`,
+      `${base}/bookings/${future._id}`,
+      `${base}/bookings/calendar?fromDate=2030-08-19T00%3A00%3A00.000Z&toDate=2030-08-23T00%3A00%3A00.000Z`,
+      `${base}/staff`,
+      `${base}/staff/${f.staff[0]!.membership._id}/schedule`,
+      `${base}/staff/${f.staff[0]!.membership._id}/time-off`,
+      `${base}/clients`,
+      `${base}/clients/${client._id}`,
+      packagePath,
+    ];
+    for (const path of reads) await request(app).get(path).set("Authorization", auth).expect(200);
+    await request(app)
+      .get(`/businesses/${foreign.business._id}/bookings/packages/${f.progress._id}`)
+      .set("Authorization", auth)
+      .expect(404);
+    await request(app)
+      .post(`/businesses/${foreign.business._id}/bookings/packages/${f.progress._id}/cancel-future`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(404);
+    await StaffMembershipModel.updateOne(
+      { _id: membership._id },
+      { $set: { employmentActive: false } },
+    );
+    await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(404);
+    await StaffMembershipModel.updateOne(
+      { _id: membership._id },
+      { $set: { employmentActive: true } },
+    );
+    const ownerPackage = await request(app)
+      .get(packagePath)
+      .set("Authorization", ownerAuth)
+      .expect(200);
+    const customerPackage = await request(app)
+      .get(`/me/packages/${f.progress._id}`)
+      .set("Authorization", customerAuth)
+      .expect(200);
+    expect(ownerPackage.body.data.purchaseSnapshot.bundlePriceCents).toBe(45000);
+    expect(customerPackage.body.data.purchaseSnapshot.bundlePriceCents).toBe(45000);
+    expect(ownerPackage.body.data).toHaveProperty("outstandingBalanceCents");
+    expect(customerPackage.body.data).toHaveProperty("outstandingBalanceCents");
+    // A synthetic existing settlement makes response redaction observable without invoking a provider.
+    await PackageProgressModel.updateOne(
+      { _id: f.progress._id },
+      {
+        $set: {
+          voidRefundSettlement: {
+            status: "SUCCEEDED",
+            amountCents: 1234,
+            providerRefundId: "synthetic",
+          },
+        },
+      },
+    );
+    const historyBefore = await BookingModel.findById(f.purchase._id).lean().orFail();
+    const financialBefore = await BookingFinancialTransactionModel.find().lean();
+    const futureReservations = await BookingSlotReservationModel.find({
+      "intervals.reservationId": future.serviceLines[0]!.reservationId,
+    }).lean();
+    expect(futureReservations).toHaveLength(1);
+    const result = await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(200);
+    expect(result.body.data.cancelledBookingIds).toEqual([String(future._id)]);
+    expect(result.body.data).not.toHaveProperty("refundSettlement");
+    expect(result.body.data).not.toHaveProperty("outstandingBalanceCents");
+    expect(result.body.data).not.toHaveProperty("bundlePriceCents");
+    const after = await PackageProgressModel.findById(f.progress._id).lean().orFail();
+    expect(after.remainingSessions).toBe(4);
+    const supervisorRead = await request(app)
+      .get(packagePath)
+      .set("Authorization", auth)
+      .expect(200);
+    expect(supervisorRead.body.data.status).toBe("ACTIVE");
+    expect(supervisorRead.body.data).not.toHaveProperty("voidRefundSettlement");
+    expect(after.sessions.find((s) => s.bookingId.equals(future._id))?.status).toBe("CANCELLED");
+    expect(after.sessions.find((s) => s.bookingId.equals(f.purchase._id))?.status).toBe(
+      "COMPLETED",
+    );
+    const cancelled = await BookingModel.findById(future._id).lean().orFail();
+    expect(cancelled.status).toBe("CANCELLED_BY_BUSINESS");
+    expect(
+      cancelled.eventHistory.filter((e) => e.note === `PACKAGE_CANCEL_FUTURE:${f.progress._id}`),
+    ).toHaveLength(1);
+    expect(await BookingModel.findById(f.purchase._id).lean().orFail()).toEqual(historyBefore);
+    expect(
+      await BookingSlotReservationModel.countDocuments({
+        "intervals.reservationId": future.serviceLines[0]!.reservationId,
+      }),
+    ).toBe(0);
+    expect(await BookingFinancialTransactionModel.find().lean()).toEqual(financialBefore);
+    const replay = await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(200);
+    expect(replay.body.data.cancelledBookingIds).toEqual([]);
+    expect(await PackageProgressModel.findById(f.progress._id).lean().orFail()).toEqual(after);
+    expect(await BookingModel.findById(future._id).lean().orFail()).toEqual(cancelled);
+    const ownerReplay = await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", ownerAuth)
+      .send({})
+      .expect(200);
+    const customerReplay = await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", customerAuth)
+      .send({})
+      .expect(200);
+    expect(ownerReplay.body.data.refundSettlement).toMatchObject({
+      amountCents: 1234,
+      providerRefundId: "synthetic",
+    });
+    expect(customerReplay.body.data.refundSettlement).toMatchObject({
+      amountCents: 1234,
+      providerRefundId: "synthetic",
+    });
+    expect(await PackageProgressModel.findById(f.progress._id).lean().orFail()).toEqual(after);
+    await request(app)
+      .delete(`${base}/staff/${membership._id}`)
+      .set("Authorization", ownerAuth)
+      .expect(200);
+    const removed = await StaffMembershipModel.findById(membership._id).lean().orFail();
+    expect(removed.removedAt).toBeInstanceOf(Date);
+    expect((await userRepository.findById(supervisor._id))?.status).toBe("ACTIVE");
+    for (const path of reads) {
+      const denial = await request(app).get(path).set("Authorization", auth).expect(404);
+      expect(denial.body.data).toBeUndefined();
+    }
+    await request(app)
+      .post(`${packagePath}/cancel-future`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(404);
+    await request(app)
+      .post(`${base}/bookings/${future._id}/cancel`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(404);
+    expect(await PackageProgressModel.findById(f.progress._id).lean().orFail()).toEqual(after);
+    expect(await BookingModel.findById(future._id).lean().orFail()).toEqual(cancelled);
+    await request(app).get(packagePath).set("Authorization", ownerAuth).expect(200);
+    await request(app)
+      .get(`${base}/bookings/${future._id}`)
+      .set("Authorization", ownerAuth)
+      .expect(200);
+  }, 120_000);
+
+  it("9B Admin reads a real legacy purchase and redeemed session linkage", async () => {
+    const f = await setUpSettledPackage();
+    const redeemed = await redeemConfirmed(
+      String(f.customer._id),
+      String(f.business._id),
+      String(f.progress._id),
+      redeemInput(f.staff[0]!.membership._id),
+    );
+    const admin = await userRepository.create({
+      normalizedEmail: `admin9b-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+    });
+    const tokens = new TokenService(new SessionRepository());
+    const auth = `Bearer ${await issueTestAccessToken(tokens, { userId: admin._id, role: "SUPER_ADMIN" })}`;
+    const app = express();
+    app.use("/super-admin", createSuperAdminRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const response = await request(app)
+      .get(`/super-admin/bookings/${redeemed._id}`)
+      .set("Authorization", auth)
+      .expect(200);
+    expect(response.body.data.businessId).toBe(String(f.business._id));
+    expect(response.body.data.serviceLines[0]).toMatchObject({
+      packageProgressId: String(f.progress._id),
+      sessionIndex: 2,
+      sessionsInPackage: 5,
+      staffMembershipId: String(f.staff[0]!.membership._id),
+    });
+    const saved = await PackageProgressModel.findById(f.progress._id).orFail();
+    expect(
+      saved.sessions.some(
+        (session) => session.bookingId.equals(redeemed._id) && session.status === "SCHEDULED",
+      ),
+    ).toBe(true);
+  });
 
   // --- Purchase --------------------------------------------------------------------------------
 

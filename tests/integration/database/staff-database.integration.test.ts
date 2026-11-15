@@ -13,6 +13,7 @@ import { AuthService } from "../../../src/modules/auth/auth.service.js";
 import { Argon2PasswordHasher } from "../../../src/modules/auth/password-hasher.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { BusinessService } from "../../../src/modules/business/business.service.js";
 import { BusinessAccessRepository } from "../../../src/modules/business/business-access.repository.js";
 import { BusinessLinkVerificationRepository } from "../../../src/modules/business/business-link-verification.repository.js";
@@ -26,6 +27,7 @@ import { ContactChangeChallengeRepository } from "../../../src/modules/contact-c
 import { LinkedAccountRepository } from "../../../src/modules/linked-account/linked-account.repository.js";
 import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
+import { PlatformSettingsModel } from "../../../src/modules/platform-settings/platform-settings.model.js";
 import { RegistrationSessionRepository } from "../../../src/modules/registration-session/registration-session.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
@@ -48,6 +50,7 @@ import { StaffInvitationRepository } from "../../../src/modules/staff-invitation
 import { StaffInvitationService } from "../../../src/modules/staff-invitation/staff-invitation.service.js";
 import { StaffInvitationAcceptService } from "../../../src/modules/staff-invitation/staff-invitation-accept.service.js";
 import { createDeferredStorageServiceFromEnv } from "../../../src/modules/storage/storage.service.js";
+import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import type {
@@ -223,6 +226,65 @@ describe("database-backed StaffMembership integration", () => {
 
     return member.membershipId;
   };
+
+  it("8B rejects STAFF management and super-admin requests without writes", async () => {
+    const { user: owner, business } = await createBusinessOwner(
+      "auth8b-owner@example.com",
+      "Auth 8B",
+    );
+    const staff = await seedStaffMember(userRepository, staffRepository, owner._id, business._id, {
+      name: "Staff A",
+      email: "auth8b-staff@example.com",
+      role: "STAFF",
+    });
+    const colleague = await seedStaffMember(
+      userRepository,
+      staffRepository,
+      owner._id,
+      business._id,
+      { name: "Staff B", email: "auth8b-colleague@example.com", role: "STAFF" },
+    );
+    const app = express();
+    app.use(express.json());
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use("/businesses", createBusinessRoute());
+    app.use("/super-admin", createSuperAdminRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const auth = await bearerFor(staff.userId, "STAFF");
+    const base = `/businesses/${business._id}`;
+    await request(app).get(`${base}/staff/me/schedule`).set("Authorization", auth).expect(200);
+    const beforeBusiness = await businessRepository.findById(business._id);
+    const beforeMembers = await StaffMembershipModel.find({ businessId: business._id }).lean();
+    const beforeSchedules = await StaffScheduleModel.find().lean();
+    const beforeInvitations = await StaffInvitationModel.find().lean();
+    const beforeSettings = await PlatformSettingsModel.find().lean();
+    const beforeUsers = await UserModel.find().lean();
+    const endpoints = [
+      ["get", "/super-admin/dashboard/summary"],
+      ["get", "/super-admin/customers"],
+      ["post", `/super-admin/businesses/${business._id}/approve`],
+      ["post", `/super-admin/customers/${staff.userId}/suspend`],
+      ["patch", "/super-admin/settings/platform"],
+      ["put", `${base}/booking-settings`],
+      ["put", `${base}/tax-settings`],
+      ["patch", base],
+      ["post", `${base}/staff`],
+      ["patch", `${base}/staff/${requireMembershipId(colleague)}`],
+      ["delete", `${base}/staff/${requireMembershipId(colleague)}`],
+      ["put", `${base}/staff/${requireMembershipId(colleague)}/schedule`],
+      ["get", `${base}/staff/${requireMembershipId(colleague)}/schedule`],
+    ] as const;
+    for (const [method, path] of endpoints)
+      await request(app)[method](path).set("Authorization", auth).send({}).expect(403);
+    expect(await businessRepository.findById(business._id)).toEqual(beforeBusiness);
+    expect(await StaffMembershipModel.find({ businessId: business._id }).lean()).toEqual(
+      beforeMembers,
+    );
+    expect(await StaffScheduleModel.find().lean()).toEqual(beforeSchedules);
+    expect(await StaffInvitationModel.find().lean()).toEqual(beforeInvitations);
+    expect(await PlatformSettingsModel.find().lean()).toEqual(beforeSettings);
+    expect(await UserModel.find().lean()).toEqual(beforeUsers);
+  });
 
   // --- Index invariants -----------------------------------------------------------
 
@@ -1187,6 +1249,40 @@ describe("database-backed StaffMembership integration", () => {
   });
 
   describe("Phase 4A — Supervisor schedule/list access + Staff self-service (real HTTP boundary)", () => {
+    it("8 owner removal revokes an existing STAFF token for self-service reads", async () => {
+      const { user: owner, business } = await createBusinessOwner(
+        "revocation-owner@example.com",
+        "Revocation",
+      );
+      const staff = await seedStaffMember(
+        userRepository,
+        staffRepository,
+        owner._id,
+        business._id,
+        { name: "Staff A", email: "revocation-staff@example.com", role: "STAFF" },
+      );
+      const app = buildStaffApp();
+      const staffToken = await bearerFor(staff.userId, "STAFF");
+      const ownerToken = await bearerFor(owner._id, "BUSINESS_OWNER");
+      const base = `/businesses/${business._id}/staff`;
+      for (const path of ["me/schedule", "me/services", "me/appointments"])
+        await request(app).get(`${base}/${path}`).set("Authorization", staffToken).expect(200);
+      await request(app)
+        .delete(`${base}/${requireMembershipId(staff)}`)
+        .set("Authorization", ownerToken)
+        .expect(200);
+      expect(
+        (await StaffMembershipModel.findById(requireMembershipId(staff)).orFail()).removedAt,
+      ).toBeInstanceOf(Date);
+      for (const path of ["me/schedule", "me/services", "me/appointments"]) {
+        const response = await request(app)
+          .get(`${base}/${path}`)
+          .set("Authorization", staffToken)
+          .expect(404);
+        expect(response.body.data).toBeUndefined();
+      }
+      await request(app).get(base).set("Authorization", ownerToken).expect(200);
+    });
     it("allows an active SUPERVISOR to list staff and read/write a colleague's schedule", async () => {
       const { user: owner, business } = await createBusinessOwner(
         "owner-a@example.com",

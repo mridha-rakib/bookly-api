@@ -5,13 +5,18 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
+import { env } from "../../../src/config/env.js";
+import { createAuthRoute } from "../../../src/modules/auth/auth.route.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { createBusinessBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { ReviewRepository } from "../../../src/modules/review/review.repository.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
@@ -356,6 +361,54 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
     expect(response.status).toBe(403);
   });
 
+  it("9 customer restrictions require Super Admin and preserve role boundaries", async () => {
+    const admin = await createSuperAdmin();
+    const { owner, business } = await createPendingBusiness("Customer boundary");
+    const staff = await createStaff(business._id);
+    const customer = await userRepository.create({
+      normalizedEmail: `customer-${new Types.ObjectId()}@example.com`,
+      passwordHash: "synthetic-hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    const supervisor = await userRepository.create({
+      normalizedEmail: `supervisor-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+    });
+    const app = buildSuperAdminApp();
+    const path = `/super-admin/customers/${customer._id}`;
+    for (const [id, role] of [
+      [owner._id, "BUSINESS_OWNER"],
+      [staff.user._id, "STAFF"],
+      [supervisor._id, "SUPERVISOR"],
+      [customer._id, "CUSTOMER"],
+    ] as const) {
+      const auth = await bearerFor(id, role);
+      await request(app).get(path).set("Authorization", auth).expect(403);
+      await request(app).post(`${path}/suspend`).set("Authorization", auth).send({}).expect(403);
+    }
+    expect((await UserModel.findById(customer._id).orFail()).status).toBe("ACTIVE");
+    const auth = await bearerFor(admin._id, "SUPER_ADMIN");
+    const detail = await request(app).get(path).set("Authorization", auth).expect(200);
+    expect(JSON.stringify(detail.body)).not.toContain("synthetic-hash");
+    await request(app)
+      .post(`${path}/suspend`)
+      .set("Authorization", auth)
+      .send({ reason: "synthetic test" })
+      .expect(200);
+    expect((await UserModel.findById(customer._id).orFail()).status).toBe("SUSPENDED");
+    await request(app)
+      .post(`/super-admin/customers/${owner._id}/suspend`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(404);
+    expect((await UserModel.findById(owner._id).orFail()).status).toBe("ACTIVE");
+    await request(app).post(`${path}/reactivate`).set("Authorization", auth).send({}).expect(200);
+    expect((await UserModel.findById(customer._id).orFail()).status).toBe("ACTIVE");
+  });
+
   it("rejects a CUSTOMER token on GET /super-admin/bookings (403)", async () => {
     const customer = await userRepository.create({
       normalizedEmail: `cust-${new Types.ObjectId().toString()}@example.com`,
@@ -372,10 +425,78 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
     expect(response.status).toBe(403);
   });
 
+  it("3.7F actual Admin logout revokes the token used for protected Admin reads", async () => {
+    const admin = await createSuperAdmin();
+    const session = await tokenService.createRefreshSession({ userId: admin._id });
+    const token = await tokenService.createAccessToken({
+      userId: admin._id,
+      role: "SUPER_ADMIN",
+      sessionFamilyId: session.tokenFamilyId,
+    });
+    const app = express();
+    app.use(express.json());
+    app.use("/auth", createAuthRoute());
+    app.use("/super-admin", createSuperAdminRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    await request(app)
+      .get("/super-admin/dashboard/summary")
+      .set("Authorization", `Bearer ${token}`)
+      .expect(200);
+    await request(app)
+      .post("/auth/logout")
+      .set("Cookie", `${env.AUTH_COOKIE_NAME}=${encodeURIComponent(session.refreshToken)}`)
+      .send({ intentId: "synthetic-admin-logout", familyId: session.tokenFamilyId })
+      .expect(200);
+    const denied = await request(app)
+      .get("/super-admin/dashboard/summary")
+      .set("Authorization", `Bearer ${token}`)
+      .expect(401);
+    expect(denied.body.data).toBeUndefined();
+  });
+
   it("rejects requests with no Authorization header at all (401)", async () => {
     const app = buildSuperAdminApp();
     const response = await request(app).get("/super-admin/dashboard/summary");
     expect(response.status).toBe(401);
+  });
+
+  it("3.7 non-admin and inactive or revoked admin sessions cannot approve a business", async () => {
+    const { owner, business } = await createPendingBusiness("Authorization 3.7");
+    const admin = await createSuperAdmin();
+    const app = buildSuperAdminApp();
+    const path = `/super-admin/businesses/${business._id}/approve`;
+    const accounts: Array<{
+      id: Types.ObjectId;
+      role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF";
+    }> = [{ id: owner._id, role: "BUSINESS_OWNER" }];
+    for (const role of ["CUSTOMER", "SUPERVISOR", "STAFF"] as const) {
+      const user = await userRepository.create({
+        normalizedEmail: `${role}-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role,
+        status: "ACTIVE",
+      });
+      accounts.push({ id: user._id, role });
+    }
+    for (const { id, role } of accounts) {
+      await request(app)
+        .post(path)
+        .set("Authorization", await bearerFor(id, role))
+        .expect(403);
+      expect((await businessRepository.findById(business._id))?.status).toBe("PENDING");
+    }
+    const adminBearer = await bearerFor(admin._id, "SUPER_ADMIN");
+    await UserModel.updateOne({ _id: admin._id }, { $set: { status: "SUSPENDED" } });
+    await request(app).post(path).set("Authorization", adminBearer).expect(403);
+    await UserModel.updateOne({ _id: admin._id }, { $set: { status: "ACTIVE" } });
+    await tokenService.revokeAllSessionsForUser(admin._id);
+    await request(app).post(path).set("Authorization", adminBearer).expect(401);
+    expect((await businessRepository.findById(business._id))?.status).toBe("PENDING");
+    await request(app)
+      .post(path)
+      .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"))
+      .expect(200);
+    expect((await businessRepository.findById(business._id))?.status).toBe("APPROVED");
   });
 
   it("rejects a STAFF token attempting to approve a business (403), and the business stays PENDING", async () => {
@@ -393,6 +514,37 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
   });
 
   // --- Business approve/reject/suspend: CAS correctness, idempotency, audit trail ---------------
+
+  it("9B Owner profile reflects Admin approval and suspension on subsequent reads", async () => {
+    const admin = await createSuperAdmin();
+    const { owner, business } = await createPendingBusiness("Owner status 9B");
+    const adminApp = buildSuperAdminApp();
+    const ownerApp = express();
+    ownerApp.use("/businesses", createBusinessRoute());
+    ownerApp.use(createErrorHandler({ isProduction: true }));
+    const adminAuth = await bearerFor(admin._id, "SUPER_ADMIN"),
+      ownerAuth = await bearerFor(owner._id, "BUSINESS_OWNER");
+    const read = async () =>
+      (
+        await request(ownerApp)
+          .get("/businesses/my-profile")
+          .set("Authorization", ownerAuth)
+          .expect(200)
+      ).body.data.primary.status;
+    expect(await read()).toBe("PENDING");
+    await request(adminApp)
+      .post(`/super-admin/businesses/${business._id}/approve`)
+      .set("Authorization", adminAuth)
+      .send({})
+      .expect(200);
+    expect(await read()).toBe("APPROVED");
+    await request(adminApp)
+      .post(`/super-admin/businesses/${business._id}/suspend`)
+      .set("Authorization", adminAuth)
+      .send({})
+      .expect(200);
+    expect(await read()).toBe("SUSPENDED");
+  });
 
   it("a SUPER_ADMIN can approve a PENDING business; status becomes APPROVED with an audited statusHistory entry", async () => {
     const superAdmin = await createSuperAdmin();
@@ -657,6 +809,94 @@ describe("HTTP-level Super Admin business/booking/customer/dashboard (Batch 11)"
   });
 
   // --- Global Bookings: cross-business list, businessName enrichment, detail reuse ---------------
+
+  it("9B reads a persisted parallel booking and legacy package relationship through Admin HTTP", async () => {
+    const admin = await createSuperAdmin();
+    const f = await setupBookableBusiness(admin);
+    const second = await createStaff(f.business._id);
+    const secondService = await createFixedService(f.business._id, second.membership._id, 5000);
+    await staffWorksMondayToFriday(second.membership._id, f.business._id);
+    const app = buildBookingApp();
+    const created = await request(app)
+      .post(`/businesses/${f.business._id}/bookings`)
+      .set("Authorization", await bearerFor(f.owner._id, "BUSINESS_OWNER"))
+      .send({
+        serviceLines: [f.service, secondService].map((service, index) => ({
+          serviceId: String(service._id),
+          staffMembershipId: String(index ? second.membership._id : f.membership._id),
+          addonIds: [],
+          pricingInput: {},
+        })),
+        startAt: startAtFor("10:00"),
+        businessClientId: String(f.client._id),
+        idempotencyKey: `9b-${new Types.ObjectId()}`,
+      })
+      .expect(201);
+    const bookingId = new Types.ObjectId(created.body.data.id);
+    await request(app)
+      .post(`/businesses/${f.business._id}/bookings/${bookingId}/reschedule`)
+      .set("Authorization", await bearerFor(f.owner._id, "BUSINESS_OWNER"))
+      .send({ startAt: startAtFor("11:00") })
+      .expect(200);
+    const afterMove = await request(buildSuperAdminApp())
+      .get(`/super-admin/bookings/${bookingId}`)
+      .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"))
+      .expect(200);
+    expect(afterMove.body.data.schedule.startAt).toBe(startAtFor("11:00"));
+    const packageId = new Types.ObjectId(),
+      customerId = new Types.ObjectId();
+    await BookingModel.updateOne(
+      { _id: bookingId },
+      {
+        $set: {
+          "customer.customerUserId": customerId,
+          "serviceLines.0.pricingInput.packageProgressId": packageId,
+          "serviceLines.0.pricingInput.sessionIndex": 1,
+          "serviceLines.0.pricingInput.sessionsInPackage": 3,
+        },
+      },
+    );
+    await PackageProgressModel.create({
+      _id: packageId,
+      businessId: f.business._id,
+      customerUserId: customerId,
+      businessClientId: f.client._id,
+      serviceId: f.service._id,
+      totalSessions: 3,
+      remainingSessions: 2,
+      completedSessions: 0,
+      originBookingId: bookingId,
+      sessions: [{ sessionIndex: 1, bookingId, status: "SCHEDULED" }],
+      purchaseSnapshot: {
+        name: "Synthetic legacy package",
+        bundlePriceCents: 10000,
+        durationMin: 60,
+        sessionsInPackage: 3,
+      },
+    });
+    const response = await request(buildSuperAdminApp())
+      .get(`/super-admin/bookings/${bookingId}`)
+      .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"))
+      .expect(200);
+    expect(response.body.data.businessId).toBe(String(f.business._id));
+    expect(response.body.data.serviceLines).toHaveLength(2);
+    expect(
+      response.body.data.serviceLines.map(
+        (line: { staffMembershipId: string }) => line.staffMembershipId,
+      ),
+    ).toEqual([String(f.membership._id), String(second.membership._id)]);
+    expect(response.body.data.serviceLines[0]).toMatchObject({
+      packageProgressId: String(packageId),
+      sessionIndex: 1,
+      sessionsInPackage: 3,
+    });
+    expect(response.body.data.schedule.startAt).toBe(startAtFor("11:00"));
+    expect(
+      (await PackageProgressModel.findById(packageId).orFail()).sessions[0]?.bookingId.equals(
+        bookingId,
+      ),
+    ).toBe(true);
+  });
 
   it("global bookings list spans multiple businesses and enriches each row with businessName (no N+1, single batched lookup)", async () => {
     const superAdmin = await createSuperAdmin();

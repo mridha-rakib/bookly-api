@@ -79,7 +79,7 @@ const toPackageProgressSessionDto = (
  * comment), passed in here purely for DTO assembly. */
 export type PackageProgressSettlement = {
   balanceSettled: boolean;
-  outstandingBalanceCents: number;
+  outstandingBalanceCents: number | null;
 };
 
 export type PackageProgressDto = {
@@ -95,7 +95,8 @@ export type PackageProgressDto = {
    * yet settled — sessions 2..N cannot be redeemed yet) > DEPLETED (no sessions left) > ACTIVE. */
   status: "ACTIVE" | "AWAITING_BALANCE" | "DEPLETED" | "VOIDED";
   balanceSettled: boolean;
-  outstandingBalanceCents: number;
+  outstandingBalanceCents: number | null;
+  settlementAvailable: boolean;
   sessions: PackageProgressSessionDto[];
   originBookingId: string;
   purchaseSnapshot: {
@@ -145,6 +146,7 @@ export const toPackageProgressDto = (
     status,
     balanceSettled: settlement.balanceSettled,
     outstandingBalanceCents: settlement.outstandingBalanceCents,
+    settlementAvailable: settlement.outstandingBalanceCents !== null,
     // Session indices are intentionally not unique across cancellation/rebooking attempts: a
     // restored entitlement can be claimed again as the same logical session number. Preserve
     // all Booking history, ordered deterministically by logical index then persisted session

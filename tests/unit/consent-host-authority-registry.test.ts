@@ -130,3 +130,24 @@ it("re-resolves protected key availability and sanitizes resolver failures", () 
     /^Consent host authority unavailable$/,
   );
 });
+
+it("Phase 4.0: a whitespace-padded twin cannot replace a revoked generation", () => {
+  const resolve = vi.fn(() => syntheticConsentHost.auditKey);
+  const revoked = entry("REVOKED");
+  for (const authorityId of [
+    ` ${revoked.profile.authorityId}`,
+    `${revoked.profile.authorityId}\n`,
+  ]) {
+    const twin = entry("VERIFY_ONLY");
+    twin.profile = { ...twin.profile, authorityId };
+    expect(() => createConsentHostAuthorityRegistry([revoked, twin], resolve)).toThrow(
+      "unavailable",
+    );
+    // A non-canonical identity is refused on its own too, never normalized into a grant.
+    expect(() => createConsentHostAuthorityRegistry([twin], resolve)).toThrow("unavailable");
+  }
+  const paddedHost = entry("CURRENT");
+  paddedHost.profile = { ...paddedHost.profile, hostId: `${paddedHost.profile.hostId} ` };
+  expect(() => createConsentHostAuthorityRegistry([paddedHost], resolve)).toThrow("unavailable");
+  expect(resolve).not.toHaveBeenCalled();
+});

@@ -2,7 +2,8 @@ import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { buildErrorResponse } from "../../common/http/responses.js";
+import { z } from "zod";
+import { buildErrorResponse, sendSuccess } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { attributeRateLimitRejections } from "../../common/middleware/rate-limit-attribution.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
@@ -92,6 +93,7 @@ import {
 import { AuthService } from "./auth.service.js";
 import { createAuthProviderRoute } from "./auth-provider.route.js";
 import { Argon2PasswordHasher } from "./password-hasher.js";
+import { PasswordRecoveryService } from "./password-recovery.service.js";
 import { TokenService } from "./token.service.js";
 
 const avatarUpload = multer({
@@ -319,6 +321,83 @@ export const createAuthRoute = (): Router => {
   );
   const otpVerifyLimiter = authRateLimit("auth-otp-verify", env.AUTH_OTP_VERIFY_RATE_LIMIT_MAX);
   const refreshLimiter = authRateLimit("auth-refresh", env.AUTH_REFRESH_RATE_LIMIT_MAX);
+
+  const recovery = new PasswordRecoveryService(
+    createEmailOtpProvider(),
+    passwordHasher,
+    sessionRepository,
+  );
+  const recoveryRequestSchema = z
+    .object({ email: z.email(), previousChallenge: z.string().min(20).max(128).optional() })
+    .strict();
+  const recoveryVerifySchema = z
+    .object({ challenge: z.string().min(20).max(128), code: z.string().regex(/^\d{4}$/) })
+    .strict();
+  const recoveryCompleteSchema = z
+    .object({ resetToken: z.string().min(20).max(128), newPassword: z.string().min(6).max(256) })
+    .strict();
+  for (const portal of ["customer", "professional"] as const) {
+    const scope = portal === "customer" ? "CUSTOMER" : "PROFESSIONAL";
+    router.post(
+      `/${portal}/password-recovery/request`,
+      otpSendLimiter,
+      validateRequest({ body: recoveryRequestSchema }),
+      asyncHandler(async (req, res) => {
+        const { email, previousChallenge } = (req.validated?.body ?? {}) as z.infer<
+          typeof recoveryRequestSchema
+        >;
+        const result = await recovery.request(scope, email, previousChallenge);
+        sendSuccess(
+          res,
+          200,
+          "If eligible, a code may be sent. Please allow time between requests.",
+          result,
+        );
+      }),
+    );
+    router.post(
+      `/${portal}/password-recovery/resend`,
+      otpSendLimiter,
+      validateRequest({ body: z.object({ challenge: z.string().min(20).max(128) }).strict() }),
+      asyncHandler(async (req, res) => {
+        const { challenge } = (req.validated?.body ?? {}) as { challenge: string };
+        await recovery.resend(scope, challenge);
+        sendSuccess(
+          res,
+          200,
+          "If eligible, a code may be sent. Please allow time between requests.",
+        );
+      }),
+    );
+    router.post(
+      `/${portal}/password-recovery/verify`,
+      otpVerifyLimiter,
+      validateRequest({ body: recoveryVerifySchema }),
+      asyncHandler(async (req, res) => {
+        const { challenge, code } = (req.validated?.body ?? {}) as z.infer<
+          typeof recoveryVerifySchema
+        >;
+        sendSuccess(
+          res,
+          200,
+          "Verification successful",
+          await recovery.verify(scope, challenge, code),
+        );
+      }),
+    );
+    router.post(
+      `/${portal}/password-recovery/complete`,
+      otpVerifyLimiter,
+      validateRequest({ body: recoveryCompleteSchema }),
+      asyncHandler(async (req, res) => {
+        const { resetToken, newPassword } = (req.validated?.body ?? {}) as z.infer<
+          typeof recoveryCompleteSchema
+        >;
+        await recovery.complete(scope, resetToken, newPassword);
+        sendSuccess(res, 200, "Password changed");
+      }),
+    );
+  }
 
   router.post(
     "/customer/entry",

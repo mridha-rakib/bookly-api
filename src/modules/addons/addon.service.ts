@@ -104,6 +104,7 @@ export class AddonService {
   ): Promise<AddonDto> {
     const business = await this.requireOwnedBusiness(actorUserId, businessId);
     const fields = await this.buildAddonFields(business, body);
+    await this.validateServiceAssignments(business, fields.assignedServiceIds);
 
     const input: CreateAddonInput = {
       businessId: business._id,
@@ -135,6 +136,7 @@ export class AddonService {
     }
 
     const fields = await this.buildAddonFields(business, body);
+    await this.validateServiceAssignments(business, fields.assignedServiceIds, existing._id);
     const replaced = await this.addonRepository.replaceById(business._id, addonId, {
       status: body.status,
       name: body.name,
@@ -305,6 +307,31 @@ export class AddonService {
     addonId: Types.ObjectId,
     requestedServiceIds: string[],
   ): Promise<void> {
+    const { toAdd, toRemove } = await this.validateServiceAssignments(
+      business,
+      requestedServiceIds,
+      addonId,
+    );
+
+    if (toAdd.length > 0) {
+      await this.addonServiceAssignmentRepository.insertMany(
+        toAdd.map((id) => ({
+          businessId: business._id,
+          addonId,
+          serviceId: new Types.ObjectId(id),
+        })),
+      );
+    }
+    if (toRemove.length > 0) {
+      await this.addonServiceAssignmentRepository.deleteByAddonAndServiceIds(addonId, toRemove);
+    }
+  }
+
+  private async validateServiceAssignments(
+    business: BusinessDocument,
+    requestedServiceIds: string[],
+    addonId?: Types.ObjectId,
+  ): Promise<{ toAdd: string[]; toRemove: string[] }> {
     if (
       requestedServiceIds.length > 0 &&
       !requestedServiceIds.every((id) => Types.ObjectId.isValid(id))
@@ -326,9 +353,9 @@ export class AddonService {
 
     const serviceById = new Map(services.map((service) => [String(service._id), service]));
 
-    const existingAssignments = await this.addonServiceAssignmentRepository.findByAddonIds([
-      addonId,
-    ]);
+    const existingAssignments = addonId
+      ? await this.addonServiceAssignmentRepository.findByAddonIds([addonId])
+      : [];
     const existingServiceIds = new Set(
       existingAssignments.map((assignment) => String(assignment.serviceId)),
     );
@@ -343,18 +370,7 @@ export class AddonService {
       }
     }
 
-    if (toAdd.length > 0) {
-      await this.addonServiceAssignmentRepository.insertMany(
-        toAdd.map((id) => ({
-          businessId: business._id,
-          addonId,
-          serviceId: new Types.ObjectId(id),
-        })),
-      );
-    }
-    if (toRemove.length > 0) {
-      await this.addonServiceAssignmentRepository.deleteByAddonAndServiceIds(addonId, toRemove);
-    }
+    return { toAdd, toRemove };
   }
 
   // --- Authorization -------------------------------------------------------------------------

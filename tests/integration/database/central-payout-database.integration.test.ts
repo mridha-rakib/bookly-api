@@ -35,7 +35,7 @@ import {
   stopIsolatedReplicaSet,
 } from "./mongo-replset-helper.js";
 
-const BANK = "ba_fake_central";
+const BANK = "ba_fakecentral";
 
 /** Deterministic Stripe stand-in. Honours idempotency keys like Stripe does. */
 class FakeCentralPayoutGateway implements CentralPayoutGateway {
@@ -223,15 +223,14 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
   });
 
-  it("12 LIVE execution is blocked unless enabled; TEST/LIVE data never mix", async () => {
+  it("12 LIVE execution stays blocked and TEST/LIVE data never mix", async () => {
     gateway.modeValue = "LIVE";
     gateway.balance = { ...gateway.balance, livemode: true };
     await expect(submit()).rejects.toMatchObject({ statusCode: 409 });
-    gateway.balance = { ...gateway.balance, livemode: false }; // LIVE key, TEST data
-    liveEnabled = true;
+    gateway.modeValue = "TEST"; // TEST key, LIVE data
     await expect(submit()).rejects.toMatchObject({ statusCode: 409 });
     expect(gateway.createCalls).toHaveLength(0);
-    gateway.modeValue = "TEST";
+    gateway.balance = { ...gateway.balance, livemode: false };
     const op = await submit();
     expect(op).toMatchObject({ mode: "TEST", state: "SUBMITTED", providerStatus: "pending" });
     const overview = await service.getOverview();

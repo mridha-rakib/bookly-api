@@ -261,6 +261,39 @@ describe("database-backed Add-on integration", () => {
   // --- Status lifecycle ----------------------------------------------------------------------
 
   describe("Status lifecycle (DRAFT / ACTIVE / INACTIVE / ARCHIVED)", () => {
+    it("does not create or replace an add-on when its service association is invalid", async () => {
+      const { user, business } = await createBusinessOwner(
+        "assignment-guard@example.com",
+        "Assignment Guard",
+      );
+      const active = await createRealService(business._id, "Active");
+      const archived = await createRealService(business._id, "Archived", "ARCHIVED");
+      const ownerId = String(user._id);
+      const businessId = String(business._id);
+      const invalid = {
+        status: "DRAFT" as const,
+        name: "Rejected",
+        assignedServiceIds: [String(archived._id)],
+      };
+      await expect(addonService.createAddon(ownerId, businessId, invalid)).rejects.toThrow(
+        "archived service",
+      );
+      expect(await AddonModel.countDocuments({ businessId: business._id })).toBe(0);
+
+      const created = await addonService.createAddon(ownerId, businessId, {
+        status: "DRAFT",
+        name: "Original",
+        assignedServiceIds: [String(active._id)],
+      });
+      await expect(
+        addonService.updateAddon(ownerId, businessId, created.id, invalid),
+      ).rejects.toThrow("archived service");
+      const unchanged = await addonService.getAddon(ownerId, businessId, created.id);
+      expect(unchanged.name).toBe("Original");
+      expect(unchanged.assignedServices.map((entry) => entry.serviceId)).toEqual([
+        String(active._id),
+      ]);
+    });
     it("creates ACTIVE and INACTIVE Add-ons", async () => {
       const { user, business } = await createBusinessOwner("owner@example.com", "Salon A");
       const category = await createCategory(business._id);

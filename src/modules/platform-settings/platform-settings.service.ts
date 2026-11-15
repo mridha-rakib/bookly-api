@@ -1,6 +1,8 @@
 import { env } from "../../config/env.js";
 import { type BusinessCategoryKey, businessCategoryKeys } from "./business-category.js";
 import {
+  DEFAULT_MAX_SERVICES_PER_BOOKING,
+  DEFAULT_NO_SHOW_CATEGORY_WINDOWS,
   defaultNoShowWindowFor,
   getFixedPlatformRules,
   MIN_MAX_SERVICES_PER_BOOKING,
@@ -40,13 +42,13 @@ export class PlatformSettingsService {
   public constructor(private readonly repository: PlatformSettingsRepository) {}
 
   public async getSettings(): Promise<PlatformSettingsDto> {
-    const doc = await this.repository.getOrCreate();
+    const doc = await this.readSettings();
     return this.toDto(doc);
   }
 
   /** The authoritative product limit for how many service lines one booking may contain. */
   public async getMaxServicesPerBooking(): Promise<number> {
-    const doc = await this.repository.getOrCreate();
+    const doc = await this.readSettings();
     return doc.maxServicesPerBooking;
   }
 
@@ -57,9 +59,20 @@ export class PlatformSettingsService {
   public async resolveNoShowWindow(
     categoryKey: BusinessCategoryKey,
   ): Promise<NoShowCategoryWindow> {
-    const doc = await this.repository.getOrCreate();
+    const doc = await this.readSettings();
     const merged = this.mergedWindows(doc);
     return merged.find((w) => w.categoryKey === categoryKey) ?? defaultNoShowWindowFor(categoryKey);
+  }
+
+  private async readSettings(): Promise<
+    Pick<PlatformSettingsDocument, "maxServicesPerBooking" | "noShowCategoryWindows">
+  > {
+    return (
+      (await this.repository.findSingleton()) ?? {
+        maxServicesPerBooking: DEFAULT_MAX_SERVICES_PER_BOOKING,
+        noShowCategoryWindows: DEFAULT_NO_SHOW_CATEGORY_WINDOWS.map((window) => ({ ...window })),
+      }
+    );
   }
 
   public async updateSettings(input: UpdatePlatformSettingsInput): Promise<PlatformSettingsDto> {
@@ -122,7 +135,9 @@ export class PlatformSettingsService {
     });
   }
 
-  private mergedWindows(doc: PlatformSettingsDocument): NoShowCategoryWindow[] {
+  private mergedWindows(
+    doc: Pick<PlatformSettingsDocument, "noShowCategoryWindows">,
+  ): NoShowCategoryWindow[] {
     const byKey = new Map(doc.noShowCategoryWindows.map((w) => [w.categoryKey, w]));
     return businessCategoryKeys.map((key) => {
       const stored = byKey.get(key);
@@ -136,7 +151,9 @@ export class PlatformSettingsService {
     });
   }
 
-  private toDto(doc: PlatformSettingsDocument): PlatformSettingsDto {
+  private toDto(
+    doc: Pick<PlatformSettingsDocument, "maxServicesPerBooking" | "noShowCategoryWindows">,
+  ): PlatformSettingsDto {
     return {
       fixed: getFixedPlatformRules(),
       session: {

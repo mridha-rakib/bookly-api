@@ -5,12 +5,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { createDashboardOverviewRoute } from "../../../src/modules/dashboard-overview/dashboard-overview.route.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
+import { buildBooking } from "../../unit/stage-b-fixtures.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -114,9 +116,15 @@ describe("HTTP-level Dashboard Overview authorization", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.data.scope).toBe("FULL");
+    expect(response.body.data.financials).toEqual(
+      expect.objectContaining({
+        monthlyRevenueCents: expect.any(Number),
+        recentActivity: expect.any(Array),
+      }),
+    );
   });
 
-  it("an active Supervisor of the same Business can read the full Overview", async () => {
+  it("an active Supervisor receives operational overview without Owner financial aggregates", async () => {
     const { business } = await createBusiness();
     const { user: supervisor } = await createStaff(business._id, "SUPERVISOR");
     const app = buildApp();
@@ -127,6 +135,10 @@ describe("HTTP-level Dashboard Overview authorization", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.data.scope).toBe("FULL");
+    expect(response.body.data.financials).toBeNull();
+    expect(response.body.data.noShowCount).toEqual(expect.any(Number));
+    expect(response.body.data.schedule).toEqual(expect.any(Array));
+    expect(response.body.data.timeline).toEqual(expect.any(Array));
   });
 
   it("a Staff member can read a scoped-down Overview of their own Business (no financials)", async () => {
@@ -140,6 +152,68 @@ describe("HTTP-level Dashboard Overview authorization", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.data.scope).toBe("STAFF_SCOPED");
+    expect(response.body.data.financials).toBeNull();
+  });
+
+  it("Staff overview exposes only assigned lines and no booking financial details", async () => {
+    const { business } = await createBusiness();
+    const me = await createStaff(business._id);
+    const colleague = await createStaff(business._id);
+    const booking = buildBooking({
+      businessId: business._id,
+      schedule: {
+        timezone: TIMEZONE,
+        startAt: new Date("2030-08-20T07:00:00Z"),
+        endAt: new Date("2030-08-20T08:00:00Z"),
+      },
+    } as never);
+    const original = booking.serviceLines[0]!;
+    booking.serviceLines = [
+      {
+        ...original,
+        responsibleStaffMembershipId: colleague.membership._id,
+        serviceSnapshot: { ...original.serviceSnapshot, name: "Private colleague service" },
+        staffSnapshot: { firstName: "Private", lastName: "Colleague" },
+      },
+      {
+        ...original,
+        responsibleStaffMembershipId: me.membership._id,
+        serviceSnapshot: { ...original.serviceSnapshot, name: "My service" },
+      },
+    ];
+    await BookingModel.collection.insertOne(booking as never);
+    const unverified = buildBooking({
+      businessId: business._id,
+      reference: "BK-UNVERIFIED",
+      schedule: {
+        timezone: TIMEZONE,
+        startAt: new Date("2030-08-20T09:00:00Z"),
+        endAt: new Date("2030-08-20T10:00:00Z"),
+      },
+    } as never);
+    unverified.serviceLines[0]!.responsibleStaffMembershipId = me.membership._id;
+    unverified.serviceLines[0]!.pricingInput.packageItemId = new Types.ObjectId();
+    await BookingModel.collection.insertOne(unverified as never);
+    const response = await request(buildApp())
+      .get(
+        `/businesses/${business._id}/dashboard/overview?range=Custom&fromDate=2030-08-20&toDate=2030-08-20`,
+      )
+      .set("Authorization", await bearerFor(me.user._id, "STAFF"))
+      .expect(200);
+    expect(response.body.data.todayBookingsCount).toBe(1);
+    expect(response.body.data.schedule[0].serviceName).toBe("My service");
+    expect(response.body.data.timeline[0].detail).toBe("My service");
+    expect(response.body.data.timeline[0].durationMin).toBe(original.serviceSnapshot.durationMin);
+    const json = JSON.stringify(response.body.data);
+    for (const forbidden of [
+      "Private colleague",
+      "totalPaymentCents",
+      "platformFeeCents",
+      "remainingFeeCents",
+      "staffName",
+      "leadType",
+    ])
+      expect(json).not.toContain(forbidden);
     expect(response.body.data.financials).toBeNull();
   });
 

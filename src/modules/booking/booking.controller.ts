@@ -212,7 +212,17 @@ export class BookingController {
     const packageProgressContexts =
       await this.bookingService.getPackageProgressContextsForBusinessBooking(booking);
 
-    sendSuccess(response, 200, "Booking", toBookingDetailDto(booking, packageProgressContexts));
+    const detail = toBookingDetailDto(booking, packageProgressContexts);
+    if (role === "SUPERVISOR") {
+      sendSuccess(response, 200, "Booking", {
+        ...detail,
+        packageSessions: detail.packageSessions.map(
+          ({ balanceSettled, outstandingBalanceCents, ...session }) => session,
+        ),
+      });
+      return;
+    }
+    sendSuccess(response, 200, "Booking", detail);
   };
 
   public listForBusiness = async (request: Request, response: Response): Promise<void> => {
@@ -501,17 +511,31 @@ export class BookingController {
   public getPackageForBusiness = async (request: Request, response: Response): Promise<void> => {
     const actor = this.requireBusinessActor(request);
     const params = request.validated?.params as PackageProgressBusinessParams;
-    sendSuccess(
-      response,
-      200,
-      "Package",
-      await this.lifecycleService.getPackageForBusiness(
-        actor.userId,
-        actor.role,
-        params.businessId,
-        params.packageProgressId,
-      ),
+    const progress = await this.lifecycleService.getPackageForBusiness(
+      actor.userId,
+      actor.role,
+      params.businessId,
+      params.packageProgressId,
     );
+    if (actor.role === "SUPERVISOR") {
+      const {
+        balanceSettled,
+        outstandingBalanceCents,
+        settlementAvailable,
+        voidRefundSettlement,
+        purchaseSnapshot,
+        fulfilmentEntitlement,
+        ...operational
+      } = progress;
+      const { bundlePriceCents, discountPercent, ...snapshot } = purchaseSnapshot;
+      sendSuccess(response, 200, "Package", {
+        ...operational,
+        purchaseSnapshot: snapshot,
+        fulfilmentEntitlement: fulfilmentEntitlement && { mode: fulfilmentEntitlement.mode },
+      });
+      return;
+    }
+    sendSuccess(response, 200, "Package", progress);
   };
 
   public packageAction =
@@ -540,7 +564,9 @@ export class BookingController {
           availableSessions: result.packageProgress.voidedAt
             ? 0
             : result.packageProgress.remainingSessions,
-          refundSettlement: result.packageProgress.voidRefundSettlement,
+          ...(actor.role !== "SUPERVISOR" && {
+            refundSettlement: result.packageProgress.voidRefundSettlement,
+          }),
         },
       );
     };

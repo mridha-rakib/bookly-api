@@ -16,6 +16,7 @@ import {
 } from "../../../src/modules/auth/auth.middleware.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { CompositeAvailabilityService } from "../../../src/modules/availability/composite-availability.service.js";
 import { BookingController } from "../../../src/modules/booking/booking.controller.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
@@ -36,6 +37,7 @@ import { BookingEmailDeliveryEligibility } from "../../../src/modules/booking/bo
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
 import { BookingRecoveryInbox } from "../../../src/modules/booking/booking-recovery-inbox.js";
 import { NoShowResolutionService } from "../../../src/modules/booking/no-show-resolution.service.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
@@ -64,6 +66,8 @@ import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-a
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
+import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../../../src/modules/platform-settings/platform-settings.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -72,9 +76,11 @@ import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import type { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
+import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
@@ -387,6 +393,201 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     idempotencyKey: `key-${new Types.ObjectId().toString()}`,
   });
 
+  it("parallel customer booking persists two reservations and replays a single fake payment", async () => {
+    const f = await setupBookableBusiness(10000);
+    const second = await createStaff(f.business._id);
+    await staffWorksMondayToFriday(second.membership._id, f.business._id);
+    const otherService = await createFixedService(f.business._id, second.membership._id, 5000);
+    await ServiceModel.updateOne(
+      { _id: otherService._id },
+      { $set: { "fixedPricing.durationMin": 90 } },
+    );
+    const customer = await createCustomer("parallel");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+    const lines = [
+      {
+        serviceId: String(f.service._id),
+        staffMembershipId: String(f.membership._id),
+        addonIds: [],
+        pricingInput: {},
+      },
+      {
+        serviceId: String(otherService._id),
+        staffMembershipId: String(second.membership._id),
+        addonIds: [],
+        pricingInput: {},
+      },
+    ];
+    const input = { ...finalizeInput(f.service._id, f.membership._id), serviceLines: lines };
+    const composite = new CompositeAvailabilityService(
+      availabilityService,
+      serviceRepository,
+      new PlatformSettingsService(new PlatformSettingsRepository()),
+    );
+    const result = await composite.get(String(f.business._id), {
+      fromDate: DATE,
+      toDate: DATE,
+      lines: lines.map(({ serviceId, staffMembershipId }) => ({ serviceId, staffMembershipId })),
+    });
+    expect(result.days[0]?.slots.some((slot) => slot.startAt === input.startAt)).toBe(true);
+    const preview = await creationService.previewCustomerBooking(
+      String(customer._id),
+      String(f.business._id),
+      input,
+    );
+    expect(preview.serviceLines).toHaveLength(2);
+    expect(preview.financials.servicesSubtotalCents).toBe(15000);
+    const booked = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(f.business._id),
+      input,
+    );
+    expect(booked.status).toBe("confirmed");
+    if (booked.status !== "confirmed") throw new Error("expected confirmed booking");
+    const booking = await BookingModel.findById(booked.booking._id).orFail();
+    expect(booking.serviceLines).toHaveLength(2);
+    expect(booking.schedule.startAt.toISOString()).toBe(input.startAt);
+    expect(booking.schedule.endAt.getTime() - booking.schedule.startAt.getTime()).toBe(90 * 60000);
+    expect(booking.serviceLines.map((line) => line.serviceSnapshot.durationMin)).toEqual([60, 90]);
+    expect(booking.serviceLines.map((line) => line.amountCents)).toEqual([10000, 5000]);
+    expect(booking.serviceLines.map((line) => String(line.serviceId))).toEqual(
+      lines.map((line) => line.serviceId),
+    );
+    expect(booking.serviceLines.map((line) => String(line.responsibleStaffMembershipId))).toEqual(
+      lines.map((line) => line.staffMembershipId),
+    );
+    const reservations = await BookingSlotReservationModel.find({
+      businessId: f.business._id,
+    }).lean();
+    expect(reservations).toHaveLength(2);
+    for (const line of booking.serviceLines)
+      expect(
+        reservations.some(
+          (row) =>
+            String(row.staffMembershipId) === String(line.responsibleStaffMembershipId) &&
+            row.intervals.some(
+              (interval) => String(interval.reservationId) === String(line.reservationId),
+            ),
+        ),
+      ).toBe(true);
+    const retry = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(f.business._id),
+      input,
+    );
+    expect(retry.status).toBe("confirmed");
+    expect(await BookingModel.countDocuments()).toBe(1);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+
+  it("3.7 customer parallel booking is visible through five role reads after an owner move", async () => {
+    const f = await setupBookableBusiness();
+    const second = await createStaff(f.business._id);
+    await staffWorksMondayToFriday(second.membership._id, f.business._id);
+    const serviceB = await createFixedService(f.business._id, second.membership._id, 5000);
+    const customer = await createCustomer("five-roles");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(f.business._id, f.owner._id, customer._id);
+    const supervisor = await userRepository.create({
+      normalizedEmail: `supervisor-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+    });
+    await staffRepository.create({
+      userId: supervisor._id,
+      businessId: f.business._id,
+      role: "SUPERVISOR",
+      createdByUserId: f.owner._id,
+    });
+    const admin = await userRepository.create({
+      normalizedEmail: `admin-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+    });
+    const input = finalizeInput(f.service._id, f.membership._id);
+    input.serviceLines.push({
+      serviceId: String(serviceB._id),
+      staffMembershipId: String(second.membership._id),
+      addonIds: [],
+      pricingInput: {},
+    });
+    const booked = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(f.business._id),
+      input,
+    );
+    if (booked.status !== "confirmed") throw Error("expected confirmed booking");
+    const app = express();
+    app.use(express.json());
+    app.use("/businesses", createBusinessBookingRoute());
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use("/me", createCustomerBookingRoute());
+    app.use("/super-admin", createSuperAdminRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const tokens = new TokenService(new SessionRepository());
+    const auth = async (
+      userId: Types.ObjectId,
+      role: "CUSTOMER" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "SUPER_ADMIN",
+    ) => `Bearer ${await issueTestAccessToken(tokens, { userId, role })}`;
+    const bookingId = String(booked.booking._id);
+    const staffPath = `/businesses/${f.business._id}/staff/me/appointments/${bookingId}`;
+    const staffBearer = await auth(f.membership.userId, "STAFF");
+    const paths: Array<[string, string]> = [
+      [`/me/bookings/${bookingId}`, await auth(customer._id, "CUSTOMER")],
+      [
+        `/businesses/${f.business._id}/bookings/${bookingId}`,
+        await auth(f.owner._id, "BUSINESS_OWNER"),
+      ],
+      [
+        `/businesses/${f.business._id}/bookings/${bookingId}`,
+        await auth(supervisor._id, "SUPERVISOR"),
+      ],
+      [staffPath, staffBearer],
+      [`/super-admin/bookings/${bookingId}`, await auth(admin._id, "SUPER_ADMIN")],
+    ];
+    await lifecycleService.rescheduleByOwner(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      bookingId,
+      startAtFor("12:00"),
+    );
+    for (const [path, bearer] of paths) {
+      const response = await request(app).get(path).set("Authorization", bearer).expect(200);
+      expect(response.body.data.schedule.startAt).toBe(startAtFor("12:00"));
+    }
+    const staffView = await request(app)
+      .get(staffPath)
+      .set("Authorization", staffBearer)
+      .expect(200);
+    expect(staffView.body.data.services).toHaveLength(1);
+    expect(staffView.body.data).not.toHaveProperty("financials");
+    const reservations = await BookingSlotReservationModel.find({
+      businessId: f.business._id,
+    }).lean();
+    expect(
+      reservations
+        .flatMap((row) => row.intervals)
+        .filter((interval) => interval.startAt.toISOString() === startAtFor("12:00")),
+    ).toHaveLength(2);
+    await lifecycleService.cancelByBusiness(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      bookingId,
+      undefined,
+    );
+    for (const [path, bearer] of paths) {
+      const response = await request(app).get(path).set("Authorization", bearer).expect(200);
+      expect(response.body.data.status).toBe("CANCELLED_BY_BUSINESS");
+    }
+    const released = await BookingSlotReservationModel.find({ businessId: f.business._id }).lean();
+    expect(released.flatMap((row) => row.intervals)).toHaveLength(0);
+  });
+
   // P4A: use the existing real payment fixture and original operation; no new gateway/queue.
   const recoveryFixture = async () => {
     const f = await setupBookableBusiness();
@@ -547,6 +748,51 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
     expect(result.resolved).toEqual([]);
     expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
   });
+  it("3.7 payment attempt remains separate from the settled ledger until booking commit and replay is idempotent", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("requires_action");
+    const pending = await t.finalize();
+    if (pending.status !== "requires_action") throw Error("expected authentication");
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    expect(attempt.providerStatus).toBe("REQUIRES_ACTION");
+    expect(await BookingModel.countDocuments()).toBe(0);
+    expect(await BookingFinancialTransactionModel.countDocuments({ status: "SUCCEEDED" })).toBe(0);
+
+    paymentGateway.succeedPaymentIntent(pending.paymentIntentId);
+    const committed = await t.finalize();
+    if (committed.status !== "confirmed") throw Error("expected committed booking");
+    const settledAttempt = await PaymentAttemptModel.findById(attempt._id).orFail();
+    expect(settledAttempt.providerStatus).toBe("SUCCEEDED");
+    expect(String(settledAttempt.bookingId)).toBe(String(committed.booking._id));
+    expect(String(settledAttempt.customerUserId)).toBe(String(t.customer._id));
+    expect(String(settledAttempt.businessId)).toBe(String(t.business._id));
+    const rows = await financialTransactionService.listForBooking(committed.booking._id);
+    expect(
+      rows.some(
+        (row) =>
+          String(row._id) === String(settledAttempt.succeededTransactionId) &&
+          row.status === "SUCCEEDED" &&
+          row.amountCents === settledAttempt.expectedAmountCents &&
+          row.currency === settledAttempt.currency,
+      ),
+    ).toBe(true);
+    await t.finalize();
+    expect(
+      await BookingFinancialTransactionModel.countDocuments({ bookingId: committed.booking._id }),
+    ).toBe(rows.length);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+  });
+
+  it("3.7 a declined attempt creates no succeeded booking transaction", async () => {
+    const t = await recoveryFixture();
+    paymentGateway.queueNextChargeOutcome("failed");
+    await expect(t.finalize()).rejects.toMatchObject({ statusCode: 402 });
+    expect((await PaymentAttemptModel.findOne().orFail()).providerStatus).toBe("FAILED");
+    expect(await BookingModel.countDocuments()).toBe(0);
+    expect(await BookingFinancialTransactionModel.countDocuments({ status: "SUCCEEDED" })).toBe(0);
+  });
+
   it("P4A a normal paid Booking is committed only with the exact durable ledger and attempt", async () => {
     const t = await recoveryFixture();
     await expect(t.status()).resolves.toMatchObject({ state: "NOT_OBSERVED", canDismiss: false });

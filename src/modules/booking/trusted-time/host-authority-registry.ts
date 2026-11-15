@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { consentHostPolicySchema, validateConsentHostPolicy } from "./host-policy.js";
 import type { QualifiedConsentHost } from "./qualified-host.js";
 
@@ -38,6 +39,10 @@ export function createConsentHostAuthorityRegistry(
     const parsed = consentHostPolicySchema.safeParse(input.profile);
     if (
       !parsed.success ||
+      // Reviewed identities must already be canonical. The schema trims identity strings, so
+      // a padded twin would otherwise evade the duplicate check below and silently replace an
+      // earlier (e.g. REVOKED) generation of the same authority.
+      !isDeepStrictEqual(parsed.data, input.profile) ||
       input.version !== 1 ||
       !text(input.qualificationReference) ||
       !/^[a-f0-9]{64}$/.test(input.chronycSha256) ||
@@ -45,7 +50,7 @@ export function createConsentHostAuthorityRegistry(
       !text(input.keyReference) ||
       !text(input.keyVersion) ||
       !["CURRENT", "VERIFY_ONLY", "REVOKED"].includes(input.disposition) ||
-      records.has(input.profile.authorityId)
+      records.has(parsed.data.authorityId)
     )
       return denied();
     const profile = parsed.data;

@@ -14,6 +14,7 @@ export type EmailOtpPurpose =
   | "REGISTRATION"
   | "BUSINESS_LINK"
   | "STAFF_TEMP_PASSWORD"
+  | "PASSWORD_RESET"
   | "EMAIL_CHANGE"
   | "PAYOUT_DESTINATION_CHANGE";
 
@@ -55,6 +56,14 @@ const buildLegacyOtpContent = (
       subject: "Your Bookly staff account is ready",
       heading: "Your Bookly staff account is ready",
       text: `A Bookly staff account was created for you. Log in at the Bookly professional login using this email address and the temporary password below, then change your password once you're in:\n\nTemporary password: ${code}\n\nIf you were not expecting this, please contact the business that added you.`,
+    };
+  }
+
+  if (purpose === "PASSWORD_RESET") {
+    return {
+      subject: "Reset your Bookly password",
+      heading: "Reset your password",
+      text: `Enter this code in Bookly to reset your password: ${code}. It expires in ${env.OTP_EXPIRY_MINUTES} minutes. If you did not request this, ignore this email.`,
     };
   }
 

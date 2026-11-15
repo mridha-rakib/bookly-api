@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
-import mongoose from "mongoose";
+import mongoose, { Types } from "mongoose";
 import httpRequest from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
@@ -11,6 +11,7 @@ import {
 } from "../../../src/modules/auth/auth.middleware.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import { createCustomerBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BookingCreationClaimModel } from "../../../src/modules/booking/booking-creation-claim.model.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { verifyBatchCompletion } from "../../../src/modules/booking/package-batch-completion.js";
@@ -29,21 +30,32 @@ import { PackagePurchaseService } from "../../../src/modules/booking/package-pur
 import { verifyPackagePurchaseClaimCompletion } from "../../../src/modules/booking/package-purchase-authority.js";
 import { observeConsentHost } from "../../../src/modules/booking/trusted-time/host-clock.js";
 import { requireQualifiedConsentHost } from "../../../src/modules/booking/trusted-time/qualified-host.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
+import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
+import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { createFinancialRelationshipService } from "../../../src/modules/client/financial-relationship.factory.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
+import { createPackageViewRoute } from "../../../src/modules/package-progress/package-view.route.js";
 import { readPackagePurchaseCompletion } from "../../../src/modules/package-progress/package-view.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
 import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-attempt.repository.js";
+import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { SessionModel } from "../../../src/modules/session/session.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
+import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
+import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
+import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
+import { issueTestAccessToken } from "../../helpers/access-token.js";
 import {
   syntheticConsentHost,
   syntheticHostObservation,
@@ -88,11 +100,12 @@ describe("P3B actual consent certification and genuine atomic completion", () =>
     vi.useRealTimers();
   });
   afterAll(stopIsolatedReplicaSet);
-  async function fixture(first = false) {
+  async function fixture(first = false, bundlePriceCents?: number) {
     const t = await packageBatchFixture({
       certifiedConsent: true,
       operationId: randomUUID(),
       first,
+      ...(bundlePriceCents !== undefined ? { bundlePriceCents } : {}),
     });
     if (!first)
       await BusinessClientModel.updateOne(
@@ -128,7 +141,7 @@ describe("P3B actual consent certification and genuine atomic completion", () =>
       payments,
       () => INTERNAL_TIME,
     );
-    return { ...t, writer, gateway };
+    return { ...t, writer, gateway, attempts, refunds, relationships };
   }
   it("P4I verifies the original durable certificate while current issuance authority is unavailable", async () => {
     await fixture();
@@ -248,6 +261,383 @@ describe("P3B actual consent certification and genuine atomic completion", () =>
     expect(result.body.data.state).toBe("COMMITTED");
     expect(await readPackagePurchaseCompletion(full.progress)).toBe("VERIFIED");
     expect(await BookingModel.countDocuments()).toBe(full.bookings.length);
+  });
+
+  it("6B certified purchase supports HTTP redemption, move, cancellation and exact replay", async () => {
+    const t = await fixture(false, 0);
+    const full = await t.writer.complete(t.scope);
+    const initial = full.bookings[0];
+    const item = full.progress.items[0];
+    if (!initial || !item || !initial.serviceLines[0]) throw Error("missing purchase fixture");
+    const services = {
+      authority: t.authority,
+      tokens: t.tokens,
+      users: new UserRepository(),
+      staff: new StaffRepository(),
+      management: t.booking,
+      operations: new PackageLifecycleOperations(),
+      availability: t.availability,
+      lifecycle: new PackageLifecycleService(
+        t.availability,
+        t.reservations,
+        t.booking,
+        () => INTERNAL_TIME,
+      ),
+    } satisfies PackageLifecycleHttpServices;
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createAuthenticateAccessTokenMiddleware(t.tokens, new UserRepository()),
+      requireActiveUser(),
+    );
+    app.post(
+      "/package-views/actions/:action",
+      asyncHandler(new PackageLifecycleHttpController(services, () => INTERNAL_TIME).execute),
+    );
+    app.use("/package-views", createPackageViewRoute());
+    app.use("/me", createCustomerBookingRoute());
+    app.use("/super-admin", createSuperAdminRoute());
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const post = (action: string, body: object, authorization = t.authorization) =>
+      httpRequest(app)
+        .post(`/package-views/actions/${action}`)
+        .set("Authorization", authorization)
+        .send(body);
+    const base = {
+      businessId: String(t.scope.businessId),
+      packageProgressId: String(full.progress._id),
+    };
+    const startAt = new Date(initial.schedule.startAt.getTime() + 86400000);
+    const redeem = {
+      ...base,
+      key: randomUUID(),
+      packageItemId: String(item.packageItemId),
+      staffMembershipId: String(initial.serviceLines[0].responsibleStaffMembershipId),
+      startAt,
+    };
+    const other = await UserModel.create({
+      normalizedEmail: "foreign-6b@example.test",
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const foreign = `Bearer ${await issueTestAccessToken(t.tokens, { userId: other._id, role: "CUSTOMER" })}`;
+    await post("redeem", redeem, foreign).expect(404);
+    await post("redeem", { ...redeem, businessId: String(new Types.ObjectId()) }).expect(404);
+    const baselineReservations = await BookingSlotReservationModel.find().lean();
+    const reserve = t.reservations.reserveOrJoin.bind(t.reservations);
+    const failedReserve = vi
+      .spyOn(t.reservations, "reserveOrJoin")
+      .mockImplementationOnce(async (...args) => {
+        await reserve(...args);
+        throw Error("synthetic post-reservation failure");
+      });
+    await post("redeem", { ...redeem, key: randomUUID() }).expect(500);
+    failedReserve.mockRestore();
+    expect(await BookingSlotReservationModel.find().lean()).toEqual(baselineReservations);
+    expect(await BookingModel.countDocuments()).toBe(full.bookings.length);
+    expect(
+      (await PackageProgressV2Model.findById(full.progress._id).orFail()).items[0]
+        ?.remainingSessions,
+    ).toBe(item.remainingSessions);
+    const created = await post("redeem", redeem).expect(200);
+    const replay = await post("redeem", redeem).expect(200);
+    expect(replay.body.data.bookingId).toBe(created.body.data.bookingId);
+    const bookingId = created.body.data.bookingId as string;
+    await httpRequest(app)
+      .get(`/package-views/owned/${full.progress._id}`)
+      .set("Authorization", t.authorization)
+      .expect(200);
+    await httpRequest(app)
+      .get(`/package-views/owned/${full.progress._id}`)
+      .set("Authorization", foreign)
+      .expect(404);
+    const customerBooking = await httpRequest(app)
+      .get(`/me/bookings/${bookingId}`)
+      .set("Authorization", t.authorization)
+      .expect(200);
+    expect(customerBooking.body.data.id).toBe(bookingId);
+    await httpRequest(app)
+      .get(`/me/bookings/${bookingId}`)
+      .set("Authorization", foreign)
+      .expect(404);
+    const admin = await UserModel.create({
+      normalizedEmail: `admin-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const adminToken = `Bearer ${await issueTestAccessToken(t.tokens, { userId: admin._id, role: "SUPER_ADMIN" })}`;
+    const adminBooking = await httpRequest(app)
+      .get(`/super-admin/bookings/${bookingId}`)
+      .set("Authorization", adminToken)
+      .expect(200);
+    expect(adminBooking.body.data.businessId).toBe(String(t.scope.businessId));
+    const owner = await UserModel.create({
+      _id: t.f.business.ownerUserId,
+      normalizedEmail: `owner-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const supervisor = await UserModel.create({
+      normalizedEmail: `supervisor-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    await new StaffRepository().create({
+      userId: supervisor._id,
+      businessId: t.scope.businessId,
+      role: "SUPERVISOR",
+      createdByUserId: owner._id,
+    });
+    const ownerToken = `Bearer ${await issueTestAccessToken(t.tokens, { userId: owner._id, role: "BUSINESS_OWNER" })}`;
+    const supervisorToken = `Bearer ${await issueTestAccessToken(t.tokens, { userId: supervisor._id, role: "SUPERVISOR" })}`;
+    const settlementUrl = `/package-views/settlement/${t.scope.businessId}/${bookingId}`;
+    for (const authorization of [ownerToken, supervisorToken]) {
+      const view = await httpRequest(app)
+        .get(settlementUrl)
+        .set("Authorization", authorization)
+        .expect(200);
+      expect(view.body.data.packageProgressId).toBe(String(full.progress._id));
+      expect(view.body.data.session.bookingId).toBe(bookingId);
+      if (authorization === ownerToken) {
+        expect(view.body.data).toHaveProperty("purchaseFinancials");
+        expect(view.body.data).toHaveProperty("payments");
+      } else {
+        for (const field of ["purchaseFinancials", "payments", "operations", "historyLimit"])
+          expect(view.body.data).not.toHaveProperty(field);
+        expect(view.body.data.session.booking).not.toHaveProperty("outstandingBalanceCents");
+      }
+    }
+    await httpRequest(app)
+      .get(`/package-views/owned/${full.progress._id}`)
+      .set("Authorization", supervisorToken)
+      .expect(403);
+    await httpRequest(app)
+      .post("/package-views/actions/redeem")
+      .set("Authorization", supervisorToken)
+      .send(redeem)
+      .expect(403);
+    const assignedId = initial.serviceLines[0]?.responsibleStaffMembershipId;
+    const assigned = t.f.providers.find((provider) => provider._id.equals(assignedId));
+    if (assigned?.role !== "STAFF") throw Error("expected assigned staff");
+    await UserModel.create({
+      _id: assigned.userId,
+      normalizedEmail: `staff-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "STAFF",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const staffToken = `Bearer ${await issueTestAccessToken(t.tokens, { userId: assigned.userId, role: "STAFF" })}`;
+    const staffRead = await httpRequest(app)
+      .get(`/businesses/${t.scope.businessId}/staff/me/appointments/${bookingId}`)
+      .set("Authorization", staffToken)
+      .expect(200);
+    expect(staffRead.body.data.services).toHaveLength(1);
+    expect(JSON.stringify(staffRead.body.data)).not.toMatch(
+      /financials|amountCents|purchaseFinancials|paymentIntent/,
+    );
+    const consumed = await PackageProgressV2Model.findById(full.progress._id).orFail();
+    expect(consumed.items[0]?.remainingSessions).toBe(item.remainingSessions - 1);
+    expect(consumed.sessions.length).toBe(full.progress.sessions.length + 1);
+    const hasSlot = async (at: Date) =>
+      (await BookingSlotReservationModel.find().lean()).some((day) =>
+        day.intervals.some((interval) => interval.startAt.getTime() === at.getTime()),
+      );
+    expect(await hasSlot(startAt)).toBe(true);
+    const beforeMove = await BookingSlotReservationModel.find().lean();
+    const moveAt = new Date(initial.schedule.startAt.getTime() + 3 * 86400000);
+    const move = { ...base, key: randomUUID(), bookingId, startAt: moveAt };
+    await post("reschedule", move).expect(200);
+    await post("reschedule", move).expect(200);
+    const moved = await BookingModel.findById(bookingId).orFail();
+    expect(moved.schedule.startAt).toEqual(moveAt);
+    expect(
+      (await PackageProgressV2Model.findById(full.progress._id).orFail()).items[0]
+        ?.remainingSessions,
+    ).toBe(item.remainingSessions - 1);
+    expect(await BookingSlotReservationModel.find().lean()).not.toEqual(beforeMove);
+    expect(await hasSlot(startAt)).toBe(false);
+    expect(await hasSlot(moveAt)).toBe(true);
+    const cancel = { ...base, key: randomUUID(), bookingId };
+    await post("cancel", cancel).expect(200);
+    await post("cancel", cancel).expect(200);
+    const final = await PackageProgressV2Model.findById(full.progress._id).orFail();
+    expect(final.items[0]?.remainingSessions).toBe(item.remainingSessions);
+    expect((await BookingModel.findById(bookingId).orFail()).status).toBe("CANCELLED_BY_CUSTOMER");
+    expect(await hasSlot(moveAt)).toBe(false);
+    expect(await BookingModel.countDocuments()).toBe(full.bookings.length + 1);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+  });
+
+  it("3.7F supervisor cancellation exposes only operational outcome with persisted purchase and refund records", async () => {
+    const t = await fixture(true);
+    const operationId = t.scope.idempotencyKey.split(":").at(-1);
+    if (!operationId) throw Error("missing operation");
+    const purchased = await new PackagePurchaseService(t.authority, t.writer).complete(
+      t.authorization,
+      t.scope.businessId,
+      operationId,
+    );
+    if (purchased.state !== "COMPLETE") throw Error("expected certified purchase");
+    const [supervisorBooking, ownerBooking] = purchased.bookingIds;
+    if (!supervisorBooking || !ownerBooking) throw Error("expected two package bookings");
+    const progress = await PackageProgressV2Model.findById(purchased.packageProgressId).orFail();
+    const attempt = await PaymentAttemptModel.findOne({ packageProgressId: progress._id }).orFail();
+    if (!attempt.providerPaymentIntentId) throw Error("missing synthetic payment intent");
+    const refund = await RefundOperationModel.create({
+      logicalIdempotencyKey: `synthetic-history-${randomUUID()}`,
+      sourcePaymentAttemptId: attempt._id,
+      sourcePaymentIntentId: attempt.providerPaymentIntentId,
+      bookingId: supervisorBooking,
+      packageProgressId: progress._id,
+      businessId: t.scope.businessId,
+      customerUserId: progress.customerUserId,
+      businessClientId: progress.businessClientId,
+      expectedRefundAmountCents: 123,
+      currency: "EUR",
+      reason: "synthetic historical refund",
+      providerStatus: "SUCCEEDED",
+    });
+    const owner = await UserModel.create({
+      _id: t.f.business.ownerUserId,
+      normalizedEmail: `owner-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "BUSINESS_OWNER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const supervisor = await UserModel.create({
+      normalizedEmail: `supervisor-${randomUUID()}@example.test`,
+      passwordHash: "unused",
+      role: "SUPERVISOR",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    await new StaffRepository().create({
+      userId: supervisor._id,
+      businessId: t.scope.businessId,
+      role: "SUPERVISOR",
+      createdByUserId: owner._id,
+    });
+    const services = {
+      authority: t.authority,
+      tokens: t.tokens,
+      users: new UserRepository(),
+      staff: new StaffRepository(),
+      management: t.booking,
+      operations: new PackageLifecycleOperations(),
+      availability: t.availability,
+      lifecycle: new PackageLifecycleService(
+        t.availability,
+        t.reservations,
+        t.booking,
+        () => INTERNAL_TIME,
+      ),
+    } satisfies PackageLifecycleHttpServices;
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createAuthenticateAccessTokenMiddleware(t.tokens, new UserRepository()),
+      requireActiveUser(),
+    );
+    app.post(
+      "/package-views/actions/:action",
+      asyncHandler(new PackageLifecycleHttpController(services, () => INTERNAL_TIME).execute),
+    );
+    app.use(createErrorHandler({ isProduction: true }));
+    const base = {
+      businessId: String(t.scope.businessId),
+      packageProgressId: String(progress._id),
+    };
+    const cancel = async (
+      actor: typeof supervisor,
+      role: "SUPERVISOR" | "BUSINESS_OWNER",
+      bookingId: string,
+    ) =>
+      httpRequest(app)
+        .post("/package-views/actions/cancel")
+        .set(
+          "Authorization",
+          `Bearer ${await issueTestAccessToken(t.tokens, { userId: actor._id, role })}`,
+        )
+        .send({ ...base, bookingId, key: randomUUID() })
+        .expect(200);
+    const ledgerBefore = await BookingFinancialTransactionModel.find().lean();
+    const response = await cancel(supervisor, "SUPERVISOR", supervisorBooking);
+    expect(response.body.data).toMatchObject({
+      state: "COMMITTED",
+      status: "CANCELLED_BY_BUSINESS",
+      bookingId: supervisorBooking,
+    });
+    expect(Object.keys(response.body.data).sort()).toEqual(
+      ["bookingId", "committedAt", "endAt", "startAt", "state", "status"].sort(),
+    );
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /refund|payment|amount|settlement|provider/iu,
+    );
+    expect((await BookingModel.findById(supervisorBooking).orFail()).status).toBe(
+      "CANCELLED_BY_BUSINESS",
+    );
+    const afterCancel = await PackageProgressV2Model.findById(progress._id).orFail();
+    expect(
+      afterCancel.sessions.find((session) => String(session.bookingId) === supervisorBooking)
+        ?.status,
+    ).toBe("CANCELLED");
+    expect(await PaymentAttemptModel.findById(attempt._id).lean()).toEqual(attempt.toObject());
+    expect(await RefundOperationModel.findById(refund._id).lean()).toEqual(refund.toObject());
+    expect(await BookingFinancialTransactionModel.find().lean()).toEqual(ledgerBefore);
+    const ownerResponse = await cancel(owner, "BUSINESS_OWNER", ownerBooking);
+    expect(ownerResponse.body.data).toMatchObject({
+      state: "COMMITTED",
+      status: "CANCELLED_BY_BUSINESS",
+    });
+    expect(Object.keys(ownerResponse.body.data).sort()).toEqual(
+      Object.keys(response.body.data).sort(),
+    );
+  });
+
+  it("6B concurrent last-credit redemptions on certified purchase commit only one booking", async () => {
+    const t = await fixture(false, 0);
+    const full = await t.writer.complete(t.scope);
+    const first = full.bookings[0];
+    const item = full.progress.items[0];
+    if (!first || !item || !first.serviceLines[0]) throw Error("missing purchase fixture");
+    const staffId = first.serviceLines[0].responsibleStaffMembershipId;
+    const lifecycle = new PackageLifecycleService(
+      t.availability,
+      t.reservations,
+      t.booking,
+      () => INTERNAL_TIME,
+    );
+    const redeem = (day: number) =>
+      lifecycle.customer(t.scope.customer, {
+        key: `6b:${randomUUID()}`,
+        action: "REDEEM",
+        businessId: t.scope.businessId,
+        businessClientId: t.scope.businessClientId,
+        packageProgressId: full.progress._id,
+        packageItemId: item.packageItemId,
+        staffMembershipId: staffId,
+        startAt: new Date(first.schedule.startAt.getTime() + day * 86400000),
+      });
+    for (let day = 1; day < item.remainingSessions; day++) await redeem(day);
+    const before = await BookingModel.countDocuments();
+    const results = await Promise.allSettled([redeem(8), redeem(9)]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(await BookingModel.countDocuments()).toBe(before + 1);
+    expect(
+      (await PackageProgressV2Model.findById(full.progress._id).orFail()).items[0]
+        ?.remainingSessions,
+    ).toBe(0);
   });
   it.each([0, 1])(
     "post-commit bound at deadline+%ims cannot certify or imply a late commit",
@@ -495,6 +885,166 @@ describe("P3B actual consent certification and genuine atomic completion", () =>
     expect(t.gateway.paymentIntentInputs).toHaveLength(1);
     expect(await readPackagePurchaseCompletion(complete.progress)).toBe("VERIFIED");
   });
+
+  it("6A purchase service binds real certified consent, persists entitlements and replays one paid purchase", async () => {
+    const t = await fixture(true);
+    const service = new PackagePurchaseService(t.authority, t.writer);
+    const operationId = t.scope.idempotencyKey.split(":").at(-1)!;
+    const claim = await BookingCreationClaimModel.findOne().orFail();
+    const certificate = await verifyCertifiedPackageConsent(claim.toObject());
+    expect(certificate.certificateId).toBeDefined();
+    expect(
+      await PackageConsentEvidenceModel.countDocuments({
+        operationKey: t.scope.idempotencyKey,
+        phase: "CERTIFICATION",
+      }),
+    ).toBe(1);
+    const first = await service.complete(t.authorization, t.scope.businessId, operationId);
+    const replay = await service.complete(t.authorization, t.scope.businessId, operationId);
+    expect(first.state).toBe("COMPLETE");
+    expect(replay).toEqual(first);
+    if (first.state !== "COMPLETE") throw Error("expected verified purchase");
+    const progress = await PackageProgressV2Model.findById(first.packageProgressId).orFail();
+    expect(String(progress.businessId)).toBe(String(t.scope.businessId));
+    expect(String(progress.customerUserId)).toBe(String(t.f.context.customerUserId));
+    expect(progress.items.length).toBeGreaterThan(0);
+    expect(
+      progress.items.every(
+        (item) =>
+          item.totalSessions > 0 &&
+          item.remainingSessions >= 0 &&
+          item.remainingSessions <= item.totalSessions,
+      ),
+    ).toBe(true);
+    expect(await PackageProgressV2Model.countDocuments()).toBe(1);
+    expect(await BookingModel.countDocuments()).toBe(first.bookingIds.length);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    expect(t.gateway.createdPaymentIntentIds()).toHaveLength(1);
+    expect(t.gateway.paymentIntentInputs[0]?.amountCents).toBe(
+      t.quote.payload.financials.requiredUpfrontCents,
+    );
+    expect(progress.purchaseSnapshot.bundlePriceCents).toBe(
+      t.quote.payload.financials.bundlePriceCents,
+    );
+    expect((await PaymentAttemptModel.findOne().orFail()).providerStatus).toBe("SUCCEEDED");
+  });
+
+  it("6A repeated payment callback cannot duplicate a certified purchase", async () => {
+    const t = await fixture(true);
+    const operationId = t.scope.idempotencyKey.split(":").at(-1);
+    if (!operationId) throw Error("missing operation ID");
+    const purchase = await new PackagePurchaseService(t.authority, t.writer).complete(
+      t.authorization,
+      t.scope.businessId,
+      operationId,
+    );
+    expect(purchase.state).toBe("COMPLETE");
+    const attempt = await PaymentAttemptModel.findOne().orFail();
+    if (!attempt.providerPaymentIntentId) throw Error("missing fake payment intent");
+    const source = await t.gateway.retrievePaymentIntent(attempt.providerPaymentIntentId);
+    const webhook = new StripeWebhookService(
+      t.gateway,
+      new StripeWebhookEventRepository(),
+      new BookingFinancialTransactionService(new BookingFinancialTransactionRepository()),
+      undefined,
+      t.attempts,
+      t.refunds,
+      undefined,
+      new BookingRepository(),
+      t.relationships,
+    );
+    const event = {
+      id: "evt_6a_duplicate",
+      type: "payment_intent.succeeded",
+      data: {
+        object: {
+          id: source.paymentIntentId,
+          amount: source.amountCents,
+          currency: "eur",
+          customer: source.customerId,
+          metadata: source.metadata,
+        },
+      },
+    };
+    expect(await Reflect.apply(webhook.process, webhook, [event])).toBe(true);
+    expect(await Reflect.apply(webhook.process, webhook, [event])).toBe(false);
+    expect(await PackageProgressV2Model.countDocuments()).toBe(1);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+    if (purchase.state === "COMPLETE")
+      expect(await BookingModel.countDocuments()).toBe(purchase.bookingIds.length);
+  });
+
+  it.each(["requires_action", "failed"] as const)(
+    "6A %s payment remains unissued at the purchase service boundary",
+    async (outcome) => {
+      const t = await fixture(true);
+      t.gateway.queueNextChargeOutcome(outcome);
+      const service = new PackagePurchaseService(t.authority, t.writer);
+      const operationId = t.scope.idempotencyKey.split(":").at(-1)!;
+      const result = await service.complete(t.authorization, t.scope.businessId, operationId);
+      expect(result.state).toBe("PAYMENT_PENDING");
+      if (result.state !== "PAYMENT_PENDING") throw Error("expected pending purchase");
+      expect(result.providerStatus).toBe(outcome === "failed" ? "FAILED" : "REQUIRES_ACTION");
+      expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await PaymentAttemptModel.countDocuments()).toBe(1);
+      expect(t.gateway.createdPaymentIntentIds()).toHaveLength(1);
+    },
+  );
+
+  it("6A foreign customer and business cannot use a certified purchase operation", async () => {
+    const t = await fixture(true);
+    const service = new PackagePurchaseService(t.authority, t.writer);
+    const operationId = t.scope.idempotencyKey.split(":").at(-1)!;
+    const other = await UserModel.create({
+      normalizedEmail: "foreign-6a@example.test",
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+      security: { passwordUpdatedAt: new Date() },
+    });
+    const foreign = `Bearer ${await issueTestAccessToken(t.tokens, { userId: other._id, role: "CUSTOMER" })}`;
+    await expect(service.complete(foreign, t.scope.businessId, operationId)).rejects.toThrow();
+    await expect(
+      service.complete(t.authorization, new Types.ObjectId(), operationId),
+    ).rejects.toThrow();
+    expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+    expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+    expect(t.gateway.createdPaymentIntentIds()).toHaveLength(0);
+  });
+
+  it.each(["missing", "tampered", "wrong-package"] as const)(
+    "6A %s certification cannot initiate payment or issue entitlements",
+    async (mode) => {
+      const t = await fixture(true);
+      const service = new PackagePurchaseService(t.authority, t.writer);
+      const operationId = t.scope.idempotencyKey.split(":").at(-1);
+      if (!operationId) throw Error("missing operation ID");
+      if (mode === "missing") {
+        await PackageConsentEvidenceModel.collection.deleteOne({
+          operationKey: t.scope.idempotencyKey,
+          phase: "CERTIFICATION",
+        });
+      } else if (mode === "tampered") {
+        await PackageConsentEvidenceModel.collection.updateOne(
+          { operationKey: t.scope.idempotencyKey, phase: "CERTIFICATION" },
+          { $set: { "payload.deadlineMs": Date.now() + 999999999 } },
+        );
+      } else {
+        await BookingCreationClaimModel.collection.updateOne(
+          { idempotencyKey: t.scope.idempotencyKey },
+          { $set: { "packageCheckoutAcceptance.packageId": new Types.ObjectId() } },
+        );
+      }
+      await expect(
+        service.complete(t.authorization, t.scope.businessId, operationId),
+      ).rejects.toThrow();
+      expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+      expect(await PackageProgressV2Model.countDocuments()).toBe(0);
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(t.gateway.createdPaymentIntentIds()).toHaveLength(0);
+    },
+  );
 
   it("P4F pending purchase status retains original certification and link-generation fences before revealing 3DS recovery", async () => {
     const t = await fixture(true);

@@ -54,7 +54,7 @@ export class PackageProgressService {
       const originBooking = bookingById.get(String(pkg.originBookingId));
       const settlement = originBooking
         ? computePackageBalanceSettlement(originBooking)
-        : { balanceSettled: false, outstandingBalanceCents: 0 };
+        : { balanceSettled: false, outstandingBalanceCents: null };
       return toPackageProgressDto(
         pkg,
         settlement,
@@ -88,7 +88,7 @@ export class PackageProgressService {
     const originBooking = bookingsById.get(String(progress.originBookingId));
     const settlement = originBooking
       ? computePackageBalanceSettlement(originBooking)
-      : { balanceSettled: false, outstandingBalanceCents: 0 };
+      : { balanceSettled: false, outstandingBalanceCents: null };
 
     return toPackageProgressDto(progress, settlement, bookingsById);
   }

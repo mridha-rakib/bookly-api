@@ -10,8 +10,12 @@ import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { createAvailabilityRoute } from "../../../src/modules/availability/availability.route.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
-import { createBusinessBookingRoute } from "../../../src/modules/booking/booking.route.js";
+import {
+  createBusinessBookingRoute,
+  createCustomerBookingRoute,
+} from "../../../src/modules/booking/booking.route.js";
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
+import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BookingSlotReservationClaimModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation-claim.model.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
@@ -22,9 +26,11 @@ import { BusinessClientModel } from "../../../src/modules/client/client.model.js
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { createClientRoute } from "../../../src/modules/client/client.route.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import { CustomerPaymentProfileModel } from "../../../src/modules/payment/customer-payment-profile.model.js";
 import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { StripePaymentGateway } from "../../../src/modules/payment/stripe-payment-gateway.js";
+import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -278,6 +284,7 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
     app.use("/businesses", createStaffScheduleRoute());
     app.use("/businesses", createAvailabilityRoute());
     app.use("/businesses", createBusinessBookingRoute());
+    app.use("/me", createCustomerBookingRoute());
     app.use(createErrorHandler({ isProduction: true }));
     return app;
   };
@@ -288,6 +295,338 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
   ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- Tests -----------------------------------------------------------------------------------
+
+  it("7C scopes legacy package reads to active supervisors and hides settlement", async () => {
+    const t = await setupBookableBusiness();
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    const foreign = await createBusiness("Foreign 7C");
+    const outsider = await createStaff(foreign.business._id, "SUPERVISOR");
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const created = await request(app)
+      .post(base)
+      .set("Authorization", auth)
+      .send(validBody(t.service._id, t.membership._id, t.client._id))
+      .expect(201);
+    const bookingId = new Types.ObjectId(created.body.data.id);
+    const customerId = new Types.ObjectId();
+    const packageId = new Types.ObjectId();
+    await BookingModel.updateOne(
+      { _id: bookingId },
+      {
+        $set: {
+          "customer.customerUserId": customerId,
+          "serviceLines.0.pricingInput.packageProgressId": packageId,
+          "serviceLines.0.pricingInput.sessionIndex": 1,
+          "serviceLines.0.pricingInput.sessionsInPackage": 2,
+        },
+      },
+    );
+    await PackageProgressModel.create({
+      _id: packageId,
+      businessId: t.business._id,
+      customerUserId: customerId,
+      businessClientId: t.client._id,
+      serviceId: t.service._id,
+      totalSessions: 2,
+      remainingSessions: 1,
+      completedSessions: 0,
+      originBookingId: bookingId,
+      sessions: [{ sessionIndex: 1, bookingId, status: "SCHEDULED" }],
+      purchaseSnapshot: {
+        name: "Synthetic package",
+        bundlePriceCents: 8000,
+        durationMin: 60,
+        sessionsInPackage: 2,
+      },
+      voidRefundSettlement: {
+        status: "SUCCEEDED",
+        amountCents: 1000,
+        providerRefundId: "synthetic",
+      },
+    });
+    const path = `${base}/packages/${packageId}`;
+    const response = await request(app).get(path).set("Authorization", auth).expect(200);
+    expect(response.body.data).toMatchObject({
+      id: String(packageId),
+      businessId: String(t.business._id),
+      originBookingId: String(bookingId),
+      sessions: [
+        {
+          bookingId: String(bookingId),
+          booking: { professional: { membershipId: String(t.membership._id) } },
+        },
+      ],
+    });
+    expect(response.body.data.status).toBeDefined();
+    expect(response.body.data).not.toHaveProperty("outstandingBalanceCents");
+    expect(response.body.data).not.toHaveProperty("voidRefundSettlement");
+    expect(response.body.data.purchaseSnapshot).not.toHaveProperty("bundlePriceCents");
+    const detail = await request(app)
+      .get(`${base}/${bookingId}`)
+      .set("Authorization", auth)
+      .expect(200);
+    expect(detail.body.data.packageSessions).toHaveLength(1);
+    expect(detail.body.data.packageSessions[0]).not.toHaveProperty("outstandingBalanceCents");
+    const otherCustomer = await userRepository.create({
+      normalizedEmail: `other-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    await request(app)
+      .get(`/me/packages/${packageId}`)
+      .set("Authorization", await bearerFor(otherCustomer._id, "CUSTOMER"))
+      .expect(404);
+    await request(app).get(`/me/packages/${packageId}`).set("Authorization", auth).expect(403);
+    await request(app)
+      .get(path)
+      .set("Authorization", await bearerFor(outsider.user._id, "SUPERVISOR"))
+      .expect(404);
+    await request(app)
+      .get(`/businesses/${foreign.business._id}/bookings/packages/${packageId}`)
+      .set("Authorization", auth)
+      .expect(404);
+    await request(app).post(`${path}/terminate`).set("Authorization", auth).send({}).expect(403);
+    await request(app).post(`${path}/sessions`).set("Authorization", auth).send({}).expect(403);
+    await StaffMembershipModel.updateOne(
+      { _id: supervisor.membership._id },
+      { $set: { employmentActive: false } },
+    );
+    await request(app).get(path).set("Authorization", auth).expect(404);
+    expect(
+      (await PackageProgressModel.findById(packageId).orFail()).sessions[0]?.bookingId.toString(),
+    ).toBe(String(bookingId));
+  });
+
+  it("creates two parallel services after composite availability and rejects a conflicting assignment", async () => {
+    const t = await setupBookableBusiness();
+    const second = await createStaff(t.business._id);
+    await staffWorksMondayToFriday(second.membership._id, t.business._id);
+    const secondService = await createFixedService(t.business._id, second.membership._id, 5000);
+    const app = buildApp();
+    const bearer = await bearerFor(t.owner._id, "BUSINESS_OWNER");
+    const lines = [
+      { serviceId: String(t.service._id), staffMembershipId: String(t.membership._id) },
+      { serviceId: String(secondService._id), staffMembershipId: String(second.membership._id) },
+    ];
+    const query = { fromDate: DATE, toDate: DATE, lines };
+    const available = await request(app)
+      .post(`/businesses/${t.business._id}/bookings/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query)
+      .expect(200);
+    expect(
+      available.body.data.days[0].slots.some(
+        (slot: { startAt: string }) => slot.startAt === startAtFor("10:00"),
+      ),
+    ).toBe(true);
+    await request(app)
+      .post(`/businesses/${t.business._id}/bookings/composite-availability`)
+      .set("Authorization", bearer)
+      .send({
+        ...query,
+        lines: [lines[0], { ...lines[1], staffMembershipId: String(t.membership._id) }],
+      })
+      .expect(409);
+    const body = {
+      ...validBody(t.service._id, t.membership._id, t.client._id),
+      serviceLines: lines.map((line) => ({ ...line, addonIds: [], pricingInput: {} })),
+    };
+    const created = await request(app)
+      .post(`/businesses/${t.business._id}/bookings`)
+      .set("Authorization", bearer)
+      .send(body)
+      .expect(201);
+    const booking = await BookingModel.findById(created.body.data.id).orFail();
+    expect(booking.serviceLines).toHaveLength(2);
+    expect(booking.serviceLines.map((line) => String(line.responsibleStaffMembershipId))).toEqual(
+      lines.map((line) => line.staffMembershipId),
+    );
+    expect(booking.schedule.startAt.toISOString()).toBe(startAtFor("10:00"));
+    expect(booking.financials.servicesSubtotalCents).toBe(13000);
+    expect(booking.serviceLines.map((line) => line.amountCents)).toEqual([8000, 5000]);
+    expect(booking.serviceLines.map((line) => String(line.serviceId))).toEqual(
+      lines.map((line) => line.serviceId),
+    );
+    expect(
+      booking.serviceLines.every(
+        (line) => Boolean(line.serviceSnapshot.name) && Boolean(line.staffSnapshot?.firstName),
+      ),
+    ).toBe(true);
+    const reserved = await BookingSlotReservationModel.find({ businessId: t.business._id }).lean();
+    expect(reserved).toHaveLength(2);
+    for (const line of booking.serviceLines) {
+      const day = reserved.find(
+        (item) => String(item.staffMembershipId) === String(line.responsibleStaffMembershipId),
+      );
+      expect(
+        day?.intervals.some(
+          (interval) =>
+            String(interval.reservationId) === String(line.reservationId) &&
+            interval.startAt.toISOString() === startAtFor("10:00"),
+        ),
+      ).toBe(true);
+    }
+    const replay = await request(app)
+      .post(`/businesses/${t.business._id}/bookings`)
+      .set("Authorization", bearer)
+      .send(body)
+      .expect(201);
+    expect(replay.body.data.id).toBe(created.body.data.id);
+    expect(await BookingModel.countDocuments()).toBe(1);
+    expect(await BookingSlotReservationModel.countDocuments()).toBe(2);
+    const conflicting = { ...body, idempotencyKey: `conflict-${new Types.ObjectId()}` };
+    const rejected = await request(app)
+      .post(`/businesses/${t.business._id}/bookings`)
+      .set("Authorization", bearer)
+      .send(conflicting);
+    expect(rejected.status).toBe(409);
+    expect(await BookingModel.countDocuments()).toBe(1);
+    const afterConflict = await BookingSlotReservationModel.find({
+      businessId: t.business._id,
+    }).lean();
+    expect(afterConflict.map((doc) => doc.intervals.length)).toEqual([1, 1]);
+    const after = await request(app)
+      .post(`/businesses/${t.business._id}/bookings/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query)
+      .expect(200);
+    expect(
+      after.body.data.days[0].slots.some(
+        (slot: { startAt: string }) => slot.startAt === startAtFor("10:00"),
+      ),
+    ).toBe(false);
+  });
+
+  it("rolls back both parallel reservations if the second reservation fails", async () => {
+    const t = await setupBookableBusiness();
+    const second = await createStaff(t.business._id);
+    await staffWorksMondayToFriday(second.membership._id, t.business._id);
+    const other = await createFixedService(t.business._id, second.membership._id);
+    const app = buildApp();
+    const bearer = await bearerFor(t.owner._id, "BUSINESS_OWNER");
+    const body = {
+      ...validBody(t.service._id, t.membership._id, t.client._id),
+      serviceLines: [
+        {
+          serviceId: String(t.service._id),
+          staffMembershipId: String(t.membership._id),
+          addonIds: [],
+          pricingInput: {},
+        },
+        {
+          serviceId: String(other._id),
+          staffMembershipId: String(second.membership._id),
+          addonIds: [],
+          pricingInput: {},
+        },
+      ],
+    };
+    const original = BookingSlotReservationService.prototype.reserveOrJoin;
+    let calls = 0;
+    const spy = vi
+      .spyOn(BookingSlotReservationService.prototype, "reserveOrJoin")
+      .mockImplementation(async function (this: BookingSlotReservationService, ...args) {
+        calls += 1;
+        if (calls === 2) throw new Error("synthetic second reservation failure");
+        return original.apply(this, args);
+      });
+    try {
+      const result = await request(app)
+        .post(`/businesses/${t.business._id}/bookings`)
+        .set("Authorization", bearer)
+        .send(body);
+      expect(result.status).toBeGreaterThanOrEqual(400);
+      expect(calls).toBe(2);
+      expect(await BookingModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments()).toBe(0);
+      expect(await BookingSlotReservationClaimModel.countDocuments()).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("rejects invalid parallel selections before creating booking or reservation state", async () => {
+    const t = await setupBookableBusiness();
+    const second = await createStaff(t.business._id);
+    await staffWorksMondayToFriday(second.membership._id, t.business._id);
+    const secondService = await createFixedService(t.business._id, second.membership._id, 5000);
+    const app = buildApp();
+    const bearer = await bearerFor(t.owner._id, "BUSINESS_OWNER");
+    const lines = [
+      { serviceId: String(t.service._id), staffMembershipId: String(t.membership._id) },
+      { serviceId: String(secondService._id), staffMembershipId: String(second.membership._id) },
+    ];
+    const body = {
+      ...validBody(t.service._id, t.membership._id, t.client._id),
+      serviceLines: lines.map((line) => ({ ...line, addonIds: [], pricingInput: {} })),
+    };
+    const query = { fromDate: DATE, toDate: DATE, lines };
+    const path = `/businesses/${t.business._id}/bookings`;
+    const invalid = await request(app)
+      .post(path)
+      .set("Authorization", bearer)
+      .send({
+        ...body,
+        serviceLines: [
+          body.serviceLines[0],
+          { ...body.serviceLines[1], staffMembershipId: String(t.membership._id) },
+        ],
+      });
+    expect(invalid.status).toBe(409);
+    await StaffMembershipModel.updateOne(
+      { _id: second.membership._id },
+      { $set: { employmentActive: false } },
+    );
+    const unavailable = await request(app)
+      .post(`${path}/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query);
+    expect(unavailable.status).toBeGreaterThanOrEqual(400);
+    expect(unavailable.status).toBeLessThan(500);
+    const unavailableBooking = await request(app)
+      .post(path)
+      .set("Authorization", bearer)
+      .send(body);
+    expect(unavailableBooking.status).toBeGreaterThanOrEqual(400);
+    expect(unavailableBooking.status).toBeLessThan(500);
+    await StaffMembershipModel.updateOne(
+      { _id: second.membership._id },
+      { $set: { employmentActive: true } },
+    );
+    await ServiceModel.updateOne({ _id: secondService._id }, { $set: { status: "INACTIVE" } });
+    const inactiveAvailability = await request(app)
+      .post(`${path}/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query);
+    expect(inactiveAvailability.status).toBeGreaterThanOrEqual(400);
+    expect(inactiveAvailability.status).toBeLessThan(500);
+    const inactiveBooking = await request(app).post(path).set("Authorization", bearer).send(body);
+    expect(inactiveBooking.status).toBeGreaterThanOrEqual(400);
+    expect(inactiveBooking.status).toBeLessThan(500);
+    await ServiceModel.updateOne({ _id: secondService._id }, { $set: { status: "ACTIVE" } });
+    await new PlatformSettingsRepository().update({ maxServicesPerBooking: 1 });
+    await request(app)
+      .post(`${path}/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query)
+      .expect(400);
+    await request(app).post(path).set("Authorization", bearer).send(body).expect(400);
+    await new PlatformSettingsRepository().update({ maxServicesPerBooking: 5 });
+    await ServiceModel.updateOne({ _id: secondService._id }, { $set: { isPackageDeal: true } });
+    await request(app)
+      .post(`${path}/composite-availability`)
+      .set("Authorization", bearer)
+      .send(query)
+      .expect(400);
+    const packageResult = await request(app).post(path).set("Authorization", bearer).send(body);
+    expect(packageResult.status).toBeGreaterThanOrEqual(400);
+    expect(packageResult.status).toBeLessThan(500);
+    expect(await BookingModel.countDocuments()).toBe(0);
+    expect(await BookingSlotReservationModel.countDocuments()).toBe(0);
+  });
 
   it.skipIf(!hasLocalBrowser).each(["FIXED", "HOURLY", "PER_PERSON", "NEW_CLIENT", "TRAVEL"])(
     "BC-F02 browser %s uses real form, API persistence and list/calendar reads",
@@ -856,6 +1195,64 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
     expect(count).toBe(1);
   });
 
+  it("rejects cross-business lifecycle mutations without changing the booking or reservation", async () => {
+    const t = await setupBookableBusiness();
+    const foreign = await createBusiness("Foreign Salon");
+    const app = buildApp();
+    const created = await request(app)
+      .post(`/businesses/${t.business._id}/bookings`)
+      .set("Authorization", await bearerFor(t.owner._id, "BUSINESS_OWNER"))
+      .send(validBody(t.service._id, t.membership._id, t.client._id));
+    expect(created.status).toBe(201);
+    const bookingId = created.body.data.id as string;
+    const auth = await bearerFor(foreign.owner._id, "BUSINESS_OWNER");
+    for (const [action, body] of [
+      ["cancel", { reason: "Test" }],
+      ["complete", {}],
+      ["no-show", {}],
+      ["reschedule", { startAt: startAtFor("11:00") }],
+    ] as const) {
+      const response = await request(app)
+        .post(`/businesses/${t.business._id}/bookings/${bookingId}/${action}`)
+        .set("Authorization", auth)
+        .send(body);
+      expect(response.status).toBe(404);
+    }
+    const booking = await BookingModel.findById(bookingId).orFail();
+    expect(booking.status).toBe("UPCOMING");
+    const reservation = await BookingSlotReservationModel.findOne({
+      businessId: t.business._id,
+    }).orFail();
+    expect(reservation.intervals).toHaveLength(1);
+  });
+
+  it.each(["DRAFT", "INACTIVE", "ARCHIVED"] as const)(
+    "rejects a %s add-on before booking or reserving a slot",
+    async (status) => {
+      const t = await setupBookableBusiness();
+      const addon = await addonRepository.create({
+        businessId: t.business._id,
+        status,
+        name: "Unavailable extra",
+        priceCents: 1000,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        { businessId: t.business._id, addonId: addon._id, serviceId: t.service._id },
+      ]);
+      const response = await request(buildApp())
+        .post(`/businesses/${t.business._id}/bookings`)
+        .set("Authorization", await bearerFor(t.owner._id, "BUSINESS_OWNER"))
+        .send(
+          validBody(t.service._id, t.membership._id, t.client._id, "10:00", [String(addon._id)]),
+        );
+      expect(response.status).toBe(404);
+      expect(await BookingModel.countDocuments({ businessId: t.business._id })).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments({ businessId: t.business._id })).toBe(
+        0,
+      );
+    },
+  );
+
   it("BC-F02 accepted add-on snapshots survive later price changes and a taken slot rejects fresh submission", async () => {
     const t = await setupBookableBusiness();
     const addon = await addonRepository.create({
@@ -915,6 +1312,180 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
       .send(validBody(service._id, membership._id, client._id));
 
     expect(response.status).toBe(201);
+  });
+
+  it("7B Supervisor reads, reschedules and cancels an owned booking while a foreign Supervisor is denied", async () => {
+    const t = await setupBookableBusiness();
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    const foreign = await createBusiness("Other 7B");
+    const outsider = await createStaff(foreign.business._id, "SUPERVISOR");
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const foreignAuth = await bearerFor(outsider.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const created = await request(app)
+      .post(base)
+      .set("Authorization", auth)
+      .send(validBody(t.service._id, t.membership._id, t.client._id))
+      .expect(201);
+    const id = created.body.data.id as string;
+    await request(app).get(`${base}/${id}`).set("Authorization", auth).expect(200);
+    await request(app).get(`${base}/${id}`).set("Authorization", foreignAuth).expect(404);
+    await request(app)
+      .post(`${base}/${id}/cancel`)
+      .set("Authorization", foreignAuth)
+      .send({ reason: "test" })
+      .expect(404);
+    await request(app)
+      .post(`${base}/${id}/reschedule`)
+      .set("Authorization", auth)
+      .send({ startAt: startAtFor("11:00") })
+      .expect(200);
+    expect((await BookingModel.findById(id).orFail()).schedule.startAt.toISOString()).toBe(
+      startAtFor("11:00"),
+    );
+    await request(app)
+      .post(`${base}/${id}/cancel`)
+      .set("Authorization", auth)
+      .send({ reason: "test" })
+      .expect(200);
+    expect((await BookingModel.findById(id).orFail()).status).toBe("CANCELLED_BY_BUSINESS");
+    const reservation = await BookingSlotReservationModel.findOne({
+      businessId: t.business._id,
+    }).orFail();
+    expect(reservation.intervals).toHaveLength(0);
+  });
+
+  it("7B Supervisor completes an eligible manual booking through the real route", async () => {
+    const t = await setupBookableBusiness();
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const created = await request(app)
+      .post(base)
+      .set("Authorization", auth)
+      .send(validBody(t.service._id, t.membership._id, t.client._id))
+      .expect(201);
+    const id = created.body.data.id as string;
+    await request(app)
+      .post(`${base}/${id}/complete`)
+      .set("Authorization", auth)
+      .send({})
+      .expect(200);
+    expect((await BookingModel.findById(id).orFail()).status).toBe("COMPLETED");
+  });
+
+  it("7B Supervisor marks and reverses a no-show through the real routes", async () => {
+    const t = await setupBookableBusiness();
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const created = await request(app)
+      .post(base)
+      .set("Authorization", auth)
+      .send(validBody(t.service._id, t.membership._id, t.client._id))
+      .expect(201);
+    const id = created.body.data.id as string;
+    const booking = await BookingModel.findById(id).orFail();
+    const start = booking.schedule.startAt.getTime();
+    const openMinutes = booking.noShowEligibilitySnapshot?.opensAfterMinutes ?? 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(start + openMinutes * 60_000));
+    try {
+      const activeAuth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+      await request(app)
+        .post(`${base}/${id}/no-show`)
+        .set("Authorization", activeAuth)
+        .send({})
+        .expect(200);
+      expect((await BookingModel.findById(id).orFail()).status).toBe("PENDING");
+      await request(app)
+        .post(`${base}/${id}/no-show/cancel`)
+        .set("Authorization", activeAuth)
+        .send({})
+        .expect(200);
+      expect((await BookingModel.findById(id).orFail()).status).toBe("NO_SHOW_CANCELLED");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("7B Supervisor can waive a pending no-show charge through the real route", async () => {
+    const t = await setupBookableBusiness();
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const created = await request(app)
+      .post(base)
+      .set("Authorization", auth)
+      .send(validBody(t.service._id, t.membership._id, t.client._id))
+      .expect(201);
+    const id = created.body.data.id as string;
+    const booking = await BookingModel.findById(id).orFail();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(
+      new Date(
+        booking.schedule.startAt.getTime() +
+          (booking.noShowEligibilitySnapshot?.opensAfterMinutes ?? 0) * 60_000,
+      ),
+    );
+    try {
+      const activeAuth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+      await request(app)
+        .post(`${base}/${id}/no-show`)
+        .set("Authorization", activeAuth)
+        .send({})
+        .expect(200);
+      await request(app)
+        .post(`${base}/${id}/waive-fee`)
+        .set("Authorization", activeAuth)
+        .send({ reason: "Customer emergency" })
+        .expect(200);
+      expect((await BookingModel.findById(id).orFail()).status).toBe("NO_SHOW_WAIVED");
+      expect(await PaymentAttemptModel.countDocuments()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("7B Supervisor creates a parallel booking with two distinct assigned professionals", async () => {
+    const t = await setupBookableBusiness();
+    const second = await createStaff(t.business._id);
+    const supervisor = await createStaff(t.business._id, "SUPERVISOR");
+    await staffWorksMondayToFriday(second.membership._id, t.business._id);
+    const secondService = await createFixedService(t.business._id, second.membership._id, 5000);
+    const app = buildApp();
+    const auth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const base = `/businesses/${t.business._id}/bookings`;
+    const lines = [
+      { serviceId: String(t.service._id), staffMembershipId: String(t.membership._id) },
+      { serviceId: String(secondService._id), staffMembershipId: String(second.membership._id) },
+    ];
+    const available = await request(app)
+      .post(`${base}/composite-availability`)
+      .set("Authorization", auth)
+      .send({ fromDate: DATE, toDate: DATE, lines })
+      .expect(200);
+    expect(
+      available.body.data.days[0].slots.some(
+        (slot: { startAt: string }) => slot.startAt === startAtFor("10:00"),
+      ),
+    ).toBe(true);
+    const body = {
+      ...validBody(t.service._id, t.membership._id, t.client._id),
+      serviceLines: lines.map((line) => ({ ...line, addonIds: [], pricingInput: {} })),
+    };
+    const result = await request(app).post(base).set("Authorization", auth).send(body).expect(201);
+    const booking = await BookingModel.findById(result.body.data.id).orFail();
+    expect(
+      booking.serviceLines.map((line) => String(line.responsibleStaffMembershipId)).sort(),
+    ).toEqual([String(t.membership._id), String(second.membership._id)].sort());
+    expect(await BookingSlotReservationModel.countDocuments({ businessId: t.business._id })).toBe(
+      2,
+    );
   });
 
   it("rejects a STAFF token outright (403) — Staff has no booking-management permission", async () => {

@@ -22,7 +22,20 @@ export const toDashboardOverviewDto = (overview: DashboardOverview) => ({
   period: overview.period,
   todayBookingsCount: overview.todayBookingsCount,
   todayRemainingCount: overview.todayRemainingCount,
-  schedule: overview.schedule,
+  ...(overview.noShowCount !== undefined ? { noShowCount: overview.noShowCount } : {}),
+  schedule:
+    overview.scope === "STAFF_SCOPED"
+      ? overview.schedule.map(
+          ({
+            totalPaymentCents,
+            platformFeeCents,
+            remainingFeeCents,
+            staffName,
+            leadType,
+            ...row
+          }) => row,
+        )
+      : overview.schedule,
   timeline: overview.timeline,
   financials: overview.financials
     ? {

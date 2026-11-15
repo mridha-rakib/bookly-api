@@ -106,7 +106,7 @@ export const startTestBrowser = async () => {
           break;
         await delay(25);
       }
-      return { evaluate };
+      return { evaluate, command };
     };
     return { page, close };
   } catch (error) {

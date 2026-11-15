@@ -42,6 +42,7 @@ export async function issueAuthSession(
     role: UserRole;
     status: string;
     twoFactorEnabled?: boolean | undefined;
+    credentialStamp?: Date | undefined;
   },
   context: RequestContext,
   session?: ClientSession,
@@ -52,6 +53,7 @@ export async function issueAuthSession(
       _id: user.userId,
       role: user.role,
       twoFactorEnabled: true,
+      ...(user.credentialStamp ? { credentialStamp: user.credentialStamp } : {}),
     });
   }
   // The refresh family comes first: the access token is bound to it (`sid`), so revoking the
@@ -59,6 +61,7 @@ export async function issueAuthSession(
   const refreshSession = await tokenService.createRefreshSession(
     {
       userId: user.userId,
+      ...(user.credentialStamp ? { credentialStamp: user.credentialStamp } : {}),
       ...(verifiedFactorVersion === undefined ? {} : { twoFactorVersion: verifiedFactorVersion }),
       ...(context.userAgent ? { userAgent: context.userAgent } : {}),
       ...(context.ipAddress ? { ipAddress: context.ipAddress } : {}),

@@ -20,6 +20,8 @@ import {
   type PackageConsentServices,
   packageConsentOperationKey,
 } from "../../../src/modules/booking/package-consent.route.js";
+import { verifyCertifiedPackageConsent } from "../../../src/modules/booking/package-consent-certification.js";
+import { PackageConsentEvidenceModel } from "../../../src/modules/booking/package-consent-evidence.js";
 import * as hostClock from "../../../src/modules/booking/trusted-time/host-clock.js";
 import * as qualifiedHost from "../../../src/modules/booking/trusted-time/qualified-host.js";
 import { BusinessOpeningHoursModel } from "../../../src/modules/business-hours/business-hours.model.js";
@@ -643,6 +645,17 @@ describe("gated consent-only HTTP adapter; real auth/CAS with synthetic domain r
       .set("Authorization", s.auth)
       .send({});
     const { certification, purchaseAvailable, ...accepted } = result.body.data;
+    expect(certification).toBe("CERTIFIED");
+    const acceptedClaim = await BookingCreationClaimModel.findOne().orFail();
+    expect(acceptedClaim.actorUserId.toString()).toBe(String(f.context.customerUserId));
+    expect(acceptedClaim.businessId.toString()).toBe(String(f.business._id));
+    expect(await verifyCertifiedPackageConsent(acceptedClaim.toObject())).toBeTruthy();
+    expect(
+      await PackageConsentEvidenceModel.countDocuments({
+        operationKey: acceptedClaim.idempotencyKey,
+        phase: "CERTIFICATION",
+      }),
+    ).toBe(1);
     expect(replay.body.data.accepted).toEqual(accepted);
     expect(replay.body.data.certification).toBe(certification);
     expect(replay.body.data.purchaseAvailable).toBe(purchaseAvailable);

@@ -254,6 +254,7 @@ export class BookingRepository {
     dayStart: Date,
     dayEnd: Date,
     staffMembershipId?: Types.ObjectId | string,
+    page = 0,
   ): Promise<BookingDocument[]> {
     const query: Record<string, unknown> = {
       businessId,
@@ -264,7 +265,8 @@ export class BookingRepository {
     }
 
     return BookingModel.find(query)
-      .sort({ "schedule.startAt": 1 })
+      .sort({ "schedule.startAt": 1, _id: 1 })
+      .skip(page * MAX_DASHBOARD_SCHEDULE_ROWS)
       .limit(MAX_DASHBOARD_SCHEDULE_ROWS)
       .exec();
   }

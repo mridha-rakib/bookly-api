@@ -33,6 +33,7 @@ import { formatFulfilmentAddress } from "./booking-email-data.js";
 export type BookingRescheduledEmailServiceLine = {
   name: string;
   durationMin: number;
+  staffName?: string;
 };
 
 export type BookingRescheduledEmailData = {
@@ -94,10 +95,19 @@ export const buildBookingRescheduledEmailData = (
     newTime: formatTimeInTimezone(newStart, tz),
     durationMin: durationMinutesBetween(newStart, newEnd),
     venueTimezone: tz,
-    services: booking.serviceLines.map((line) => ({
-      name: line.serviceSnapshot.name,
-      durationMin: line.serviceSnapshot.durationMin,
-    })),
+    services: booking.serviceLines.map((line) => {
+      const staffName = line.staffSnapshot
+        ? [line.staffSnapshot.firstName, line.staffSnapshot.lastName]
+            .filter(Boolean)
+            .join(" ")
+            .trim()
+        : "";
+      return {
+        name: line.serviceSnapshot.name,
+        durationMin: line.serviceSnapshot.durationMin,
+        ...(staffName ? { staffName } : {}),
+      };
+    }),
     fulfilment: {
       kind: booking.fulfilment.mode as "AT_BUSINESS_LOCATION" | "TRAVEL_TO_CUSTOMER",
       address: formatFulfilmentAddress(booking),
@@ -119,7 +129,7 @@ const detailRow = (label: string, value: string): string =>
   `</tr>`;
 
 const serviceSummary = (line: BookingRescheduledEmailServiceLine): string =>
-  `${line.name} (${line.durationMin} min)`;
+  `${line.name} (${line.durationMin} min${line.staffName ? ` · ${line.staffName}` : ""})`;
 
 export const renderBookingRescheduledCustomerEmail = (
   data: BookingRescheduledEmailData,

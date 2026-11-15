@@ -25,6 +25,8 @@ export type SessionEndReminderEmailData = {
   customerName: string;
   businessName: string;
   serviceName: string;
+  /** Parallel lines share a booking end; it need not be each service's end. */
+  bookingLevel?: boolean;
   /** Business/venue-local, from `Booking.schedule.timezone`. */
   endDate: string;
   endTime: string;
@@ -47,6 +49,7 @@ export const buildSessionEndReminderEmailData = (
     customerName: booking.customer.contact.firstName,
     businessName: context.businessName,
     serviceName: booking.serviceLines[0]?.serviceSnapshot.name ?? "your session",
+    ...(booking.serviceLines.length > 1 ? { bookingLevel: true } : {}),
     endDate: formatDateInTimezone(booking.schedule.endAt, tz),
     endTime: formatTimeInTimezone(booking.schedule.endAt, tz),
     venueTimezone: tz,
@@ -55,12 +58,11 @@ export const buildSessionEndReminderEmailData = (
 };
 
 export const renderSessionEndReminderEmail = (data: SessionEndReminderEmailData): RenderedEmail => {
+  const subject = data.bookingLevel ? "your booking" : `your session for ${data.serviceName}`;
   const contentHtml =
     emailTitle("Your session is ending soon") +
     emailParagraph(
-      `Hi ${escapeHtml(data.customerName)}, your session for ${escapeHtml(
-        data.serviceName,
-      )} with ${escapeHtml(data.businessName)} is scheduled to end at ${escapeHtml(
+      `Hi ${escapeHtml(data.customerName)}, ${escapeHtml(subject)} with ${escapeHtml(data.businessName)} is scheduled to end at ${escapeHtml(
         data.endTime,
       )} on ${escapeHtml(data.endDate)}.`,
     ) +
@@ -69,7 +71,7 @@ export const renderSessionEndReminderEmail = (data: SessionEndReminderEmailData)
   const contentText = [
     "Your session is ending soon",
     "",
-    `Hi ${data.customerName}, your session for ${data.serviceName} with ${data.businessName} is scheduled to end at ${data.endTime} on ${data.endDate}.`,
+    `Hi ${data.customerName}, ${subject} with ${data.businessName} is scheduled to end at ${data.endTime} on ${data.endDate}.`,
     "",
     `Times are shown in the venue's local timezone (${data.venueTimezone}).`,
     "",

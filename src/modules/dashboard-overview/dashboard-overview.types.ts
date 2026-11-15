@@ -9,10 +9,8 @@ import type {
  * The Business Owner/Supervisor/Staff dashboard "Overview" screen's real backend shape — see
  * DashboardOverview.tsx/SupervisorOverview.tsx/StaffOverview.tsx's own mock data this replaces.
  *
- * `FULL` (BUSINESS_OWNER, SUPERVISOR): every field populated, including `financials` — no
- * product rule currently authorizes STAFF to see Business-wide financial figures (matches
- * FinanceService's own "no canonical product rule granting... Supervisor financial access... [is
- * even narrower]" precedent — Overview is deliberately narrower still for STAFF).
+ * `FULL` (BUSINESS_OWNER, SUPERVISOR): business-wide operational data. Only the Owner receives
+ * `financials`; Supervisors receive the separate operational no-show count.
  * `STAFF_SCOPED`: `schedule`/`timeline` contain ONLY this Staff member's own bookings today
  * (never the whole Business's), and `financials` is `null` entirely — matches
  * StaffOverview.tsx's own mock UI, which never renders a financial card for Staff.
@@ -99,8 +97,10 @@ export type DashboardOverview = {
   todayBookingsCount: number;
   /** Bookings today still `UPCOMING` and not yet started. */
   todayRemainingCount: number;
+  /** Operational count for Owners and Supervisors; omitted for Staff. */
+  noShowCount?: number;
   schedule: DashboardOverviewScheduleRow[];
   timeline: DashboardOverviewTimelineEntry[];
-  /** `null` for `STAFF_SCOPED` — see this type's own doc comment. */
+  /** Owner-only; null for Supervisors and Staff. */
   financials: DashboardOverviewFinancials | null;
 };

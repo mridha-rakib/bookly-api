@@ -1,7 +1,7 @@
 import express from "express";
 import { Types } from "mongoose";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
@@ -10,6 +10,7 @@ import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import { createCustomerBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
@@ -21,18 +22,22 @@ import { BookingFinancialTransactionService } from "../../../src/modules/booking
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { BusinessPayoutModel } from "../../../src/modules/finance/business-payout.model.js";
 import { BusinessPayoutRepository } from "../../../src/modules/finance/business-payout.repository.js";
 import { BusinessPayoutService } from "../../../src/modules/finance/business-payout.service.js";
 import { FinanceError } from "../../../src/modules/finance/finance.errors.js";
 import { FinanceService } from "../../../src/modules/finance/finance.service.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
+import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { encryptIban } from "../../../src/modules/payout-destination/payout-destination.crypto.js";
 import { PayoutDestinationRepository } from "../../../src/modules/payout-destination/payout-destination.repository.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
@@ -371,11 +376,21 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
   const setupBookableBusiness = async (priceCents = 8000) => {
     const { owner, business } = await createBusiness("Salon A");
+    const approved = await businessRepository.casUpdateStatus(
+      business._id,
+      ["PENDING"],
+      "APPROVED",
+      {
+        fromStatus: "PENDING",
+        actorUserId: owner._id,
+        changedAt: new Date(),
+      },
+    );
     const { membership } = await createStaff(business._id);
     const service = await createFixedService(business._id, membership._id, priceCents);
     await openMondayToFriday(business._id, owner._id);
     await staffWorksMondayToFriday(membership._id, business._id);
-    return { owner, business, membership, service };
+    return { owner, business: approved ?? business, membership, service };
   };
 
   const finalizeInput = (serviceId: Types.ObjectId, staffId: Types.ObjectId, time = "10:00") => ({
@@ -465,7 +480,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
   const bearerFor = async (
     userId: Types.ObjectId | string,
-    role: "SUPER_ADMIN" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF",
+    role: "SUPER_ADMIN" | "BUSINESS_OWNER" | "SUPERVISOR" | "STAFF" | "CUSTOMER",
   ) => `Bearer ${await issueTestAccessToken(tokenService, { userId, role })}`;
 
   // --- 1/2: first booking PLATFORM_FEE is Bookly's; its Stripe fee is NOT Business-borne -----
@@ -581,15 +596,17 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (cancelBooking.status !== "confirmed") throw new Error("expected confirmed");
-    await BookingModel.updateOne(
-      { _id: cancelBooking.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
-    await lifecycleService.cancelByCustomer(
-      String(cancelCustomer._id),
-      String(cancelBooking.booking._id),
-      "x",
-    );
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(cancelBooking.booking.schedule.startAt.getTime() - 60 * 60 * 1000));
+    try {
+      await lifecycleService.cancelByCustomer(
+        String(cancelCustomer._id),
+        String(cancelBooking.booking._id),
+        "x",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
 
     const payable = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
     expect(payable.noShowAmountCents).toBeGreaterThan(0);
@@ -635,16 +652,18 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       finalizeInput(service._id, membership._id, "14:00"),
     );
     if (failBooking.status !== "confirmed") throw new Error("expected confirmed");
-    await BookingModel.updateOne(
-      { _id: failBooking.booking._id },
-      { $set: { "schedule.startAt": new Date(Date.now() + 60 * 60 * 1000) } },
-    ).exec();
     paymentGateway.queueNextChargeOutcome("failed");
-    await lifecycleService.cancelByCustomer(
-      String(failCustomer._id),
-      String(failBooking.booking._id),
-      "x",
-    );
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(failBooking.booking.schedule.startAt.getTime() - 60 * 60 * 1000));
+    try {
+      await lifecycleService.cancelByCustomer(
+        String(failCustomer._id),
+        String(failBooking.booking._id),
+        "x",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
 
     const payable = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
     expect(payable.noShowAmountCents).toBe(0);
@@ -1054,6 +1073,177 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
   // --- 19: cents-only, no floating point issues ------------------------------------------------
 
+  it("serves persisted platform fees through authorized HTTP with identity, currency and pagination", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
+    const first = await bookFirstTimeCustomer(
+      business,
+      owner,
+      membership,
+      service,
+      "http1",
+      "09:00",
+    );
+    await bookFirstTimeCustomer(business, owner, membership, service, "http2", "11:00");
+    const admin = await userRepository.create({
+      normalizedEmail: `admin-finance-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+    });
+    const app = buildSuperAdminApp();
+    const query = {
+      from: new Date(Date.now() - 86_400_000).toISOString(),
+      to: new Date(Date.now() + 86_400_000).toISOString(),
+      types: "PLATFORM_FEE",
+      limit: "1",
+    };
+    const token = await bearerFor(admin._id, "SUPER_ADMIN");
+    const page1 = await request(app)
+      .get("/super-admin/finance/transactions")
+      .query({ ...query, page: "1" })
+      .set("Authorization", token);
+    const page2 = await request(app)
+      .get("/super-admin/finance/transactions")
+      .query({ ...query, page: "2" })
+      .set("Authorization", token);
+    expect(page1.status).toBe(200);
+    expect(page2.status).toBe(200);
+    expect(page1.body.data.pagination).toEqual({ page: 1, limit: 1, total: 2 });
+    expect(page2.body.data.pagination).toEqual({ page: 2, limit: 1, total: 2 });
+    const rows = [...page1.body.data.transactions, ...page2.body.data.transactions];
+    expect(new Set(rows.map((row) => row.id)).size).toBe(2);
+    const row = rows.find((item) => item.bookingId === String(first.booking._id));
+    expect(row).toMatchObject({
+      businessId: String(business._id),
+      businessName: business.name,
+      bookingReference: first.booking.reference,
+      customerName: [
+        first.booking.customer.contact.firstName,
+        first.booking.customer.contact.lastName,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      type: "PLATFORM_FEE",
+      status: "SUCCEEDED",
+      owner: "BOOKLY",
+      grossCents: first.booking.financials.platformFeeCents,
+      netCents: first.booking.financials.platformFeeCents,
+      currency: "EUR",
+    });
+    expect(JSON.stringify(row)).not.toMatch(/clientSecret|passwordHash|providerReference/i);
+    const denied = await request(app)
+      .get("/super-admin/finance/transactions")
+      .query(query)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"));
+    expect(denied.status).toBe(403);
+    const ledgerBefore = await BookingFinancialTransactionModel.find().lean();
+    const payoutsBefore = await BusinessPayoutModel.find().lean();
+    await request(app)
+      .post(`/super-admin/businesses/${business._id}/finance/payouts`)
+      .set("Authorization", await bearerFor(owner._id, "BUSINESS_OWNER"))
+      .send({})
+      .expect(403);
+    expect(await BookingFinancialTransactionModel.find().lean()).toEqual(ledgerBefore);
+    expect(await BusinessPayoutModel.find().lean()).toEqual(payoutsBefore);
+  });
+
+  it("3.7F serializes fee and refund statuses from persisted ledger rows", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
+    const { booking } = await bookFirstTimeCustomer(
+      business,
+      owner,
+      membership,
+      service,
+      "status-http",
+    );
+    const admin = await userRepository.create({
+      normalizedEmail: `finance-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+    });
+    const entries = [
+      ["NO_SHOW_FEE", "PENDING", 111],
+      ["NO_SHOW_FEE", "FAILED", 222],
+      ["NO_SHOW_FEE", "WAIVED", 333],
+      ["NO_SHOW_FEE", "SUCCEEDED", 444],
+      ["REFUND", "PENDING", 555],
+      ["REFUND", "FAILED", 666],
+      ["REFUND", "SUCCEEDED", 777],
+    ] as const;
+    for (const [type, status, amountCents] of entries) {
+      await BookingFinancialTransactionModel.create({
+        businessId: business._id,
+        bookingId: booking._id,
+        businessClientId: booking.customer.businessClientId,
+        customerUserId: booking.customer.customerUserId,
+        type,
+        status,
+        direction: type === "REFUND" ? "DEBIT" : "CREDIT",
+        amountCents,
+        currency: "EUR",
+      });
+    }
+    const app = buildSuperAdminApp();
+    const token = await bearerFor(admin._id, "SUPER_ADMIN");
+    const query = {
+      from: new Date(Date.now() - 86400000).toISOString(),
+      to: new Date(Date.now() + 86400000).toISOString(),
+      limit: "20",
+    };
+    const fees = await request(app)
+      .get("/super-admin/finance/transactions")
+      .query({ ...query, types: "NO_SHOW_FEE" })
+      .set("Authorization", token)
+      .expect(200);
+    const refunds = await request(app)
+      .get("/super-admin/finance/transactions")
+      .query({ ...query, types: "REFUND" })
+      .set("Authorization", token)
+      .expect(200);
+    expect(fees.body.data.pagination.total).toBe(4);
+    expect(refunds.body.data.pagination.total).toBe(3);
+    const fee = await BookingFinancialTransactionModel.findOne({
+      businessId: business._id,
+      type: "NO_SHOW_FEE",
+      status: "SUCCEEDED",
+    }).orFail();
+    await BusinessPayoutModel.create({
+      businessId: business._id,
+      periodStart: new Date("2030-01-01T00:00:00Z"),
+      periodEnd: new Date("2030-01-02T00:00:00Z"),
+      grossBusinessOwnedCents: 444,
+      processingFeesCents: 0,
+      refundsCents: 0,
+      netPayoutCents: 444,
+      currency: "EUR",
+      status: "PAID",
+      settledTransactionIds: [fee._id],
+      initiatedByUserId: admin._id,
+    });
+    const payouts = await request(app)
+      .get("/super-admin/finance/payouts")
+      .set("Authorization", token)
+      .expect(200);
+    expect(payouts.body.data.payouts[0]).toMatchObject({
+      businessId: String(business._id),
+      netPayoutCents: 444,
+      currency: "EUR",
+      status: "PAID",
+    });
+    for (const [type, status, amount] of entries) {
+      const rows = type === "REFUND" ? refunds.body.data.transactions : fees.body.data.transactions;
+      expect(rows.find((row: { grossCents: number }) => row.grossCents === amount)).toMatchObject({
+        type,
+        status,
+        grossCents: amount,
+        netCents: status === "SUCCEEDED" ? amount : 0,
+        currency: "EUR",
+        bookingId: String(booking._id),
+      });
+    }
+  });
+
   it("every computed total is an integer number of cents", async () => {
     const { owner, business, membership, service } = await setupBookableBusiness(8000);
     const customer = await createCustomer("cents");
@@ -1105,6 +1295,93 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
   // --- 14/15/16: authorization (HTTP-level, real route + real auth middleware) ----------------
 
   describe("authorization (route-level)", () => {
+    it("denies an active supervisor payout mutation without changing financial records", async () => {
+      const { owner, business, membership, service } = await setupBookableBusiness(8000);
+      await bookFirstTimeCustomer(business, owner, membership, service, "supervisor-denial");
+      const supervisor = await userRepository.create({
+        normalizedEmail: `supervisor-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPERVISOR",
+        status: "ACTIVE",
+      });
+      await staffRepository.create({
+        userId: supervisor._id,
+        businessId: business._id,
+        role: "SUPERVISOR",
+        createdByUserId: owner._id,
+      });
+      const snapshot = () =>
+        Promise.all([
+          BookingFinancialTransactionModel.find().lean(),
+          PaymentAttemptModel.find().lean(),
+          RefundOperationModel.find().lean(),
+          BusinessPayoutModel.find().lean(),
+        ]);
+      const before = await snapshot();
+      const app = buildSuperAdminApp();
+      await request(app)
+        .post(`/super-admin/businesses/${business._id}/finance/payouts`)
+        .set("Authorization", await bearerFor(supervisor._id, "SUPERVISOR"))
+        .send({})
+        .expect(403);
+      expect(await snapshot()).toEqual(before);
+      const admin = await userRepository.create({
+        normalizedEmail: `admin-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPER_ADMIN",
+        status: "ACTIVE",
+      });
+      await request(app)
+        .get("/super-admin/finance/pending-payouts")
+        .set("Authorization", await bearerFor(admin._id, "SUPER_ADMIN"))
+        .expect(200);
+    });
+
+    it("denies customer business finance reads while preserving own booking access", async () => {
+      const a = await setupBookableBusiness(8000);
+      const b = await setupBookableBusiness(8000);
+      const own = await bookFirstTimeCustomer(
+        a.business,
+        a.owner,
+        a.membership,
+        a.service,
+        "finance-own",
+      );
+      const other = await bookFirstTimeCustomer(
+        b.business,
+        b.owner,
+        b.membership,
+        b.service,
+        "finance-other",
+      );
+      const app = buildSuperAdminApp();
+      app.use("/businesses", createBusinessRoute());
+      app.use("/me", createCustomerBookingRoute());
+      app.use(createErrorHandler({ isProduction: true }));
+      const token = await bearerFor(own.customer._id, "CUSTOMER");
+      const period = {
+        from: new Date(Date.now() - 86400000).toISOString(),
+        to: new Date(Date.now() + 86400000).toISOString(),
+      };
+      for (const business of [a.business, b.business]) {
+        const response = await request(app)
+          .get(`/businesses/${business._id}/finance/transactions`)
+          .query(period)
+          .set("Authorization", token)
+          .expect(403);
+        expect(response.body.data).toBeUndefined();
+      }
+      const result = await request(app)
+        .get(`/me/bookings/${own.booking._id}`)
+        .set("Authorization", token)
+        .expect(200);
+      expect(result.body.data.id).toBe(String(own.booking._id));
+      await request(app)
+        .get(`/me/bookings/${other.booking._id}`)
+        .set("Authorization", token)
+        .expect(404);
+    });
+
     it("denies a Business Owner from triggering a payout", async () => {
       const { owner, business } = await setupBookableBusiness(8000);
       const app = buildSuperAdminApp();

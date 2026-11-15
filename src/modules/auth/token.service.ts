@@ -128,6 +128,7 @@ export class TokenService {
     input: {
       userId: Types.ObjectId;
       authenticatedAt?: Date;
+      credentialStamp?: Date;
       twoFactorVersion?: number;
       userAgent?: string;
       ipAddress?: string;
@@ -140,6 +141,7 @@ export class TokenService {
 
     const createInput = {
       userId: input.userId,
+      ...(input.credentialStamp ? { credentialStamp: input.credentialStamp } : {}),
       authenticatedAt: input.authenticatedAt ?? new Date(),
       ...(input.twoFactorVersion === undefined ? {} : { twoFactorVersion: input.twoFactorVersion }),
       refreshTokenHash: sha256(refreshToken),

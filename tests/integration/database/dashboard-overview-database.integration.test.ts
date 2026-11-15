@@ -1,5 +1,5 @@
 import { Types } from "mongoose";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   businessLocalToUtc,
@@ -296,7 +296,7 @@ describe("database-backed Dashboard Overview", () => {
     expect(noShowActivity?.customerName).toBe("Jane Doe");
   });
 
-  it("gives an active Supervisor of the same Business the same full Overview", async () => {
+  it("gives an active Supervisor operational data without Owner financial aggregates", async () => {
     const { owner, business } = await createBusiness();
     const { membership } = await createStaffMember(business._id, "STAFF");
     const { staffUser: supervisorUser } = await createStaffMember(business._id, "SUPERVISOR");
@@ -311,7 +311,19 @@ describe("database-backed Dashboard Overview", () => {
         startAt: todayAt("09:00"),
       }),
     );
+    await bookingRepository.create(
+      buildBookingInput({
+        businessId: business._id,
+        clientId: client._id,
+        staffMembershipId: membership._id,
+        actorUserId: owner._id,
+        startAt: todayAt("11:00"),
+        status: "NO_SHOW_CHARGED",
+      }),
+    );
 
+    const financeRead = vi.spyOn(financeService, "getNetPayoutForBusiness");
+    const ledgerRead = vi.spyOn(financialTransactionService, "listRecentForBusiness");
     const overview = await service.getOverview(
       String(supervisorUser._id),
       "SUPERVISOR",
@@ -319,8 +331,12 @@ describe("database-backed Dashboard Overview", () => {
     );
 
     expect(overview.scope).toBe("FULL");
-    expect(overview.todayBookingsCount).toBe(1);
-    expect(overview.financials).not.toBeNull();
+    expect(overview.todayBookingsCount).toBe(2);
+    expect(overview.noShowCount).toBe(1);
+    expect(overview.schedule).toHaveLength(2);
+    expect(overview.financials).toBeNull();
+    expect(financeRead).not.toHaveBeenCalled();
+    expect(ledgerRead).not.toHaveBeenCalled();
   });
 
   it("inactive Supervisor cannot retain the FULL financial Overview; Owner scope survives", async () => {

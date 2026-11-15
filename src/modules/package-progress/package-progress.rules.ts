@@ -63,7 +63,7 @@ export type PackageProgressStatus = "ACTIVE" | "AWAITING_BALANCE" | "DEPLETED" |
 /** One shared derived status for customer Package detail and Business Booking detail. */
 export const derivePackageProgressStatus = (
   progress: Pick<PackageProgressDocument, "remainingSessions" | "voidedAt">,
-  settlement: PackageBalanceSettlement,
+  settlement: Pick<PackageBalanceSettlement, "balanceSettled">,
 ): PackageProgressStatus =>
   progress.voidedAt
     ? "VOIDED"
@@ -77,7 +77,7 @@ export const derivePackageProgressStatus = (
  * entitlement, and completion of session 1 is deliberately irrelevant. */
 export const isPackageSchedulingUnlocked = (
   progress: Pick<PackageProgressDocument, "remainingSessions" | "voidedAt">,
-  settlement: PackageBalanceSettlement,
+  settlement: Pick<PackageBalanceSettlement, "balanceSettled">,
 ): boolean => derivePackageProgressStatus(progress, settlement) === "ACTIVE";
 
 /**

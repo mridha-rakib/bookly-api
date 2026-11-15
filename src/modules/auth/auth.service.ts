@@ -186,6 +186,7 @@ export class AuthService {
         role: user.role,
         status: user.status,
         twoFactorEnabled: user.twoFactorEnabled,
+        credentialStamp: user.security?.passwordUpdatedAt,
       },
       context,
     );

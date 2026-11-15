@@ -1,6 +1,9 @@
 import { AppError, type ErrorDetail } from "../../common/errors/app-error.js";
 
 const defaultMessages: Record<string, string> = {
+  AVAILABILITY_COMPOSITE_CONFLICT:
+    "Parallel services require distinct professionals and ordinary services",
+  AVAILABILITY_TOO_MANY_SERVICES: "Too many services for one booking",
   AVAILABILITY_BUSINESS_NOT_FOUND: "Business not found",
   AVAILABILITY_SERVICE_NOT_FOUND: "Service not found for this business",
   AVAILABILITY_STAFF_NOT_FOUND: "Staff member not found for this business",

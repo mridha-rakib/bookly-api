@@ -1,5 +1,5 @@
 import { Router } from "express";
-
+import { sendSuccess } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { AddonRepository } from "../addons/addon.repository.js";
@@ -18,6 +18,8 @@ import { BusinessBookingSettingsRepository } from "../business-booking-settings/
 import { BusinessHoursRepository } from "../business-hours/business-hours.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../client/client.repository.js";
+import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
@@ -25,8 +27,15 @@ import { StaffScheduleRepository } from "../staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../staff/staff-time-off.repository.js";
 import { UserRepository } from "../user/user.repository.js";
 import { AvailabilityController } from "./availability.controller.js";
-import { availabilityParamsSchema, getAvailabilityQuerySchema } from "./availability.schema.js";
+import {
+  availabilityParamsSchema,
+  type CompositeAvailabilityBody,
+  compositeAvailabilityBodySchema,
+  compositeAvailabilityParamsSchema,
+  getAvailabilityQuerySchema,
+} from "./availability.schema.js";
 import { AvailabilityService } from "./availability.service.js";
+import { CompositeAvailabilityService } from "./composite-availability.service.js";
 
 /**
  * A standalone, top-level route (not nested under business.route.ts's Owner-only gate) —
@@ -77,6 +86,34 @@ export const createAvailabilityRoute = (): Router => {
   );
 
   const controller = new AvailabilityController(availabilityService, bookingService);
+
+  const composite = new CompositeAvailabilityService(
+    availabilityService,
+    serviceRepository,
+    new PlatformSettingsService(new PlatformSettingsRepository()),
+  );
+  router.post(
+    "/:businessId/bookings/composite-availability",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
+    validateRequest({
+      params: compositeAvailabilityParamsSchema,
+      body: compositeAvailabilityBodySchema,
+    }),
+    asyncHandler(async (req, res) => {
+      const { businessId } = (req.validated?.params ?? {}) as { businessId: string };
+      if (!req.auth) throw new Error("Authenticated user missing");
+      const { userId, role } = req.auth;
+      await bookingService.requireBookingManagementAccess(userId, role, businessId);
+      sendSuccess(
+        res,
+        200,
+        "Composite availability",
+        await composite.get(businessId, req.validated?.body as CompositeAvailabilityBody),
+      );
+    }),
+  );
 
   router.get(
     "/:businessId/services/:serviceId/availability",

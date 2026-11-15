@@ -6,22 +6,9 @@ export type PlatformSettingsPatch = {
 };
 
 export class PlatformSettingsRepository {
-  /**
-   * Lazily materialises the singleton with schema defaults on first ever read. `$setOnInsert`
-   * only fires on insert, so an existing admin-edited document is returned untouched — a
-   * restart / fresh process never overwrites persisted edits.
-   */
-  public async getOrCreate(): Promise<PlatformSettingsDocument> {
-    return PlatformSettingsModel.findOneAndUpdate(
-      { key: "SINGLETON" },
-      { $setOnInsert: { key: "SINGLETON" } },
-      {
-        returnDocument: "after",
-        upsert: true,
-        setDefaultsOnInsert: true,
-        runValidators: true,
-      },
-    ).orFail();
+  /** Read only: an absent singleton is handled by the service without persisting defaults. */
+  public async findSingleton(): Promise<PlatformSettingsDocument | null> {
+    return PlatformSettingsModel.findOne({ key: "SINGLETON" }).exec();
   }
 
   public async update(patch: PlatformSettingsPatch): Promise<PlatformSettingsDocument> {

@@ -141,13 +141,43 @@ export class PackageViewService {
       .maxTimeMS(2000)
       .exec();
     const view = toCustomerPackageView(progress, bookings);
+    const session = view.sessions.find((s) => s.bookingId === bookingId) ?? null;
+    if (supervisor) {
+      const appointment = session?.booking;
+      return {
+        originBookingId: view.originBookingId,
+        packageProgressId: String(progress._id),
+        purchaseCompletion: await readPackagePurchaseCompletion(progress),
+        session: session
+          ? {
+              bookingId: session.bookingId,
+              itemId: session.itemId,
+              status: session.status,
+              restoration: session.restoration,
+              booking: appointment
+                ? {
+                    status: appointment.status,
+                    role: appointment.role,
+                    startAt: appointment.startAt,
+                    endAt: appointment.endAt,
+                    timezone: appointment.timezone,
+                    staffId: appointment.staffId,
+                    staffName: appointment.staffName,
+                    occupiedDurationMin: appointment.occupiedDurationMin,
+                  }
+                : null,
+            }
+          : null,
+        actionsAvailable: false as const,
+      };
+    }
     return {
       originBookingId: view.originBookingId,
       packageProgressId: String(progress._id),
       purchaseCompletion: await readPackagePurchaseCompletion(progress),
       purchaseFinancials: view.purchaseFinancials,
       ...(await readPackageOperationViews(progress)),
-      session: view.sessions.find((s) => s.bookingId === bookingId) ?? null,
+      session,
       actionsAvailable: false as const,
     };
   }

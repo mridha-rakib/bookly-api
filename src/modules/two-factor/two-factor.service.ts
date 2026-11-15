@@ -130,11 +130,16 @@ export class TwoFactorService {
   }
 
   public async requireSecondFactor(
-    user: Pick<UserDocument, "_id" | "role" | "twoFactorEnabled">,
+    user: Pick<UserDocument, "_id" | "role" | "twoFactorEnabled"> & { credentialStamp?: Date },
   ): Promise<void> {
     if (!professionalRoles.includes(user.role) || !user.twoFactorEnabled) return;
     const current = await this.user(String(user._id));
-    if (!current.twoFactorEnabled) throw new AuthError("TWO_FACTOR_CONFLICT", 409);
+    if (
+      !current.twoFactorEnabled ||
+      (user.credentialStamp &&
+        current.security.passwordUpdatedAt.getTime() !== user.credentialStamp.getTime())
+    )
+      throw new AuthError("TWO_FACTOR_CONFLICT", 409);
     await this.reserve(String(user._id));
     const token = opaqueToken();
     await TwoFactorChallengeModel.create({

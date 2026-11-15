@@ -10,6 +10,7 @@ import {
 import { toBookingPackageSessionIdentityDtos } from "../booking/booking.dto.js";
 import type { BookingDocument } from "../booking/booking.model.js";
 import type { BookingRepository } from "../booking/booking.repository.js";
+import { bookingDeliveryPurchaseVerified } from "../booking/booking-email-delivery-eligibility.js";
 import type { BookingFinancialTransactionDocument } from "../booking-financial-transaction/booking-financial-transaction.model.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessDocument } from "../business/business.model.js";
@@ -93,25 +94,49 @@ export class DashboardOverviewService {
     const dayEnd = businessLocalToUtc(business.timezone, addCalendarDays(toDate, 1), "00:00");
 
     const staffMembershipId = scope.kind === "STAFF" ? scope.staffMembershipId : undefined;
-    const todaysBookings = await this.bookingRepository.findScheduleForBusinessOnDate(
+    let todaysBookings = await this.bookingRepository.findScheduleForBusinessOnDate(
       business._id,
       dayStart,
       dayEnd,
       staffMembershipId,
     );
+    let staffCount = 0;
+    let staffRemaining = 0;
+    if (staffMembershipId) {
+      const visible: BookingDocument[] = [];
+      let batch = todaysBookings;
+      let page = 0;
+      while (batch.length) {
+        for (const booking of batch) {
+          if (!(await bookingDeliveryPurchaseVerified(booking))) continue;
+          staffCount++;
+          if (booking.status === "UPCOMING" && booking.schedule.startAt >= now) staffRemaining++;
+          if (visible.length < 200) visible.push(booking);
+        }
+        if (batch.length < 200) break;
+        batch = await this.bookingRepository.findScheduleForBusinessOnDate(
+          business._id,
+          dayStart,
+          dayEnd,
+          staffMembershipId,
+          ++page,
+        );
+      }
+      todaysBookings = visible;
+    }
 
     const schedule = todaysBookings.map((booking) =>
-      this.toScheduleRow(booking, business.timezone),
+      this.toScheduleRow(booking, business.timezone, staffMembershipId),
     );
     const timeline = todaysBookings.map((booking) =>
-      this.toTimelineEntry(booking, business.timezone),
+      this.toTimelineEntry(booking, business.timezone, staffMembershipId),
     );
     const todayRemainingCount = todaysBookings.filter(
       (booking) => booking.status === "UPCOMING" && booking.schedule.startAt >= now,
     ).length;
 
     const financials =
-      scope.kind === "FULL"
+      scope.kind === "FULL" && actorRole === "BUSINESS_OWNER"
         ? await this.buildFinancials(
             business,
             dateStr,
@@ -119,23 +144,45 @@ export class DashboardOverviewService {
             selection ? { from: dayStart, to: dayEnd } : undefined,
           )
         : null;
-    const totals = selection
-      ? await this.bookingRepository.getOverviewRangeTotals(
-          business._id,
-          dayStart,
-          dayEnd,
-          now,
-          staffMembershipId,
-        )
-      : undefined;
+    // Supervisors retain the operational no-show count without receiving the owner-only
+    // ledger, payout, revenue or aggregate financial figures.
+    const noShowCount =
+      actorRole === "SUPERVISOR"
+        ? await this.bookingRepository.countNoShowsForBusinessInRange(
+            business._id,
+            selection
+              ? dayStart
+              : businessLocalToUtc(business.timezone, `${dateStr.slice(0, 7)}-01`, "00:00"),
+            selection
+              ? dayEnd
+              : businessLocalToUtc(
+                  business.timezone,
+                  addCalendarMonths(`${dateStr.slice(0, 7)}-01`, 1),
+                  "00:00",
+                ),
+          )
+        : financials?.noShowMonthCount;
+    const totals =
+      selection && !staffMembershipId
+        ? await this.bookingRepository.getOverviewRangeTotals(
+            business._id,
+            dayStart,
+            dayEnd,
+            now,
+            staffMembershipId,
+          )
+        : undefined;
 
     return {
       scope: scope.kind === "FULL" ? "FULL" : "STAFF_SCOPED",
       currency: "EUR",
       todayDateStr: dateStr,
       period: { fromDate, toDate, timezone: business.timezone, scheduleLimit: 200 },
-      todayBookingsCount: totals?.count ?? todaysBookings.length,
-      todayRemainingCount: totals?.remaining ?? todayRemainingCount,
+      todayBookingsCount: staffMembershipId ? staffCount : (totals?.count ?? todaysBookings.length),
+      todayRemainingCount: staffMembershipId
+        ? staffRemaining
+        : (totals?.remaining ?? todayRemainingCount),
+      ...(noShowCount !== undefined ? { noShowCount } : {}),
       schedule,
       timeline,
       financials:
@@ -177,7 +224,7 @@ export class DashboardOverviewService {
 
     if (actorRole === "SUPERVISOR") {
       const membership = await this.staffRepository.findActiveByUserId(actorUserId);
-      // This FULL scope includes Booking and ledger-derived financial figures.
+      // FULL denotes business-wide operational visibility; financials are Owner-only.
       if (
         membership?.role !== "SUPERVISOR" ||
         membership.employmentActive !== true ||
@@ -286,8 +333,15 @@ export class DashboardOverviewService {
 
   // --- Row builders --------------------------------------------------------------------------
 
-  private toScheduleRow(booking: BookingDocument, timezone: string): DashboardOverviewScheduleRow {
-    const firstLine = booking.serviceLines[0];
+  private toScheduleRow(
+    booking: BookingDocument,
+    timezone: string,
+    staffId?: Types.ObjectId,
+  ): DashboardOverviewScheduleRow {
+    const lines = staffId
+      ? booking.serviceLines.filter((line) => staffId.equals(line.responsibleStaffMembershipId))
+      : booking.serviceLines;
+    const firstLine = lines[0];
     const staffName = firstLine?.staffSnapshot
       ? [firstLine.staffSnapshot.firstName, firstLine.staffSnapshot.lastName]
           .filter(Boolean)
@@ -301,34 +355,38 @@ export class DashboardOverviewService {
       time: utcToBusinessLocalTime(timezone, booking.schedule.startAt),
       status: booking.status,
       customerName: this.fullName(booking),
-      serviceName: firstLine?.serviceSnapshot.name ?? "—",
+      serviceName: staffId
+        ? lines.map((line) => line.serviceSnapshot.name).join(", ") || "—"
+        : (firstLine?.serviceSnapshot.name ?? "—"),
       totalPaymentCents: booking.financials.totalCents,
       platformFeeCents: booking.financials.platformFeeCents,
       remainingFeeCents: booking.financials.balanceDueCents,
       staffName,
       leadType: this.leadType(booking),
-      packageSessions: toBookingPackageSessionIdentityDtos(booking),
+      packageSessions: toBookingPackageSessionIdentityDtos({ ...booking, serviceLines: lines }),
     };
   }
 
   private toTimelineEntry(
     booking: BookingDocument,
     timezone: string,
+    staffId?: Types.ObjectId,
   ): DashboardOverviewTimelineEntry {
-    const firstLine = booking.serviceLines[0];
-    const durationMin = booking.serviceLines.reduce(
-      (sum, line) => sum + line.serviceSnapshot.durationMin,
-      0,
-    );
+    const lines = staffId
+      ? booking.serviceLines.filter((line) => staffId.equals(line.responsibleStaffMembershipId))
+      : booking.serviceLines;
+    const durationMin = lines.reduce((sum, line) => sum + line.serviceSnapshot.durationMin, 0);
 
     return {
       bookingId: String(booking._id),
       time: utcToBusinessLocalTime(timezone, booking.schedule.startAt),
       customerName: this.fullName(booking),
-      detail: firstLine?.serviceSnapshot.name ?? "—",
+      detail: staffId
+        ? lines.map((line) => line.serviceSnapshot.name).join(", ") || "—"
+        : (lines[0]?.serviceSnapshot.name ?? "—"),
       date: utcToBusinessLocalDate(timezone, booking.schedule.startAt).dateStr,
       durationMin,
-      packageSessions: toBookingPackageSessionIdentityDtos(booking),
+      packageSessions: toBookingPackageSessionIdentityDtos({ ...booking, serviceLines: lines }),
     };
   }
 

@@ -276,8 +276,11 @@ describe("database-backed BusinessClient integration", () => {
 
   it("denies a Supervisor of a different Business, an unrelated Owner, STAFF, and CUSTOMER tokens", async () => {
     const { business: businessA } = await createBusinessOwner("owner-a@example.com", "Salon A");
-    const { user: ownerB } = await createBusinessOwner("owner-b@example.com", "Salon B");
-    const supervisorOfB = await createSupervisor(new Types.ObjectId(), "supervisor-b@example.com");
+    const { user: ownerB, business: businessB } = await createBusinessOwner(
+      "owner-b@example.com",
+      "Salon B",
+    );
+    const supervisorOfB = await createSupervisor(businessB._id, "supervisor-b@example.com");
     const staffUser = await userRepository.create({
       normalizedEmail: "staffer@example.com",
       passwordHash: "hash",

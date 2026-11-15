@@ -10,6 +10,7 @@ type CreateSessionInput = {
   refreshTokenHash: string;
   tokenFamilyId: string;
   authenticatedAt?: Date | undefined;
+  credentialStamp?: Date | undefined;
   twoFactorVersion?: number | undefined;
   expiresAt: Date;
   userAgent?: string | undefined;
@@ -22,8 +23,14 @@ export class SessionRepository {
     session?: ClientSession,
   ): Promise<SessionDocument> {
     const insert = async (transaction: ClientSession) => {
-      await this.lockActiveUser(input.userId, transaction, input.twoFactorVersion);
-      return new SessionModel(input).save({ session: transaction });
+      await this.lockActiveUser(
+        input.userId,
+        transaction,
+        input.twoFactorVersion,
+        input.credentialStamp,
+      );
+      const { credentialStamp: _credentialStamp, ...sessionInput } = input;
+      return new SessionModel(sessionInput).save({ session: transaction });
     };
     return session
       ? insert(session)
@@ -100,10 +107,12 @@ export class SessionRepository {
     userId: Types.ObjectId,
     session: ClientSession,
     factorVersion?: number,
+    credentialStamp?: Date,
   ): Promise<void> {
     const user = await UserModel.findOneAndUpdate(
       {
         _id: userId,
+        ...(credentialStamp ? { "security.passwordUpdatedAt": credentialStamp } : {}),
         status: { $nin: ["SUSPENDED", "DELETED"] },
         $or: [
           { twoFactorEnabled: { $ne: true } },

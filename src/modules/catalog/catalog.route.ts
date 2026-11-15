@@ -1,5 +1,5 @@
 import { Router } from "express";
-
+import { sendSuccess } from "../../common/http/responses.js";
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
 import { env } from "../../config/env.js";
@@ -13,7 +13,13 @@ import {
   requireRoles,
 } from "../auth/auth.middleware.js";
 import { TokenService } from "../auth/token.service.js";
+import {
+  type CompositeAvailabilityBody,
+  compositeAvailabilityBodySchema,
+  compositeAvailabilityParamsSchema,
+} from "../availability/availability.schema.js";
 import { AvailabilityService } from "../availability/availability.service.js";
+import { CompositeAvailabilityService } from "../availability/composite-availability.service.js";
 import { BookingSlotReservationRepository } from "../booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BusinessRepository } from "../business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../business-booking-settings/business-booking-settings.repository.js";
@@ -22,6 +28,8 @@ import { BusinessHoursRepository } from "../business-hours/business-hours.reposi
 import { BusinessMediaRepository } from "../business-media/business-media.repository.js";
 import { BusinessTravelSettingsRepository } from "../business-travel-settings/business-travel-settings.repository.js";
 import { PackageProgressRepository } from "../package-progress/package-progress.repository.js";
+import { PlatformSettingsRepository } from "../platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../platform-settings/platform-settings.service.js";
 import { ServiceRepository } from "../services/service.repository.js";
 import { SessionRepository } from "../session/session.repository.js";
 import { StaffRepository } from "../staff/staff.repository.js";
@@ -147,6 +155,32 @@ export const createCatalogRoute = (): Router => {
     validateRequest({ params: catalogServiceParamsSchema }),
     requireApprovedBusiness(businessRepository),
     asyncHandler(controller.listServiceAddons),
+  );
+
+  const composite = new CompositeAvailabilityService(
+    availabilityService,
+    serviceRepository,
+    new PlatformSettingsService(new PlatformSettingsRepository()),
+  );
+  router.post(
+    "/businesses/:businessId/bookings/composite-availability",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["CUSTOMER"]),
+    validateRequest({
+      params: compositeAvailabilityParamsSchema,
+      body: compositeAvailabilityBodySchema,
+    }),
+    requireApprovedBusiness(businessRepository),
+    asyncHandler(async (req, res) => {
+      const { businessId } = (req.validated?.params ?? {}) as { businessId: string };
+      sendSuccess(
+        res,
+        200,
+        "Composite availability",
+        await composite.get(businessId, req.validated?.body as CompositeAvailabilityBody),
+      );
+    }),
   );
 
   router.get(

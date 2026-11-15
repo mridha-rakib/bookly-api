@@ -400,7 +400,7 @@ export class BookingService {
     return uniqueIds.map((id) => {
       const addon = addonById.get(id);
 
-      if (!addon) {
+      if (addon?.status !== "ACTIVE") {
         throw new BookingError("BOOKING_ADDON_NOT_FOUND", 404);
       }
 

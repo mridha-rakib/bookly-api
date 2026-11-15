@@ -122,6 +122,37 @@ describe("HTTP-level Super Admin Platform Settings (Batch 21)", () => {
     expect(response.body.data.session.refreshTokenTtlDays).toBe(30);
   });
 
+  it("reads defaults without creating a settings document", async () => {
+    const app = buildApp();
+    const bearer = await bearerFor("SUPER_ADMIN");
+    await request(app)
+      .get("/super-admin/settings/platform")
+      .set("Authorization", bearer)
+      .expect(200);
+    await request(app).get("/platform/booking-config").expect(200);
+    expect(await PlatformSettingsModel.countDocuments()).toBe(0);
+  });
+
+  it("does not alter existing timestamps on reads", async () => {
+    const app = buildApp();
+    const bearer = await bearerFor("SUPER_ADMIN");
+    await request(app)
+      .patch("/super-admin/settings/platform")
+      .set("Authorization", bearer)
+      .send({ maxServicesPerBooking: 7 })
+      .expect(200);
+    const before = await PlatformSettingsModel.findOne({ key: "SINGLETON" }).lean();
+    await request(app)
+      .get("/super-admin/settings/platform")
+      .set("Authorization", bearer)
+      .expect(200);
+    const response = await request(app).get("/platform/booking-config").expect(200);
+    const after = await PlatformSettingsModel.findOne({ key: "SINGLETON" }).lean();
+    expect(response.body.data.maxServicesPerBooking).toBe(7);
+    expect(after?.createdAt).toEqual(before?.createdAt);
+    expect(after?.updatedAt).toEqual(before?.updatedAt);
+  });
+
   it("PATCH persists maxServicesPerBooking and a fresh GET returns it", async () => {
     const app = buildApp();
     const bearer = await bearerFor("SUPER_ADMIN");
@@ -138,7 +169,7 @@ describe("HTTP-level Super Admin Platform Settings (Batch 21)", () => {
       .expect(200);
     expect(fresh.body.data.editable.maxServicesPerBooking).toBe(7);
 
-    // Lazy-default getOrCreate must NOT clobber the persisted edit.
+    // A read must not clobber the persisted edit.
     const doc = await PlatformSettingsModel.findOne({ key: "SINGLETON" }).lean();
     expect(doc?.maxServicesPerBooking).toBe(7);
   });

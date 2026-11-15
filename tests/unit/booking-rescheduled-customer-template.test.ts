@@ -69,6 +69,57 @@ const withActor = (actorRole: string, linked = true) =>
   }) as never;
 
 describe("BOOKING_RESCHEDULED_CUSTOMER template", () => {
+  it("associates each persisted professional with its own service in HTML and text", () => {
+    const fixture = {
+      ...(bookingBase as Record<string, unknown>),
+      serviceLines: [
+        {
+          serviceSnapshot: { name: "Massage", durationMin: 45 },
+          staffSnapshot: { firstName: "Maria", lastName: "K" },
+        },
+        {
+          serviceSnapshot: { name: "Facial", durationMin: 60 },
+          staffSnapshot: { firstName: "Alex", lastName: "L" },
+        },
+        { serviceSnapshot: { name: "Consultation", durationMin: 15 } },
+      ],
+    } as never;
+    const data = buildBookingRescheduledEmailData(fixture, { businessName: "Glow Studio" });
+    expect(data.services).toEqual([
+      { name: "Massage", durationMin: 45, staffName: "Maria K" },
+      { name: "Facial", durationMin: 60, staffName: "Alex L" },
+      { name: "Consultation", durationMin: 15 },
+    ]);
+    const email = renderBookingRescheduledCustomerEmail(data);
+    for (const body of [email.html, email.text]) {
+      expect(body).toContain("Massage (45 min · Maria K)");
+      expect(body).toContain("Facial (60 min · Alex L)");
+      expect(body).toContain("Consultation (15 min)");
+      expect(body).toContain("16:30");
+    }
+  });
+
+  it("renders a single professional safely and supports older queued payloads without one", () => {
+    const fixture = {
+      ...(bookingBase as Record<string, unknown>),
+      serviceLines: [
+        {
+          serviceSnapshot: { name: "Cut", durationMin: 45 },
+          staffSnapshot: { firstName: "<Maria>", lastName: "" },
+        },
+      ],
+    } as never;
+    const data = buildBookingRescheduledEmailData(fixture, { businessName: "Glow Studio" });
+    const email = renderBookingRescheduledCustomerEmail(data);
+    expect(email.html).toContain("&lt;Maria&gt;");
+    expect(email.text).toContain("Cut (45 min · <Maria>)");
+    expect(
+      renderBookingRescheduledCustomerEmail({
+        ...data,
+        services: [{ name: "Cut", durationMin: 45 }],
+      }).text,
+    ).toContain("Cut (45 min)");
+  });
   it("payload carries both times in the venue timezone, not UTC/browser", () => {
     const data = buildBookingRescheduledEmailData(bookingBase, { businessName: "Glow Studio" });
     expect(data.previousTime).toBe("12:00");

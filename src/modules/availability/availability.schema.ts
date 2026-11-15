@@ -23,3 +23,26 @@ export const getAvailabilityQuerySchema = z
 
 export type AvailabilityParams = z.infer<typeof availabilityParamsSchema>;
 export type GetAvailabilityQuery = z.infer<typeof getAvailabilityQuerySchema>;
+
+export const compositeAvailabilityParamsSchema = z.object({ businessId: objectIdSchema }).strict();
+export const compositeAvailabilityBodySchema = z
+  .object({
+    fromDate: isoDateSchema,
+    toDate: isoDateSchema,
+    customerCity: z.enum(businessCities).optional(),
+    lines: z
+      .array(
+        z
+          .object({
+            serviceId: objectIdSchema,
+            staffMembershipId: objectIdSchema,
+            hours: z.number().positive().max(24).optional(),
+            partySize: z.number().int().min(1).max(1000).optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+  })
+  .strict();
+export type CompositeAvailabilityBody = z.infer<typeof compositeAvailabilityBodySchema>;

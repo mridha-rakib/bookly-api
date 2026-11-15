@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { asyncHandler } from "../../../src/common/middleware/async-handler.js";
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { validateRequest } from "../../../src/common/middleware/validate-request.js";
+import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
 import {
@@ -19,6 +20,7 @@ import {
   getAvailabilityQuerySchema,
 } from "../../../src/modules/availability/availability.schema.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
+import { CompositeAvailabilityService } from "../../../src/modules/availability/composite-availability.service.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
@@ -29,9 +31,12 @@ import { BusinessHoursRepository } from "../../../src/modules/business-hours/bus
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../../../src/modules/platform-settings/platform-settings.service.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
@@ -219,6 +224,98 @@ describe("database-backed Availability integration", () => {
 
   // A Tuesday.
   const DATE = "2030-08-20";
+
+  it("8B authorized schedule and time off change single and composite availability", async () => {
+    const { owner, business } = await createBusiness("schedule8b@example.com", "Schedule 8B");
+    const a = await createStaff(business._id);
+    const b = await createStaff(business._id);
+    const supervisor = await createStaff(business._id, "SUPERVISOR");
+    const serviceA = await createFixedService(business._id, a.membership._id);
+    const serviceB = await createFixedService(business._id, b.membership._id);
+    await openMondayToFriday(business._id, owner._id);
+    await staffWorksMondayToFriday(a.membership._id, business._id);
+    await staffWorksMondayToFriday(b.membership._id, business._id);
+    const app = express();
+    app.use(express.json());
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const ownerAuth = await bearerFor(owner._id, "BUSINESS_OWNER");
+    const supervisorAuth = await bearerFor(supervisor.user._id, "SUPERVISOR");
+    const staffAuth = await bearerFor(a.user._id, "STAFF");
+    const path = `/businesses/${business._id}/staff/${a.membership._id}`;
+    const schedule = {
+      days: [
+        {
+          dayOfWeek: "TUESDAY",
+          intervals: [
+            { startTime: "10:00", endTime: "12:00" },
+            { startTime: "13:00", endTime: "15:00" },
+          ],
+        },
+      ],
+    };
+    const single = async () =>
+      (
+        await availabilityService.getAvailability({
+          businessId: String(business._id),
+          serviceId: String(serviceA._id),
+          staffMembershipId: String(a.membership._id),
+          fromDate: DATE,
+          toDate: DATE,
+        })
+      ).days[0]!.slots.map((s) => s.startAt);
+    const composite = new CompositeAvailabilityService(
+      availabilityService,
+      serviceRepository,
+      new PlatformSettingsService(new PlatformSettingsRepository()),
+    );
+    const parallel = async () =>
+      (
+        await composite.get(String(business._id), {
+          fromDate: DATE,
+          toDate: DATE,
+          lines: [
+            { serviceId: String(serviceA._id), staffMembershipId: String(a.membership._id) },
+            { serviceId: String(serviceB._id), staffMembershipId: String(b.membership._id) },
+          ],
+        })
+      ).days[0]!.slots.map((s) => s.startAt);
+    const at = (time: string) => businessLocalToUtc(TIMEZONE, DATE, time).toISOString();
+    expect(await single()).toContain(at("09:00"));
+    await request(app)
+      .put(`${path}/schedule`)
+      .set("Authorization", staffAuth)
+      .send(schedule)
+      .expect(403);
+    expect(await single()).toContain(at("09:00"));
+    await request(app)
+      .put(`${path}/schedule`)
+      .set("Authorization", ownerAuth)
+      .send(schedule)
+      .expect(200);
+    const saved = await staffScheduleRepository.findByMembershipId(a.membership._id);
+    expect(saved?.days.find((day) => day.dayOfWeek === "TUESDAY")?.intervals).toMatchObject(
+      schedule.days[0]?.intervals ?? [],
+    );
+    const changed = await single();
+    expect(changed).toEqual([at("10:00"), at("11:00"), at("13:00"), at("14:00")]);
+    expect(await parallel()).toEqual(changed);
+    const created = await request(app)
+      .post(`${path}/time-off`)
+      .set("Authorization", supervisorAuth)
+      .send({ type: "ANNUAL_HOLIDAY", startDate: DATE })
+      .expect(201);
+    expect(await staffTimeOffRepository.listByMembershipId(a.membership._id)).toHaveLength(1);
+    expect(await single()).toEqual([]);
+    expect(await parallel()).toEqual([]);
+    await request(app)
+      .delete(`${path}/time-off/${created.body.data.id}`)
+      .set("Authorization", supervisorAuth)
+      .expect(200);
+    expect(await staffTimeOffRepository.listByMembershipId(a.membership._id)).toHaveLength(0);
+    expect(await single()).toEqual(changed);
+    expect(await parallel()).toEqual(changed);
+  });
 
   it("returns bookable slots for a fully-configured business/service/staff", async () => {
     const { owner, business } = await createBusiness("owner@example.com", "Salon A");

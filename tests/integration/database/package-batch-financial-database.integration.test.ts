@@ -58,6 +58,7 @@ import { RefundOperationModel } from "../../../src/modules/payment/refund-operat
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
+import { PlatformSettingsService } from "../../../src/modules/platform-settings/platform-settings.service.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
@@ -654,7 +655,7 @@ describe("F2 preparation-only same-parent financial/delivery integration", () =>
   it("F2-61 changed global no-show window rejects the accepted snapshot", async () => {
     const t = await fixture(false, false, { policy: true, categoryWindow: true });
     const repository = new PlatformSettingsRepository();
-    const current = await repository.getOrCreate();
+    const current = (await new PlatformSettingsService(repository).getSettings()).editable;
     await repository.update({
       noShowCategoryWindows: current.noShowCategoryWindows.map((w) => ({
         categoryKey: w.categoryKey,
@@ -1238,7 +1239,10 @@ describe("F2 preparation-only same-parent financial/delivery integration", () =>
           true,
           travel ? { travel: true } : { policy: true, categoryWindow: true },
         );
-        const settings = !travel ? await new PlatformSettingsRepository().getOrCreate() : null;
+        const settings = !travel
+          ? (await new PlatformSettingsService(new PlatformSettingsRepository()).getSettings())
+              .editable
+          : null;
         const mutate = async () => {
           if (domain === "travel")
             return new BusinessTravelSettingsRepository().upsertByBusinessId(t.scope.businessId, [

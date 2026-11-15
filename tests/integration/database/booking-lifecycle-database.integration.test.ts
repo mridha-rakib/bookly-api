@@ -47,6 +47,7 @@ import { BusinessHoursRepository } from "../../../src/modules/business-hours/bus
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
+import { createDashboardOverviewRoute } from "../../../src/modules/dashboard-overview/dashboard-overview.route.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
 import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
@@ -62,6 +63,7 @@ import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
@@ -398,6 +400,107 @@ describe("database-backed Booking creation + lifecycle integration", () => {
   };
 
   // --- Manual creation: happy path + snapshot correctness ------------------------------------
+
+  it("8B owner booking changes propagate to assigned staff reads and reservations", async () => {
+    const f = await setupBookableBusiness();
+    const second = await createStaff(f.business._id);
+    await staffWorksMondayToFriday(second.membership._id, f.business._id);
+    const serviceB = await createFixedService(f.business._id, second.membership._id);
+    await ServiceModel.updateOne({ _id: serviceB._id }, { $set: { name: "Second service" } });
+    const tokenService = new TokenService(new SessionRepository());
+    const authA = `Bearer ${await issueTestAccessToken(tokenService, { userId: f.membership.userId, role: "STAFF" })}`;
+    const authB = `Bearer ${await issueTestAccessToken(tokenService, { userId: second.user._id, role: "STAFF" })}`;
+    const app = express();
+    app.use("/businesses", createStaffScheduleRoute());
+    app.use("/businesses", createDashboardOverviewRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const base = `/businesses/${f.business._id}`;
+    const booking = await creationService.createManualBooking(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      {
+        serviceLines: [
+          {
+            serviceId: String(f.service._id),
+            staffMembershipId: String(f.membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+          {
+            serviceId: String(serviceB._id),
+            staffMembershipId: String(second.membership._id),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: startAtFor("10:00"),
+        businessClientId: String(f.client._id),
+        idempotencyKey: `8b-${new Types.ObjectId()}`,
+      },
+    );
+    const read = (auth: string) =>
+      request(app).get(`${base}/staff/me/appointments/${booking._id}`).set("Authorization", auth);
+    const a = await read(authA).expect(200);
+    const b = await read(authB).expect(200);
+    expect(a.body.data.services.map((s: { serviceName: string }) => s.serviceName)).toEqual([
+      "Haircut",
+    ]);
+    expect(b.body.data.services.map((s: { serviceName: string }) => s.serviceName)).toEqual([
+      "Second service",
+    ]);
+    const overview = await request(app)
+      .get(`${base}/dashboard/overview?range=Custom&fromDate=${DATE}&toDate=${DATE}`)
+      .set("Authorization", authA)
+      .expect(200);
+    expect(overview.body.data.todayBookingsCount).toBe(1);
+    expect(overview.body.data.financials).toBeNull();
+    expect(JSON.stringify(overview.body)).not.toContain("Second service");
+    await lifecycleService.rescheduleByOwner(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(booking._id),
+      startAtFor("11:00"),
+    );
+    expect((await read(authA).expect(200)).body.data.schedule.startAt).toBe(startAtFor("11:00"));
+    expect((await read(authB).expect(200)).body.data.schedule.startAt).toBe(startAtFor("11:00"));
+    const moved = await BookingModel.findById(booking._id).orFail();
+    expect(moved.schedule.startAt.toISOString()).toBe(startAtFor("11:00"));
+    const reservations = await BookingSlotReservationModel.find({
+      businessId: f.business._id,
+      occupancyDate: DATE,
+    }).lean();
+    expect(
+      reservations
+        .flatMap((r) => r.intervals)
+        .filter((i) => i.startAt.toISOString() === startAtFor("11:00")),
+    ).toHaveLength(2);
+    await lifecycleService.cancelByBusiness(
+      String(f.owner._id),
+      "BUSINESS_OWNER",
+      String(f.business._id),
+      String(booking._id),
+      undefined,
+    );
+    expect((await read(authA).expect(200)).body.data.status).toBe("CANCELLED_BY_BUSINESS");
+    expect((await read(authB).expect(200)).body.data.status).toBe("CANCELLED_BY_BUSINESS");
+    const afterOverview = await request(app)
+      .get(`${base}/dashboard/overview?range=Custom&fromDate=${DATE}&toDate=${DATE}`)
+      .set("Authorization", authA)
+      .expect(200);
+    expect(afterOverview.body.data.todayBookingsCount).toBe(1);
+    expect(afterOverview.body.data.schedule[0].status).toBe("CANCELLED_BY_BUSINESS");
+    expect(JSON.stringify(afterOverview.body)).not.toContain("Second service");
+    expect(
+      (
+        await BookingSlotReservationModel.find({
+          businessId: f.business._id,
+          occupancyDate: DATE,
+        }).lean()
+      ).flatMap((r) => r.intervals),
+    ).toHaveLength(0);
+  });
 
   it("creates a real, persisted MANUAL Booking with a correct financial snapshot and a real occupancy reservation", async () => {
     const { owner, business, membership, service, client } = await setupBookableBusiness();
