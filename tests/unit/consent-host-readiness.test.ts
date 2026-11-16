@@ -86,8 +86,30 @@ it("rejects controls, commas and JavaScript whitespace in both host paths", () =
   }
 });
 
-it("retains absolute-path and normalization restrictions for both host paths", () => {
-  for (const field of ["chronycPath", "chronycSocketPath"] as const) {
+it("names only chrony's read-only loopback monitoring endpoint, never its control socket", () => {
+  expect(() =>
+    validateConsentHostPolicy({ ...syntheticConsentHost, chronycSocketPath: "127.0.0.1" }),
+  ).not.toThrow();
+  for (const endpoint of [
+    "/run/chrony/chronyd.sock",
+    "/var/run/chrony/chronyd.sock",
+    "::1",
+    "localhost",
+    "127.0.0.1:323",
+    "127.0.0.2",
+    "0.0.0.0",
+    " 127.0.0.1",
+    "127.0.0.1 ",
+    "",
+  ]) {
+    expect(() =>
+      validateConsentHostPolicy({ ...syntheticConsentHost, chronycSocketPath: endpoint }),
+    ).toThrow("Invalid qualified host policy");
+  }
+});
+
+it("retains absolute-path and normalization restrictions for the chronyc path", () => {
+  for (const field of ["chronycPath"] as const) {
     for (const path of [
       "usr/bin/chronyc",
       "./chronyc",
@@ -103,7 +125,7 @@ it("retains absolute-path and normalization restrictions for both host paths", (
     }
     for (const path of [
       "/usr/bin/chronyc",
-      "/run/chrony/chronyd.sock",
+      "/usr/local/bin/chronyc",
       "/run/chrony-._socket",
       "/run/chrony\u0080socket",
     ]) {

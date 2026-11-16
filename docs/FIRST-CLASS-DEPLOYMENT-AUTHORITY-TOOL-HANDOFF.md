@@ -15,7 +15,12 @@ before activation.
 
 ## 1. Minimum Linux requirements
 
-- Debian/Ubuntu layout, systemd, `/usr/bin/git`, `/usr/bin/systemctl`, Node.js 24 at `/usr/bin/node`, pnpm.
+- Debian/Ubuntu layout, systemd, `/usr/bin/git`, `/usr/bin/systemctl`, pnpm, and Node.js 24 at
+  `/usr/bin/node` or `/usr/local/bin/node`. The wrapper tries them in that order. It follows every
+  symlink hop and refuses (`NODE_RUNTIME_UNAVAILABLE`) unless every path component is root-owned
+  and not group/other-writable and the version is v24. An unsafe earlier candidate is never
+  skipped. On Hetzner, `/usr/local/bin/node -> /opt/node-v24.22.2-linux-x64/bin/node` already
+  qualifies, so no new symlink is needed.
 - **Qualified clock = chrony.** The API's consent clock reads `chronyc tracking`. The tool
   measures `chronyc` (approved path), `/usr/sbin/chronyd`, `/etc/chrony/chrony.conf` and every
   file in `/etc/chrony/conf.d` and `/etc/chrony/sources.d`. `systemd-timesyncd` is **not** a
@@ -23,8 +28,15 @@ before activation.
   It also refuses while timesyncd is active (`CLOCK_SOURCE_CONFLICT`). Replacing timesyncd with
   chrony, and choosing the time sources and their reference IDs, is an Owner-approved host
   change. It is not done by this tool.
-- chrony's command socket (for example `/run/chrony/chronyd.sock`) must be reachable by root (the tool)
-  and by the API user (the API's own consent clock).
+- **Read-only clock access.** The API and the tool query chrony only through chronyd's loopback
+  UDP monitoring port: `chronyc -h 127.0.0.1 -n -c tracking`. The profile's `chronycSocketPath`
+  must be exactly `127.0.0.1`; any socket path or other address is refused. chronyd answers only
+  monitoring commands there. Clock-changing commands (`settime`, `makestep`, source changes)
+  are accepted only on its Unix control socket (`/run/chrony/chronyd.sock`).
+  - Keep chrony's default command port (`cmdport 323`, bound to localhost, `cmdallow` localhost).
+    Do **not** set `cmdport 0`.
+  - Do **not** add the API user to `_chrony` or grant it `/run/chrony`. The API unit needs no
+    change for clock access.
 
 ## 2. Install the tool (root-owned, from the published commit)
 
@@ -47,18 +59,38 @@ git -c safe.directory='*' -C /opt/bookly-first-class-authority/<sha> status --po
 
 ## 3. Root-owned API artifact and dependencies
 
-The deployed API root (for example `/srv/bookly/api`, written into `deployment.json`) must hold
-exactly the build from step 2, owned by root and not group/other-writable, with every ancestor
-directory the same:
+Each First-Class API release goes into its **own new** root-owned directory under
+`/srv/bookly/fc-releases`.
+- It holds exactly the build from step 2, owned by root and not group/other-writable, with every
+  ancestor directory the same.
+- Never point this procedure at an existing checkout or release. On Hetzner, `/srv/bookly/api`
+  is the live checkout that holds the API `.env`, and `/srv/bookly/releases/*` (owned by
+  `deploy`) are the rollback releases. Do not chown, chmod, rsync or delete anything in them.
 
 ```sh
-rsync -a --delete /opt/bookly-first-class-authority/<sha>/dist/ /srv/bookly/api/dist/
-cp /opt/bookly-first-class-authority/<sha>/{package.json,pnpm-lock.yaml} /srv/bookly/api/
-# node_modules: frozen install as the unprivileged build user, then copied in as root.
-(cd /home/build/deploy && cp /srv/bookly/api/{package.json,pnpm-lock.yaml} . && pnpm install --frozen-lockfile --prod)
-rsync -a --delete /home/build/deploy/node_modules/ /srv/bookly/api/node_modules/
-chown -R root:root /srv/bookly/api && chmod -R go-w /srv/bookly/api
+SHA=<published sha>
+R=/srv/bookly/fc-releases/api-$SHA
+install -d -o root -g root -m 0755 /srv/bookly/fc-releases
+install -d -o root -g root -m 0755 "$R"                  # new, empty, release-specific
+cp -a /opt/bookly-first-class-authority/$SHA/dist "$R/dist"
+cp /opt/bookly-first-class-authority/$SHA/package.json /opt/bookly-first-class-authority/$SHA/pnpm-lock.yaml "$R/"
+# node_modules: frozen production install as the unprivileged build user in an empty directory,
+# then copied in as root.
+#   (as build user) D=$(mktemp -d); cp <checkout>/{package.json,pnpm-lock.yaml,pnpm-workspace.yaml} "$D"
+#                   cd "$D" && pnpm install --frozen-lockfile --prod --ignore-scripts
+cp -a "$D/node_modules" "$R/node_modules"
+# The API keeps reading its existing environment file through a symlink (outside both digests).
+ln -s /srv/bookly/api/.env "$R/.env"
+chown -hR root:root "$R" && chmod -R go-w "$R"          # only the new release directory
 ```
+
+`deployment.json` names the real release path (`"apiRoot": "/srv/bookly/fc-releases/api-<sha>"`).
+The tool refuses a symlinked path such as `/srv/bookly/current-api`.
+- **Switch:** `ln -s "$R" /srv/bookly/current-api.next && mv -Tf /srv/bookly/current-api.next
+  /srv/bookly/current-api`, then restart the API.
+- **Rollback:** `bookly-first-class-authority stop --reason rollback`, point `current-api` back to
+  the previous `/srv/bookly/releases/api-<sha>`, then restart the API. The First-Class gates stay
+  closed; every other feature runs as before.
 
 The tool refuses (`ARTIFACT_NOT_ROOT_OWNED`, `ARTIFACT_MISMATCH`) unless the deployed `dist`,
 `package.json` and `pnpm-lock.yaml` produce the same artifact digest v1 as the clean checkout at
@@ -69,7 +101,10 @@ the signed `releaseSha`. It also requires `node_modules/.modules.yaml` and pins 
 ## 4. Protected directories
 
 ```sh
-install -d -o root -g root -m 0755 /etc/bookly /etc/bookly/first-class-authority
+# /etc/bookly already exists (root:deploy 0750, holds environment backups). It already passes the
+# root-controlled check: do NOT chown/chmod it. Create only the new subdirectory.
+stat -c '%U %a' /etc/bookly                                   # expect: root 750 (no group/other write)
+install -d -o root -g root -m 0755 /etc/bookly/first-class-authority
 install -d -o root -g root -m 0755 /etc/bookly-first-class-authority-tool
 install -d -o root -g root -m 0700 /var/lib/bookly-first-class-authority
 namei -l /etc/bookly/first-class-authority /var/lib/bookly-first-class-authority
@@ -89,7 +124,7 @@ Tool configuration (root, 0644, regular files, provisioned out of band, **no def
 | `release-approval.pub` | Owner Ed25519 SPKI PEM (trust anchor) | Owner |
 | `clock-policy.json` | the five-limit policy, byte-for-byte the object signed in the record's `policy` | Owner |
 | `attestation-policy.json` | `{"version":1,"approvalReference":"…","maxValidityMs":<n>}` | Owner |
-| `deployment.json` | `{"version":1,"apiRoot":"/srv/bookly/api","apiUid":<api uid>}` | operator |
+| `deployment.json` | `{"version":1,"apiRoot":"/srv/bookly/fc-releases/api-<sha>","apiUid":<api uid>}` | operator |
 
 ## 5. Service ordering
 
@@ -117,7 +152,7 @@ Expected: all tests pass. With nothing provisioned, every API gate denies.
 
 1. `bookly-first-class-authority init-signing-key`: generates the deployment key on the host.
    Its public fingerprint goes to the Owner.
-2. Write a draft profile (`chronycPath`, `chronycSocketPath`, `referenceIds`, `maxAcquireMs`),
+2. Write a draft profile (`chronycPath`, `chronycSocketPath` = `127.0.0.1`, `referenceIds`, `maxAcquireMs`),
    then run `bookly-first-class-authority measure-host --profile <draft.json>`. It outputs
    `hostId` (machine id), current `bootId`, `configurationHash` (contract v1), the chrony
    hashes and the version output.

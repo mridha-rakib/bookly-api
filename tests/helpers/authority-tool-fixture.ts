@@ -128,9 +128,10 @@ export function createToolFixture() {
       host.mono += BigInt(host.monoStepMs) * 1_000_000n;
       if (file === CHRONYC) {
         if (host.chronycFails) throw Error("timeout");
-        return args[0] === "--version"
-          ? { stdout: `${host.version}\n`, exitCode: 0 }
-          : { stdout: `${host.tracking(host.wall)}\n`, exitCode: 0 };
+        if (args[0] === "--version") return { stdout: `${host.version}\n`, exitCode: 0 };
+        // Only the read-only loopback monitoring query is answered (never the control socket).
+        if (args.join(" ") !== "-h 127.0.0.1 -n -c tracking") throw Error("unexpected chronyc use");
+        return { stdout: `${host.tracking(host.wall)}\n`, exitCode: 0 };
       }
       if (file === LINUX_PATHS.systemctl)
         return { stdout: `${host.timesyncd}\n`, exitCode: host.timesyncd === "active" ? 0 : 3 };
@@ -169,7 +170,7 @@ export function createToolFixture() {
 
   const draftProfile = {
     chronycPath: CHRONYC,
-    chronycSocketPath: "/run/chrony/chronyd.sock",
+    chronycSocketPath: "127.0.0.1",
     referenceIds: ["TEST"],
     maxAcquireMs: POLICY.maxAcquireMs,
   };

@@ -19,6 +19,13 @@ const absolutePath = z
   );
 const positive = z.number().int().safe().positive();
 
+/** The only chronyc command endpoint (`chronyc -h <endpoint>`) a qualified profile may name:
+ * chronyd's loopback UDP command port. chronyd answers only monitoring commands (such as
+ * `tracking`) there; every clock-changing command (settime, makestep, source changes) is
+ * accepted only on its root-only Unix control socket, which the API must never be granted.
+ * The field keeps its v1 name `chronycSocketPath` for signed-record compatibility. */
+export const CHRONY_READ_ONLY_COMMAND_ENDPOINT = "127.0.0.1";
+
 /** Structural validation only. Neither a parsed profile nor a key grants qualification. */
 export const consentHostPolicySchema = z
   .object({
@@ -27,7 +34,7 @@ export const consentHostPolicySchema = z
     hostId: identity,
     configurationHash: z.string().regex(/^[a-f0-9]{64}$/),
     chronycPath: absolutePath,
-    chronycSocketPath: absolutePath,
+    chronycSocketPath: z.literal(CHRONY_READ_ONLY_COMMAND_ENDPOINT),
     chronycVersionOutput: z.string().trim().min(1).max(1024),
     referenceIds: z
       .array(identity)

@@ -1,7 +1,74 @@
 #!/bin/sh
 # Installed as /usr/local/sbin/bookly-first-class-authority (root:root 0755).
-# Runs the compiled tool from the root-owned verified checkout; no environment is passed on.
+# Runs the compiled tool from the root-owned verified checkout with a validated Node.js 24
+# runtime; no environment is passed on.
 set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 TOOL_ROOT=/opt/bookly-first-class-authority/current
+# Fixed candidates, in order. No PATH search and no environment override.
+NODE_CANDIDATES="/usr/bin/node /usr/local/bin/node"
+
+refuse() {
+  printf '%s\n' "NODE_RUNTIME_UNAVAILABLE: $1" >&2
+  exit 1
+}
+
+# One path entry (not followed): owned by root; unless it is a symlink, not group/other-writable.
+entry_ok() {
+  info=$(stat -c '%u %A' -- "$1" 2>/dev/null) || return 1
+  case "$info" in
+    "0 l"*) return 0 ;;
+    "0 ?????w"* | "0 ????????w"*) return 1 ;;
+    "0 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Every component from / to the absolute path itself must pass entry_ok.
+chain_ok() {
+  case "$1" in /*) ;; *) return 1 ;; esac
+  entry_ok / || return 1
+  current=
+  rest=${1#/}
+  while [ -n "$rest" ]; do
+    part=${rest%%/*}
+    if [ "$part" = "$rest" ]; then rest=; else rest=${rest#*/}; fi
+    case "$part" in "" | . | ..) return 1 ;; esac
+    current="$current/$part"
+    entry_ok "$current" || return 1
+  done
+}
+
+# Follows a candidate one symlink hop at a time (at most 8), checking each hop's full chain.
+resolve_node() {
+  path=$1
+  hops=0
+  while :; do
+    chain_ok "$path" || return 1
+    [ -L "$path" ] || break
+    hops=$((hops + 1))
+    [ "$hops" -le 8 ] || return 1
+    target=$(readlink -- "$path") || return 1
+    case "$target" in
+      /*) path=$target ;;
+      *) path="${path%/*}/$target" ;;
+    esac
+    path=$(realpath -s -- "$path") || return 1
+  done
+  [ -f "$path" ] && [ -x "$path" ] || return 1
+  version=$(/usr/bin/env -i "$path" --version 2>/dev/null) || return 1
+  case "$version" in v24.*) ;; *) return 1 ;; esac
+  NODE=$path
+}
+
+NODE=
+for candidate in $NODE_CANDIDATES; do
+  [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+  if resolve_node "$candidate"; then break; fi
+  refuse "$candidate is not a root-controlled Node.js 24 runtime"
+done
+[ -n "$NODE" ] || refuse "no Node.js 24 at $NODE_CANDIDATES"
+
 exec /usr/bin/env -i LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-  /usr/bin/node "$TOOL_ROOT/ops/first-class-authority/build/ops/first-class-authority/src/main.js" "$@"
+  "$NODE" "$TOOL_ROOT/ops/first-class-authority/build/ops/first-class-authority/src/main.js" "$@"

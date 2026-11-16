@@ -64,7 +64,7 @@ export function loadLocalAuthority(dir: string): QualifiedConsentHost {
     hostId: policy.hostId,
     configurationHash: createHash("sha256").update(JSON.stringify(policy)).digest("hex"),
     chronycPath: "/local-acceptance/no-chrony",
-    chronycSocketPath: "/local-acceptance/no-chrony-socket",
+    chronycSocketPath: "127.0.0.1", // never contacted: local acceptance uses its own clock
     chronycVersionOutput: LOCAL_VERSION_OUTPUT,
     referenceIds: [LOCAL_REFERENCE_ID],
     maxAcquireMs: 5000,

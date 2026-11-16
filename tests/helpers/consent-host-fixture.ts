@@ -10,7 +10,7 @@ export const syntheticConsentHost: QualifiedConsentHost = {
   hostId: "test-only",
   configurationHash: "a".repeat(64),
   chronycPath: "/never-execute-test-clock",
-  chronycSocketPath: "/never-connect-test-socket",
+  chronycSocketPath: "127.0.0.1",
   chronycVersionOutput: "synthetic-version",
   referenceIds: ["TEST"],
   maxAcquireMs: 5000,

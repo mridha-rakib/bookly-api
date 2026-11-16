@@ -115,7 +115,7 @@ describe("deployment authority tool: issuance compatible with the published API 
       hostId: MACHINE,
       configurationHash: "a".repeat(64),
       chronycPath: "/usr/bin/chronyc",
-      chronycSocketPath: "/run/chrony/chronyd.sock",
+      chronycSocketPath: "127.0.0.1",
       chronycVersionOutput: "v",
       referenceIds: ["TEST"],
       maxAcquireMs: 5000,
