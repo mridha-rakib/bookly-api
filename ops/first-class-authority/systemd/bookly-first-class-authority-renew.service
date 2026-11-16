@@ -1,0 +1,15 @@
+# Renews the First-Class deployment attestation. Root-only; the API never runs this.
+[Unit]
+Description=Bookly First-Class deployment attestation renewal
+After=chrony.service time-sync.target
+Wants=time-sync.target
+ConditionPathExists=!/var/lib/bookly-first-class-authority/stopped.json
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/bookly-first-class-authority renew
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+UMask=0077

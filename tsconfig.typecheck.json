@@ -4,6 +4,6 @@
     "rootDir": ".",
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts"],
+  "include": ["src/**/*.ts", "tests/**/*.ts", "ops/**/*.ts", "vitest.config.ts"],
   "exclude": ["dist", "node_modules"]
 }

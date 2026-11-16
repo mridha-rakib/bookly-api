@@ -1,0 +1,7 @@
+#!/bin/sh
+# Installed as /usr/local/sbin/bookly-first-class-authority (root:root 0755).
+# Runs the compiled tool from the root-owned verified checkout; no environment is passed on.
+set -eu
+TOOL_ROOT=/opt/bookly-first-class-authority/current
+exec /usr/bin/env -i LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /usr/bin/node "$TOOL_ROOT/ops/first-class-authority/build/ops/first-class-authority/src/main.js" "$@"

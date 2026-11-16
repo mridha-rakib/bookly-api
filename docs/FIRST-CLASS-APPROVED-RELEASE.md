@@ -57,6 +57,7 @@ together.
   in-process sequence monotonicity bound but do not remove this.
 - `node_modules` is outside the artifact digest; the deployment authority must install it from
   the attested lockfile (`pnpm install --frozen-lockfile`) and protect it like `dist`.
-- The deployment authority must be implemented and operated outside this application (see
-  `FIRST-CLASS-DEPLOYMENT-AUTHORITY-HANDOFF.md`). It is not part of this repository.
+- The deployment authority runs outside the API process, as root. Its source is in
+  `ops/first-class-authority/`, and installation and operation are described in
+  `FIRST-CLASS-DEPLOYMENT-AUTHORITY-TOOL-HANDOFF.md`.
 - The audit-key custody trade-offs in `FIRST-CLASS-AUDIT-KEY-CUSTODY.md` still apply.

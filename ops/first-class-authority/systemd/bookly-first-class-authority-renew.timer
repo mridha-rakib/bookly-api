@@ -1,0 +1,13 @@
+# The renewal interval is policy-dependent and NOT approved. Replace APPROVED_RENEWAL_INTERVAL
+# with an Owner-approved value strictly shorter than attestation-policy.json maxValidityMs.
+# Left unreplaced, systemd rejects the timer and nothing renews (fail closed).
+[Unit]
+Description=Bookly First-Class deployment attestation renewal timer
+
+[Timer]
+OnBootSec=APPROVED_RENEWAL_INTERVAL
+OnUnitActiveSec=APPROVED_RENEWAL_INTERVAL
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

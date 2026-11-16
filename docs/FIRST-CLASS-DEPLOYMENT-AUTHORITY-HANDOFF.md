@@ -5,6 +5,9 @@ before First-Class Checkout can open. It authorizes nothing by itself. Do not ge
 keys, write approvals or fabricate qualification evidence without the separate Owner approvals
 listed in step 0.
 
+The root-only tool that produces these files is in `ops/first-class-authority/`. To install
+and operate it, see `FIRST-CLASS-DEPLOYMENT-AUTHORITY-TOOL-HANDOFF.md`.
+
 The published code is fail-closed: with no `/etc/bookly/first-class-authority` directory, or any
 invalid file in it, every First-Class gate denies with HTTP 503/404.
 

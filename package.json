@@ -16,6 +16,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "pnpm clean && tsc -p tsconfig.json",
     "start": "node dist/app/server.js",
+    "build:authority-tool": "tsc -p ops/first-class-authority/tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "check": "biome check .",
     "check:fix": "biome check --write .",
