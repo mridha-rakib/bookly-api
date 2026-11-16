@@ -39,6 +39,15 @@ const UNRESOLVED_PROVIDER_STATUSES: ReadonlySet<PaymentAttemptProviderStatus> = 
   "UNKNOWN",
   "REQUIRES_ACTION",
 ]);
+/** Provider outcomes that are not settled yet (same set as
+ * PaymentAttemptRepository.hasUnsettledForCustomer). SUCCEEDED, FAILED and CANCELED are settled. */
+const UNSETTLED_PROVIDER_STATUSES: ReadonlySet<PaymentAttemptProviderStatus> = new Set([
+  "NOT_CREATED",
+  "CREATED",
+  "REQUIRES_ACTION",
+  "PROCESSING",
+  "UNKNOWN",
+]);
 
 export class MoneyRecoveryService {
   public constructor(
@@ -180,8 +189,11 @@ export class MoneyRecoveryService {
             await this.relationshipService?.reconcileForPaymentAttempt(candidate._id);
           } else {
             // Keep the original package payment current while complete batch proof is pending.
-            // Provider state alone never materializes or confirms the package.
-            await this.reconcileAuthentication(candidate._id);
+            // Provider state alone never materializes or confirms the package, so once the
+            // provider outcome is settled an unresolved batch (e.g. an unknown commit result)
+            // is left untouched: no provider read, only the retry schedule (F2-22/24/29/30).
+            if (UNSETTLED_PROVIDER_STATUSES.has(candidate.providerStatus))
+              await this.reconcileAuthentication(candidate._id);
             await this.paymentAttemptRepository.scheduleRecoveryRetry(
               candidate._id,
               "Canonical complete batch monetary proof is unresolved",
