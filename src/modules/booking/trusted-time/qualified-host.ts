@@ -1,4 +1,5 @@
-import { AppError } from "../../../common/errors/app-error.js";
+import { approvedConsentHostInput } from "./approved-consent-host-input.js";
+import { composeQualifiedConsentHost } from "./qualified-host-composition.js";
 
 export type QualifiedConsentHost = {
   /** Exact reviewed boot. A reboot requires renewed qualification, never auto-adoption. */
@@ -19,31 +20,21 @@ export type QualifiedConsentHost = {
   auditKey: Buffer;
 };
 
-/** Owner approved source trust model, NOT a qualified host or numerical policy. Replace this
- * registry only through audited deployment qualification and explicit final authority approval.
- * No environment flag, posted settings or generic grant factory can activate it. */
+/** Construct once from the release-owned input. Missing qualification remains fail-closed;
+ * the registry resolves protected keys for every use, including historical verification. */
+const approvedHost = composeQualifiedConsentHost(approvedConsentHostInput);
+
 export function requireQualifiedConsentHost(): QualifiedConsentHost {
-  throw new AppError("Consent host qualification and numerical policy are pending", 503, {
-    details: [
-      { code: "PACKAGE_CONSENT_HOST_UNQUALIFIED", message: "No production clock is approved" },
-    ],
-  });
+  return approvedHost.requireQualifiedConsentHost();
 }
 
 /** Historical verification is a separate protected composition seam. Never fall back to
  * the current host or trust an evidence-supplied profile/key. No entries approved yet. */
-export function requireConsentHostVerificationProfile(_identity: {
+export function requireConsentHostVerificationProfile(identity: {
   authorityId: string;
   hostId: string;
   configurationHash: string;
   approvedBootId: string;
 }): QualifiedConsentHost {
-  throw new AppError("Consent host verification authority is unavailable", 503, {
-    details: [
-      {
-        code: "PACKAGE_CONSENT_HOST_VERIFICATION_UNAVAILABLE",
-        message: "No historical authority is approved",
-      },
-    ],
-  });
+  return approvedHost.requireConsentHostVerificationProfile(identity);
 }

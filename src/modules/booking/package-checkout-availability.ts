@@ -8,6 +8,7 @@ import {
   readPackageConsentHttpReadiness,
   shippedPackageConsentHttpActivation,
 } from "./package-consent-http-activation.js";
+import { observeConsentHost } from "./trusted-time/host-clock.js";
 import { requireQualifiedConsentHost } from "./trusted-time/qualified-host.js";
 
 /** Read-only display hint for catalogue/offer DTOs. True only when a Customer could actually
@@ -15,7 +16,8 @@ import { requireQualifiedConsentHost } from "./trusted-time/qualified-host.js";
  * consent route applies), the consent host is qualified, and batch purchase is activated.
  * Any partial rollout returns false. It grants nothing: every quote, acceptance,
  * certification and purchase request re-checks its own authority.
- * Normal composition always returns false (all three fail closed). No writes, no clock read. */
+ * Normal composition remains disabled until the reviewed release is configured. The shipped
+ * readiness path checks the live qualified clock; it performs no application data writes. */
 export type PackageCheckoutReadiness =
   | { available: true; reason: null }
   | {
@@ -40,9 +42,12 @@ export async function readPackageCheckoutReadiness(
     return { available: false, reason: "CONSENT_LIFETIME_UNAPPROVED" };
   try {
     requireQualifiedConsentHost();
-  } catch (error) {
-    if (error instanceof AppError) return { available: false, reason: "CONSENT_HOST_UNQUALIFIED" };
-    throw error;
+    // The mounted production composition must not advertise checkout while the qualified
+    // clock cannot produce a fresh bounded observation. The observation is not a consent proof.
+    if (consentHttp === shippedPackageConsentHttpActivation)
+      await observeConsentHost("0".repeat(64));
+  } catch {
+    return { available: false, reason: "CONSENT_HOST_UNQUALIFIED" };
   }
   try {
     await verifyPackageBatchActivation();

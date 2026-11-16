@@ -2,8 +2,9 @@
  * Phase 4.0 — shipped First-Class activation boundary census.
  *
  * Pins the shipped (src/) composition so that no Consent HTTP, qualified-host, historical
- * verifier or strict-deadline Batch authority can be granted by environment, by a new
- * consumer, or by an accidentally wired inert building block. Only the reviewed
+ * verifier or strict-deadline Batch authority can be granted by environment or a new
+ * consumer. The reviewed host composition is wired but its release input is unconfigured.
+ * Only the reviewed
  * development entry points in dev/ swap these four seams, and only through their resolve
  * hooks. No test double is installed here: every runtime assertion uses the real modules.
  */
@@ -137,14 +138,79 @@ describe("Phase 4.0 shipped authority surface", () => {
   });
 
   it("authority modules read no environment, clock, file system or database", () => {
-    for (const file of ["package-batch-authority.ts", "trusted-time/qualified-host.ts"]) {
+    for (const file of [
+      "package-batch-authority.ts",
+      "approved-first-class-release.ts",
+      "trusted-time/qualified-host.ts",
+      "trusted-time/approved-consent-host-input.ts",
+    ]) {
       const path = join(booking, file);
       const code = readFileSync(path, "utf8");
-      expect(
-        specifiers(path).filter((s) => !s.endsWith("/common/errors/app-error.js")),
-        file,
-      ).toEqual([]);
-      expect(code, file).not.toMatch(/process\.env|\benv\.|Date\.now|new Date|readFile|mongoose/);
+      const allowed =
+        file === "package-batch-authority.ts"
+          ? [
+              "./approved-first-class-release.js",
+              "./package-consent-commit-deadline.js",
+              "./trusted-time/require-qualified-linux-boot.js",
+              "./trusted-time/qualified-host.js",
+            ].sort()
+          : file === "trusted-time/qualified-host.ts"
+            ? ["./approved-consent-host-input.js", "./qualified-host-composition.js"]
+            : file === "trusted-time/approved-consent-host-input.ts"
+              ? [
+                  "./approved-release-loader.js",
+                  "./file-audit-key-resolver.js",
+                  "./first-class-deployment-authority.js",
+                  "./host-authority-history.js",
+                  "./qualified-host-composition.js",
+                ].sort()
+              : file === "approved-first-class-release.ts"
+                ? ["./trusted-time/first-class-deployment-authority.js"]
+                : [];
+      expect(specifiers(path).sort(), file).toEqual(allowed);
+      expect(code, file).not.toMatch(/process\.env|\benv\.|Date\.now|new Date|mongoose/);
+      expect(code, file).not.toMatch(/readFile/);
+    }
+  });
+});
+
+describe("First-Class deployment authority boundary", () => {
+  const trustedTime = join(booking, "trusted-time");
+
+  it("reads only the fixed root-provisioned directory, never environment or request data", () => {
+    for (const name of [
+      "deployment-attestation.ts",
+      "first-class-deployment-authority.ts",
+      "protected-authority-files.ts",
+      "approved-release-loader.ts",
+      "authenticated-release-record.ts",
+    ]) {
+      const code = readFileSync(join(trustedTime, name), "utf8");
+      expect(code, name).not.toMatch(/process\.env|\benv\.|config\/env|mongoose|express/);
+    }
+    expect(readFileSync(join(trustedTime, "protected-authority-files.ts"), "utf8")).toContain(
+      'export const FIRST_CLASS_AUTHORITY_DIRECTORY = "/etc/bookly/first-class-authority";',
+    );
+  });
+
+  it("only the two approval readers import the process-local authority", () => {
+    const importers = sourceFiles(srcRoot)
+      .filter((file) =>
+        specifiers(file).some((s) => /first-class-deployment-authority(?:\.js)?$/.test(s)),
+      )
+      .map(posixPath)
+      .sort();
+    expect(importers).toEqual([
+      "src/modules/booking/approved-first-class-release.ts",
+      "src/modules/booking/trusted-time/approved-consent-host-input.ts",
+    ]);
+  });
+
+  it("ships no private key, key generation or synthetic approval in src", () => {
+    for (const file of sourceFiles(srcRoot)) {
+      const code = readFileSync(file, "utf8");
+      expect(code, posixPath(file)).not.toMatch(/BEGIN (?:[A-Z]+ )?PRIVATE KEY|generateKeyPair/);
+      expect(code, posixPath(file)).not.toMatch(/synthetic-(?:release|policy|attestation)/);
     }
   });
 });
@@ -183,27 +249,67 @@ describe("Phase 4.0 shipped wiring census", () => {
     // chrony-bound building blocks, must be reviewed as part of a coordinated activation.
     expect(sorted).toEqual({
       "trusted-time/host-clock.ts": [
+        "src/modules/booking/package-checkout-availability.ts",
         "src/modules/booking/package-consent-certification.ts",
         "src/modules/booking/package-consent-evidence.ts",
         "src/modules/booking/package-consent-protocol.ts",
       ],
       "trusted-time/qualified-host.ts": [
+        "src/modules/booking/package-batch-authority.ts",
         "src/modules/booking/package-checkout-availability.ts",
         "src/modules/booking/package-consent-protocol.ts",
         "src/modules/booking/package-purchase-authority.ts",
       ],
+      "trusted-time/first-class-deployment-authority.ts": [
+        "src/modules/booking/approved-first-class-release.ts",
+      ],
+      "trusted-time/require-qualified-linux-boot.ts": [
+        "src/modules/booking/package-batch-authority.ts",
+      ],
     });
   });
 
-  it("the inert registry/history/policy/composition blocks have no shipped importer at all", () => {
-    // Phase 4.1: these four may import one another; nothing else in src (including the
-    // deny-only qualified-host seam) may import them until a reviewed activation release.
+  it("only the approved host seam and its release input import the composition", () => {
+    // The host seam may import only the composition; no other importer or direct access
+    // to registry, history or numerical policy is permitted.
     const inert =
       /(?:host-authority-registry|host-authority-history|qualified-host-composition|consent-clock-policy)(?:\.js)?$/;
     for (const file of files) {
       if (inert.test(file.replace(/\.ts$/, ""))) continue;
+      if (posixPath(file) === "src/modules/booking/trusted-time/authenticated-release-record.ts") {
+        expect(
+          specifiers(file)
+            .filter((s) => inert.test(s))
+            .sort(),
+        ).toEqual([
+          "./consent-clock-policy.js",
+          "./host-authority-history.js",
+          "./host-authority-registry.js",
+        ]);
+        continue;
+      }
+      if (posixPath(file) === "src/modules/booking/trusted-time/approved-release-loader.ts") {
+        expect(specifiers(file).filter((s) => inert.test(s))).toEqual([
+          "./host-authority-registry.js",
+        ]);
+        continue;
+      }
       for (const specifier of specifiers(file))
-        expect(specifier, posixPath(file)).not.toMatch(inert);
+        if (inert.test(specifier)) {
+          const allowed =
+            posixPath(file) === "src/modules/booking/trusted-time/approved-consent-host-input.ts"
+              ? [
+                  "./qualified-host-composition.js",
+                  "./host-authority-history.js",
+                  "./host-authority-registry.js",
+                ]
+              : ["./qualified-host-composition.js"];
+          expect([
+            "src/modules/booking/trusted-time/qualified-host.ts",
+            "src/modules/booking/trusted-time/approved-consent-host-input.ts",
+          ]).toContain(posixPath(file));
+          expect(allowed).toContain(specifier);
+        }
     }
   });
 });

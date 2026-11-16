@@ -41,12 +41,14 @@ describe("shipped state", () => {
   });
 
   it("Package purchase activation stays denied regardless of any assessment", async () => {
+    expect(assessConsentCommitDeadline(input(), SYNTHETIC).kind).toBe("CERTIFIED");
     await expect(verifyPackageBatchActivation()).rejects.toMatchObject({ statusCode: 503 });
     const source = readFileSync(
       new URL("../../src/modules/booking/package-batch-authority.ts", import.meta.url),
       "utf8",
     );
-    expect(source).not.toContain("package-consent-commit-deadline");
+    // Importing the fixed lifetime is allowed; synthetic arithmetic must never grant rollout.
+    expect(source).not.toContain("assessConsentCommitDeadline");
   });
 
   it("uses exactly the Owner-approved 30-minute lifetime", () => {

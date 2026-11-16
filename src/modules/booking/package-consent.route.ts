@@ -82,39 +82,50 @@ export const createPackageConsentRoute = (
     // Informational VAT sits beside, never inside, the hashed/signed retained terms.
     return { ...view, tax: await readPackageQuoteTax(tax, view) };
   };
-  router.use((req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    // Shipped composition passes no options (= shippedPackageConsentHttpActivation, disabled).
-    // A runtime flag cannot grant B1c authority. Explicit options remain an isolated
-    // engineering-test composition seam only. Catalogue availability reads the same gate.
-    const readiness = readPackageConsentHttpReadiness(options);
-    if (readiness.state === "DISABLED")
-      return next(
-        consentError("Package terms review is unavailable", 404, "PACKAGE_CONSENT_DISABLED"),
-      );
-    const origin = req.headers.origin;
-    if (origin && !(options.origins ?? env.CORS_ORIGINS).includes(origin))
-      return next(consentError("Origin is not allowed", 403, "PACKAGE_CONSENT_ORIGIN_REJECTED"));
-    if (readiness.state === "NOT_CONFIGURED")
-      return next(
-        consentError(
-          "Package quote lifetime requires server configuration",
-          503,
-          "PACKAGE_CONSENT_NOT_CONFIGURED",
-        ),
-      );
-    if (readiness.state === "LIFETIME_UNAPPROVED")
-      return next(
-        consentError(
-          "The approved quote lifetime is 30 minutes",
-          503,
-          "PACKAGE_CONSENT_LIFETIME_UNAPPROVED",
-        ),
-      );
-    const lifetime = readiness.lifetimeMs;
-    services ??= (options.build ?? buildPackageConsentServices)(lifetime);
-    next();
-  });
+  router.use(
+    asyncHandler(async (req, res, next) => {
+      res.setHeader("Cache-Control", "no-store");
+      // Shipped composition passes no options (= shippedPackageConsentHttpActivation, disabled).
+      // A runtime flag cannot grant B1c authority. Explicit options remain an isolated
+      // engineering-test composition seam only. Catalogue availability reads the same gate.
+      const readiness = readPackageConsentHttpReadiness(options);
+      if (readiness.state === "DISABLED")
+        return next(
+          consentError("Package terms review is unavailable", 404, "PACKAGE_CONSENT_DISABLED"),
+        );
+      const origin = req.headers.origin;
+      if (origin && !(options.origins ?? env.CORS_ORIGINS).includes(origin))
+        return next(consentError("Origin is not allowed", 403, "PACKAGE_CONSENT_ORIGIN_REJECTED"));
+      if (readiness.state === "NOT_CONFIGURED")
+        return next(
+          consentError(
+            "Package quote lifetime requires server configuration",
+            503,
+            "PACKAGE_CONSENT_NOT_CONFIGURED",
+          ),
+        );
+      if (readiness.state === "LIFETIME_UNAPPROVED")
+        return next(
+          consentError(
+            "The approved quote lifetime is 30 minutes",
+            503,
+            "PACKAGE_CONSENT_LIFETIME_UNAPPROVED",
+          ),
+        );
+      // The mounted application route must agree with the catalogue and batch gates before
+      // constructing services or reading data. Explicit injected options remain a test seam.
+      if (options === shippedPackageConsentHttpActivation) {
+        const checkout = await readPackageCheckoutReadiness(options);
+        if (!checkout.available)
+          return next(
+            consentError("Package terms review is unavailable", 503, "PACKAGE_CONSENT_UNAVAILABLE"),
+          );
+      }
+      const lifetime = readiness.lifetimeMs;
+      services ??= (options.build ?? buildPackageConsentServices)(lifetime);
+      next();
+    }),
+  );
   router.use(
     (req, res, next) => {
       if (!services) return next(new Error("Consent composition missing"));

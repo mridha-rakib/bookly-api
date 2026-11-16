@@ -1,4 +1,5 @@
 import { env } from "../../config/env.js";
+import { readApprovedFirstClassRelease } from "./approved-first-class-release.js";
 import { PACKAGE_CONSENT_STRICT_LIFETIME_MS } from "./package-consent-commit-deadline.js";
 
 /** Consent HTTP composition inputs. `enabled` is the existing route seam; no env flag sets it. */
@@ -9,7 +10,10 @@ export type PackageConsentHttpActivation = Readonly<{ enabled?: boolean; lifetim
  * partial rollout (qualified host + batch authority without Consent HTTP) cannot advertise a
  * checkout the route would refuse. Changing it is part of the coordinated activation release,
  * never a runtime toggle. Isolated engineering tests may substitute this module. */
-export const shippedPackageConsentHttpActivation: PackageConsentHttpActivation = Object.freeze({});
+const release = readApprovedFirstClassRelease();
+export const shippedPackageConsentHttpActivation: PackageConsentHttpActivation = Object.freeze(
+  release ? { enabled: true, lifetimeMs: release.lifetimeMs } : {},
+);
 
 export type PackageConsentHttpReadiness =
   | { state: "DISABLED" }

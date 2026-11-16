@@ -42,10 +42,9 @@ const deniedComposition: QualifiedConsentHostComposition = Object.freeze({
   },
 });
 
-/** P4I §3 step 3 building block, NOT a qualification, installer or activation API. It is not
- * imported by shipped code. A later reviewed release may replace the two deny-only bodies in
- * `qualified-host.ts` with these delegates; that replacement still needs the approved policy,
- * qualified entries, protected resolver and the separate coordinated activation release.
+/** P4I §3 step 3 building block, NOT a qualification, installer or activation API. The shipped
+ * host seam delegates here using a release-owned input, which is currently unconfigured. A
+ * coordinated release still needs an approved policy, qualified entries and protected resolver.
  *
  * Every input is required; there are no defaults and no environment, file, JSON or database
  * discovery. Construction never throws: missing/invalid policy, entries or resolver yields a
@@ -56,11 +55,15 @@ const deniedComposition: QualifiedConsentHostComposition = Object.freeze({
  * The approved policy binds only the CURRENT issuer. VERIFY_ONLY history keeps the limits it
  * was originally qualified under, so a policy change never invalidates sealed evidence.
  */
-export function composeQualifiedConsentHost(input: {
+export type QualifiedConsentHostCompositionInput = {
   policy: unknown;
   entries: readonly ConsentHostAuthorityEntry[];
   resolveProtectedKey: (reference: string, version: string, purpose: "SIGN" | "VERIFY") => Buffer;
-}): QualifiedConsentHostComposition {
+};
+
+export function composeQualifiedConsentHost(
+  input: QualifiedConsentHostCompositionInput | undefined,
+): QualifiedConsentHostComposition {
   let registry: ReturnType<typeof createConsentHostAuthorityRegistry>;
   let policy: ReturnType<typeof parseApprovedConsentClockPolicy>;
   try {
