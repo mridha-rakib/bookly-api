@@ -219,6 +219,10 @@ packageProgressSchema.index({ businessId: 1, customerUserId: 1, serviceId: 1 });
 packageProgressSchema.index({ "sessions.bookingId": 1 });
 packageProgressSchema.index({ businessId: 1, customerUserId: 1, "items.serviceId": 1 });
 packageProgressSchema.index({ businessId: 1, "items.serviceId": 1 });
+// CW-1 — central withdrawal eligibility: active packages (refundable unused sessions) and void
+// refunds not yet settled, platform-wide. Additive; provision before enabling withdrawals.
+packageProgressSchema.index({ remainingSessions: 1 });
+packageProgressSchema.index({ "voidRefundSettlement.status": 1 }, { sparse: true });
 
 // Explicit isolation also covers exists(), deletes and terminal hooks. No default version
 // is written onto old records and legacy DTOs never receive a v2 shape.

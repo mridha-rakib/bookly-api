@@ -36,6 +36,10 @@ import {
   StripePayoutHistoryCoverageModel,
   StripePayoutObservationModel,
 } from "./stripe-payout-observation.model.js";
+import {
+  evaluateWithdrawalEligibility,
+  type WithdrawalEligibility,
+} from "./withdrawal-eligibility.js";
 
 /** FG03B-2 — one page of the read-only observed-payout review, always scoped to the current
  * verified Stripe platform account. Provider evidence only: never a ledger, never a permission. */
@@ -230,7 +234,8 @@ export class CentralPayoutService {
         );
     return {
       mode,
-      liveExecutionEnabled: false, // No approved reserve authority exists, even if the deployment flag is set.
+      // CW-1 — the deployment flag; every LIVE request still needs AVAILABLE eligibility.
+      liveExecutionEnabled: this.deps.policy.liveExecutionEnabled,
       balances: currencies.map((currency) => ({
         currency,
         availableCents: balance.available.find((b) => b.currency === currency)?.amountCents ?? 0,
@@ -266,6 +271,36 @@ export class CentralPayoutService {
         syncEnabled: this.deps.policy.historySyncEnabled === true,
       }),
     };
+  }
+
+  /** CW-1 — the authoritative, server-side withdrawal eligibility the Super Admin reviews. */
+  public async getEligibility(): Promise<WithdrawalEligibility> {
+    return (await this.evaluateEligibility()).eligibility;
+  }
+
+  /** Reads Stripe (balance, account) and evidence once and evaluates eligibility from them; the
+   * same evaluation backs the review, the confirmation and the pre-dispatch revalidation. */
+  private async evaluateEligibility(excludeOperationId?: Types.ObjectId) {
+    const mode = this.deps.gateway.mode() ?? null;
+    const [balance, account, outstanding] = await Promise.all([
+      this.provider(() => this.deps.gateway.retrieveBalance()),
+      this.provider(() => this.deps.gateway.retrieveAccountPayoutState()),
+      this.deps.businessAttributedUnpaid?.() ?? Promise.resolve(null),
+    ]);
+    const readiness = await readReconciliationReadiness({
+      mode,
+      currentAccountId: account.accountId,
+      syncEnabled: this.deps.policy.historySyncEnabled === true,
+    });
+    const eligibility = await evaluateWithdrawalEligibility({
+      mode,
+      accountId: account.accountId,
+      balance,
+      readiness,
+      businessOutstanding: outstanding,
+      ...(excludeOperationId ? { excludeOperationId } : {}),
+    });
+    return { eligibility, balance, account };
   }
 
   /** FG03B-0/1 — read-only. Uses the shared linkage classifier (see RecentStripePayoutView);
@@ -331,6 +366,8 @@ export class CentralPayoutService {
       currency: string;
       destinationId: string;
       currentPassword?: string | undefined;
+      /** CW-1 — the eligibility digest the Super Admin reviewed; any change refuses the request. */
+      eligibilityDigest: string;
     },
   ): Promise<CentralPayoutOperationDocument> {
     const requestKey = `${actorUserId}:${input.requestId}`;
@@ -345,10 +382,7 @@ export class CentralPayoutService {
     };
 
     const mode = this.deps.gateway.mode();
-    const [balance, account] = await Promise.all([
-      this.provider(() => this.deps.gateway.retrieveBalance()),
-      this.provider(() => this.deps.gateway.retrieveAccountPayoutState()),
-    ]);
+    const { eligibility, balance, account } = await this.evaluateEligibility();
     const blocking = [
       ...this.executionRestrictions(mode ?? null, balance.livemode),
       ...this.accountRestrictions(account),
@@ -376,6 +410,27 @@ export class CentralPayoutService {
         "The amount is more than the available Stripe balance in this currency",
         422,
       );
+    // CW-1 — the authoritative, server-side eligibility (never a client calculation).
+    const decision = eligibility.currencies.find((c) => c.currency === input.currency);
+    if (decision?.status !== "AVAILABLE")
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_ELIGIBILITY_UNAVAILABLE",
+        decision?.blockers[0]?.message ??
+          "No withdrawal amount can be established for this currency",
+        409,
+      );
+    if (decision.digest !== input.eligibilityDigest)
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_ELIGIBILITY_CHANGED",
+        "The financial evidence changed since you reviewed this withdrawal. Review the new eligible amount and confirm again.",
+        409,
+      );
+    if (input.amountCents > decision.eligibleCents)
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_EXCEEDS_ELIGIBLE",
+        "The amount is more than the eligible withdrawal amount",
+        422,
+      );
 
     const _id = new Types.ObjectId();
     let op: CentralPayoutOperationDocument;
@@ -393,8 +448,19 @@ export class CentralPayoutService {
           destinationBankName: destination.bankName ?? undefined,
           destinationLast4: destination.last4,
           state: "PREPARED",
+          // The unique slot admits one unresolved withdrawal: two requests can never both spend
+          // the same eligibility.
           activeSlot: "CENTRAL",
           providerIdempotencyKey: `central-payout:${String(_id)}`,
+          eligibility: {
+            policyVersion: eligibility.policyVersion,
+            digest: decision.digest,
+            evaluatedAt: eligibility.evaluatedAt,
+            eligibleCents: decision.eligibleCents,
+            stripeAvailableCents: decision.stripeAvailableCents,
+            ledgerHeldCents: decision.ledgerHeldCents ?? 0,
+            protectedCents: decision.protected.totalCents,
+          },
           audit: [this.entry("REQUESTED", "API", undefined, undefined, actor.userId)],
         })
       ).toObject();
@@ -604,6 +670,59 @@ export class CentralPayoutService {
         );
       return this.audit(op, this.entry("BLOCKED", source, reason));
     }
+    // CW-1 — revalidate eligibility immediately before calling Stripe (after the reservation is
+    // committed, outside any database transaction). This operation itself is excluded; anything
+    // else that changed since review (balance, payouts, protected refunds/disputes, evidence)
+    // must still cover the immutable amount.
+    let revalidated: CentralPayoutOperationDocument | null = null;
+    try {
+      const { eligibility } = await this.evaluateEligibility(op._id);
+      const decision = eligibility.currencies.find((c) => c.currency === op.currency);
+      if (decision?.status !== "AVAILABLE" || op.amountCents > decision.eligibleCents) {
+        const why =
+          decision?.status === "AVAILABLE"
+            ? `eligible amount is now ${decision.eligibleCents}`
+            : (decision?.blockers[0]?.message ?? "eligibility unavailable");
+        revalidated =
+          op.dispatchCount === 0
+            ? await this.update(
+                op,
+                { state: "PREPARED", dispatchCount: 0 },
+                {
+                  $set: {
+                    state: "REJECTED",
+                    failureMessage: `Not sent: eligibility changed (${why})`.slice(0, 500),
+                  },
+                  $unset: { activeSlot: 1 },
+                  $push: {
+                    audit: {
+                      $each: [
+                        this.entry("BLOCKED", source, `Eligibility changed: ${why}`),
+                        this.entry("RESERVATION_RELEASED", source, "Never sent to Stripe"),
+                      ],
+                    },
+                  },
+                },
+              )
+            : // Possibly already at Stripe: never resend against insufficient eligibility.
+              await this.audit(
+                op,
+                this.entry(
+                  "REQUIRES_REVIEW",
+                  source,
+                  `Not resent: eligibility no longer covers it (${why})`,
+                ),
+              );
+      }
+    } catch {
+      // Provider or evidence read failed: never send blind. The operation keeps its reservation
+      // and identity; Refresh retries the same operation later.
+      revalidated = await this.audit(
+        op,
+        this.entry("BLOCKED", source, "Eligibility could not be revalidated; not sent"),
+      );
+    }
+    if (revalidated) return revalidated;
     await CentralPayoutOperationModel.updateOne(
       { _id: op._id },
       {
@@ -637,7 +756,14 @@ export class CentralPayoutService {
               failureMessage: failure.message.slice(0, 500),
             },
             $unset: { activeSlot: 1 },
-            $push: { audit: this.entry("PROVIDER_REJECTED", source, failure.message) },
+            $push: {
+              audit: {
+                $each: [
+                  this.entry("PROVIDER_REJECTED", source, failure.message),
+                  this.entry("RESERVATION_RELEASED", source, "Stripe certainly created no payout"),
+                ],
+              },
+            },
           },
         );
       }
@@ -713,6 +839,24 @@ export class CentralPayoutService {
           providerEventId,
         )
       : this.entry("STATUS_CHANGED", source, `${op.providerStatus} → ${status}`, providerEventId);
+    // CW-1 — accepted, in-transit and paid payouts stay counted as cash out of Stripe; only a
+    // Stripe-reported failure or cancellation returns them to eligibility (audited). Acceptance
+    // alone never releases anything.
+    const released =
+      (status === "failed" || status === "canceled") &&
+      op.providerStatus !== "failed" &&
+      op.providerStatus !== "canceled";
+    const entries = released
+      ? [
+          entry,
+          this.entry(
+            "RESERVATION_RELEASED",
+            source,
+            `Stripe reported the payout ${status}; funds return to the Stripe balance`,
+            providerEventId,
+          ),
+        ]
+      : [entry];
     const updated = await this.update(op, filter, {
       $set: {
         state: "SUBMITTED",
@@ -725,7 +869,7 @@ export class CentralPayoutService {
         lastSyncedAt: new Date(),
       },
       $unset: { activeSlot: 1 },
-      $push: { audit: entry },
+      $push: { audit: { $each: entries } },
     });
     // FG03B-2 — the operation now records this exact payout id: an observation written earlier
     // (e.g. a webhook that arrived while the request was unconfirmed) becomes VERIFIED_BOOKLY,
@@ -849,6 +993,10 @@ export class CentralPayoutService {
           message: "Stripe returned data for a different mode than the configured key",
         },
       ];
+    // CW-1 — the reserve policy is implemented: every request (TEST and LIVE) must pass the
+    // authoritative eligibility gate at confirmation and again immediately before dispatch.
+    // LIVE additionally requires the deployment's explicit enablement, which stays off until the
+    // release is separately authorized.
     if (mode === "LIVE" && !this.deps.policy.liveExecutionEnabled)
       return [
         {
@@ -856,19 +1004,16 @@ export class CentralPayoutService {
           message: "LIVE withdrawals are disabled in this deployment",
         },
       ];
-    if (mode === "LIVE")
-      return [
-        {
-          code: "CENTRAL_PAYOUT_RESERVE_POLICY_UNAPPROVED",
-          message:
-            "LIVE withdrawals remain disabled until the Owner approves a reserve policy and its financial controls are implemented and reviewed",
-        },
-      ];
     return [];
   }
 
   private accountRestrictions(account: CentralAccountPayoutState): Restriction[] {
     const restrictions: Restriction[] = [];
+    if (!account.accountId)
+      restrictions.push({
+        code: "CENTRAL_PAYOUT_ACCOUNT_UNIDENTIFIED",
+        message: "The Stripe account could not be identified",
+      });
     if (!account.payoutsEnabled)
       restrictions.push({
         code: "CENTRAL_PAYOUT_PAYOUTS_DISABLED",

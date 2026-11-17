@@ -1,6 +1,8 @@
-# Central Withdrawal reserve decision — pending
+# Central Withdrawal reserve decision
 
-Status: **OWNER/ACCOUNTING DECISION PENDING**. Date: 8 November 2026.
+> **Update 17 November 2026:** the Owner confirmed the ownership and manual-settlement rules (A, B, H; no second approval, I). They are implemented as policy CW-1 in `CENTRAL-WITHDRAWAL-ELIGIBILITY.md`, which replaces the hard-coded source denial with eligibility, reservation and LIVE-flag controls. Category J (Stripe, legal and accountant confirmation) remains external. LIVE stays off by deployment flag until a release is authorized. The original analysis below is kept for reference.
+
+Status (original): **OWNER/ACCOUNTING DECISION PENDING**. Date: 8 November 2026.
 
 LIVE Bookly payouts remain source-denied, including when the deployment flag is enabled. A bank account visible in Stripe, a verified bank, a positive Stripe balance, and Super Admin access do not constitute reserve approval. No numerical policy is proposed here.
 

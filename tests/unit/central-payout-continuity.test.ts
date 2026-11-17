@@ -26,7 +26,19 @@ vi.mock("../../src/modules/central-payout/payout-reconciliation.js", async (impo
   },
   // FG03B-2 — linkage promotion after a confirmed payout id is a DB write; stubbed here too.
   promoteObservationLinkage: async () => {},
+  readReconciliationReadiness: async () => ({ blockers: [] }),
 }));
+// CW-1 — pre-dispatch revalidation reads the database; these tests fix the decision instead.
+const cw = vi.hoisted(() => ({ status: "AVAILABLE" as "AVAILABLE" | "UNAVAILABLE" }));
+vi.mock("../../src/modules/central-payout/withdrawal-eligibility.js", async (importOriginal) => {
+  const helper = await import("../helpers/central-eligibility-mock.js");
+  return {
+    ...(await importOriginal<
+      typeof import("../../src/modules/central-payout/withdrawal-eligibility.js")
+    >()),
+    evaluateWithdrawalEligibility: async () => helper.fixedEligibility(cw.status),
+  };
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -90,6 +102,18 @@ function fixture(mode: "TEST" | "LIVE" = "TEST") {
       createPayout: create,
       listRecentPayouts: list,
       retrievePayout: async () => payout,
+      retrieveBalance: async () => ({
+        livemode: mode === "LIVE",
+        available: [{ currency: "eur", amountCents: 1_000_000 }],
+        pending: [],
+      }),
+      retrieveAccountPayoutState: async () => ({
+        accountId: "acct_unittest",
+        payoutsEnabled: true,
+        scheduleInterval: "manual",
+        destinationsReadable: true,
+        destinations: [],
+      }),
     } as unknown as CentralPayoutGateway,
     policy: { liveExecutionEnabled: mode === "LIVE" },
     verifyStepUp: vi.fn(),
@@ -145,13 +169,18 @@ describe("Central withdrawal continuity", () => {
     expect(f.create).not.toHaveBeenCalled();
   });
 
-  it("never resends an uncertain LIVE payout while reserve authority is denied", async () => {
-    const f = fixture("LIVE");
-    f.list.mockResolvedValue([]);
-    await f.service.refresh(String(f.op._id));
-    expect(f.create).not.toHaveBeenCalled();
-    expect(f.op.state).toBe("UNKNOWN");
-    expect(f.op.audit.at(-1)?.kind).toBe("BLOCKED");
+  it("CW-1 never resends an uncertain LIVE payout unless current eligibility covers it", async () => {
+    cw.status = "UNAVAILABLE";
+    try {
+      const f = fixture("LIVE");
+      f.list.mockResolvedValue([]);
+      await f.service.refresh(String(f.op._id));
+      expect(f.create).not.toHaveBeenCalled();
+      expect(f.op.state).toBe("UNKNOWN");
+      expect(f.op.audit.at(-1)?.kind).toBe("REQUIRES_REVIEW");
+    } finally {
+      cw.status = "AVAILABLE";
+    }
   });
 
   it("accepts provider-confirmed paid-to-failed transitions without another payout", async () => {
@@ -181,6 +210,21 @@ describe("Central withdrawal continuity", () => {
       idempotencyKey: "original-key",
       metadata: f.payout.metadata,
     });
+  });
+
+  it("CW-1 never resends a possibly-sent withdrawal when eligibility no longer covers it", async () => {
+    cw.status = "UNAVAILABLE";
+    try {
+      const f = fixture();
+      f.op.dispatchCount = 1;
+      f.list.mockResolvedValue([]);
+      await f.service.refresh(String(f.op._id));
+      expect(f.create).not.toHaveBeenCalled();
+      expect(f.op.state).toBe("UNKNOWN"); // never closed: Stripe may already hold it
+      expect(f.op.audit.at(-1)).toMatchObject({ kind: "REQUIRES_REVIEW" });
+    } finally {
+      cw.status = "AVAILABLE";
+    }
   });
 
   it.each(["destination", "automatic"])(

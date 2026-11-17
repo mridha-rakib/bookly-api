@@ -87,6 +87,8 @@ schema.index({ bookingId: 1, createdAt: -1, _id: -1 });
 schema.index({ providerDisputeId: 1 }, { unique: true });
 // Support list / open-dispute backstop.
 schema.index({ final: 1, updatedAt: 1 });
+// CW-1 — uncorrelated disputes protected by central withdrawal eligibility.
+schema.index({ correlation: 1 });
 // Business-scoped read.
 schema.index({ businessId: 1, createdAt: -1 });
 

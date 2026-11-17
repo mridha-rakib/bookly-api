@@ -32,11 +32,24 @@ export type CentralPayoutAuditEntry = {
     | "STATUS_CHANGED"
     | "MISMATCH"
     | "REQUIRES_REVIEW"
-    | "BLOCKED";
+    | "BLOCKED"
+    /** CW-1 — the withdrawn amount is no longer counted as out of Stripe (never sent, Stripe
+     * certainly created nothing, or Stripe reported the payout failed/canceled). */
+    | "RESERVATION_RELEASED";
   source?: "API" | "WEBHOOK" | "REFRESH" | "RECOVERY" | undefined;
   detail?: string | undefined;
   providerEventId?: string | undefined;
   actorUserId?: Types.ObjectId | undefined;
+};
+
+export type CentralPayoutEligibilitySnapshot = {
+  policyVersion: string;
+  digest: string;
+  evaluatedAt: Date;
+  eligibleCents: number;
+  stripeAvailableCents: number;
+  ledgerHeldCents: number;
+  protectedCents: number;
 };
 
 export type CentralPayoutOperationDocument = {
@@ -60,6 +73,8 @@ export type CentralPayoutOperationDocument = {
   estimatedArrivalAt?: Date | undefined;
   failureCode?: string | undefined;
   failureMessage?: string | undefined;
+  /** CW-1 — the eligibility evaluation this request was confirmed against (immutable). */
+  eligibility?: CentralPayoutEligibilitySnapshot | undefined;
   dispatchCount: number;
   lastDispatchedAt?: Date | undefined;
   lastSyncedAt?: Date | undefined;
@@ -104,6 +119,20 @@ const schema = new Schema<CentralPayoutOperationDocument>(
     estimatedArrivalAt: { type: Date },
     failureCode: { type: String },
     failureMessage: { type: String, maxlength: 500 },
+    eligibility: {
+      type: new Schema<CentralPayoutEligibilitySnapshot>(
+        {
+          policyVersion: { type: String, required: true },
+          digest: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+          evaluatedAt: { type: Date, required: true },
+          eligibleCents: { type: Number, required: true, validate: Number.isSafeInteger },
+          stripeAvailableCents: { type: Number, required: true, validate: Number.isSafeInteger },
+          ledgerHeldCents: { type: Number, required: true, validate: Number.isSafeInteger },
+          protectedCents: { type: Number, required: true, validate: Number.isSafeInteger },
+        },
+        { _id: false },
+      ),
+    },
     dispatchCount: { type: Number, required: true, default: 0 },
     lastDispatchedAt: { type: Date },
     lastSyncedAt: { type: Date },

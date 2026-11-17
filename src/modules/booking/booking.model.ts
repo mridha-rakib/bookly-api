@@ -1088,6 +1088,9 @@ bookingSchema.index({ reference: 1 }, { unique: true });
 bookingSchema.index({ businessId: 1, "schedule.startAt": 1 });
 // Status-filtered lists within a Business (Upcoming/Canceled/etc tabs).
 bookingSchema.index({ businessId: 1, status: 1 });
+// CW-1 — platform-wide refund exposure for central withdrawal eligibility (bookings whose upfront
+// payment can still be refunded). Additive; provision before enabling withdrawals.
+bookingSchema.index({ status: 1 });
 // A specific Staff member's bookings by time range — the future per-Staff conflict/availability
 // query. One array field (serviceLines) participates, which MongoDB fully supports in a
 // compound index (at most one array path per compound index — this index has exactly one).

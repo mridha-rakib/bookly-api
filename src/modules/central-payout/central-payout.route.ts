@@ -23,6 +23,8 @@ export const initiateCentralPayoutBodySchema = z
     currency: z.string().regex(/^[a-z]{3}$/, "Use a lowercase ISO currency code"),
     destinationId: z.string().regex(/^ba_[A-Za-z0-9]{1,250}$/, "Choose the linked bank account"),
     currentPassword: z.string().min(1).max(256),
+    /** CW-1 — the eligibility digest the Super Admin reviewed (GET .../eligibility). */
+    eligibilityDigest: z.string().regex(/^[a-f0-9]{64}$/, "Review the eligible amount first"),
   })
   .strict();
 export const centralPayoutParamsSchema = z.object({
@@ -147,6 +149,13 @@ export const createCentralPayoutRouter = (service: CentralPayoutService): Router
         withdrawals: page.items.map(toCentralPayoutOperationDto),
         pagination: { page: query.page, limit: query.limit, total: page.total },
       });
+    }),
+  );
+  // CW-1 — the authoritative withdrawal eligibility (Super Admin router gate). Read-only.
+  router.get(
+    "/finance/withdrawals/eligibility",
+    asyncHandler(async (_request: Request, response: Response) => {
+      sendSuccess(response, 200, "Withdrawal eligibility", await service.getEligibility());
     }),
   );
   // FG03B-2 — read-only review of observed Stripe payouts (database only, current verified

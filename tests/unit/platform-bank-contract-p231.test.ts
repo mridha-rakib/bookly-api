@@ -12,6 +12,22 @@ vi.mock("../../src/config/env.js", () => ({ env: fake.env }));
 vi.mock("../../src/modules/payment/stripe-client.js", () => ({
   getStripeClient: () => ({ accounts: fake.accounts }),
 }));
+// CW-1 — eligibility/readiness read the database; DB-less unit tests fix the decision.
+vi.mock("../../src/modules/central-payout/withdrawal-eligibility.js", async (importOriginal) => {
+  const helper = await import("../helpers/central-eligibility-mock.js");
+  return {
+    ...(await importOriginal<
+      typeof import("../../src/modules/central-payout/withdrawal-eligibility.js")
+    >()),
+    evaluateWithdrawalEligibility: async () => helper.fixedEligibility("AVAILABLE"),
+  };
+});
+vi.mock("../../src/modules/central-payout/payout-reconciliation.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../../src/modules/central-payout/payout-reconciliation.js")
+  >()),
+  readReconciliationReadiness: async () => ({ blockers: [] }),
+}));
 const bank = (id: string, currency = "eur", isDefault = true) => ({
   object: "bank_account",
   id,
@@ -204,6 +220,7 @@ it.each(["duplicates", "partial", "malformed"])(
         amountCents: 100,
         currency: "eur",
         destinationId: "ba_default",
+        eligibilityDigest: "a".repeat(64),
       }),
     ).rejects.toMatchObject({ statusCode: 409 });
     expect(create).not.toHaveBeenCalled();

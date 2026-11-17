@@ -7,9 +7,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createErrorHandler } from "../../../src/common/middleware/error-handler.js";
 import { TokenService } from "../../../src/modules/auth/token.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import type { BookingFinancialTransactionType } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.types.js";
 import { createCentralPayoutRouter } from "../../../src/modules/central-payout/central-payout.route.js";
 import { CentralPayoutService } from "../../../src/modules/central-payout/central-payout.service.js";
 import {
@@ -25,8 +27,11 @@ import {
   StripePayoutHistoryCoverageModel,
   StripePayoutObservationModel,
 } from "../../../src/modules/central-payout/stripe-payout-observation.model.js";
+import { BusinessPayoutModel } from "../../../src/modules/finance/business-payout.model.js";
+import { PackageProgressModel } from "../../../src/modules/package-progress/package-progress.model.js";
 import type { PaymentGateway } from "../../../src/modules/payment/payment.types.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
+import { PaymentDisputeModel } from "../../../src/modules/provider-reversal/payment-dispute.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventModel } from "../../../src/modules/stripe-webhook/stripe-webhook-event.model.js";
@@ -76,7 +81,12 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
   public mode() {
     return this.modeValue;
   }
+  /** CW-1 — runs before each balance read (e.g. a balance change between review and dispatch). */
+  public onRetrieveBalance: ((call: number) => void) | null = null;
+  public balanceCalls = 0;
   public async retrieveBalance() {
+    this.balanceCalls += 1;
+    this.onRetrieveBalance?.(this.balanceCalls);
     return this.balance;
   }
   public async retrieveAccountPayoutState() {
@@ -118,6 +128,16 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
       automatic: false,
       metadata: input.metadata,
     };
+    // Like Stripe, a newly created payout leaves the available balance immediately.
+    if (!existing)
+      this.balance = {
+        ...this.balance,
+        available: this.balance.available.map((b) =>
+          b.currency === input.currency
+            ? { ...b, amountCents: b.amountCents - input.amountCents }
+            : b,
+        ),
+      };
     this.payouts.set(input.idempotencyKey, payout);
     if (outcome === "lost") throw new CentralPayoutProviderError("Request timed out", false);
     return payout;
@@ -212,18 +232,52 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
         return { email: "admin@example.com" };
       },
     });
+    // CW-1 — €1,000 of completed, Stripe-charged Bookly platform fees backs the fake balance.
+    await ledgerRow("PLATFORM_FEE", 100_000);
   });
   afterAll(async () => {
     await stopIsolatedReplicaSet();
   });
 
-  const submit = (overrides: Partial<Parameters<CentralPayoutService["initiate"]>[1]> = {}) =>
+  /** CW-1 — a Stripe-charged ledger row (ownership by type; providerReference = PaymentIntent). */
+  const ledgerRow = (
+    type: BookingFinancialTransactionType,
+    amountCents: number,
+    over: Record<string, unknown> = {},
+  ): Promise<unknown> =>
+    BookingFinancialTransactionModel.create({
+      businessId: new Types.ObjectId(),
+      bookingId: new Types.ObjectId(),
+      businessClientId: new Types.ObjectId(),
+      type,
+      direction: ["REFUND", "DISPUTE_WITHDRAWAL", "TAX_REVERSAL", "PROMO_SUBSIDY"].includes(type)
+        ? "CREDIT"
+        : "DEBIT",
+      amountCents,
+      currency: "EUR",
+      status: "SUCCEEDED",
+      providerReference: `pi_${new Types.ObjectId()}`,
+      ...over,
+    });
+  /** Complete, current payout evidence for the current mode (one full read of the fake history). */
+  const ensureEvidence = async () => {
+    const mode = gateway.modeValue ?? "TEST";
+    if (!(await StripePayoutHistoryCoverageModel.exists({ mode, state: "COMPLETE" })))
+      await service.syncProviderHistory(String(admin), { maxPages: 10 });
+  };
+  const digestFor = async (currency = "eur") => {
+    await ensureEvidence();
+    const eligibility = await service.getEligibility();
+    return eligibility.currencies.find((c) => c.currency === currency)?.digest ?? "0".repeat(64);
+  };
+  const submit = async (overrides: Partial<Parameters<CentralPayoutService["initiate"]>[1]> = {}) =>
     service.initiate(String(admin), {
       requestId: randomUUID(),
       amountCents: 20_000,
       currency: "eur",
       destinationId: BANK,
       currentPassword: "correct-password",
+      eligibilityDigest: await digestFor(overrides.currency),
       ...overrides,
     });
 
@@ -308,6 +362,21 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
 
     // FG03B-2 — the observed-payout review route: Super Admin only, strict bounded filters
     // (validation runs before any Stripe call or database read).
+    // CW-1 — the eligibility read is Super Admin only; no Business role reaches it.
+    const eligibilityRoute = "/super-admin/finance/withdrawals/eligibility";
+    await request(app).get(eligibilityRoute).expect(401);
+    for (const role of ["BUSINESS_OWNER", "STAFF", "CUSTOMER"] as const)
+      await request(app)
+        .get(eligibilityRoute)
+        .set("Authorization", `Bearer ${await tokenFor(role)}`)
+        .expect(403);
+    // A confirmation without a reviewed eligibility digest is rejected by validation.
+    await request(app)
+      .post("/super-admin/finance/withdrawals")
+      .set("Authorization", `Bearer ${superToken}`)
+      .send(body)
+      .expect(400);
+
     const review = "/super-admin/finance/withdrawals/provider-payouts";
     await request(app).get(review).expect(401);
     for (const role of ["BUSINESS_OWNER", "STAFF", "CUSTOMER"] as const)
@@ -430,7 +499,7 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     const overview = await service.getOverview();
     expect(overview.restrictions).toEqual([]);
     expect(overview.balances).toEqual([
-      { currency: "eur", availableCents: 50_000, pendingCents: 1_000 },
+      { currency: "eur", availableCents: 30_000, pendingCents: 1_000 },
     ]);
   });
 
@@ -473,7 +542,8 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     ]);
 
     gateway.nextCreate = "rejected";
-    expect(await submit()).toMatchObject({
+    // CW-1 — within what remains eligible after the two payouts above.
+    expect(await submit({ amountCents: 5_000 })).toMatchObject({
       state: "REJECTED",
       failureCode: "balance_insufficient",
     });
@@ -1230,5 +1300,272 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     expect(gateway.createCalls).toHaveLength(1);
     expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
     expect(await BookingFinancialTransactionModel.countDocuments()).toBe(ledgerBefore);
+  });
+
+  // --- CW-1 — authoritative withdrawal eligibility, reservation and LIVE gate -------------------
+
+  const rawBooking = async (status: string, extra: Record<string, unknown> = {}) => {
+    const _id = new Types.ObjectId();
+    await BookingModel.collection.insertOne({
+      _id,
+      reference: `CW-${String(_id)}`,
+      status,
+      currency: "EUR",
+      ...extra,
+    });
+    return _id;
+  };
+  const eur = async () => {
+    await ensureEvidence();
+    const eligibility = await service.getEligibility();
+    return eligibility.currencies.find((c) => c.currency === "eur") as NonNullable<
+      (typeof eligibility.currencies)[number]
+    >;
+  };
+  const withdraw = (amountCents: number, eligibilityDigest: string) =>
+    service.initiate(String(admin), {
+      requestId: randomUUID(),
+      amountCents,
+      currency: "eur",
+      destinationId: BANK,
+      currentPassword: "correct-password",
+      eligibilityDigest,
+    });
+
+  it("CW-1 eligibility: Bookly fees vs Business funds, protected refunds/disputes, cash and ledger caps", async () => {
+    // Ledger (beforeEach: €1,000 completed Bookly PLATFORM_FEE, Stripe-charged).
+    const upcoming = await rawBooking("UPCOMING");
+    await ledgerRow("DEPOSIT", 30_000, { bookingId: upcoming }); // Business-owned, refundable
+    await ledgerRow("CANCELLATION_FEE", 5_000); // Business-owned penalty charged via Stripe
+    await ledgerRow("DEPOSIT", 7_000, { providerReference: undefined }); // paid directly: not Stripe cash
+    await ledgerRow("PROCESSING_FEE", 2_000, { metadata: { sourceType: "PLATFORM_FEE" } });
+    await ledgerRow("REFUND", 3_000, { metadata: { sourceType: "DEPOSIT" } });
+    await ledgerRow("PROMO_SUBSIDY", 1_000); // Bookly → Business credit, never Stripe cash
+    // In progress at Stripe / not yet debited by Stripe.
+    await RefundOperationModel.collection.insertOne({
+      providerStatus: "PROVIDER_PENDING",
+      currency: "EUR",
+      expectedRefundAmountCents: 1_500,
+      bookingId: new Types.ObjectId(),
+    });
+    await PaymentDisputeModel.collection.insertOne({
+      providerDisputeId: "du_open",
+      amountCents: 4_000,
+      currency: "eur",
+      final: false,
+      correlation: "CORRELATED",
+      providerStatus: "needs_response",
+    });
+    // Debited (ledgered) and won disputes need no protection.
+    await PaymentDisputeModel.collection.insertOne({
+      providerDisputeId: "du_won",
+      amountCents: 9_000,
+      currency: "eur",
+      final: true,
+      outcome: "WON",
+      correlation: "CORRELATED",
+      providerStatus: "won",
+    });
+
+    const before = await eur();
+    expect(before).toMatchObject({
+      status: "AVAILABLE",
+      stripeAvailableCents: 50_000,
+      // 100,000 + 30,000 + 5,000 charged − 2,000 fee − 3,000 refund
+      ledgerHeldCents: 130_000,
+      protected: {
+        refundsInProgressCents: 1_500,
+        refundableBookingsCents: 30_000,
+        refundablePackagesCents: 0,
+        disputesCents: 4_000,
+        totalCents: 35_500,
+      },
+      // min(50,000 Stripe available, 130,000 ledger-held) − 35,500 protected
+      eligibleCents: 14_500,
+    });
+    // Ownership is reported, never merged: Bookly earns only its net fee; Business funds are not
+    // Bookly revenue and stay a recorded liability.
+    expect(before.ledger).toMatchObject({
+      booklyNetRevenueCents: 100_000 - 2_000 - 1_000,
+      businessOwnedNetCents: 30_000 + 5_000 + 7_000 + 1_000 - 3_000,
+      businessSettledCents: 0,
+    });
+
+    await expect(withdraw(14_501, before.digest)).rejects.toMatchObject({
+      statusCode: 422,
+      details: [{ code: "CENTRAL_PAYOUT_EXCEEDS_ELIGIBLE" }],
+    });
+    const op = await withdraw(14_500, before.digest);
+    expect(op).toMatchObject({ state: "SUBMITTED", amountCents: 14_500 });
+    expect(op.eligibility).toMatchObject({
+      policyVersion: "CW-1",
+      digest: before.digest,
+      eligibleCents: 14_500,
+      protectedCents: 35_500,
+    });
+
+    // The withdrawn amount is out of Stripe (balance and ledger-held both reduced): it cannot be
+    // spent twice, and nothing Business-owned changed.
+    const after = await eur();
+    expect(after.stripeAvailableCents).toBe(35_500);
+    expect(after.ledger.stripePayoutsOutCents).toBe(14_500);
+    expect(after.eligibleCents).toBe(0);
+    expect(after.ledger.businessOwnedNetCents).toBe(before.ledger.businessOwnedNetCents);
+    expect(after.ledger.booklyNetRevenueCents).toBe(before.ledger.booklyNetRevenueCents);
+    expect(await BusinessPayoutModel.countDocuments()).toBe(0);
+    expect(
+      await BookingFinancialTransactionModel.countDocuments({ payoutId: { $exists: true } }),
+    ).toBe(0);
+
+    // Stripe later reports the payout failed: funds return and the release is audited.
+    gateway.balance = {
+      ...gateway.balance,
+      available: [{ currency: "eur", amountCents: 50_000 }],
+    };
+    const stripePayout = gateway.payouts.get(op.providerIdempotencyKey) as ProviderPayout;
+    await service.syncFromWebhook({ ...stripePayout, status: "failed" }, "evt_cw_failed");
+    const failed = await service.get(String(op._id));
+    expect(failed.audit.map((a) => a.kind)).toContain("RESERVATION_RELEASED");
+    expect((await eur()).eligibleCents).toBe(14_500);
+  });
+
+  it("CW-1 fails closed on missing, unresolved or contradictory evidence and unsupported currency", async () => {
+    // No payout history read yet: unavailable, and confirmation is refused before any operation.
+    let eligibility = await service.getEligibility();
+    let decision = eligibility.currencies.find((c) => c.currency === "eur");
+    expect(decision).toMatchObject({ status: "UNAVAILABLE", eligibleCents: 0 });
+    expect(decision?.blockers.map((b) => b.code)).toContain("HISTORY_NEVER_SYNCED");
+    await expect(withdraw(100, decision?.digest as string)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_ELIGIBILITY_UNAVAILABLE" }],
+    });
+
+    // An unconfirmed Stripe processing fee leaves cash unknown.
+    await ensureEvidence();
+    await ledgerRow("PROCESSING_FEE", 300, { status: "PENDING" });
+    expect((await eur()).blockers.map((b) => b.code)).toContain("PROCESSING_FEES_UNRESOLVED");
+    await BookingFinancialTransactionModel.deleteMany({ status: "PENDING" });
+
+    // An external (Dashboard) payout is counted as cash already out — not ignored, not blocking.
+    gateway.history = [historyPayout(1, { id: "po_dashboard", amountCents: 60_000 })];
+    await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    decision = await eur();
+    expect(decision).toMatchObject({ status: "AVAILABLE", ledgerHeldCents: 40_000 });
+    expect(decision.eligibleCents).toBe(40_000);
+    // More paid out than the ledger can explain: contradictory, never a negative "eligible".
+    gateway.history = [historyPayout(1, { id: "po_dashboard", amountCents: 160_000 })];
+    await StripePayoutObservationModel.deleteMany({});
+    await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    decision = await eur();
+    expect(decision.status).toBe("UNAVAILABLE");
+    expect(decision.blockers.map((b) => b.code)).toContain("LEDGER_PROVIDER_MISMATCH");
+
+    // A Stripe currency Bookly never charges in cannot be attributed.
+    gateway.balance = {
+      ...gateway.balance,
+      available: [...gateway.balance.available, { currency: "usd", amountCents: 9_999 }],
+    };
+    eligibility = await service.getEligibility();
+    expect(eligibility.currencies.find((c) => c.currency === "usd")).toMatchObject({
+      status: "UNAVAILABLE",
+      eligibleCents: 0,
+    });
+    expect(gateway.createCalls).toHaveLength(0);
+  });
+
+  it("CW-1 stale reviews, competing requests and pre-dispatch changes never overspend", async () => {
+    const reviewed = await eur();
+    expect(reviewed.eligibleCents).toBe(50_000);
+    // A refund starts after the review: the reviewed digest is stale and is refused.
+    await RefundOperationModel.collection.insertOne({
+      providerStatus: "CREATED",
+      currency: "EUR",
+      expectedRefundAmountCents: 2_000,
+    });
+    await expect(withdraw(1_000, reviewed.digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_ELIGIBILITY_CHANGED" }],
+    });
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
+
+    // Two confirmations of the same full eligibility at once: at most one reaches Stripe.
+    const current = await eur();
+    const results = await Promise.allSettled([
+      withdraw(current.eligibleCents, current.digest),
+      withdraw(current.eligibleCents, current.digest),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    for (const r of results)
+      if (r.status === "rejected") expect(r.reason).toMatchObject({ statusCode: 409 });
+    expect(gateway.createCalls).toHaveLength(1);
+
+    // The balance drops between confirmation and dispatch: revalidation refuses to send and
+    // releases the reservation (audited); the operation is closed, never sent.
+    gateway.balance = {
+      ...gateway.balance,
+      available: [{ currency: "eur", amountCents: 50_000 }],
+    };
+    await StripePayoutObservationModel.deleteMany({});
+    await CentralPayoutOperationModel.deleteMany({});
+    const fresh = await eur();
+    const callsAtReview = gateway.balanceCalls;
+    gateway.onRetrieveBalance = (call) => {
+      if (call === callsAtReview + 2)
+        gateway.balance = {
+          ...gateway.balance,
+          available: [{ currency: "eur", amountCents: 1_000 }],
+        };
+    };
+    const rejected = await withdraw(10_000, fresh.digest);
+    gateway.onRetrieveBalance = null;
+    expect(rejected).toMatchObject({ state: "REJECTED" });
+    expect(rejected.failureMessage).toContain("Not sent: eligibility changed");
+    expect(rejected.audit.map((a) => a.kind)).toEqual(
+      expect.arrayContaining(["BLOCKED", "RESERVATION_RELEASED"]),
+    );
+    expect(rejected.activeSlot).toBeUndefined();
+    expect(gateway.createCalls).toHaveLength(1); // still only the earlier one
+  });
+
+  it("CW-1 refund exposure covers cancellations owed and active packages, without double counting", async () => {
+    const owedBooking = await rawBooking("LATE_CANCELLATION", {
+      cancellationOutcome: { refundOwedCents: 2_500, settlementStatus: "PENDING" },
+    });
+    await ledgerRow("DEPOSIT", 6_000, { bookingId: owedBooking });
+    const completedOrigin = await rawBooking("COMPLETED");
+    await ledgerRow("PLATFORM_FEE", 8_000, { bookingId: completedOrigin });
+    await PackageProgressModel.collection.insertOne({
+      originBookingId: completedOrigin,
+      remainingSessions: 3,
+    });
+    const refundingBooking = await rawBooking("UPCOMING");
+    await ledgerRow("DEPOSIT", 4_000, { bookingId: refundingBooking });
+    await RefundOperationModel.collection.insertOne({
+      providerStatus: "PROVIDER_PENDING",
+      currency: "EUR",
+      expectedRefundAmountCents: 4_000,
+      bookingId: refundingBooking,
+    });
+    const decision = await eur();
+    expect(decision.protected).toMatchObject({
+      refundableBookingsCents: 2_500, // the refund owed, not the whole deposit
+      refundablePackagesCents: 8_000, // the active package's unused value on its origin charge
+      refundsInProgressCents: 4_000, // counted once (not again as an upcoming booking)
+    });
+  });
+
+  it("CW-1 LIVE executes only with the deployment flag and available eligibility (mocked Stripe)", async () => {
+    gateway.modeValue = "LIVE";
+    gateway.balance = { ...gateway.balance, livemode: true };
+    const live = await eur();
+    expect(live.status).toBe("AVAILABLE");
+    await expect(withdraw(1_000, live.digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_LIVE_DISABLED" }],
+    });
+    expect(gateway.createCalls).toHaveLength(0);
+    liveEnabled = true;
+    const op = await withdraw(1_000, (await eur()).digest);
+    expect(op).toMatchObject({ mode: "LIVE", state: "SUBMITTED" });
+    expect(gateway.createCalls).toEqual([op.providerIdempotencyKey]);
+    // A LIVE payout from the mocked gateway is the only money "moved"; no ledger row is written.
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(1);
   });
 });

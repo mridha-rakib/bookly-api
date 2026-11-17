@@ -19,6 +19,23 @@ const stripe = vi.hoisted(() => ({
   accounts: { retrieveCurrent: vi.fn(), listExternalAccounts: vi.fn() },
 }));
 vi.mock("../../src/modules/payment/stripe-client.js", () => ({ getStripeClient: () => stripe }));
+// CW-1 — eligibility/readiness read the database; DB-less unit tests fix the decision.
+const cw = vi.hoisted(() => ({ status: "AVAILABLE" as "AVAILABLE" | "UNAVAILABLE" }));
+vi.mock("../../src/modules/central-payout/withdrawal-eligibility.js", async (importOriginal) => {
+  const helper = await import("../helpers/central-eligibility-mock.js");
+  return {
+    ...(await importOriginal<
+      typeof import("../../src/modules/central-payout/withdrawal-eligibility.js")
+    >()),
+    evaluateWithdrawalEligibility: async () => helper.fixedEligibility(cw.status),
+  };
+});
+vi.mock("../../src/modules/central-payout/payout-reconciliation.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../../src/modules/central-payout/payout-reconciliation.js")
+  >()),
+  readReconciliationReadiness: async () => ({ blockers: [] }),
+}));
 afterEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
@@ -35,6 +52,7 @@ function fixture(mode: CentralStripeMode | undefined = "TEST", liveEnabled = fal
     defaultForCurrency: true,
   };
   const account = {
+    accountId: "acct_platform",
     payoutsEnabled: true,
     scheduleInterval: "manual",
     destinationsReadable: true,
@@ -156,25 +174,42 @@ it("Stripe permissions failure is unreadable, not an empty configured bank list"
   expect(stripe.accounts.listExternalAccounts.mock.calls[0]?.[0]).toBe("acct_platform");
 });
 
-it("keeps LIVE execution denied even when the deployment flag is enabled, before operation creation", async () => {
-  const f = fixture("LIVE", true);
+it("CW-1 LIVE needs the deployment flag AND available eligibility, before operation creation", async () => {
   vi.spyOn(CentralPayoutOperationModel, "findOne").mockReturnValue({
     lean: () => ({ exec: async () => null }),
   } as never);
   const create = vi.spyOn(CentralPayoutOperationModel, "create");
+  const request = {
+    requestId: "request",
+    amountCents: 500,
+    currency: "eur",
+    destinationId: "ba_platform",
+    currentPassword: "test",
+    eligibilityDigest: "a".repeat(64),
+  };
+  // Flag off: refused whatever the eligibility.
   await expect(
-    f.service.initiate(String(new Types.ObjectId()), {
-      requestId: "request",
-      amountCents: 500,
-      currency: "eur",
-      destinationId: "ba_platform",
-      currentPassword: "test",
+    fixture("LIVE", false).service.initiate(String(new Types.ObjectId()), request),
+  ).rejects.toMatchObject({ details: [{ code: "CENTRAL_PAYOUT_LIVE_DISABLED" }] });
+  // Flag on but eligibility unavailable: still refused, with the evidence reason.
+  cw.status = "UNAVAILABLE";
+  try {
+    const f = fixture("LIVE", true);
+    await expect(f.service.initiate(String(new Types.ObjectId()), request)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_ELIGIBILITY_UNAVAILABLE" }],
+    });
+    expect(f.gateway.createPayout).not.toHaveBeenCalled();
+  } finally {
+    cw.status = "AVAILABLE";
+  }
+  // A digest that no longer matches the current evaluation is refused as stale.
+  await expect(
+    fixture("LIVE", true).service.initiate(String(new Types.ObjectId()), {
+      ...request,
+      eligibilityDigest: "b".repeat(64),
     }),
-  ).rejects.toMatchObject({
-    details: [{ code: "CENTRAL_PAYOUT_RESERVE_POLICY_UNAPPROVED", message: expect.any(String) }],
-  });
+  ).rejects.toMatchObject({ details: [{ code: "CENTRAL_PAYOUT_ELIGIBILITY_CHANGED" }] });
   expect(create).not.toHaveBeenCalled();
-  expect(f.gateway.createPayout).not.toHaveBeenCalled();
 });
 it("does not treat pending provider funds as available", async () => {
   const f = fixture();
@@ -187,6 +222,7 @@ it("does not treat pending provider funds as available", async () => {
       amountCents: 2000,
       currency: "eur",
       destinationId: "ba_platform",
+      eligibilityDigest: "a".repeat(64),
     }),
   ).rejects.toMatchObject({ statusCode: 422 });
   expect(f.gateway.createPayout).not.toHaveBeenCalled();
