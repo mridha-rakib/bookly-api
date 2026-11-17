@@ -9,6 +9,7 @@ import { aggregateOwnershipForPeriod } from "../super-admin/super-admin-analytic
 import type { BusinessPayoutRepository } from "./business-payout.repository.js";
 import { FinanceError } from "./finance.errors.js";
 import {
+  type BusinessFinanceBalance,
   type BusinessPayableSummary,
   FINANCE_LEDGER_CURRENCY,
   type FinancePayoutHistoryPage,
@@ -105,6 +106,53 @@ export class FinanceService {
   ): Promise<BusinessPayableSummary> {
     const business = await this.requireOwnedFinanceBusiness(actorUserId, businessId);
     return this.buildBusinessPayable(business);
+  }
+
+  /** Finance Gap 01 — the Owner's all-time earned / recorded-as-paid / outstanding balance (see
+   * BusinessFinanceBalance). Read-only; the same Owner-only check as every method above. */
+  public async getBusinessBalance(
+    actorUserId: string,
+    businessId: string,
+  ): Promise<BusinessFinanceBalance> {
+    const business = await this.requireOwnedFinanceBusiness(actorUserId, businessId);
+    const [allTimeBuckets, paid, outstanding] = await Promise.all([
+      this.financialTransactionService.aggregateAllTimeOwnedBySource({
+        businessId: business._id,
+        types: [...BUSINESS_PAYABLE_TYPES],
+      }),
+      this.businessPayoutRepository.sumPaidForBusiness(business._id),
+      this.buildBusinessPayable(business),
+    ]);
+    const earned = combineBusinessOwnedBuckets(allTimeBuckets);
+    const sumType = (type: string) =>
+      allTimeBuckets.filter((b) => b.type === type).reduce((sum, b) => sum + b.totalCents, 0);
+    const difference = earned.netCents - paid.totalCents - outstanding.netCents;
+
+    return {
+      currency: FINANCE_LEDGER_CURRENCY,
+      earned: {
+        grossCents: earned.grossCents,
+        depositCents: sumType("DEPOSIT"),
+        feeRecoveryCents: sumType("NO_SHOW_FEE") + sumType("CANCELLATION_FEE"),
+        promoSubsidyCents: earned.promoSubsidyCents,
+        processingFeesCents: earned.processingFeesCents,
+        refundsCents: earned.refundsCents,
+        disputeAdjustmentsCents: earned.disputeAdjustmentsCents,
+        netCents: earned.netCents,
+      },
+      recordedPaid: {
+        amountCents: paid.totalCents,
+        payoutCount: paid.count,
+        lastRecordedAt: paid.lastPaidAt,
+      },
+      outstanding: {
+        netCents: outstanding.netCents,
+        payableCents: Math.max(0, outstanding.netCents),
+        transactionCount: outstanding.transactionCount,
+      },
+      reconciled: difference === 0,
+      reconciliationDifferenceCents: difference,
+    };
   }
 
   /** P6 — the same Owner-only check, for Business-facing reads served outside this service
@@ -319,6 +367,7 @@ export class FinanceService {
         periodEnd: item.periodEnd,
         grossBusinessOwnedCents: item.grossBusinessOwnedCents,
         processingFeesCents: item.processingFeesCents,
+        refundsCents: item.refundsCents,
         disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
         netPayoutCents: item.netPayoutCents,
         currency: item.currency,
@@ -432,6 +481,7 @@ export class FinanceService {
         periodEnd: item.periodEnd,
         grossBusinessOwnedCents: item.grossBusinessOwnedCents,
         processingFeesCents: item.processingFeesCents,
+        refundsCents: item.refundsCents,
         disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
         netPayoutCents: item.netPayoutCents,
         currency: item.currency,

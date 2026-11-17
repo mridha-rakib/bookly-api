@@ -53,6 +53,12 @@ export const createFinanceRoute = (): Router => {
     validateRequest({ params: financeBusinessParamsSchema, query: financeSummaryQuerySchema }),
     asyncHandler(controller.getSummary),
   );
+  // Finance Gap 01 — read-only all-time earned / recorded as paid / outstanding.
+  router.get(
+    "/:businessId/finance/balance",
+    validateRequest({ params: financeBusinessParamsSchema }),
+    asyncHandler(controller.getBalance),
+  );
   router.get(
     "/:businessId/finance/transactions/export.csv",
     validateRequest({ params: financeBusinessParamsSchema, query: financeTransactionsQuerySchema }),

@@ -1,6 +1,7 @@
 import { PLATFORM_REPORTING_TIMEZONE } from "../../common/time/platform-reporting.js";
 import type { BusinessPayoutDocument } from "./business-payout.model.js";
 import type {
+  BusinessFinanceBalance,
   BusinessPayableSummary,
   FinancePayoutHistoryPage,
   FinanceSummary,
@@ -67,6 +68,7 @@ export type FinancePayoutHistoryItemDto = {
   periodEnd: string;
   grossBusinessOwnedCents: number;
   processingFeesCents: number;
+  refundsCents: number;
   disputeAdjustmentsCents: number;
   netPayoutCents: number;
   currency: FinancePayoutHistoryPage["items"][number]["currency"];
@@ -83,12 +85,27 @@ export const toFinancePayoutHistoryItemDto = (
   periodEnd: item.periodEnd.toISOString(),
   grossBusinessOwnedCents: item.grossBusinessOwnedCents,
   processingFeesCents: item.processingFeesCents,
+  refundsCents: item.refundsCents,
   disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
   netPayoutCents: item.netPayoutCents,
   currency: item.currency,
   status: item.status,
   paidAt: item.paidAt?.toISOString(),
   providerReference: item.providerReference,
+});
+
+/** Finance Gap 01 — the Owner's all-time balance (see BusinessFinanceBalance). */
+export const toBusinessFinanceBalanceDto = (balance: BusinessFinanceBalance) => ({
+  currency: balance.currency,
+  earned: balance.earned,
+  recordedPaid: {
+    amountCents: balance.recordedPaid.amountCents,
+    payoutCount: balance.recordedPaid.payoutCount,
+    lastRecordedAt: balance.recordedPaid.lastRecordedAt?.toISOString(),
+  },
+  outstanding: balance.outstanding,
+  reconciled: balance.reconciled,
+  reconciliationDifferenceCents: balance.reconciliationDifferenceCents,
 });
 
 // --- Batch 8: Business payable + Super Admin platform-wide finance ----------------------------

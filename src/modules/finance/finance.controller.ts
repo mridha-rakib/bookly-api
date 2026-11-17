@@ -5,6 +5,7 @@ import { AuthError } from "../auth/auth.errors.js";
 import { ProviderReversalQueryService } from "../provider-reversal/provider-reversal.query.js";
 import type { BusinessReversalListQuery } from "../provider-reversal/provider-reversal.schema.js";
 import {
+  toBusinessFinanceBalanceDto,
   toFinancePayoutHistoryItemDto,
   toFinanceSummaryDto,
   toFinanceTransactionRowDto,
@@ -80,6 +81,10 @@ export class FinanceController {
         "CURRENCY",
         "PAID AT",
         "STATUS",
+        // Finance Gap 01 — appended (existing column positions unchanged).
+        "REFUNDS CENTS",
+        "DISPUTE ADJUSTMENTS CENTS",
+        "RECORD REFERENCE",
       ],
       async (page) => {
         const result = await this.financeService.listPayoutHistory(userId, params.businessId, {
@@ -99,6 +104,9 @@ export class FinanceController {
           dto.currency,
           dto.paidAt,
           dto.status,
+          dto.refundsCents,
+          dto.disputeAdjustmentsCents,
+          dto.providerReference,
         ];
       },
     );
@@ -138,6 +146,14 @@ export class FinanceController {
       transactions: page.rows.map(toFinanceTransactionRowDto),
       pagination: { page: query.page, limit: query.limit, total: page.total },
     });
+  };
+
+  /** Finance Gap 01 — all-time earned / recorded as paid / outstanding (Owner-only). */
+  public getBalance = async (request: Request, response: Response): Promise<void> => {
+    const userId = this.requireUserId(request);
+    const params = request.validated?.params as FinanceBusinessParams;
+    const balance = await this.financeService.getBusinessBalance(userId, params.businessId);
+    sendSuccess(response, 200, "Finance balance", toBusinessFinanceBalanceDto(balance));
   };
 
   public listPayoutHistory = async (request: Request, response: Response): Promise<void> => {

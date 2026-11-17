@@ -300,6 +300,9 @@ export class BookingFinancialTransactionService {
    * the same reason every other all-time aggregate here is: one reduced `$group`, never a raw
    * dump. */
   public async aggregateAllTimeOwnedBySource(input: {
+    /** Finance Gap 01 — restricts the all-time aggregate to one Business (the Owner's balance
+     * card). Uses the `{businessId, type, status, payoutId}` index. Absent = platform-wide. */
+    businessId?: Types.ObjectId | string;
     types: BookingFinancialTransactionType[];
     /** Split the result per Business (Super Admin Business Analytics "Top by revenue") instead
      * of collapsing to one platform-wide total per (type, source). Read-only pass-through — no
@@ -308,6 +311,7 @@ export class BookingFinancialTransactionService {
     scope?: PlatformReportingScope;
   }): Promise<OwnershipAggregateBucket[]> {
     return this.transactionRepository.aggregateBusinessOwnedBySource({
+      ...(input.businessId ? { businessId: input.businessId } : {}),
       types: input.types,
       unclaimedOnly: false,
       ...(input.groupByBusiness === undefined ? {} : { groupByBusiness: input.groupByBusiness }),

@@ -776,6 +776,16 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
     const before = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
     expect(before.netCents).toBe(1600 - 55);
+    // Finance Gap 01 — the Owner's balance: the first booking's PLATFORM_FEE (and its fee) is
+    // Bookly's, so earned is the DEPOSIT net only; nothing recorded as paid yet.
+    const balanceBefore = await financeService.getBusinessBalance(
+      String(owner._id),
+      String(business._id),
+    );
+    expect(balanceBefore.earned).toMatchObject({ depositCents: 1600, netCents: 1600 - 55 });
+    expect(balanceBefore.recordedPaid).toMatchObject({ amountCents: 0, payoutCount: 0 });
+    expect(balanceBefore.outstanding).toMatchObject({ netCents: 1600 - 55, payableCents: 1545 });
+    expect(balanceBefore.reconciled).toBe(true);
 
     const admin = await userRepository.create({
       normalizedEmail: `admin-${new Types.ObjectId().toString()}@example.com`,
@@ -800,6 +810,24 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     const after = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
     expect(after.netCents).toBe(0);
     expect(after.grossCents).toBe(0);
+
+    // Finance Gap 01 — earned is unchanged; the recorded transfer moves it from outstanding to
+    // recorded as paid, never counted twice.
+    const balanceAfter = await financeService.getBusinessBalance(
+      String(owner._id),
+      String(business._id),
+    );
+    expect(balanceAfter.earned.netCents).toBe(1600 - 55);
+    expect(balanceAfter.recordedPaid).toMatchObject({ amountCents: 1600 - 55, payoutCount: 1 });
+    expect(balanceAfter.recordedPaid.lastRecordedAt?.getTime()).toBe(payout.paidAt?.getTime());
+    expect(balanceAfter.outstanding).toMatchObject({ netCents: 0, payableCents: 0 });
+    expect(balanceAfter.reconciled).toBe(true);
+    const ownerHistory = await financeService.listPayoutHistory(
+      String(owner._id),
+      String(business._id),
+      { page: 1, limit: 20 },
+    );
+    expect(ownerHistory.items[0]).toMatchObject({ refundsCents: 0, netPayoutCents: 1600 - 55 });
 
     // The settled ledger rows are now permanently excluded from payable — never re-claimable.
     const settled = await BookingFinancialTransactionModel.find({

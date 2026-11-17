@@ -1,4 +1,4 @@
-import type { ClientSession, Types } from "mongoose";
+import mongoose, { type ClientSession, type Types } from "mongoose";
 
 import { type BusinessPayoutDocument, BusinessPayoutModel } from "./business-payout.model.js";
 
@@ -52,6 +52,33 @@ export class BusinessPayoutRepository {
       BusinessPayoutModel.countDocuments({}).exec(),
     ]);
     return { items, total };
+  }
+
+  /** Finance Gap 01 — one Business's total recorded as paid (Super Admin attestations), with the
+   * latest record time. Single reduced `$group` over the `{businessId, periodStart}` index. */
+  public async sumPaidForBusiness(
+    businessId: Types.ObjectId | string,
+  ): Promise<{ totalCents: number; count: number; lastPaidAt: Date | undefined }> {
+    const result = await BusinessPayoutModel.aggregate<{
+      totalCents: number;
+      count: number;
+      lastPaidAt: Date | null;
+    }>([
+      { $match: { businessId: new mongoose.Types.ObjectId(String(businessId)), status: "PAID" } },
+      {
+        $group: {
+          _id: null,
+          totalCents: { $sum: "$netPayoutCents" },
+          count: { $sum: 1 },
+          lastPaidAt: { $max: "$paidAt" },
+        },
+      },
+    ]).exec();
+    return {
+      totalCents: result[0]?.totalCents ?? 0,
+      count: result[0]?.count ?? 0,
+      lastPaidAt: result[0]?.lastPaidAt ?? undefined,
+    };
   }
 
   /** Batch 8 (Super Admin Finance Stats — "Sent to businesses") — a single reduced sum, never a

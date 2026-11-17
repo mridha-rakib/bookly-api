@@ -94,6 +94,9 @@ export type FinancePayoutHistoryItem = {
   periodEnd: Date;
   grossBusinessOwnedCents: number;
   processingFeesCents: number;
+  /** Finance Gap 01 — Business-owned refund reversals settled by this payout (already stored on
+   * every payout row; previously omitted, so gross − processing did not explain net). */
+  refundsCents: number;
   /** P6 — net Business-owned dispute effect settled by this payout (0 for pre-P6 payouts). */
   disputeAdjustmentsCents: number;
   netPayoutCents: number;
@@ -101,6 +104,42 @@ export type FinancePayoutHistoryItem = {
   status: BusinessPayoutStatus;
   paidAt?: Date | undefined;
   providerReference?: string | undefined;
+};
+
+/**
+ * Finance Gap 01 — the Business Owner's all-time balance with Bookly, built from the canonical
+ * ledger ownership rules (finance-ownership.ts) and the payout records:
+ *
+ *   earned       — every SUCCEEDED Business-owned ledger row (deposits, no-show and late-
+ *                  cancellation fees, Bookly-funded promo subsidies) minus Business-borne
+ *                  processing fees, refunds and dispute movements. Money a customer paid the
+ *                  Business directly (off-platform) is never one of these ledger types.
+ *   recordedPaid — the sum of PAID payout records: Super Admin attestations that an external bank
+ *                  transfer was made. Bookly does not verify bank receipt.
+ *   outstanding  — the same unclaimed net that `BusinessPayoutService.executePayout` would settle.
+ *
+ * Each ledger row is claimed by at most one payout, so `earned.netCents` should equal
+ * `recordedPaid.amountCents + outstanding.netCents`. `reconciled` reports that check rather than
+ * assuming it; any difference is returned, never hidden or redistributed.
+ */
+export type BusinessFinanceBalance = {
+  currency: BookingCurrency;
+  earned: {
+    grossCents: number;
+    depositCents: number;
+    feeRecoveryCents: number;
+    promoSubsidyCents: number;
+    processingFeesCents: number;
+    refundsCents: number;
+    disputeAdjustmentsCents: number;
+    netCents: number;
+  };
+  recordedPaid: { amountCents: number; payoutCount: number; lastRecordedAt: Date | undefined };
+  /** `netCents` may be negative (deductions carried into the next payout); `payableCents` is what
+   * is currently owed (never below zero). */
+  outstanding: { netCents: number; payableCents: number; transactionCount: number };
+  reconciled: boolean;
+  reconciliationDifferenceCents: number;
 };
 
 export type FinancePayoutHistoryPage = {
