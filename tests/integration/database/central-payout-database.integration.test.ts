@@ -223,6 +223,80 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
   });
 
+  it("FG03B-0 recent Stripe payouts: origin verified only by a recorded payout id, no sensitive fields", async () => {
+    const op = await submit();
+    const base = {
+      amountCents: 2500,
+      currency: "eur",
+      status: "paid",
+      arrivalDate: null,
+      created: new Date("2030-01-01T00:00:00.000Z"),
+      destinationId: BANK,
+      failureCode: null,
+      failureMessage: null,
+      livemode: false,
+    };
+    // A Dashboard/automatic payout, and one whose metadata names a Bookly operation it is not
+    // linked to: neither may be labelled as Bookly's, and neither is called unauthorized.
+    gateway.payouts.set("dashboard", {
+      ...base,
+      id: "po_dashboard",
+      automatic: true,
+      metadata: {},
+      destinationId: "ba_unknown",
+    });
+    gateway.payouts.set("forged", {
+      ...base,
+      id: "po_forged",
+      automatic: false,
+      metadata: { booklyCentralPayoutOperationId: String(op._id) },
+    });
+    const writesBefore = await CentralPayoutOperationModel.find().lean();
+
+    const overview = await service.getOverview();
+    const byId = new Map(overview.recentStripePayouts.map((p) => [p.id, p]));
+    expect(byId.get(op.providerPayoutId as string)).toMatchObject({
+      origin: "BOOKLY_WITHDRAWAL",
+      booklyOperationId: String(op._id),
+      livemode: false,
+      destinationLast4: "6789",
+    });
+    expect(byId.get("po_dashboard")).toMatchObject({
+      origin: "NOT_VERIFIED",
+      booklyOperationId: null,
+      automatic: true,
+      destinationLast4: null,
+    });
+    expect(byId.get("po_forged")).toMatchObject({
+      origin: "NOT_VERIFIED",
+      booklyOperationId: null,
+    });
+    for (const payout of overview.recentStripePayouts) {
+      expect(payout).not.toHaveProperty("metadata");
+      expect(payout).not.toHaveProperty("destinationId");
+      expect(payout).not.toHaveProperty("failureMessage");
+    }
+    expect(overview.recentStripePayoutsScope).toEqual({
+      shown: 3,
+      returnedByStripe: 3,
+      requestLimit: 100,
+    });
+
+    // The same payout id in the other mode is not a verified link.
+    gateway.payouts.set(op.providerIdempotencyKey, {
+      ...(gateway.payouts.get(op.providerIdempotencyKey) as ProviderPayout),
+      livemode: true,
+    });
+    const crossMode = await service.getOverview();
+    expect(crossMode.recentStripePayouts.find((p) => p.id === op.providerPayoutId)?.origin).toBe(
+      "NOT_VERIFIED",
+    );
+
+    // Read-only: no operation was created or changed, no payout was requested.
+    expect(await CentralPayoutOperationModel.find().lean()).toEqual(writesBefore);
+    expect(gateway.createCalls).toHaveLength(1);
+  });
+
   it("12 LIVE execution stays blocked and TEST/LIVE data never mix", async () => {
     gateway.modeValue = "LIVE";
     gateway.balance = { ...gateway.balance, livemode: true };

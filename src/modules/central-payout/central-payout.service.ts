@@ -48,6 +48,32 @@ export type CentralPayoutPolicy = {
 
 type Restriction = { code: string; message: string };
 
+/**
+ * FG03B-0 — origin is BOOKLY_WITHDRAWAL only when a CentralPayoutOperation already records this
+ * exact Stripe payout id in the same mode (the id is written from Stripe's own response or a
+ * verified webhook). Payout metadata alone is NOT trusted as proof. Everything else is
+ * NOT_VERIFIED: possibly a Dashboard or automatic payout, possibly a Bookly withdrawal not yet
+ * linked. It is never labelled unauthorized.
+ */
+export type RecentStripePayoutView = {
+  id: string;
+  amountCents: number;
+  currency: string;
+  status: string;
+  created: Date;
+  /** Stripe's estimate only; not proof of a bank statement entry. */
+  arrivalDate: Date | null;
+  automatic: boolean;
+  livemode: boolean;
+  failureCode: string | null;
+  destinationLast4: string | null;
+  origin: "BOOKLY_WITHDRAWAL" | "NOT_VERIFIED";
+  booklyOperationId: string | null;
+};
+
+const RECENT_PAYOUT_REQUEST_LIMIT = 100;
+const RECENT_PAYOUTS_SHOWN = 10;
+
 export type CentralPayoutOverview = {
   mode: CentralStripeMode | null;
   liveExecutionEnabled: boolean;
@@ -58,7 +84,12 @@ export type CentralPayoutOverview = {
   scheduleInterval: string | null;
   /** Reasons a new withdrawal cannot be made right now (empty = permitted). */
   restrictions: Restriction[];
-  recentStripePayouts: ProviderPayout[];
+  /** FG03B-0 — read-only view of the most recent Stripe payouts (any origin). No metadata, no
+   * bank-account ids: the destination is shown only as the masked last 4 of a known account. */
+  recentStripePayouts: RecentStripePayoutView[];
+  /** FG03B-0 — what the list above covers. It is a bounded recent sample, never a complete
+   * payout history, so a payout absent from it proves nothing. */
+  recentStripePayoutsScope: { shown: number; returnedByStripe: number; requestLimit: number };
   /** Recorded Business-attributed amounts not yet paid out to Businesses (informational: Bookly
    * has no approved reserve formula, so this is NOT subtracted from the Stripe balance). */
   businessAttributedUnpaid: { currency: string; amountCents: number } | null;
@@ -135,7 +166,9 @@ export class CentralPayoutService {
     const [balance, account, recent, unpaid] = await Promise.all([
       this.provider(() => this.deps.gateway.retrieveBalance()),
       this.provider(() => this.deps.gateway.retrieveAccountPayoutState()),
-      this.provider(() => this.deps.gateway.listRecentPayouts({ limit: 100 })),
+      this.provider(() =>
+        this.deps.gateway.listRecentPayouts({ limit: RECENT_PAYOUT_REQUEST_LIMIT }),
+      ),
       this.deps.businessAttributedUnpaid?.() ?? Promise.resolve(null),
     ]);
     const currencies = [
@@ -170,9 +203,53 @@ export class CentralPayoutService {
         ...this.accountRestrictions(account),
         ...(await this.inFlightRestriction()),
       ],
-      recentStripePayouts: recent.slice(0, 10),
+      recentStripePayouts: await this.recentPayoutViews(
+        recent.slice(0, RECENT_PAYOUTS_SHOWN),
+        account.destinations,
+      ),
+      recentStripePayoutsScope: {
+        shown: Math.min(recent.length, RECENT_PAYOUTS_SHOWN),
+        returnedByStripe: recent.length,
+        requestLimit: RECENT_PAYOUT_REQUEST_LIMIT,
+      },
       businessAttributedUnpaid: unpaid,
     };
+  }
+
+  /** FG03B-0 — read-only. Links a payout to a Bookly withdrawal only by the exact recorded Stripe
+   * payout id in the same mode (see RecentStripePayoutView). One indexed query, no writes. */
+  private async recentPayoutViews(
+    payouts: ProviderPayout[],
+    destinations: CentralBankDestination[],
+  ): Promise<RecentStripePayoutView[]> {
+    const ids = payouts.map((p) => p.id);
+    const linked = ids.length
+      ? await CentralPayoutOperationModel.find(
+          { providerPayoutId: { $in: ids } },
+          { _id: 1, providerPayoutId: 1, mode: 1 },
+        )
+          .lean<Pick<CentralPayoutOperationDocument, "_id" | "providerPayoutId" | "mode">[]>()
+          .exec()
+      : [];
+    const byPayoutId = new Map(linked.map((op) => [op.providerPayoutId, op]));
+    return payouts.map((payout) => {
+      const op = byPayoutId.get(payout.id);
+      const verified = Boolean(op && op.mode === (payout.livemode ? "LIVE" : "TEST"));
+      return {
+        id: payout.id,
+        amountCents: payout.amountCents,
+        currency: payout.currency,
+        status: payout.status,
+        created: payout.created,
+        arrivalDate: payout.arrivalDate,
+        automatic: payout.automatic,
+        livemode: payout.livemode,
+        failureCode: payout.failureCode,
+        destinationLast4: destinations.find((d) => d.id === payout.destinationId)?.last4 ?? null,
+        origin: verified ? "BOOKLY_WITHDRAWAL" : "NOT_VERIFIED",
+        booklyOperationId: verified && op ? String(op._id) : null,
+      };
+    });
   }
 
   public async list(page: number, limit: number) {
