@@ -38,6 +38,8 @@ export type CentralBankDestination = {
 };
 
 export type CentralAccountPayoutState = {
+  /** FG03B-1 — the platform account id (acct_…) when Stripe returned it; scopes history coverage. */
+  accountId?: string;
   payoutsEnabled: boolean | null;
   /** Stripe `settings.payouts.schedule.interval`: manual | daily | weekly | monthly. */
   scheduleInterval: string | null;
@@ -78,6 +80,13 @@ export interface CentralPayoutGateway {
   }): Promise<ProviderPayout>;
   retrievePayout(payoutId: string): Promise<ProviderPayout>;
   listRecentPayouts(input: { createdGte?: Date; limit: number }): Promise<ProviderPayout[]>;
+  /** FG03B-1 — one page of Stripe's payout list (newest first) with Stripe's own `has_more`, for
+   * the bounded, resumable history sync. `startingAfter` is Stripe's cursor (a payout id). */
+  listPayoutsPage(input: {
+    limit: number;
+    startingAfter?: string | undefined;
+    createdGte?: Date | undefined;
+  }): Promise<{ payouts: ProviderPayout[]; hasMore: boolean }>;
 }
 
 /**

@@ -51,6 +51,7 @@ function fixture(mode: CentralStripeMode | undefined = "TEST", liveEnabled = fal
     createPayout: vi.fn(),
     retrievePayout: vi.fn(),
     listRecentPayouts: vi.fn(async () => []),
+    listPayoutsPage: vi.fn(async () => ({ payouts: [], hasMore: false })),
   };
   return {
     bank,

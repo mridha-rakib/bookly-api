@@ -161,6 +161,7 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
       }
     }
     return {
+      accountId: account.id,
       payoutsEnabled: typeof account.payouts_enabled === "boolean" ? account.payouts_enabled : null,
       scheduleInterval: account.settings?.payouts?.schedule?.interval ?? null,
       destinationsReadable: Boolean(external),
@@ -199,6 +200,28 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
     try {
       return toProviderPayout(await this.client.payouts.retrieve(payoutId));
     } catch (error) {
+      throw providerError(error);
+    }
+  }
+
+  public async listPayoutsPage(input: {
+    limit: number;
+    startingAfter?: string | undefined;
+    createdGte?: Date | undefined;
+  }): Promise<{ payouts: ProviderPayout[]; hasMore: boolean }> {
+    try {
+      const page = await this.client.payouts.list({
+        limit: Math.min(Math.max(input.limit, 1), 100),
+        ...(input.startingAfter ? { starting_after: input.startingAfter } : {}),
+        ...(input.createdGte
+          ? { created: { gte: Math.floor(input.createdGte.getTime() / 1000) } }
+          : {}),
+      });
+      if (!Array.isArray(page.data) || typeof page.has_more !== "boolean")
+        throw new CentralPayoutProviderError("Stripe payout list response is incomplete", false);
+      return { payouts: page.data.map(toProviderPayout), hasMore: page.has_more };
+    } catch (error) {
+      if (error instanceof CentralPayoutProviderError) throw error;
       throw providerError(error);
     }
   }

@@ -20,6 +20,10 @@ import {
   type ProviderPayout,
 } from "../../../src/modules/central-payout/central-payout.types.js";
 import { CentralPayoutOperationModel } from "../../../src/modules/central-payout/central-payout-operation.model.js";
+import {
+  StripePayoutHistoryCoverageModel,
+  StripePayoutObservationModel,
+} from "../../../src/modules/central-payout/stripe-payout-observation.model.js";
 import type { PaymentGateway } from "../../../src/modules/payment/payment.types.js";
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -46,6 +50,7 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
     pending: [{ currency: "eur", amountCents: 1_000 }],
   };
   public account: CentralAccountPayoutState = {
+    accountId: "acct_platformtest",
     payoutsEnabled: true,
     scheduleInterval: "manual",
     destinationsReadable: true,
@@ -115,12 +120,56 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
   public async listRecentPayouts() {
     return [...this.payouts.values()];
   }
+  /** FG03B-1 — provider history, newest first, served in small pages like Stripe's cursor list. */
+  public history: ProviderPayout[] = [];
+  public historyPageSize = 2;
+  public historyCalls: { startingAfter?: string; createdGte?: Date }[] = [];
+  /** Throw a transient provider error on this (1-based) listPayoutsPage call. */
+  public failHistoryCall: number | null = null;
+  public async listPayoutsPage(input: {
+    limit: number;
+    startingAfter?: string | undefined;
+    createdGte?: Date | undefined;
+  }) {
+    this.historyCalls.push({
+      ...(input.startingAfter ? { startingAfter: input.startingAfter } : {}),
+      ...(input.createdGte ? { createdGte: input.createdGte } : {}),
+    });
+    if (this.failHistoryCall === this.historyCalls.length)
+      throw new CentralPayoutProviderError("Rate limited by Stripe", false, "rate_limit");
+    const eligible = this.history.filter(
+      (p) => !input.createdGte || p.created.getTime() >= input.createdGte.getTime(),
+    );
+    const start = input.startingAfter
+      ? eligible.findIndex((p) => p.id === input.startingAfter) + 1
+      : 0;
+    const size = Math.min(input.limit, this.historyPageSize);
+    const payouts = eligible.slice(start, start + size);
+    return { payouts, hasMore: start + size < eligible.length };
+  }
 }
+
+const historyPayout = (n: number, over: Partial<ProviderPayout> = {}): ProviderPayout => ({
+  id: `po_hist_${n}`,
+  amountCents: 1000 + n,
+  currency: "eur",
+  status: "paid",
+  arrivalDate: null,
+  created: new Date(Date.UTC(2030, 0, 1) - n * 60_000),
+  destinationId: BANK,
+  failureCode: null,
+  failureMessage: null,
+  livemode: false,
+  automatic: true,
+  metadata: {},
+  ...over,
+});
 
 describe("P0.6 Super Admin central Stripe withdrawals", () => {
   let gateway: FakeCentralPayoutGateway;
   let service: CentralPayoutService;
   let liveEnabled: boolean;
+  let historySyncEnabled: boolean;
   const admin = new Types.ObjectId();
 
   beforeAll(async () => {
@@ -129,13 +178,19 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
   beforeEach(async () => {
     await clearIsolatedDatabase();
     await CentralPayoutOperationModel.syncIndexes();
+    await StripePayoutObservationModel.syncIndexes();
+    await StripePayoutHistoryCoverageModel.syncIndexes();
     gateway = new FakeCentralPayoutGateway();
     liveEnabled = false;
+    historySyncEnabled = true;
     service = new CentralPayoutService({
       gateway,
       policy: {
         get liveExecutionEnabled() {
           return liveEnabled;
+        },
+        get historySyncEnabled() {
+          return historySyncEnabled;
         },
       },
       verifyStepUp: async (_userId, password) => {
@@ -208,6 +263,34 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
       .send({ ...body, iban: "CY00000000000000000000000000" })
       .expect(400);
     expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
+
+    // FG03B-1 — the history sync route: Super Admin only, bounded body, and refused while the
+    // deployment flag is off (the default), before any Stripe call or checkpoint write.
+    const sync = "/super-admin/finance/withdrawals/provider-history/sync";
+    await request(app).post(sync).send({}).expect(401);
+    for (const role of ["BUSINESS_OWNER", "STAFF", "CUSTOMER"] as const)
+      await request(app)
+        .post(sync)
+        .set("Authorization", `Bearer ${await tokenFor(role)}`)
+        .send({})
+        .expect(403);
+    await request(app)
+      .post(sync)
+      .set("Authorization", `Bearer ${superToken}`)
+      .send({ maxPages: 11 })
+      .expect(400);
+    await request(app)
+      .post(sync)
+      .set("Authorization", `Bearer ${superToken}`)
+      .send({ maxPages: 2, cursor: "po_x" })
+      .expect(400);
+    const disabled = await request(app)
+      .post(sync)
+      .set("Authorization", `Bearer ${superToken}`)
+      .send({})
+      .expect(409);
+    expect(JSON.stringify(disabled.body)).toContain("CENTRAL_PAYOUT_HISTORY_SYNC_DISABLED");
+    expect(await StripePayoutHistoryCoverageModel.countDocuments()).toBe(0);
   });
 
   it("4/5 validates step-up, balance, currency and destination before anything is sent", async () => {
@@ -427,5 +510,201 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
     expect(await BookingFinancialTransactionModel.countDocuments()).toBe(ledgerBefore);
     expect(await RefundOperationModel.countDocuments()).toBe(refundsBefore);
+
+    // FG03B-1 — every payout webhook is durably observed; status never regresses; the Bookly one
+    // is verified by its recorded payout id; the Dashboard one is observed, not turned into an op.
+    const own = await StripePayoutObservationModel.findOne({ providerPayoutId: payout.id }).lean();
+    expect(own).toMatchObject({
+      mode: "TEST",
+      linkage: "VERIFIED_BOOKLY",
+      status: "failed",
+      failureCode: "account_closed",
+      firstObservedVia: "WEBHOOK",
+      lastProviderEventId: "evt_failed",
+    });
+    expect(String(own?.operationId)).toBe(String(op._id));
+    expect(own).not.toHaveProperty("metadata");
+    expect(own).not.toHaveProperty("failureMessage");
+    const other = await StripePayoutObservationModel.findOne({
+      providerPayoutId: "po_other",
+    }).lean();
+    expect(other).toMatchObject({ linkage: "NOT_VERIFIED", status: "paid", mode: "TEST" });
+    expect(other?.operationId).toBeUndefined();
+    // Redelivery of an already-processed event id is a no-op; a duplicate payload under a new id
+    // is idempotent (still one observation).
+    await webhook.process({
+      ...event("evt_other_dup", "payout.paid", "paid"),
+      data: {
+        object: { ...event("x", "payout.paid", "paid").data.object, id: "po_other", metadata: {} },
+      },
+    } as unknown as Stripe.Event);
+    expect(
+      await StripePayoutObservationModel.countDocuments({ providerPayoutId: "po_other" }),
+    ).toBe(1);
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
+    expect(gateway.createCalls).toHaveLength(1);
+  });
+
+  it("FG03B-1 webhook observations: unresolved linkage, forged metadata, TEST/LIVE separation", async () => {
+    // A Bookly operation awaiting confirmation (lost response): metadata naming it is UNRESOLVED.
+    gateway.nextCreate = "network";
+    const pendingOp = await submit();
+    expect(pendingOp.state).toBe("UNKNOWN");
+    const named = historyPayout(1, {
+      id: "po_named",
+      automatic: false,
+      metadata: { booklyCentralPayoutOperationId: String(pendingOp._id) },
+    });
+    // Different amount/destination: applyProviderPayout records a MISMATCH and does not link it.
+    await service.syncFromWebhook({ ...named, amountCents: 1 }, "evt_named");
+    expect(
+      await StripePayoutObservationModel.findOne({ providerPayoutId: "po_named" }).lean(),
+    ).toMatchObject({
+      linkage: "UNRESOLVED",
+    });
+    // Metadata naming a non-existent operation proves nothing.
+    await service.syncFromWebhook(
+      historyPayout(2, {
+        id: "po_forged",
+        metadata: { booklyCentralPayoutOperationId: String(new Types.ObjectId()) },
+      }),
+      "evt_forged",
+    );
+    expect(
+      (await StripePayoutObservationModel.findOne({ providerPayoutId: "po_forged" }).lean())
+        ?.linkage,
+    ).toBe("NOT_VERIFIED");
+    // The same payout id reported in LIVE mode is a separate observation, never merged.
+    await service.syncFromWebhook(historyPayout(3, { id: "po_both" }), "evt_t");
+    await service.syncFromWebhook(historyPayout(3, { id: "po_both", livemode: true }), "evt_l");
+    expect(await StripePayoutObservationModel.countDocuments({ providerPayoutId: "po_both" })).toBe(
+      2,
+    );
+    // Out-of-order: a later pending event never regresses an observed paid status.
+    await service.syncFromWebhook(
+      historyPayout(3, { id: "po_both", status: "pending" }),
+      "evt_old",
+    );
+    expect(
+      (
+        await StripePayoutObservationModel.findOne({
+          providerPayoutId: "po_both",
+          mode: "TEST",
+        }).lean()
+      )?.status,
+    ).toBe("paid");
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
+  });
+
+  it("FG03B-1 history sync: paginated, resumable after a provider error, complete only at the last page", async () => {
+    const ledgerBefore = await BookingFinancialTransactionModel.countDocuments();
+    gateway.history = [1, 2, 3, 4, 5].map((n) => historyPayout(n));
+    gateway.failHistoryCall = 2;
+
+    // Page 1 observed, then Stripe fails: coverage stays IN_PROGRESS with the cursor kept.
+    const first = await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    expect(first).toMatchObject({
+      outcome: "PROVIDER_ERROR",
+      state: "IN_PROGRESS",
+      pagesThisCall: 1,
+    });
+    let coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage).toMatchObject({
+      state: "IN_PROGRESS",
+      accountId: "acct_platformtest",
+      lastError: "Rate limited by Stripe",
+    });
+    expect(coverage?.run?.cursor).toBe("po_hist_2");
+    expect(coverage?.leaseId).toBeUndefined();
+    let readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.evidenceComplete).toBe(false);
+    expect(readiness.blockers.map((b) => b.code)).toEqual(
+      expect.arrayContaining([
+        "HISTORY_INCOMPLETE",
+        "HISTORY_SYNC_FAILED",
+        "UNVERIFIED_PAYOUTS_PRESENT",
+      ]),
+    );
+
+    // Bounded: one page per call pauses without claiming completion.
+    const paused = await service.syncProviderHistory(String(admin), { maxPages: 1 });
+    expect(paused).toMatchObject({ outcome: "PAUSED_AT_PAGE_LIMIT", state: "IN_PROGRESS" });
+    expect(gateway.historyCalls.at(-1)?.startingAfter).toBe("po_hist_2");
+
+    // Resume to Stripe's last page: COMPLETE, every payout observed exactly once.
+    const done = await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    expect(done).toMatchObject({ outcome: "COMPLETED", state: "COMPLETE" });
+    expect(await StripePayoutObservationModel.countDocuments({ mode: "TEST" })).toBe(5);
+    coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage?.completeAsOf).toBeInstanceOf(Date);
+    expect(coverage?.run).toBeUndefined();
+    expect(coverage?.audit.map((a) => a.kind)).toEqual(
+      expect.arrayContaining([
+        "RUN_STARTED",
+        "RUN_PROVIDER_ERROR",
+        "RUN_PAUSED_AT_PAGE_LIMIT",
+        "RUN_COMPLETED",
+      ]),
+    );
+    expect(String(coverage?.audit.at(-1)?.actorUserId)).toBe(String(admin));
+
+    // History is complete, but unverified (Dashboard/automatic) payouts still block evidence:
+    // they are reported for review, never called unauthorized, never auto-assigned.
+    readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.coverage).toMatchObject({ state: "COMPLETE", accountMatches: true });
+    expect(readiness.observations).toMatchObject({ total: 5, notVerified: 5, verifiedBookly: 0 });
+    expect(readiness.evidenceComplete).toBe(false);
+    expect(readiness.reviewNeeded).toBe(true);
+    expect(readiness.blockers.map((b) => b.code)).toEqual(["UNVERIFIED_PAYOUTS_PRESENT"]);
+
+    // The next run is incremental from the completion point (with overlap), not a full rescan.
+    await service.syncProviderHistory(String(admin));
+    expect(gateway.historyCalls.at(-1)?.createdGte).toBeInstanceOf(Date);
+
+    // No money moved: no payout created, no withdrawal operation, no ledger row.
+    expect(gateway.createCalls).toHaveLength(0);
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(ledgerBefore);
+  });
+
+  it("FG03B-1 history sync is disabled by default, single-run, and resets on a different Stripe account", async () => {
+    historySyncEnabled = false;
+    await expect(service.syncProviderHistory(String(admin))).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    expect(gateway.historyCalls).toHaveLength(0);
+    historySyncEnabled = true;
+
+    // A live lease blocks a parallel run without touching the checkpoint.
+    await StripePayoutHistoryCoverageModel.create({
+      mode: "TEST",
+      state: "NEVER_RUN",
+      leaseId: "other-run",
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+      audit: [],
+    });
+    await expect(service.syncProviderHistory(String(admin))).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("Another payout history sync"),
+    });
+    expect(gateway.historyCalls).toHaveLength(0);
+    // An expired lease (crashed run) is taken over.
+    await StripePayoutHistoryCoverageModel.updateOne(
+      { mode: "TEST" },
+      { $set: { leaseExpiresAt: new Date(Date.now() - 1) } },
+    );
+    gateway.history = [historyPayout(1)];
+    expect(await service.syncProviderHistory(String(admin))).toMatchObject({ state: "COMPLETE" });
+
+    // A different Stripe account invalidates the earlier coverage.
+    gateway.account = { ...gateway.account, accountId: "acct_otheraccount" };
+    const readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.coverage.accountMatches).toBe(false);
+    expect(readiness.blockers.map((b) => b.code)).toContain("PROVIDER_ACCOUNT_CHANGED");
+    gateway.failHistoryCall = gateway.historyCalls.length + 1;
+    await service.syncProviderHistory(String(admin));
+    const coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage).toMatchObject({ accountId: "acct_otheraccount", state: "IN_PROGRESS" });
+    expect(coverage?.completeAsOf).toBeUndefined();
   });
 });

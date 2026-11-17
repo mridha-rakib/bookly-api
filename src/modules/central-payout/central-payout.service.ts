@@ -16,6 +16,15 @@ import {
   type CentralPayoutOperationDocument,
   CentralPayoutOperationModel,
 } from "./central-payout-operation.model.js";
+import {
+  classifyPayoutLinkage,
+  type HistorySyncResult,
+  observeProviderPayout,
+  PayoutHistorySyncError,
+  type ReconciliationReadiness,
+  readReconciliationReadiness,
+  syncProviderPayoutHistory,
+} from "./payout-reconciliation.js";
 
 export class CentralPayoutError extends AppError {
   public constructor(code: string, message: string, statusCode: number) {
@@ -44,16 +53,19 @@ const isProviderStatus = (value: string): value is ProviderPayoutStatus =>
 export type CentralPayoutPolicy = {
   /** Necessary deployment flag only; the independent reserve-policy denial still applies. */
   liveExecutionEnabled: boolean;
+  /** FG03B-1 — operator-triggered Stripe payout history sync. Off unless the deployment
+   * explicitly enables it after provisioning is approved. Read-only towards money either way. */
+  historySyncEnabled?: boolean;
 };
 
 type Restriction = { code: string; message: string };
 
 /**
- * FG03B-0 — origin is BOOKLY_WITHDRAWAL only when a CentralPayoutOperation already records this
+ * FG03B-0/1 — origin is BOOKLY_WITHDRAWAL only when a CentralPayoutOperation already records this
  * exact Stripe payout id in the same mode (the id is written from Stripe's own response or a
- * verified webhook). Payout metadata alone is NOT trusted as proof. Everything else is
- * NOT_VERIFIED: possibly a Dashboard or automatic payout, possibly a Bookly withdrawal not yet
- * linked. It is never labelled unauthorized.
+ * verified webhook). Payout metadata alone is NOT trusted as proof: metadata naming a same-mode
+ * Bookly operation that has not confirmed any payout yet is LINKAGE_UNRESOLVED. Everything else
+ * is NOT_VERIFIED: possibly a Dashboard or automatic payout. It is never labelled unauthorized.
  */
 export type RecentStripePayoutView = {
   id: string;
@@ -67,7 +79,7 @@ export type RecentStripePayoutView = {
   livemode: boolean;
   failureCode: string | null;
   destinationLast4: string | null;
-  origin: "BOOKLY_WITHDRAWAL" | "NOT_VERIFIED";
+  origin: "BOOKLY_WITHDRAWAL" | "LINKAGE_UNRESOLVED" | "NOT_VERIFIED";
   booklyOperationId: string | null;
 };
 
@@ -93,6 +105,8 @@ export type CentralPayoutOverview = {
   /** Recorded Business-attributed amounts not yet paid out to Businesses (informational: Bookly
    * has no approved reserve formula, so this is NOT subtracted from the Stripe balance). */
   businessAttributedUnpaid: { currency: string; amountCents: number } | null;
+  /** FG03B-1 — read-only payout-evidence status (database reads only). Never a permission. */
+  reconciliation: ReconciliationReadiness;
 };
 
 export type CentralPayoutDeps = {
@@ -213,28 +227,24 @@ export class CentralPayoutService {
         requestLimit: RECENT_PAYOUT_REQUEST_LIMIT,
       },
       businessAttributedUnpaid: unpaid,
+      reconciliation: await readReconciliationReadiness({
+        mode,
+        currentAccountId: account.accountId,
+        syncEnabled: this.deps.policy.historySyncEnabled === true,
+      }),
     };
   }
 
-  /** FG03B-0 — read-only. Links a payout to a Bookly withdrawal only by the exact recorded Stripe
-   * payout id in the same mode (see RecentStripePayoutView). One indexed query, no writes. */
+  /** FG03B-0/1 — read-only. Uses the shared linkage classifier (see RecentStripePayoutView);
+   * bounded indexed queries, no writes on a dashboard load. */
   private async recentPayoutViews(
     payouts: ProviderPayout[],
     destinations: CentralBankDestination[],
   ): Promise<RecentStripePayoutView[]> {
-    const ids = payouts.map((p) => p.id);
-    const linked = ids.length
-      ? await CentralPayoutOperationModel.find(
-          { providerPayoutId: { $in: ids } },
-          { _id: 1, providerPayoutId: 1, mode: 1 },
-        )
-          .lean<Pick<CentralPayoutOperationDocument, "_id" | "providerPayoutId" | "mode">[]>()
-          .exec()
-      : [];
-    const byPayoutId = new Map(linked.map((op) => [op.providerPayoutId, op]));
+    const linkage = await classifyPayoutLinkage(payouts);
     return payouts.map((payout) => {
-      const op = byPayoutId.get(payout.id);
-      const verified = Boolean(op && op.mode === (payout.livemode ? "LIVE" : "TEST"));
+      const link = linkage.get(payout.id);
+      const verified = link?.linkage === "VERIFIED_BOOKLY";
       return {
         id: payout.id,
         amountCents: payout.amountCents,
@@ -246,8 +256,12 @@ export class CentralPayoutService {
         livemode: payout.livemode,
         failureCode: payout.failureCode,
         destinationLast4: destinations.find((d) => d.id === payout.destinationId)?.last4 ?? null,
-        origin: verified ? "BOOKLY_WITHDRAWAL" : "NOT_VERIFIED",
-        booklyOperationId: verified && op ? String(op._id) : null,
+        origin: verified
+          ? "BOOKLY_WITHDRAWAL"
+          : link?.linkage === "UNRESOLVED"
+            ? "LINKAGE_UNRESOLVED"
+            : "NOT_VERIFIED",
+        booklyOperationId: verified && link?.operationId ? String(link.operationId) : null,
       };
     });
   }
@@ -429,9 +443,37 @@ export class CentralPayoutService {
     )
       .lean<CentralPayoutOperationDocument>()
       .exec();
-    // Payouts Bookly did not request (e.g. made in the Stripe Dashboard) are not tracked here.
-    if (!op) return;
-    await this.applyProviderPayout(op, payout, "WEBHOOK", providerEventId);
+    // A Bookly operation (if any) is updated first, exactly as before, so the observation below
+    // links it. Payouts Bookly did not request (e.g. Stripe Dashboard or automatic payouts) never
+    // become withdrawal operations: FG03B-1 records them only as non-monetary observations.
+    if (op) await this.applyProviderPayout(op, payout, "WEBHOOK", providerEventId);
+    await observeProviderPayout(payout, "WEBHOOK", providerEventId);
+  }
+
+  /** FG03B-1 — operator-triggered, bounded, resumable Stripe payout history read. Super Admin
+   * only (router gate), disabled unless the deployment enables it, audited on the checkpoint.
+   * It only reads Stripe and writes observations/coverage: never a payout or a ledger row. */
+  public async syncProviderHistory(
+    actorUserId: string,
+    input: { maxPages?: number | undefined } = {},
+  ): Promise<HistorySyncResult> {
+    if (!this.deps.policy.historySyncEnabled)
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_HISTORY_SYNC_DISABLED",
+        "Stripe payout history sync is not enabled in this deployment",
+        409,
+      );
+    try {
+      return await syncProviderPayoutHistory(this.deps.gateway, actorUserId, {
+        ...(input.maxPages ? { maxPages: input.maxPages } : {}),
+      });
+    } catch (error) {
+      if (error instanceof PayoutHistorySyncError)
+        throw new CentralPayoutError(error.code, error.message, error.statusCode);
+      if (error instanceof CentralPayoutProviderError)
+        throw new CentralPayoutError("CENTRAL_PAYOUT_PROVIDER_UNAVAILABLE", error.message, 502);
+      throw error;
+    }
   }
 
   // --- Internals ----------------------------------------------------------------------------

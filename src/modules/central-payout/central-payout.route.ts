@@ -11,6 +11,7 @@ import type { UserRepository } from "../user/user.repository.js";
 import { CentralPayoutService } from "./central-payout.service.js";
 import type { CentralPayoutGateway } from "./central-payout.types.js";
 import type { CentralPayoutOperationDocument } from "./central-payout-operation.model.js";
+import { MAX_PAGES_PER_RUN } from "./payout-reconciliation.js";
 import { StripeCentralPayoutGateway } from "./stripe-central-payout-gateway.js";
 
 export const initiateCentralPayoutBodySchema = z
@@ -26,6 +27,10 @@ export const initiateCentralPayoutBodySchema = z
 export const centralPayoutParamsSchema = z.object({
   operationId: z.string().regex(/^[a-f0-9]{24}$/),
 });
+/** FG03B-1 — bounded history read: at most MAX_PAGES_PER_RUN Stripe pages per request. */
+export const providerHistorySyncBodySchema = z
+  .object({ maxPages: z.number().int().min(1).max(MAX_PAGES_PER_RUN).optional() })
+  .strict();
 export const centralPayoutListQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
@@ -66,6 +71,7 @@ export const createCentralPayoutService = (
   options: {
     gateway?: CentralPayoutGateway;
     liveExecutionEnabled?: boolean;
+    historySyncEnabled?: boolean;
     businessAttributedUnpaid?: () => Promise<{ currency: string; amountCents: number } | null>;
   } = {},
 ): CentralPayoutService => {
@@ -74,6 +80,7 @@ export const createCentralPayoutService = (
     gateway: options.gateway ?? new StripeCentralPayoutGateway(),
     policy: {
       liveExecutionEnabled: options.liveExecutionEnabled ?? env.CENTRAL_PAYOUTS_LIVE_ENABLED,
+      historySyncEnabled: options.historySyncEnabled ?? env.CENTRAL_PAYOUT_HISTORY_SYNC_ENABLED,
     },
     verifyStepUp: async (userId, password) => {
       const user = await userRepository.findByIdWithPassword(userId);
@@ -140,6 +147,21 @@ export const createCentralPayoutRouter = (service: CentralPayoutService): Router
       const body = request.validated?.body as z.infer<typeof initiateCentralPayoutBodySchema>;
       const op = await service.initiate(actorId(request), body);
       sendSuccess(response, 202, "Withdrawal submitted", toCentralPayoutOperationDto(op));
+    }),
+  );
+  // FG03B-1 — bounded, resumable, audited Stripe payout history read. Super Admin only (router
+  // gate) and refused unless CENTRAL_PAYOUT_HISTORY_SYNC_ENABLED is set for the deployment.
+  router.post(
+    "/finance/withdrawals/provider-history/sync",
+    validateRequest({ body: providerHistorySyncBodySchema }),
+    asyncHandler(async (request: Request, response: Response) => {
+      const body = request.validated?.body as z.infer<typeof providerHistorySyncBodySchema>;
+      sendSuccess(
+        response,
+        200,
+        "Stripe payout history read",
+        await service.syncProviderHistory(actorId(request), { maxPages: body.maxPages }),
+      );
     }),
   );
   router.post(

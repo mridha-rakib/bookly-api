@@ -447,6 +447,9 @@ export const env = createEnv({
     STRIPE_WEBHOOK_SECRET: optionalProductionRequiredString("STRIPE_WEBHOOK_SECRET"),
     // P0.6 — Super Admin withdrawals with a LIVE key stay disabled unless explicitly enabled.
     CENTRAL_PAYOUTS_LIVE_ENABLED: booleanString,
+    // FG03B-1 — operator-triggered Stripe payout history read (non-monetary). Off by default;
+    // enable only after the observation indexes are provisioned and the operation is approved.
+    CENTRAL_PAYOUT_HISTORY_SYNC_ENABLED: booleanString,
     // Unset disables 3DS cancellation. Approved maximum age from payment creation,
     // unrelated to package consent expiry or browser sessions.
     PAYMENT_AUTHENTICATION_MAX_AGE_MS: z.preprocess(

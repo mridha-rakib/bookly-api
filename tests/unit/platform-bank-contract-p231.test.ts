@@ -186,6 +186,7 @@ it.each(["duplicates", "partial", "malformed"])(
       createPayout: vi.fn(),
       retrievePayout: vi.fn(),
       listRecentPayouts: async () => [],
+      listPayoutsPage: async () => ({ payouts: [], hasMore: false }),
     };
     vi.spyOn(CentralPayoutOperationModel, "findOne").mockReturnValue({
       lean: () => ({ exec: async () => null }),
