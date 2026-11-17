@@ -6,7 +6,7 @@ import {
   sign,
   verify,
 } from "node:crypto";
-import { existsSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, renameSync } from "node:fs";
 import {
   releaseRegistryEntrySchema,
   verifyAuthenticatedReleaseRecord,
@@ -207,6 +207,9 @@ const loadSigningKey = (env: ToolEnv) => {
 };
 
 const publishedPath = (env: ToolEnv, name: string) => `${env.authorityDirectory}/${name}`;
+/** Windows (tests only) has no POSIX permission bits to compare. */
+const hasPublishedMode = (path: string) =>
+  process.platform === "win32" || (lstatSync(path).mode & 0o7777) === PUBLISHED_MODE;
 const readPublished = (env: ToolEnv, name: string) =>
   existsSync(publishedPath(env, name)) ? readFileSync(publishedPath(env, name)) : undefined;
 
@@ -402,7 +405,9 @@ function issueAttestation(
   archivePublishedAttestation(env, `superseded-${sequence}`);
   const write = (name: string, data: Buffer) => {
     const existing = readPublished(env, name);
-    if (!existing?.equals(data))
+    // Also republish unchanged bytes whose mode is wrong (e.g. 0600 left by a umask-filtered
+    // earlier write), so renewal restores API readability without manual repair.
+    if (!existing?.equals(data) || !hasPublishedMode(publishedPath(env, name)))
       writeFileAtomic(env.authorityDirectory, name, data, PUBLISHED_MODE);
   };
   write(PUBLISHED.deploymentPublicKeyPem, deploymentPem);

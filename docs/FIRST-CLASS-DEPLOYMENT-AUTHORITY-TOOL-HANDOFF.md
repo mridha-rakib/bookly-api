@@ -135,6 +135,15 @@ timer with an Owner-approved value strictly shorter than `maxValidityMs`. Left u
 timer is rejected and nothing renews (closed). The renew service does not run while
 `stopped.json` exists.
 
+File modes do not depend on the umask. The renew unit keeps `UMask=0077`, and the tool sets
+each file's mode explicitly with `fchmod` before writing to it. Published files in
+`/etc/bookly/first-class-authority` are `0644`. The signing key, state, evidence and archive
+files are `0600`, in `0700` directories. A renewal also republishes any unchanged published
+file whose mode is not `0644`, so a file that an earlier build left at `0600` is repaired with
+no manual step. Releases before this fix needed the temporary drop-in
+`bookly-first-class-authority-renew.service.d/umask.conf`. It is still compatible, so remove it
+only after a release containing the fix has been adopted through the normal signing procedure.
+
 ## 6. Synthetic acceptance on the host (before any provisioning)
 
 ```sh

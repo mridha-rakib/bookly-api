@@ -480,3 +480,29 @@ describe("deployment authority tool: shipped entry point", () => {
     );
   });
 });
+
+describe("deployment authority tool: published file modes under the renewal unit's UMask=0077", () => {
+  it.skipIf(process.platform === "win32")(
+    "renewal publishes API-readable 0644 files, keeps state 0600 and repairs a stale 0600 file",
+    async () => {
+      const { chmodSync, statSync } = await import("node:fs");
+      const { FIRST_CLASS_AUTHORITY_FILE_NAMES: names } = await import(
+        "../../src/modules/booking/trusted-time/protected-authority-files.js"
+      );
+      const { f } = await adopted();
+      const mode = (path: string) => statSync(path).mode & 0o777;
+      const publishedFile = (name: string) => join(f.env.authorityDirectory, name);
+      // Simulate the pre-fix result: an unchanged published file left root-only.
+      chmodSync(publishedFile(names.deploymentPublicKeyPem), 0o600);
+      const previous = process.umask(0o077);
+      try {
+        expect((await renewAttestation(f.env)).sequence).toBe(2);
+      } finally {
+        process.umask(previous);
+      }
+      for (const name of Object.values(names)) expect(mode(publishedFile(name))).toBe(0o644);
+      expect(mode(join(f.env.stateDirectory, "deployment-signing.key"))).toBe(0o600);
+      expect(mode(join(f.env.stateDirectory, "sequence.json"))).toBe(0o600);
+    },
+  );
+});

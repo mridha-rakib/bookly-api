@@ -3,6 +3,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -36,6 +37,11 @@ export function writeFileAtomic(directory: string, name: string, data: Buffer, m
   const temp = `${directory}/.${name}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   const fd = openSync(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, mode);
   try {
+    // The creation mode is filtered by the process umask (the renewal unit runs with
+    // UMask=0077), which would turn published 0644 files into root-only 0600 ones the API
+    // cannot read. Set the exact intended mode on the descriptor before any data is written,
+    // so published files are 0644 and private files stay 0600 under every umask.
+    fchmodSync(fd, mode);
     let offset = 0;
     while (offset < data.length) offset += writeSync(fd, data, offset);
     fsyncSync(fd);
