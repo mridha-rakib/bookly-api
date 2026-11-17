@@ -13,6 +13,10 @@ const defaultMessages: Record<string, string> = {
     "This Business has not configured payout bank details yet — a payout cannot be recorded",
   FINANCE_PAYOUT_CONFLICT:
     "This Business's pending balance changed while processing the payout — please try again",
+  /** Finance Gap 02 — the eligible balance differs from the amount/snapshot the Super Admin
+   * confirmed. Nothing was recorded. */
+  FINANCE_PAYOUT_SNAPSHOT_CHANGED:
+    "This Business's payable balance changed after you reviewed it — nothing was recorded. Review the current amount before recording the transfer.",
   // P6 — Super Admin provider-reversal support surface
   FINANCE_DISPUTE_NOT_FOUND: "Dispute not found",
   FINANCE_WEBHOOK_EVENT_NOT_FOUND: "Webhook event not found",

@@ -162,6 +162,8 @@ export const toPlatformPayoutHistoryItemDto = (
   periodEnd: item.periodEnd.toISOString(),
   grossBusinessOwnedCents: item.grossBusinessOwnedCents,
   processingFeesCents: item.processingFeesCents,
+  // Finance Gap 02 — stored on every payout; lets gross − deductions explain net in the log.
+  refundsCents: item.refundsCents,
   disputeAdjustmentsCents: item.disputeAdjustmentsCents ?? 0,
   netPayoutCents: item.netPayoutCents,
   currency: item.currency,

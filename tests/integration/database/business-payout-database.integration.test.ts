@@ -92,6 +92,21 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
   let tokenService: TokenService;
   let webhookService: StripeWebhookService;
 
+  /** Finance Gap 02 — review the current payable, then record exactly that amount/snapshot
+   * (what the Super Admin UI does). */
+  const recordReviewedPayout = async (
+    adminId: Types.ObjectId,
+    businessId: Types.ObjectId,
+    providerReference?: string,
+  ) => {
+    const payable = await financeService.getBusinessPayableForSuperAdmin(String(businessId));
+    return businessPayoutService.executePayout(String(adminId), String(businessId), {
+      expectedNetCents: payable.netCents,
+      snapshotDigest: payable.snapshotDigest ?? "",
+      ...(providerReference ? { providerReference } : {}),
+    });
+  };
+
   beforeAll(async () => {
     await connectIsolatedDatabase();
   }, 120_000);
@@ -799,10 +814,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       bankName: "Test Bank",
     });
 
-    const payout = await businessPayoutService.executePayout(
-      String(admin._id),
-      String(business._id),
-    );
+    const payout = await recordReviewedPayout(admin._id, business._id);
     expect(payout.status).toBe("PAID");
     expect(payout.netPayoutCents).toBe(1600 - 55);
     expect(payout.settledTransactionIds).toHaveLength(2); // DEPOSIT + PROCESSING_FEE
@@ -839,9 +851,9 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
 
     // Duplicate request (double-click / retry) with nothing new to claim -> a clean, safe
     // rejection, never a second (empty or duplicate) payout.
-    await expect(
-      businessPayoutService.executePayout(String(admin._id), String(business._id)),
-    ).rejects.toMatchObject({ message: expect.stringContaining("pending payable") });
+    await expect(recordReviewedPayout(admin._id, business._id)).rejects.toMatchObject({
+      message: expect.stringContaining("pending payable"),
+    });
 
     const historyPage = await businessPayoutRepository.listByBusinessId({
       businessId: business._id,
@@ -886,8 +898,8 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     await configureDestination(business._id, owner._id);
 
     const results = await Promise.allSettled([
-      businessPayoutService.executePayout(String(admin._id), String(business._id)),
-      businessPayoutService.executePayout(String(admin._id), String(business._id)),
+      recordReviewedPayout(admin._id, business._id),
+      recordReviewedPayout(admin._id, business._id),
     ]);
 
     const succeeded = results.filter((r) => r.status === "fulfilled");
@@ -922,9 +934,84 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
     // A destination IS configured here, so this still exercises the original
     // "nothing eligible" rejection rather than the new destination rule.
     await configureDestination(business._id, owner._id);
-    await expect(
-      businessPayoutService.executePayout(String(admin._id), String(business._id)),
-    ).rejects.toMatchObject({ message: expect.stringContaining("pending payable") });
+    await expect(recordReviewedPayout(admin._id, business._id)).rejects.toMatchObject({
+      message: expect.stringContaining("pending payable"),
+    });
+  });
+
+  it("[Finance Gap 02] never records an amount or entry set other than the one the Super Admin reviewed", async () => {
+    const { owner, business, membership, service } = await setupBookableBusiness(8000);
+    const customer = await createCustomer("payout-snapshot");
+    await saveCard(customer._id);
+    await linkCustomerToBusiness(business._id, owner._id, customer._id);
+    await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "10:00"),
+    );
+    const second = await creationService.finalizeCustomerBooking(
+      String(customer._id),
+      String(business._id),
+      finalizeInput(service._id, membership._id, "14:00"),
+    );
+    if (second.status !== "confirmed") throw new Error("expected confirmed");
+    await seedLegacyReturningDeposit(
+      { paymentService, financialTransactionService },
+      second.booking,
+    );
+    await configureDestination(business._id, owner._id);
+    const admin = await userRepository.create({
+      normalizedEmail: `admin-snapshot-${new Types.ObjectId().toString()}@example.com`,
+      passwordHash: "hash",
+      role: "SUPER_ADMIN",
+      status: "ACTIVE",
+    });
+
+    // 1. The Super Admin reviews €16.00 and transfers it externally...
+    const reviewed = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
+    expect(reviewed.netCents).toBe(1600);
+    expect(reviewed.snapshotDigest).toMatch(/^[a-f0-9]{64}$/);
+    // 2. ...meanwhile the deposit's Stripe fee settles: the eligible balance is now €15.45.
+    await settleProcessingFee(second.booking._id);
+    const record = (expectedNetCents: number, snapshotDigest: string) =>
+      businessPayoutService.executePayout(String(admin._id), String(business._id), {
+        expectedNetCents,
+        snapshotDigest,
+      });
+    const nothingWritten = async () => {
+      expect(await BusinessPayoutModel.countDocuments({ businessId: business._id })).toBe(0);
+      expect(
+        await BookingFinancialTransactionModel.countDocuments({
+          businessId: business._id,
+          payoutId: { $exists: true },
+        }),
+      ).toBe(0);
+    };
+
+    // 3. Confirming the reviewed (stale) amount is refused — €15.45 is never silently recorded.
+    await expect(record(reviewed.netCents, reviewed.snapshotDigest ?? "")).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("changed after you reviewed it"),
+    });
+    await nothingWritten();
+
+    // The right amount with a stale snapshot, or the right snapshot with another amount, is
+    // refused too: both the amount and the exact entry set must match.
+    const current = await financeService.getBusinessPayableForSuperAdmin(String(business._id));
+    expect(current.netCents).toBe(1545);
+    expect(current.snapshotDigest).not.toBe(reviewed.snapshotDigest);
+    await expect(record(1545, reviewed.snapshotDigest ?? "")).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(record(1600, current.snapshotDigest ?? "")).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await nothingWritten();
+
+    // 4. After re-reviewing, the exact current amount is recorded.
+    const payout = await record(current.netCents, current.snapshotDigest ?? "");
+    expect(payout.netPayoutCents).toBe(1545);
+    expect(payout.settledTransactionIds).toHaveLength(2);
   });
 
   // --- Payout Destination snapshot (new) -----------------------------------------------------
@@ -976,9 +1063,9 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
       );
       expect(payableBefore.netCents).toBeGreaterThan(0);
 
-      await expect(
-        businessPayoutService.executePayout(String(admin._id), String(business._id)),
-      ).rejects.toMatchObject({ message: expect.stringContaining("payout bank details") });
+      await expect(recordReviewedPayout(admin._id, business._id)).rejects.toMatchObject({
+        message: expect.stringContaining("payout bank details"),
+      });
 
       // Nothing was claimed, nothing was mutated, no payout row exists.
       const payableAfter = await financeService.getBusinessPayableForSuperAdmin(
@@ -1010,10 +1097,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
         bankName: "Snapshot Bank",
       });
 
-      const payout = await businessPayoutService.executePayout(
-        String(admin._id),
-        String(business._id),
-      );
+      const payout = await recordReviewedPayout(admin._id, business._id);
 
       // The amount calculation is byte-identical to the pre-existing preview formula.
       expect(payout.netPayoutCents).toBe(expected.netCents);
@@ -1043,10 +1127,7 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
         bankName: "Original Bank",
       });
 
-      const payout = await businessPayoutService.executePayout(
-        String(admin._id),
-        String(business._id),
-      );
+      const payout = await recordReviewedPayout(admin._id, business._id);
       expect(payout.destinationLast4).toBe("3000");
 
       // The Owner later replaces their bank details entirely.
@@ -1421,6 +1502,95 @@ describe("database-backed Business Payout + Super Admin Finance (Batch 8)", () =
         .send({});
 
       expect(response.status).toBe(403);
+    });
+
+    it("[Finance Gap 02] Super Admin HTTP record requires the reviewed amount + snapshot and updates every view", async () => {
+      const { owner, business, membership, service } = await setupBookableBusiness(8000);
+      const customer = await createCustomer("payout-http");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      await creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        finalizeInput(service._id, membership._id, "10:00"),
+      );
+      const second = await creationService.finalizeCustomerBooking(
+        String(customer._id),
+        String(business._id),
+        finalizeInput(service._id, membership._id, "14:00"),
+      );
+      if (second.status !== "confirmed") throw new Error("expected confirmed");
+      await seedLegacyReturningDeposit(
+        { paymentService, financialTransactionService },
+        second.booking,
+      );
+      await settleProcessingFee(second.booking._id);
+      await configureDestination(business._id, owner._id);
+      const admin = await userRepository.create({
+        normalizedEmail: `admin-http-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPER_ADMIN",
+        status: "ACTIVE",
+      });
+      const app = buildSuperAdminApp();
+      const token = await bearerFor(admin._id, "SUPER_ADMIN");
+      const url = `/super-admin/businesses/${business._id}/finance/payouts`;
+
+      // An unbound request (the pre-Gap-02 body) is rejected before anything is read or written.
+      await request(app)
+        .post(url)
+        .set("Authorization", token)
+        .send({ providerReference: "BANK-1" })
+        .expect(400);
+      expect(await BusinessPayoutModel.countDocuments({ businessId: business._id })).toBe(0);
+
+      const payable = await request(app)
+        .get(`/super-admin/businesses/${business._id}/finance/payable`)
+        .set("Authorization", token)
+        .expect(200);
+      const { netCents, snapshotDigest } = payable.body.data as {
+        netCents: number;
+        snapshotDigest: string;
+      };
+      expect(netCents).toBe(1545);
+
+      await request(app)
+        .post(url)
+        .set("Authorization", token)
+        .send({ expectedNetCents: netCents + 1, snapshotDigest })
+        .expect(409);
+      const recorded = await request(app)
+        .post(url)
+        .set("Authorization", token)
+        .send({ expectedNetCents: netCents, snapshotDigest, providerReference: "BANK-1" })
+        .expect(201);
+      expect(recorded.body.data).toMatchObject({
+        netPayoutCents: 1545,
+        providerReference: "BANK-1",
+      });
+
+      // Super Admin pending/history and the Owner's balance/history all reflect the one record.
+      const pending = await request(app)
+        .get("/super-admin/finance/pending-payouts")
+        .set("Authorization", token)
+        .expect(200);
+      expect(
+        (pending.body.data.items as Array<{ businessId: string }>).some(
+          (item) => item.businessId === String(business._id),
+        ),
+      ).toBe(false);
+      const history = await request(app)
+        .get(`/super-admin/businesses/${business._id}/finance/payouts`)
+        .set("Authorization", token)
+        .expect(200);
+      expect(history.body.data.payouts).toHaveLength(1);
+      const balance = await financeService.getBusinessBalance(
+        String(owner._id),
+        String(business._id),
+      );
+      expect(balance.recordedPaid).toMatchObject({ amountCents: 1545, payoutCount: 1 });
+      expect(balance.outstanding.payableCents).toBe(0);
+      expect(balance.reconciled).toBe(true);
     });
 
     it("denies Staff/Supervisor from accessing Super Admin finance", async () => {

@@ -836,8 +836,16 @@ describe("P6 provider-originated reversals", () => {
     }
     await configureDestination(ctx);
     const admin = await createAdmin();
-    const payout = () =>
-      businessPayoutService.executePayout(String(admin._id), String(ctx.business._id));
+    // Finance Gap 02 — records exactly the amount/snapshot just reviewed, as the UI does.
+    const payout = async () => {
+      const payable = await financeService.getBusinessPayableForSuperAdmin(
+        String(ctx.business._id),
+      );
+      return businessPayoutService.executePayout(String(admin._id), String(ctx.business._id), {
+        expectedNetCents: payable.netCents,
+        snapshotDigest: payable.snapshotDigest ?? "",
+      });
+    };
     return { ctx, deposits, admin, payout };
   };
 

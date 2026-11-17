@@ -48,6 +48,7 @@ const build = (rows: Row[], payouts: Array<{ netPayoutCents: number; paidAt: Dat
     rows
       .filter((row) => !row.payoutId)
       .map((row) => ({
+        _id: new Types.ObjectId(),
         type: row.type,
         amountCents: row.amountCents,
         metadata: row.sourceType ? { sourceType: row.sourceType } : {},

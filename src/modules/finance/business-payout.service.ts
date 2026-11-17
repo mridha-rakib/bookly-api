@@ -20,6 +20,7 @@ import {
   DISPUTE_LEDGER_TYPES,
   disputeLossCents,
 } from "./finance-ownership.js";
+import { computePayoutSnapshotDigest } from "./payout-snapshot.js";
 
 /**
  * Batch 8 — the ONLY write path that ever creates a real payout. Manual, Super-Admin-triggered,
@@ -48,10 +49,20 @@ export class BusinessPayoutService {
     private readonly payoutDestinationRepository: PayoutDestinationRepository,
   ) {}
 
+  /**
+   * Finance Gap 02 — `expectedNetCents` and `snapshotDigest` are REQUIRED: they bind this record
+   * to the exact amount and eligible entry set the Super Admin reviewed (and transferred
+   * externally). They are checked inside the transaction against the same read that decides
+   * what is claimed; any difference refuses the record with nothing written.
+   */
   public async executePayout(
     superAdminUserId: string,
     businessId: string,
-    options: { providerReference?: string | undefined } = {},
+    options: {
+      expectedNetCents: number;
+      snapshotDigest: string;
+      providerReference?: string | undefined;
+    },
   ): Promise<BusinessPayoutDocument> {
     if (!/^[a-f\d]{24}$/i.test(businessId)) {
       throw new FinanceError("FINANCE_BUSINESS_NOT_FOUND", 404);
@@ -99,6 +110,15 @@ export class BusinessPayoutService {
 
         if (entries.length === 0 || totals.netCents <= 0) {
           throw new FinanceError("FINANCE_NO_ELIGIBLE_PAYABLE", 409);
+        }
+
+        // Finance Gap 02 — the recorded amount must be exactly the confirmed amount, over exactly
+        // the reviewed entry set. Checked before any write, so a mismatch aborts cleanly.
+        if (
+          totals.netCents !== options.expectedNetCents ||
+          computePayoutSnapshotDigest(entries) !== options.snapshotDigest
+        ) {
+          throw new FinanceError("FINANCE_PAYOUT_SNAPSHOT_CHANGED", 409);
         }
 
         const ids = entries.map((entry) => entry._id);

@@ -171,6 +171,10 @@ export type BusinessPayableSummary = {
    * (a returning booking's Promo shortfall) — broken out for the same display-parity reason as
    * the other source splits above; never folded silently into `depositAmountCents`. */
   promoSubsidyAmountCents: number;
+  /** Finance Gap 02 — digest of the exact Business-owned unclaimed entries this balance is built
+   * from (see payout-snapshot.ts). Present on the single-Business payable read only; a manual
+   * transfer record must echo it with `netCents`. Absent on the aggregated pending list. */
+  snapshotDigest?: string;
 };
 
 export type PendingPayoutsPage = {

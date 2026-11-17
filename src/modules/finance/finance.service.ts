@@ -33,6 +33,7 @@ import {
   disputeLossCents,
   groupBucketsByBusiness,
 } from "./finance-ownership.js";
+import { computePayoutSnapshotDigest } from "./payout-snapshot.js";
 
 /** The ledger types the current Payouts & Finance UI actually displays — see
  * DashboardPayoutsList/PayoutsBreakdown/PayoutsHistory's own investigation notes (Batch 7
@@ -558,6 +559,10 @@ export class FinanceService {
       cancellationAmountCents,
       depositAmountCents,
       promoSubsidyAmountCents,
+      // Finance Gap 02 — over exactly the entries BusinessPayoutService.executePayout claims.
+      snapshotDigest: computePayoutSnapshotDigest(
+        entries.filter((entry) => classifyLedgerEntryOwner(entry) === "BUSINESS"),
+      ),
     };
   }
 

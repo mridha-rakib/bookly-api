@@ -123,6 +123,10 @@ export type PlatformTransactionsExportQuery = z.infer<typeof platformTransaction
 export const executePayoutBodySchema = z
   .object({
     providerReference: z.string().trim().min(1).max(200).optional(),
+    // Finance Gap 02 — the exact amount transferred externally and the payable snapshot it was
+    // read from (GET .../finance/payable `netCents` + `snapshotDigest`). Required.
+    expectedNetCents: z.number().int().positive().safe(),
+    snapshotDigest: z.string().regex(/^[a-f0-9]{64}$/),
   })
   .strict();
 

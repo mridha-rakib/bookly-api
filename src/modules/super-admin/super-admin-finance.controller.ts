@@ -283,15 +283,17 @@ export class SuperAdminFinanceController {
     });
   };
 
-  /** "Send SEPA" / "Confirm Transfer" — the Super Admin's one-step, self-attested payout
-   * action (see business-payout.model.ts's own doc comment on this confirmed product
-   * decision). */
+  /** "Record bank transfer" — the Super Admin's one-step record of a transfer already completed
+   * outside Bookly (see business-payout.model.ts's own doc comment on this confirmed product
+   * decision). Bound to the confirmed amount + payable snapshot (Finance Gap 02). */
   public executePayout = async (request: Request, response: Response): Promise<void> => {
     const userId = this.requireUserId(request);
     const params = request.validated?.params as FinanceBusinessParams;
     const body = request.validated?.body as ExecutePayoutBody;
 
     const payout = await this.businessPayoutService.executePayout(userId, params.businessId, {
+      expectedNetCents: body.expectedNetCents,
+      snapshotDigest: body.snapshotDigest,
       providerReference: body.providerReference,
     });
 
