@@ -9,10 +9,11 @@ import { Argon2PasswordHasher } from "../auth/password-hasher.js";
 import { requireCurrentPassword } from "../auth/require-current-password.js";
 import type { UserRepository } from "../user/user.repository.js";
 import { CentralPayoutService } from "./central-payout.service.js";
-import type { CentralPayoutGateway } from "./central-payout.types.js";
+import { type CentralPayoutGateway, providerPayoutStatuses } from "./central-payout.types.js";
 import type { CentralPayoutOperationDocument } from "./central-payout-operation.model.js";
 import { MAX_PAGES_PER_RUN } from "./payout-reconciliation.js";
 import { StripeCentralPayoutGateway } from "./stripe-central-payout-gateway.js";
+import { payoutLinkages } from "./stripe-payout-observation.model.js";
 
 export const initiateCentralPayoutBodySchema = z
   .object({
@@ -31,6 +32,28 @@ export const centralPayoutParamsSchema = z.object({
 export const providerHistorySyncBodySchema = z
   .object({ maxPages: z.number().int().min(1).max(MAX_PAGES_PER_RUN).optional() })
   .strict();
+/** FG03B-2 — read-only observed-payout review filters. Dates are Stripe creation days (UTC). */
+export const observedPayoutQuerySchema = z
+  .object({
+    mode: z.enum(["TEST", "LIVE"]).optional(),
+    linkage: z.enum(payoutLinkages).optional(),
+    status: z.enum(providerPayoutStatuses).optional(),
+    needsReview: z
+      .enum(["true", "false"])
+      .optional()
+      .transform((value) => (value === undefined ? undefined : value === "true")),
+    from: z.iso.date().optional(),
+    to: z.iso.date().optional(),
+    page: z.coerce.number().int().min(1).max(10_000).default(1),
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+  })
+  .strict()
+  .refine((q) => !q.from || !q.to || q.from <= q.to, {
+    message: "`from` must not be after `to`",
+    path: ["from"],
+  });
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 export const centralPayoutListQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),
@@ -124,6 +147,32 @@ export const createCentralPayoutRouter = (service: CentralPayoutService): Router
         withdrawals: page.items.map(toCentralPayoutOperationDto),
         pagination: { page: query.page, limit: query.limit, total: page.total },
       });
+    }),
+  );
+  // FG03B-2 — read-only review of observed Stripe payouts (database only, current verified
+  // account only, masked). Registered before `/:operationId`. No assignment or override exists.
+  router.get(
+    "/finance/withdrawals/provider-payouts",
+    validateRequest({ query: observedPayoutQuerySchema }),
+    asyncHandler(async (request: Request, response: Response) => {
+      const query = request.validated?.query as z.infer<typeof observedPayoutQuerySchema>;
+      sendSuccess(
+        response,
+        200,
+        "Observed Stripe payouts",
+        await service.listObservedPayouts({
+          mode: query.mode,
+          linkage: query.linkage,
+          status: query.status,
+          needsReview: query.needsReview,
+          createdFrom: query.from ? new Date(`${query.from}T00:00:00.000Z`) : undefined,
+          createdBefore: query.to
+            ? new Date(new Date(`${query.to}T00:00:00.000Z`).getTime() + DAY_MS)
+            : undefined,
+          page: query.page,
+          limit: query.limit,
+        }),
+      );
     }),
   );
   router.get(

@@ -10,6 +10,7 @@ import { TokenService } from "../../../src/modules/auth/token.service.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { createCentralPayoutRouter } from "../../../src/modules/central-payout/central-payout.route.js";
 import { CentralPayoutService } from "../../../src/modules/central-payout/central-payout.service.js";
 import {
   type CentralAccountPayoutState,
@@ -80,6 +81,14 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
   public async retrieveAccountPayoutState() {
     return this.account;
   }
+  /** FG03B-2 — the configured key's own account; `undefined` simulates an unreadable identity. */
+  public platformAccountCalls = 0;
+  public async platformAccountId() {
+    this.platformAccountCalls += 1;
+    if (!this.account.accountId)
+      throw new CentralPayoutProviderError("Platform account identity is unavailable", false);
+    return this.account.accountId;
+  }
   public async createPayout(input: {
     amountCents: number;
     currency: string;
@@ -126,6 +135,8 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
   public historyCalls: { startingAfter?: string; createdGte?: Date }[] = [];
   /** Throw a transient provider error on this (1-based) listPayoutsPage call. */
   public failHistoryCall: number | null = null;
+  /** FG03B-2 — runs before each listPayoutsPage call (e.g. to simulate a competing run). */
+  public onHistoryCall: ((call: number) => Promise<void>) | null = null;
   public async listPayoutsPage(input: {
     limit: number;
     startingAfter?: string | undefined;
@@ -135,6 +146,7 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
       ...(input.startingAfter ? { startingAfter: input.startingAfter } : {}),
       ...(input.createdGte ? { createdGte: input.createdGte } : {}),
     });
+    await this.onHistoryCall?.(this.historyCalls.length);
     if (this.failHistoryCall === this.historyCalls.length)
       throw new CentralPayoutProviderError("Rate limited by Stripe", false, "rate_limit");
     const eligible = this.history.filter(
@@ -155,7 +167,8 @@ const historyPayout = (n: number, over: Partial<ProviderPayout> = {}): ProviderP
   currency: "eur",
   status: "paid",
   arrivalDate: null,
-  created: new Date(Date.UTC(2030, 0, 1) - n * 60_000),
+  // Settled history by default: paid well outside the paid→failed window.
+  created: new Date(Date.UTC(2025, 0, 1) - n * 60_000),
   destinationId: BANK,
   failureCode: null,
   failureMessage: null,
@@ -291,6 +304,29 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
       .expect(409);
     expect(JSON.stringify(disabled.body)).toContain("CENTRAL_PAYOUT_HISTORY_SYNC_DISABLED");
     expect(await StripePayoutHistoryCoverageModel.countDocuments()).toBe(0);
+
+    // FG03B-2 — the observed-payout review route: Super Admin only, strict bounded filters
+    // (validation runs before any Stripe call or database read).
+    const review = "/super-admin/finance/withdrawals/provider-payouts";
+    await request(app).get(review).expect(401);
+    for (const role of ["BUSINESS_OWNER", "STAFF", "CUSTOMER"] as const)
+      await request(app)
+        .get(review)
+        .set("Authorization", `Bearer ${await tokenFor(role)}`)
+        .expect(403);
+    for (const bad of [
+      "limit=51",
+      "linkage=UNAUTHORIZED",
+      "status=reversed",
+      "from=2030-02-01&to=2030-01-01",
+      "from=2030-13-01",
+      "accountId=acct_other",
+      "needsReview=yes",
+    ])
+      await request(app)
+        .get(`${review}?${bad}`)
+        .set("Authorization", `Bearer ${superToken}`)
+        .expect(400);
   });
 
   it("4/5 validates step-up, balance, currency and destination before anything is sent", async () => {
@@ -574,12 +610,23 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
       (await StripePayoutObservationModel.findOne({ providerPayoutId: "po_forged" }).lean())
         ?.linkage,
     ).toBe("NOT_VERIFIED");
-    // The same payout id reported in LIVE mode is a separate observation, never merged.
+    // The same payout id reported in LIVE mode is a separate observation, never merged. FG03B-2: a
+    // LIVE event reaching a TEST-keyed deployment cannot be attributed to a verified account and
+    // is skipped; it is recorded only by a deployment whose key is in that mode.
     await service.syncFromWebhook(historyPayout(3, { id: "po_both" }), "evt_t");
     await service.syncFromWebhook(historyPayout(3, { id: "po_both", livemode: true }), "evt_l");
     expect(await StripePayoutObservationModel.countDocuments({ providerPayoutId: "po_both" })).toBe(
+      1,
+    );
+    gateway.modeValue = "LIVE";
+    await service.syncFromWebhook(historyPayout(3, { id: "po_both", livemode: true }), "evt_l");
+    gateway.modeValue = "TEST";
+    expect(await StripePayoutObservationModel.countDocuments({ providerPayoutId: "po_both" })).toBe(
       2,
     );
+    expect(
+      await StripePayoutObservationModel.countDocuments({ accountId: "acct_platformtest" }),
+    ).toBe(4);
     // Out-of-order: a later pending event never regresses an observed paid status.
     await service.syncFromWebhook(
       historyPayout(3, { id: "po_both", status: "pending" }),
@@ -706,5 +753,293 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     const coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
     expect(coverage).toMatchObject({ accountId: "acct_otheraccount", state: "IN_PROGRESS" });
     expect(coverage?.completeAsOf).toBeUndefined();
+  });
+
+  // --- FG03B-2 ---------------------------------------------------------------------------------
+
+  const DAY = 24 * 60 * 60 * 1000;
+  const daysAgo = (days: number) => new Date(Date.now() - days * DAY);
+  const reviewApp = () => {
+    const app = express();
+    app.use("/super-admin", createCentralPayoutRouter(service));
+    app.use(createErrorHandler({ isProduction: true }));
+    return app;
+  };
+  const reviewUrl = "/super-admin/finance/withdrawals/provider-payouts";
+
+  it("FG03B-2 account identity: observations are account-scoped, old accounts excluded, unknown identity fails closed", async () => {
+    await service.syncFromWebhook(historyPayout(1, { id: "po_old_a" }), "evt_a1");
+    await service.syncFromWebhook(historyPayout(2, { id: "po_old_b" }), "evt_a2");
+    expect(
+      await StripePayoutObservationModel.countDocuments({ accountId: "acct_platformtest" }),
+    ).toBe(2);
+
+    // The key now belongs to a different Stripe account: old evidence is kept but never counted.
+    gateway.account = { ...gateway.account, accountId: "acct_newplatform" };
+    await service.syncFromWebhook(historyPayout(3, { id: "po_new" }), "evt_b1");
+    let readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.accountVerified).toBe(true);
+    expect(readiness.observations).toMatchObject({ total: 1, notVerified: 1, otherAccounts: 2 });
+
+    // A payout already recorded under the old account is never rewritten under the new one.
+    await service.syncFromWebhook(
+      historyPayout(1, { id: "po_old_a", status: "failed", failureCode: "account_closed" }),
+      "evt_b2",
+    );
+    const kept = await StripePayoutObservationModel.findOne({
+      providerPayoutId: "po_old_a",
+    }).lean();
+    expect(kept).toMatchObject({ accountId: "acct_platformtest", status: "paid" });
+    expect(kept?.failureCode).toBeUndefined();
+
+    // A history page carrying the other account's payout stops before the checkpoint moves.
+    gateway.history = [historyPayout(3, { id: "po_new" }), historyPayout(1, { id: "po_old_a" })];
+    gateway.historyPageSize = 1;
+    const run = await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    expect(run).toMatchObject({ outcome: "PROVIDER_ERROR", state: "IN_PROGRESS" });
+    expect(run.error).toContain("different Stripe account");
+    const coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage?.run?.cursor).toBe("po_new");
+
+    // Review results are scoped to the current account only.
+    const page = await request(reviewApp()).get(reviewUrl).expect(200);
+    expect(
+      page.body.data.items.map((i: { providerPayoutId: string }) => i.providerPayoutId),
+    ).toEqual(["po_new"]);
+    expect(page.body.data.evidence.otherAccountObservations).toBe(2);
+
+    // Connected-account events are not platform payouts and are not recorded.
+    await service.syncFromWebhook(historyPayout(4, { id: "po_connected" }), "evt_c", "acct_conn1");
+    expect(
+      await StripePayoutObservationModel.exists({ providerPayoutId: "po_connected" }),
+    ).toBeNull();
+
+    // Unknown account identity: the webhook throws (the event stays retryable), nothing is
+    // recorded unscoped, readiness counts nothing, and the review refuses to show evidence.
+    const { accountId: _dropped, ...unidentified } = gateway.account;
+    gateway.account = unidentified;
+    await expect(
+      service.syncFromWebhook(historyPayout(5, { id: "po_unscoped" }), "evt_u"),
+    ).rejects.toThrow("identity is unavailable");
+    expect(
+      await StripePayoutObservationModel.exists({ providerPayoutId: "po_unscoped" }),
+    ).toBeNull();
+    readiness = (await service.getOverview()).reconciliation;
+    expect(readiness).toMatchObject({ accountVerified: false, evidenceComplete: false });
+    expect(readiness.observations.total).toBe(0);
+    expect(readiness.blockers.map((b) => b.code)).toContain("PROVIDER_ACCOUNT_UNVERIFIED");
+    const refused = await request(reviewApp()).get(reviewUrl).expect(409);
+    expect(JSON.stringify(refused.body)).toContain("CENTRAL_PAYOUT_ACCOUNT_UNIDENTIFIED");
+    expect(gateway.createCalls).toHaveLength(0);
+  });
+
+  it("FG03B-2 freshness: a missed webhook on an older unsettled payout is re-read; stale evidence blocks", async () => {
+    const inTransit = historyPayout(1, {
+      id: "po_transit",
+      status: "in_transit",
+      created: daysAgo(5),
+    });
+    const recentPaid = historyPayout(2, {
+      id: "po_recent_paid",
+      created: daysAgo(4),
+      arrivalDate: daysAgo(3),
+    });
+    const settled = historyPayout(3, { id: "po_settled", created: daysAgo(60) });
+    gateway.history = [recentPaid, inTransit, settled].sort(
+      (a, b) => b.created.getTime() - a.created.getTime(),
+    );
+    expect(await service.syncProviderHistory(String(admin), { maxPages: 5 })).toMatchObject({
+      outcome: "COMPLETED",
+    });
+    let readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.observations).toMatchObject({ total: 3, inFlight: 1, unsettled: 2, stale: 0 });
+    expect(readiness.blockers.map((b) => b.code)).toEqual(
+      expect.arrayContaining(["PAYOUTS_IN_FLIGHT", "PAYOUTS_WITHIN_FAILURE_WINDOW"]),
+    );
+    expect(readiness.blockers.map((b) => b.code)).not.toContain("OBSERVATIONS_STALE");
+
+    // Two days pass without any webhook (missed), and the last complete read is three days old.
+    await StripePayoutObservationModel.updateMany({}, { $set: { lastObservedAt: daysAgo(2) } });
+    await StripePayoutHistoryCoverageModel.updateOne(
+      { mode: "TEST" },
+      { $set: { completeAsOf: daysAgo(3) } },
+    );
+    readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.observations.stale).toBe(2);
+    expect(readiness.freshness.historyStale).toBe(true);
+    expect(readiness.reviewNeeded).toBe(true);
+    expect(readiness.blockers.map((b) => b.code)).toEqual(
+      expect.arrayContaining(["OBSERVATIONS_STALE", "HISTORY_STALE"]),
+    );
+    const stalePage = await request(reviewApp()).get(`${reviewUrl}?needsReview=true`).expect(200);
+    const staleRow = stalePage.body.data.items.find(
+      (i: { providerPayoutId: string }) => i.providerPayoutId === "po_transit",
+    );
+    expect(staleRow).toMatchObject({ stale: true, settlement: "UNSETTLED" });
+    expect(staleRow.reviewReasons).toEqual(["NOT_VERIFIED", "STALE"]);
+
+    // Meanwhile Stripe moved the older payouts on (webhooks missed): in transit → paid, and the
+    // recently paid one → failed. A 24h overlap alone would not re-read the 5-day-old payout.
+    gateway.history = gateway.history.map((p) =>
+      p.id === "po_transit"
+        ? { ...p, status: "paid", arrivalDate: daysAgo(1) }
+        : p.id === "po_recent_paid"
+          ? { ...p, status: "failed", failureCode: "account_closed" }
+          : p,
+    );
+    expect(await service.syncProviderHistory(String(admin), { maxPages: 5 })).toMatchObject({
+      outcome: "COMPLETED",
+    });
+    const windowStart = gateway.historyCalls.at(-1)?.createdGte as Date;
+    expect(windowStart.getTime()).toBeLessThanOrEqual(inTransit.created.getTime());
+    expect(windowStart.getTime()).toBeGreaterThan(settled.created.getTime());
+    expect(
+      await StripePayoutObservationModel.findOne({ providerPayoutId: "po_transit" }).lean(),
+    ).toMatchObject({ status: "paid", lastObservedVia: "HISTORY_SYNC" });
+    expect(
+      await StripePayoutObservationModel.findOne({ providerPayoutId: "po_recent_paid" }).lean(),
+    ).toMatchObject({ status: "failed", failureCode: "account_closed" });
+    readiness = (await service.getOverview()).reconciliation;
+    expect(readiness.observations).toMatchObject({ stale: 0, inFlight: 0, unsettled: 1 });
+    expect(readiness.freshness.historyStale).toBe(false);
+    expect(readiness.blockers.map((b) => b.code)).not.toContain("OBSERVATIONS_STALE");
+    expect(gateway.createCalls).toHaveLength(0);
+  });
+
+  it("FG03B-2 history coverage: concurrent runs never corrupt the checkpoint; window drift is refused", async () => {
+    gateway.history = [1, 2, 3, 4].map((n) => historyPayout(n));
+    gateway.historyPageSize = 1;
+    // A competing run takes over the lease while this run is reading page 2.
+    gateway.onHistoryCall = async (call) => {
+      if (call === 2)
+        await StripePayoutHistoryCoverageModel.updateOne(
+          { mode: "TEST" },
+          { $set: { leaseId: "competitor", leaseExpiresAt: new Date(Date.now() + 60_000) } },
+        );
+    };
+    const lost = await service.syncProviderHistory(String(admin), { maxPages: 5 });
+    expect(lost).toMatchObject({ outcome: "LEASE_LOST", state: "IN_PROGRESS" });
+    let coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage?.run?.cursor).toBe("po_hist_1"); // the stale run's page 2 never checkpointed
+    expect(coverage?.leaseId).toBe("competitor");
+    expect(coverage?.state).toBe("IN_PROGRESS");
+    gateway.onHistoryCall = null;
+
+    // Two simultaneous requests: at most one holds the lease; the result is one complete read.
+    await StripePayoutHistoryCoverageModel.updateOne(
+      { mode: "TEST" },
+      { $unset: { leaseId: 1, leaseExpiresAt: 1 } },
+    );
+    const results = await Promise.allSettled([
+      service.syncProviderHistory(String(admin), { maxPages: 10 }),
+      service.syncProviderHistory(String(admin), { maxPages: 10 }),
+    ]);
+    for (const r of results)
+      if (r.status === "rejected") expect(r.reason).toMatchObject({ statusCode: 409 });
+    expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+    coverage = await StripePayoutHistoryCoverageModel.findOne({ mode: "TEST" }).lean();
+    expect(coverage).toMatchObject({ state: "COMPLETE" });
+    expect(await StripePayoutObservationModel.countDocuments()).toBe(4);
+
+    // A provider page outside the requested window can never complete coverage.
+    const stray = historyPayout(9, { id: "po_stray", created: new Date(Date.UTC(2020, 0, 1)) });
+    const realList = gateway.listPayoutsPage.bind(gateway);
+    gateway.listPayoutsPage = async (input) => {
+      const page = await realList(input);
+      return { payouts: [...page.payouts, stray], hasMore: false };
+    };
+    const drift = await service.syncProviderHistory(String(admin));
+    expect(drift).toMatchObject({ outcome: "PROVIDER_ERROR", state: "IN_PROGRESS" });
+    expect(drift.error).toContain("outside the requested date window");
+  });
+
+  it("FG03B-2 linkage: a payout observed while unconfirmed becomes verified when refresh confirms it", async () => {
+    gateway.nextCreate = "lost";
+    const op = await submit();
+    expect(op.state).toBe("UNKNOWN");
+    const stripePayout = gateway.payouts.get(op.providerIdempotencyKey) as ProviderPayout;
+    gateway.history = [stripePayout];
+    await service.syncProviderHistory(String(admin));
+    expect(
+      await StripePayoutObservationModel.findOne({ providerPayoutId: stripePayout.id }).lean(),
+    ).toMatchObject({ linkage: "UNRESOLVED", claimedOperationId: expect.anything() });
+
+    // Recovery (not a webhook) confirms the payout id: the observation is promoted.
+    expect(await service.refresh(String(op._id))).toMatchObject({ state: "SUBMITTED" });
+    const promoted = await StripePayoutObservationModel.findOne({
+      providerPayoutId: stripePayout.id,
+    }).lean();
+    expect(promoted).toMatchObject({ linkage: "VERIFIED_BOOKLY" });
+    expect(String(promoted?.operationId)).toBe(String(op._id));
+    expect(promoted?.claimedOperationId).toBeUndefined();
+    // A later re-read never downgrades it, and no second payout was created.
+    await service.syncProviderHistory(String(admin));
+    expect(
+      (await StripePayoutObservationModel.findOne({ providerPayoutId: stripePayout.id }).lean())
+        ?.linkage,
+    ).toBe("VERIFIED_BOOKLY");
+    expect(gateway.createCalls).toHaveLength(1);
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
+  });
+
+  it("FG03B-2 review API: filtered pagination, masked rows, explicit evidence state, no money moved", async () => {
+    const ledgerBefore = await BookingFinancialTransactionModel.countDocuments();
+    const verifiedOp = await submit(); // po_fake_1, verified through Stripe's own response
+    const verifiedPayout = gateway.payouts.get(verifiedOp.providerIdempotencyKey) as ProviderPayout;
+    gateway.history = [
+      { ...verifiedPayout, created: new Date(Date.UTC(2025, 5, 1)) },
+      ...[1, 2, 3, 4, 5].map((n) =>
+        historyPayout(n, n === 5 ? { status: "failed", failureCode: "no_account" } : {}),
+      ),
+    ];
+    gateway.historyPageSize = 10;
+    await service.syncProviderHistory(String(admin));
+    const app = reviewApp();
+
+    const first = await request(app).get(`${reviewUrl}?linkage=NOT_VERIFIED&limit=2`).expect(200);
+    expect(first.body.data).toMatchObject({
+      mode: "TEST",
+      modeIsCurrent: true,
+      accountVerified: true,
+      pagination: { page: 1, limit: 2, total: 5 },
+      evidence: { coverageState: "COMPLETE", coverageAccountMatches: true, historyStale: false },
+    });
+    const ids = (body: { data: { items: { providerPayoutId: string }[] } }) =>
+      body.data.items.map((i) => i.providerPayoutId);
+    expect(ids(first.body)).toEqual(["po_hist_1", "po_hist_2"]); // newest first
+    const third = await request(app).get(`${reviewUrl}?linkage=NOT_VERIFIED&limit=2&page=3`);
+    expect(ids(third.body)).toEqual(["po_hist_5"]);
+
+    const verified = await request(app).get(`${reviewUrl}?linkage=VERIFIED_BOOKLY`).expect(200);
+    expect(verified.body.data.items).toHaveLength(1);
+    expect(verified.body.data.items[0]).toMatchObject({
+      providerPayoutId: verifiedPayout.id,
+      booklyOperationId: String(verifiedOp._id),
+      reviewReasons: [],
+      destinationLast4: "6789",
+    });
+
+    const failed = await request(app).get(`${reviewUrl}?status=failed`).expect(200);
+    expect(failed.body.data.items[0]).toMatchObject({
+      providerPayoutId: "po_hist_5",
+      failureCode: "no_account",
+      settlement: "SETTLED",
+    });
+    const dated = await request(app).get(`${reviewUrl}?from=2025-06-01&to=2025-06-01`).expect(200);
+    expect(ids(dated.body)).toEqual([verifiedPayout.id]);
+    const review = await request(app).get(`${reviewUrl}?needsReview=true&limit=50`).expect(200);
+    expect(review.body.data.pagination.total).toBe(5);
+    const otherMode = await request(app).get(`${reviewUrl}?mode=LIVE`).expect(200);
+    expect(otherMode.body.data).toMatchObject({ mode: "LIVE", modeIsCurrent: false, items: [] });
+
+    // Masked, non-sensitive output only: no metadata, bank ids, account ids or provider text.
+    const raw = JSON.stringify([first.body, verified.body, failed.body, review.body]);
+    for (const forbidden of ["ba_", "acct_", "metadata", "failureMessage", BANK, "destinationId"])
+      expect(raw).not.toContain(forbidden);
+
+    // Reading evidence never moves money or changes operations.
+    expect(gateway.createCalls).toHaveLength(1);
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(1);
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(ledgerBefore);
   });
 });

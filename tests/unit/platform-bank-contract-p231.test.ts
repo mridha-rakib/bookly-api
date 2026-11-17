@@ -187,6 +187,7 @@ it.each(["duplicates", "partial", "malformed"])(
       retrievePayout: vi.fn(),
       listRecentPayouts: async () => [],
       listPayoutsPage: async () => ({ payouts: [], hasMore: false }),
+      platformAccountId: async () => "acct_unittest",
     };
     vi.spyOn(CentralPayoutOperationModel, "findOne").mockReturnValue({
       lean: () => ({ exec: async () => null }),

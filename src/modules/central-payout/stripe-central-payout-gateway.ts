@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Stripe from "stripe";
 import { env } from "../../config/env.js";
 import { getStripeClient } from "../payment/stripe-client.js";
@@ -70,6 +71,8 @@ const providerError = (error: unknown): CentralPayoutProviderError => {
     typeof e.code === "string" ? e.code : null,
   );
 };
+
+const platformAccountIds = new Map<string, string>();
 
 /** The one Stripe adapter for central payouts — Bookly's own (platform) account only. */
 export class StripeCentralPayoutGateway implements CentralPayoutGateway {
@@ -171,6 +174,26 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
         .map(toDestination)
         .filter((d): d is CentralBankDestination => d !== null),
     };
+  }
+
+  /** The account a secret key belongs to never changes, so it is read once per key per process
+   * (keyed by a hash, never the key itself). A failed read is not cached. */
+  public async platformAccountId(): Promise<string> {
+    const key = env.STRIPE_SECRET_KEY;
+    if (!key) throw new CentralPayoutProviderError("Stripe is not configured", true);
+    const cacheKey = createHash("sha256").update(key).digest("hex");
+    const cached = platformAccountIds.get(cacheKey);
+    if (cached) return cached;
+    let account: Stripe.Account;
+    try {
+      account = await this.client.accounts.retrieveCurrent();
+    } catch (error) {
+      throw providerError(error);
+    }
+    if (!account || typeof account.id !== "string" || !/^acct_[A-Za-z0-9]+$/.test(account.id))
+      throw new CentralPayoutProviderError("Platform account identity is unavailable", false);
+    platformAccountIds.set(cacheKey, account.id);
+    return account.id;
   }
 
   public async createPayout(input: {

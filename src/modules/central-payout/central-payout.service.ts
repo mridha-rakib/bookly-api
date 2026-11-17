@@ -18,13 +18,41 @@ import {
 } from "./central-payout-operation.model.js";
 import {
   classifyPayoutLinkage,
+  HISTORY_STALE_AFTER_MS,
   type HistorySyncResult,
-  observeProviderPayout,
+  listObservedPayouts,
+  type ObservedPayoutView,
+  observeWebhookPayout,
   PayoutHistorySyncError,
+  promoteObservationLinkage,
   type ReconciliationReadiness,
   readReconciliationReadiness,
   syncProviderPayoutHistory,
 } from "./payout-reconciliation.js";
+import {
+  type PayoutLinkage,
+  type StripePayoutHistoryCoverageDocument,
+  StripePayoutHistoryCoverageModel,
+  StripePayoutObservationModel,
+} from "./stripe-payout-observation.model.js";
+
+/** FG03B-2 — one page of the read-only observed-payout review, always scoped to the current
+ * verified Stripe platform account. Provider evidence only: never a ledger, never a permission. */
+export type ObservedPayoutPage = {
+  mode: CentralStripeMode;
+  /** False when the requested mode differs from the configured key's mode. */
+  modeIsCurrent: boolean;
+  accountVerified: true;
+  items: ObservedPayoutView[];
+  pagination: { page: number; limit: number; total: number };
+  evidence: {
+    coverageState: "NEVER_RUN" | "IN_PROGRESS" | "COMPLETE";
+    completeAsOf: Date | null;
+    coverageAccountMatches: boolean | null;
+    historyStale: boolean;
+    otherAccountObservations: number;
+  };
+};
 
 export class CentralPayoutError extends AppError {
   public constructor(code: string, message: string, statusCode: number) {
@@ -433,8 +461,13 @@ export class CentralPayoutService {
     return this.dispatch(op, "RECOVERY");
   }
 
-  /** Webhook entry point for payout.* events (already deduplicated by Stripe event id). */
-  public async syncFromWebhook(payout: ProviderPayout, providerEventId: string): Promise<void> {
+  /** Webhook entry point for payout.* events (already deduplicated by Stripe event id).
+   * `eventAccount` is the Stripe event's own `account` (set only for connected-account events). */
+  public async syncFromWebhook(
+    payout: ProviderPayout,
+    providerEventId: string,
+    eventAccount?: string | null,
+  ): Promise<void> {
     const operationId = payout.metadata[METADATA_KEY];
     const op = await CentralPayoutOperationModel.findOne(
       operationId && Types.ObjectId.isValid(operationId)
@@ -447,7 +480,68 @@ export class CentralPayoutService {
     // links it. Payouts Bookly did not request (e.g. Stripe Dashboard or automatic payouts) never
     // become withdrawal operations: FG03B-1 records them only as non-monetary observations.
     if (op) await this.applyProviderPayout(op, payout, "WEBHOOK", providerEventId);
-    await observeProviderPayout(payout, "WEBHOOK", providerEventId);
+    // FG03B-2 — scoped to the platform account of the configured key; throws (event retryable)
+    // when that account cannot be identified, so evidence is never recorded unscoped.
+    await observeWebhookPayout(this.deps.gateway, payout, providerEventId, eventAccount);
+  }
+
+  /** FG03B-2 — read-only review of observed Stripe payouts beyond the recent sample: database
+   * reads only (no Stripe payout listing), scoped to the current verified platform account. */
+  public async listObservedPayouts(input: {
+    mode?: CentralStripeMode | undefined;
+    linkage?: PayoutLinkage | undefined;
+    status?: string | undefined;
+    needsReview?: boolean | undefined;
+    createdFrom?: Date | undefined;
+    createdBefore?: Date | undefined;
+    page: number;
+    limit: number;
+  }): Promise<ObservedPayoutPage> {
+    const currentMode = this.deps.gateway.mode();
+    if (!currentMode)
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_STRIPE_NOT_CONFIGURED",
+        "Stripe is not configured with a recognised TEST or LIVE secret key",
+        409,
+      );
+    let accountId: string;
+    try {
+      accountId = await this.deps.gateway.platformAccountId();
+    } catch {
+      // Fail closed: without a verified account no observation may be shown as current evidence.
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_ACCOUNT_UNIDENTIFIED",
+        "The current Stripe account could not be identified, so payout evidence cannot be shown",
+        409,
+      );
+    }
+    const mode = input.mode ?? currentMode;
+    const now = new Date();
+    const [page, coverage, otherAccountObservations] = await Promise.all([
+      listObservedPayouts({ ...input, accountId, mode, now }),
+      StripePayoutHistoryCoverageModel.findOne({ mode })
+        .lean<StripePayoutHistoryCoverageDocument>()
+        .exec(),
+      StripePayoutObservationModel.countDocuments({ mode, accountId: { $ne: accountId } }).exec(),
+    ]);
+    const coverageState = coverage?.state ?? "NEVER_RUN";
+    return {
+      mode,
+      modeIsCurrent: mode === currentMode,
+      accountVerified: true,
+      items: page.items,
+      pagination: { page: input.page, limit: input.limit, total: page.total },
+      evidence: {
+        coverageState,
+        completeAsOf: coverage?.completeAsOf ?? null,
+        coverageAccountMatches: coverage?.accountId ? coverage.accountId === accountId : null,
+        historyStale:
+          coverageState === "COMPLETE" &&
+          !!coverage?.completeAsOf &&
+          coverage.completeAsOf.getTime() < now.getTime() - HISTORY_STALE_AFTER_MS,
+        otherAccountObservations,
+      },
+    };
   }
 
   /** FG03B-1 — operator-triggered, bounded, resumable Stripe payout history read. Super Admin
@@ -623,6 +717,11 @@ export class CentralPayoutService {
       $unset: { activeSlot: 1 },
       $push: { audit: entry },
     });
+    // FG03B-2 — the operation now records this exact payout id: an observation written earlier
+    // (e.g. a webhook that arrived while the request was unconfirmed) becomes VERIFIED_BOOKLY,
+    // whichever path (response, recovery, refresh or webhook) confirmed it. Non-monetary.
+    if (updated.providerPayoutId === payout.id)
+      await promoteObservationLinkage(payout.id, updated.mode, updated._id);
     // A concurrent pending update can win the CAS while this request observes paid/failed.
     // Reapply the newer state before acknowledging its webhook; never lose that transition.
     if (

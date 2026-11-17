@@ -71,6 +71,10 @@ export interface CentralPayoutGateway {
   mode(): CentralStripeMode | undefined;
   retrieveBalance(): Promise<CentralBalance>;
   retrieveAccountPayoutState(): Promise<CentralAccountPayoutState>;
+  /** FG03B-2 — the platform account (acct_…) that owns the configured secret key, read from
+   * Stripe itself (never from payload metadata). Throws when it cannot be established, so callers
+   * fail closed. */
+  platformAccountId(): Promise<string>;
   createPayout(input: {
     amountCents: number;
     currency: string;

@@ -21,10 +21,19 @@ import type { CentralStripeMode } from "./central-payout.types.js";
  */
 export type PayoutLinkage = "VERIFIED_BOOKLY" | "UNRESOLVED" | "NOT_VERIFIED";
 export const payoutLinkages = ["VERIFIED_BOOKLY", "UNRESOLVED", "NOT_VERIFIED"] as const;
+
 export type PayoutObservationSource = "WEBHOOK" | "HISTORY_SYNC";
 
+/**
+ * FG03B-2 — every observation is bound to the Stripe platform account (acct_…) that reported it.
+ * The account comes from the configured secret key's own account (never from payload metadata);
+ * all readiness and review reads are scoped to `{ accountId, mode }` of the CURRENT account, so a
+ * previously configured account's evidence is retained but never counted. An observation already
+ * held under a different account is never rewritten (see observeProviderPayout).
+ */
 export type StripePayoutObservationDocument = {
   _id: Types.ObjectId;
+  accountId: string;
   mode: CentralStripeMode;
   providerPayoutId: string;
   amountCents: number;
@@ -32,6 +41,8 @@ export type StripePayoutObservationDocument = {
   automatic: boolean;
   providerCreatedAt: Date;
   destinationId?: string | undefined;
+  /** Masked last 4 of the destination bank, when the account's bank inventory named it. */
+  destinationLast4?: string | undefined;
   status: string;
   /** Lifecycle rank of `status`; an observation never moves back to a lower rank. */
   statusRank: number;
@@ -53,6 +64,7 @@ export type StripePayoutObservationDocument = {
 
 const schema = new Schema<StripePayoutObservationDocument>(
   {
+    accountId: { type: String, required: true, match: /^acct_[A-Za-z0-9]+$/ },
     mode: { type: String, enum: ["TEST", "LIVE"], required: true },
     providerPayoutId: { type: String, required: true, match: /^po_[A-Za-z0-9_]+$/ },
     amountCents: { type: Number, required: true, validate: Number.isSafeInteger },
@@ -60,6 +72,7 @@ const schema = new Schema<StripePayoutObservationDocument>(
     automatic: { type: Boolean, required: true },
     providerCreatedAt: { type: Date, required: true },
     destinationId: { type: String, maxlength: 64 },
+    destinationLast4: { type: String, match: /^[A-Za-z0-9]{4}$/ },
     status: { type: String, required: true, maxlength: 32 },
     statusRank: { type: Number, required: true },
     arrivalDate: { type: Date },
@@ -77,9 +90,12 @@ const schema = new Schema<StripePayoutObservationDocument>(
 );
 
 // Additive provisioning (production autoIndex is off) — see docs/CENTRAL-PAYOUT-OBSERVATIONS.md.
+// One record per Stripe payout per mode (payout ids are globally unique), so a payout can never be
+// re-recorded under a second account; the scoped indexes serve readiness counts and review pages.
 schema.index({ mode: 1, providerPayoutId: 1 }, { unique: true });
-schema.index({ mode: 1, linkage: 1 });
-schema.index({ mode: 1, status: 1 });
+schema.index({ accountId: 1, mode: 1, providerCreatedAt: -1 });
+schema.index({ accountId: 1, mode: 1, linkage: 1, providerCreatedAt: -1 });
+schema.index({ accountId: 1, mode: 1, status: 1, providerCreatedAt: -1 });
 
 export const StripePayoutObservationModel = model<StripePayoutObservationDocument>(
   "StripePayoutObservation",

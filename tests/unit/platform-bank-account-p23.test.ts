@@ -52,6 +52,7 @@ function fixture(mode: CentralStripeMode | undefined = "TEST", liveEnabled = fal
     retrievePayout: vi.fn(),
     listRecentPayouts: vi.fn(async () => []),
     listPayoutsPage: vi.fn(async () => ({ payouts: [], hasMore: false })),
+    platformAccountId: vi.fn(async () => "acct_unittest"),
   };
   return {
     bank,

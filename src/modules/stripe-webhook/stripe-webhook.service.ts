@@ -222,6 +222,8 @@ export class StripeWebhookService {
           await this.centralPayouts?.syncFromWebhook(
             toProviderPayout(event.data.object as Stripe.Payout),
             event.id,
+            // Set only for connected-account events: those are not platform payouts (FG03B-2).
+            typeof event.account === "string" ? event.account : null,
           );
           break;
         default:
@@ -392,6 +394,7 @@ export class StripeWebhookService {
       return {
         id: event.id,
         type: event.type,
+        ...(typeof event.account === "string" ? { account: event.account } : {}),
         data: {
           object: {
             id: payout.id,

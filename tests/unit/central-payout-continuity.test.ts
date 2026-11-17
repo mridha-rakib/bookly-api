@@ -12,7 +12,7 @@ import {
   CentralPayoutOperationModel,
 } from "../../src/modules/central-payout/central-payout-operation.model.js";
 
-// FG03B-1 — webhook payouts are also recorded as non-monetary observations (covered against a real
+// FG03B-1/2 — webhook payouts are also recorded as non-monetary observations (covered against a real
 // database in central-payout-database.integration.test.ts). These DB-less unit tests stub that
 // write so they keep asserting only the withdrawal-operation behaviour.
 const observed = vi.hoisted(() => ({ calls: [] as unknown[][] }));
@@ -20,9 +20,12 @@ vi.mock("../../src/modules/central-payout/payout-reconciliation.js", async (impo
   ...(await importOriginal<
     typeof import("../../src/modules/central-payout/payout-reconciliation.js")
   >()),
-  observeProviderPayout: async (...args: unknown[]) => {
+  observeWebhookPayout: async (...args: unknown[]) => {
     observed.calls.push(args);
+    return "OBSERVED";
   },
+  // FG03B-2 — linkage promotion after a confirmed payout id is a DB write; stubbed here too.
+  promoteObservationLinkage: async () => {},
 }));
 
 afterEach(() => {
