@@ -6,6 +6,7 @@ import { BookingRepository } from "../modules/booking/booking.repository.js";
 import { createPenaltyCollectionService } from "../modules/booking/penalty-collection.factory.js";
 import { BookingFinancialTransactionRepository } from "../modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../modules/booking-financial-transaction/booking-financial-transaction.service.js";
+import { createCentralPayoutService } from "../modules/central-payout/central-payout.route.js";
 import { createFinancialRelationshipService } from "../modules/client/financial-relationship.factory.js";
 import { PackageProgressRepository } from "../modules/package-progress/package-progress.repository.js";
 import { CustomerPaymentProfileRepository } from "../modules/payment/customer-payment-profile.repository.js";
@@ -84,6 +85,10 @@ const buildService = (): MoneyRecoveryService => {
     relationshipService,
     penaltyCollection,
     providerReversals,
+    // FG03B-3 — same composition as the webhook route, so a retried payout.* event is re-applied
+    // (status sync + observation) rather than marked processed without effect. Read-only towards
+    // money: syncFromWebhook never creates a payout.
+    createCentralPayoutService(new UserRepository()),
   );
   return new MoneyRecoveryService(
     paymentService,

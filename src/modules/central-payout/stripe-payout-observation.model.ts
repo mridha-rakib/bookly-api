@@ -56,6 +56,11 @@ export type StripePayoutObservationDocument = {
   firstObservedVia: PayoutObservationSource;
   lastObservedVia: PayoutObservationSource;
   lastProviderEventId?: string | undefined;
+  /** FG03B-3 — last time a full history read listed this payout (Stripe's current state). */
+  lastListedAt?: Date | undefined;
+  /** FG03B-3 — set when Stripe's list reported a lifecycle-earlier status than the recorded one
+   * (contradictory evidence); cleared when a later list read agrees. */
+  listedStatusConflict?: string | undefined;
   firstObservedAt: Date;
   lastObservedAt: Date;
   createdAt: Date;
@@ -83,6 +88,8 @@ const schema = new Schema<StripePayoutObservationDocument>(
     firstObservedVia: { type: String, enum: ["WEBHOOK", "HISTORY_SYNC"], required: true },
     lastObservedVia: { type: String, enum: ["WEBHOOK", "HISTORY_SYNC"], required: true },
     lastProviderEventId: { type: String, maxlength: 255 },
+    lastListedAt: { type: Date },
+    listedStatusConflict: { type: String, maxlength: 32 },
     firstObservedAt: { type: Date, required: true },
     lastObservedAt: { type: Date, required: true },
   },
@@ -109,8 +116,9 @@ export const StripePayoutObservationModel = model<StripePayoutObservationDocumen
  *   IN_PROGRESS — a run has started and not yet reached Stripe's last page (it may be paused at
  *                 its page budget, interrupted by a provider error, or awaiting resume).
  *   COMPLETE    — a run reached Stripe's last page (`has_more: false`) with every page observed.
- *                 Coverage then holds only for payouts created before `completeAsOf`; later
- *                 payouts depend on webhook delivery until the next completed run.
+ *                 Since FG03B-3 every run re-lists the FULL history, so `completeAsOf` is also
+ *                 the time from which every listed payout's status was re-verified. Later
+ *                 payouts and status changes depend on webhook delivery until the next run.
  *
  * The lease (`leaseId` + `leaseExpiresAt`) admits one run at a time; every checkpoint write is
  * conditional on still holding it.

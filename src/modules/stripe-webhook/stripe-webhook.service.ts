@@ -219,7 +219,12 @@ export class StripeWebhookService {
         case "payout.canceled":
           // Withdrawals only; never touches booking/refund ledgers. The event id claim above makes
           // a redelivery a no-op, and status ranking ignores older out-of-order states.
-          await this.centralPayouts?.syncFromWebhook(
+          // FG03B-3 — a processor built without the central-payout service (e.g. a recovery
+          // composition) must not mark a payout event processed: it stays retryable instead of
+          // silently dropping the payout status evidence.
+          if (!this.centralPayouts)
+            throw new Error("Payout events need the central payout processor; left retryable");
+          await this.centralPayouts.syncFromWebhook(
             toProviderPayout(event.data.object as Stripe.Payout),
             event.id,
             // Set only for connected-account events: those are not platform payouts (FG03B-2).

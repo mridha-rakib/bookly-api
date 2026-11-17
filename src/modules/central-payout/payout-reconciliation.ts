@@ -29,7 +29,8 @@ import {
  * operation, never touches booking/Business ledgers, and never grants withdrawal authority.
  *
  * FG03B-2: every observation is bound to the Stripe platform account that reported it, and every
- * read is scoped to the CURRENT account; evidence freshness is explicit (see `unsettledFilter`).
+ * read is scoped to the CURRENT account. FG03B-3: no age makes a `paid` status final; every full
+ * read re-verifies every payout, and finality is never inferred (see ENDED_STATUSES).
  */
 
 export const PAYOUT_METADATA_KEY = "booklyCentralPayoutOperationId";
@@ -44,52 +45,58 @@ const STATUS_RANK: Record<string, number> = {
   canceled: 3,
 };
 const rankOf = (status: string) => STATUS_RANK[status] ?? -1;
-/** Statuses Stripe never moves away from. `paid` is NOT final: Stripe can still report a paid
- * payout as failed, so it is final only once outside PAID_FAILURE_WINDOW_MS. */
-const TERMINAL_STATUSES = ["failed", "canceled"];
+/**
+ * FG03B-3 — status finality. Stripe's Payout object reference: "The status changes to `paid` if
+ * the transaction succeeds, or to `failed` or `canceled` (within 5 business days). Some payouts
+ * that fail might initially show as `paid`, then change to `failed`." No time bound is documented
+ * for paid → failed, so NO age makes `paid` final and Bookly applies no finality window. `failed`
+ * and `canceled` are Stripe's documented end states (no transition out of them is documented),
+ * yet they are still re-read by every full history read like every other payout.
+ * `paid` is Stripe's report only: it is never treated as bank-confirmed receipt.
+ */
+const ENDED_STATUSES = ["failed", "canceled"];
 
 /**
- * Engineering assumption, NOT a Stripe guarantee: a `paid` payout older than this (by Stripe's
- * arrival date, else creation) is treated as settled. Requires Stripe/accountant confirmation
- * before any financial use; changes of older paid payouts are only caught by webhooks.
+ * Operational evidence-freshness target, NOT a finality guarantee: provider status evidence older
+ * than this (from the last complete full re-read, or a non-ended payout's last Stripe
+ * confirmation) is reported stale and fails readiness closed until re-verified.
  */
-export const PAID_FAILURE_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
-/** An unsettled observation not re-confirmed by Stripe within this period is stale evidence. */
-export const OBSERVATION_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
-/** A completed history read older than this no longer vouches for payouts created since. */
-export const HISTORY_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+export const EVIDENCE_FRESHNESS_TARGET_MS = 24 * 60 * 60 * 1000;
+/** Stripe list reads may lag object creation briefly; a payout created this close to the start
+ * of a full read is not expected in that read's list. */
+const LIST_VISIBILITY_TOLERANCE_MS = 10 * 60 * 1000;
 
 const modeOf = (payout: ProviderPayout): CentralStripeMode => (payout.livemode ? "LIVE" : "TEST");
 
 type ObservationFilter = QueryFilter<StripePayoutObservationDocument>;
 
-/** Observations whose Stripe status could still change (in flight, unknown, or recently paid). */
-export const unsettledFilter = (now: Date): ObservationFilter => {
-  const cutoff = new Date(now.getTime() - PAID_FAILURE_WINDOW_MS);
-  return {
-    $or: [
-      { status: { $nin: ["paid", ...TERMINAL_STATUSES] } },
-      { status: "paid", arrivalDate: { $gt: cutoff } },
-      { status: "paid", arrivalDate: null, providerCreatedAt: { $gt: cutoff } },
-    ],
-  };
-};
+/** Stripe can still change this payout's status (pending, in transit, paid, or unknown). */
+const notEndedFilter: ObservationFilter = { status: { $nin: ENDED_STATUSES } };
 
-/** Unsettled observations Stripe has not re-confirmed recently: possibly a missed webhook. */
+/** Not-ended observations Stripe has not re-confirmed recently: possibly a missed webhook. */
 export const staleFilter = (now: Date): ObservationFilter => ({
   $and: [
-    unsettledFilter(now),
-    { lastObservedAt: { $lt: new Date(now.getTime() - OBSERVATION_STALE_AFTER_MS) } },
+    notEndedFilter,
+    { lastObservedAt: { $lt: new Date(now.getTime() - EVIDENCE_FRESHNESS_TARGET_MS) } },
   ],
 });
 
-const isUnsettled = (
-  o: Pick<StripePayoutObservationDocument, "status" | "arrivalDate" | "providerCreatedAt">,
-  now: Date,
-): boolean => {
-  if (o.status !== "paid") return !TERMINAL_STATUSES.includes(o.status);
-  return (o.arrivalDate ?? o.providerCreatedAt).getTime() > now.getTime() - PAID_FAILURE_WINDOW_MS;
-};
+/**
+ * After a COMPLETE full re-read that started at `verifiedAsOf`: observations created before it
+ * that the read did not list. Stripe should have returned them, so their current status is
+ * unverified (contradictory evidence), never assumed unchanged.
+ */
+export const notReconfirmedFilter = (verifiedAsOf: Date): ObservationFilter => ({
+  providerCreatedAt: { $lt: new Date(verifiedAsOf.getTime() - LIST_VISIBILITY_TOLERANCE_MS) },
+  $or: [{ lastListedAt: null }, { lastListedAt: { $lt: verifiedAsOf } }],
+});
+
+/** Stripe's list reported a lifecycle-earlier status than one already recorded. */
+const conflictFilter: ObservationFilter = { listedStatusConflict: { $exists: true } };
+
+export type ProviderLifecycle = "IN_FLIGHT" | "REPORTED_PAID" | "ENDED";
+const lifecycleOf = (status: string): ProviderLifecycle =>
+  ENDED_STATUSES.includes(status) ? "ENDED" : status === "paid" ? "REPORTED_PAID" : "IN_FLIGHT";
 
 export type LinkageResult = {
   linkage: PayoutLinkage;
@@ -244,9 +251,21 @@ export async function observeProviderPayout(
         ...(payout.arrivalDate ? { arrivalDate: payout.arrivalDate } : {}),
         ...(payout.failureCode ? { failureCode: payout.failureCode } : {}),
         ...(scope.destinationLast4 ? { destinationLast4: scope.destinationLast4 } : {}),
+        // FG03B-3 — a list read is Stripe's CURRENT state: it re-confirms this payout.
+        ...(source === "HISTORY_SYNC" ? { lastListedAt: now } : {}),
       },
+      ...(source === "HISTORY_SYNC" ? { $unset: { listedStatusConflict: 1 } } : {}),
     },
   ).exec();
+  // FG03B-3 — Stripe's current list reports a lifecycle-EARLIER status than one already recorded
+  // (e.g. `paid` after a recorded `failed`). Webhooks may arrive out of order, but a list read is
+  // current state, so this is contradictory evidence: keep the recorded status, mark the
+  // conflict (fails readiness closed) and do not count it as a re-confirmation.
+  if (source === "HISTORY_SYNC")
+    await StripePayoutObservationModel.updateOne(
+      { ...owned, statusRank: { $gt: rank } },
+      { $set: { listedStatusConflict: payout.status, lastListedAt: now } },
+    ).exec();
 
   // Linkage reflects current Bookly operations (a payout may become verified later). A verified
   // link is never downgraded: it rests on an operation's recorded payout id, which is permanent.
@@ -324,9 +343,6 @@ const PAGE_SIZE = 100;
 const DEFAULT_PAGES = 5;
 export const MAX_PAGES_PER_RUN = 10;
 const LEASE_MS = 2 * 60 * 1000;
-/** Re-scan window before the previous completion point (upserts are idempotent, so overlap is
- * free); protects against clock skew between this server and Stripe's `created` timestamps. */
-const RESCAN_OVERLAP_MS = 24 * 60 * 60 * 1000;
 
 export type HistorySyncOutcome =
   | "COMPLETED"
@@ -371,35 +387,20 @@ const maskedLast4 = (destinations: CentralBankDestination[]) =>
   );
 
 /**
- * Where a new run starts reading (Stripe `created.gte`). No completed run: everything. After a
- * completed run: from the earlier of (completion − overlap) and the creation time of the OLDEST
- * still-unsettled observation of this account, so every payout whose status may still change is
- * re-read from Stripe and a missed webhook cannot leave it stale.
+ * Bounded, resumable FULL re-read of the account's Stripe payout list (newest first).
+ *
+ * FG03B-3: every run lists the whole history, never a date window. Stripe documents no time
+ * bound for paid → failed, so a payout of any age may change; only a full current-state list
+ * (or a webhook) re-verifies it. A completed run therefore proves, as of its start time
+ * (`completeAsOf`), that every payout Stripe lists was re-read; observations Stripe did not list
+ * are reported as not re-confirmed. Each call reads at most MAX_PAGES_PER_RUN pages of 100.
  */
-async function runWindowStart(
-  accountId: string,
-  mode: CentralStripeMode,
-  completeAsOf: Date | undefined,
-): Promise<Date | undefined> {
-  if (!completeAsOf) return undefined;
-  const overlapStart = new Date(completeAsOf.getTime() - RESCAN_OVERLAP_MS);
-  const oldest = await StripePayoutObservationModel.findOne(
-    { $and: [{ accountId, mode }, unsettledFilter(new Date())] },
-    { providerCreatedAt: 1 },
-  )
-    .sort({ providerCreatedAt: 1 })
-    .lean<Pick<StripePayoutObservationDocument, "providerCreatedAt">>()
-    .exec();
-  return oldest && oldest.providerCreatedAt < overlapStart
-    ? oldest.providerCreatedAt
-    : overlapStart;
-}
-
 export async function syncProviderPayoutHistory(
   gateway: CentralPayoutGateway,
   actorUserId: string,
-  options: { maxPages?: number } = {},
+  options: { maxPages?: number; trigger?: "OPERATOR" | "WORKER" } = {},
 ): Promise<HistorySyncResult> {
+  const trigger = options.trigger ?? "OPERATOR";
   const mode = gateway.mode();
   if (!mode)
     throw new PayoutHistorySyncError(
@@ -482,24 +483,18 @@ export async function syncProviderPayoutHistory(
 
   let run = coverage.run;
   if (!run) {
-    const createdGte = await runWindowStart(accountId, mode, coverage.completeAsOf);
-    run = {
-      startedAt: new Date(),
-      ...(createdGte ? { createdGte } : {}),
-      pages: 0,
-      observed: 0,
-    };
+    run = { startedAt: new Date(), pages: 0, observed: 0 };
+    // A previously completed full read stays valid as of its `completeAsOf` while this
+    // re-verification runs; only a first-ever read is IN_PROGRESS.
     const started = await StripePayoutHistoryCoverageModel.updateOne(held, {
-      $set: { state: "IN_PROGRESS", run, lastRunAt: new Date() },
+      $set: {
+        state: coverage.completeAsOf ? "COMPLETE" : "IN_PROGRESS",
+        run,
+        lastRunAt: new Date(),
+      },
       $push: {
         audit: {
-          $each: [
-            audit(
-              "RUN_STARTED",
-              actorUserId,
-              createdGte ? `from ${createdGte.toISOString()}` : "full history",
-            ),
-          ],
+          $each: [audit("RUN_STARTED", actorUserId, `full history re-read (${trigger})`)],
           $slice: -50,
         },
       },
@@ -524,7 +519,7 @@ export async function syncProviderPayoutHistory(
               audit(
                 `RUN_${outcome}`,
                 actorUserId,
-                `${pagesThisCall} page(s), ${observedThisCall} payout(s)${error ? `; ${error}` : ""}`,
+                `${trigger}: ${pagesThisCall} page(s), ${observedThisCall} payout(s)${error ? `; ${error}` : ""}`,
               ),
             ],
             $slice: -50,
@@ -552,11 +547,8 @@ export async function syncProviderPayoutHistory(
   while (pagesThisCall < maxPages) {
     let page: { payouts: ProviderPayout[]; hasMore: boolean };
     try {
-      page = await gateway.listPayoutsPage({
-        limit: PAGE_SIZE,
-        startingAfter: cursor,
-        createdGte: run.createdGte,
-      });
+      // Full history: no date window (FG03B-3).
+      page = await gateway.listPayoutsPage({ limit: PAGE_SIZE, startingAfter: cursor });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Stripe request failed";
       logger.warn({ event: "CENTRAL_PAYOUT_HISTORY_SYNC_PROVIDER_ERROR", mode }, message);
@@ -569,12 +561,14 @@ export async function syncProviderPayoutHistory(
       return providerFailure("Stripe returned an empty page that claims more results");
     if (cursor && page.payouts.some((p) => p.id === cursor))
       return providerFailure("Stripe repeated an already-read page; the cursor did not advance");
-    // Stripe filters by whole seconds (the gateway floors `created.gte`).
-    const windowStartMs = run.createdGte
-      ? Math.floor(run.createdGte.getTime() / 1000) * 1000
-      : Number.NEGATIVE_INFINITY;
-    if (page.payouts.some((p) => p.created.getTime() < windowStartMs))
-      return providerFailure("Stripe returned payouts outside the requested date window");
+    // Newest-first cursor pagination: a page that is not strictly older than the cursor would
+    // mean records could be skipped, so the run stops instead of advancing.
+    const ordered = page.payouts.every(
+      (p, i, all) =>
+        i === 0 || p.created.getTime() <= (all[i - 1] as ProviderPayout).created.getTime(),
+    );
+    if (!ordered)
+      return providerFailure("Stripe returned a page that is not in newest-first order");
 
     const linkage = await classifyPayoutLinkage(page.payouts);
     let conflicts = 0;
@@ -635,10 +629,11 @@ export async function syncProviderPayoutHistory(
 export type ReconciliationBlocker = { code: string; message: string };
 
 /**
- * A read-only evidence status for future withdrawal-eligibility checks. `evidenceComplete: true`
- * only means Bookly holds complete, fully linked, fresh payout evidence for the CURRENT Stripe
- * account up to `completeAsOf`; it is NOT permission to withdraw and grants no authority. Any
- * blocker means evidence is incomplete.
+ * A read-only evidence status for future withdrawal-eligibility checks (eligibility itself is out
+ * of scope). `evidenceComplete: true` only means Bookly holds complete, fully linked PROVIDER
+ * evidence for the CURRENT Stripe account, re-verified by a full read within the freshness target;
+ * it is NOT financial finality (see `finality`), NOT permission to withdraw and grants no
+ * authority. Any unknown, stale, incomplete or contradictory evidence is a blocker.
  */
 export type ReconciliationReadiness = {
   mode: CentralStripeMode | null;
@@ -651,7 +646,7 @@ export type ReconciliationReadiness = {
     completeAsOf: Date | null;
     lastCompletedAt: Date | null;
     lastRunAt: Date | null;
-    runInProgress: { pages: number; observed: number; windowStart: Date | null } | null;
+    runInProgress: { pages: number; observed: number; startedAt: Date } | null;
     lastError: string | null;
     /** null when the current Stripe account identity could not be read. */
     accountMatches: boolean | null;
@@ -662,26 +657,36 @@ export type ReconciliationReadiness = {
     notVerified: number;
     unresolved: number;
     inFlight: number;
-    /** Status could still change (in flight or paid within the failure window). */
-    unsettled: number;
-    /** Unsettled and not re-confirmed by Stripe within the staleness period. */
+    /** Stripe reports `paid` — not bank-confirmed and still able to change to `failed`. */
+    reportedPaid: number;
+    /** Not ended and not re-confirmed by Stripe within the freshness target. */
     stale: number;
+    /** Created before the last complete full read, but that read did not list them. */
+    notReconfirmed: number;
+    /** Stripe's current list contradicted the recorded status. */
+    statusConflicts: number;
     /** Retained observations of other Stripe accounts: excluded from every count above. */
     otherAccounts: number;
   };
   freshness: {
-    historyStale: boolean;
-    staleAfterHours: number;
-    paidFailureWindowDays: number;
+    /** Every payout's status was re-read from Stripe at or after this time (null: never). */
+    statusVerifiedAsOf: Date | null;
+    verificationStale: boolean;
+    freshnessTargetHours: number;
   };
+  /** FG03B-3 — financial finality is never inferred from Stripe statuses or their age. */
+  finality: { established: false; code: "BANK_SETTLEMENT_NOT_VERIFIED"; message: string };
   unresolvedWithdrawalOperations: number;
   syncEnabled: boolean;
   blockers: ReconciliationBlocker[];
 };
 
-const FRESHNESS_POLICY = {
-  staleAfterHours: OBSERVATION_STALE_AFTER_MS / 3_600_000,
-  paidFailureWindowDays: PAID_FAILURE_WINDOW_MS / 86_400_000,
+const FRESHNESS_TARGET_HOURS = EVIDENCE_FRESHNESS_TARGET_MS / 3_600_000;
+const FINALITY: ReconciliationReadiness["finality"] = {
+  established: false,
+  code: "BANK_SETTLEMENT_NOT_VERIFIED",
+  message:
+    "Financial finality is not established. Stripe's `paid` is Stripe's report, not a bank-confirmed receipt, and Stripe documents that a paid payout can later change to failed without a time limit. Bookly holds no bank-statement evidence.",
 };
 const EMPTY_COUNTS = {
   total: 0,
@@ -689,10 +694,24 @@ const EMPTY_COUNTS = {
   notVerified: 0,
   unresolved: 0,
   inFlight: 0,
-  unsettled: 0,
+  reportedPaid: 0,
   stale: 0,
+  notReconfirmed: 0,
+  statusConflicts: 0,
   otherAccounts: 0,
 };
+
+/** The completion time of the last full read IF it applies to the current account; else null. */
+const verifiedAsOf = (
+  coverage: StripePayoutHistoryCoverageDocument | null,
+  accountId: string | undefined,
+): Date | null =>
+  coverage?.state === "COMPLETE" &&
+  coverage.completeAsOf &&
+  accountId &&
+  coverage.accountId === accountId
+    ? coverage.completeAsOf
+    : null;
 
 export async function readReconciliationReadiness(input: {
   mode: CentralStripeMode | null;
@@ -719,7 +738,12 @@ export async function readReconciliationReadiness(input: {
         accountMatches: null,
       },
       observations: { ...EMPTY_COUNTS },
-      freshness: { historyStale: false, ...FRESHNESS_POLICY },
+      freshness: {
+        statusVerifiedAsOf: null,
+        verificationStale: false,
+        freshnessTargetHours: FRESHNESS_TARGET_HOURS,
+      },
+      finality: FINALITY,
       unresolvedWithdrawalOperations: 0,
       syncEnabled: input.syncEnabled,
       blockers: [
@@ -731,32 +755,36 @@ export async function readReconciliationReadiness(input: {
     };
   }
   const accountId = input.currentAccountId;
+  const coverage = await StripePayoutHistoryCoverageModel.findOne({ mode })
+    .lean<StripePayoutHistoryCoverageDocument>()
+    .exec();
+  const asOf = verifiedAsOf(coverage, accountId);
   const count = (filter: ObservationFilter) =>
     accountId
       ? StripePayoutObservationModel.countDocuments({ $and: [{ accountId, mode }, filter] }).exec()
       : Promise.resolve(0);
   const [
-    coverage,
     total,
     verifiedBookly,
     notVerified,
     unresolved,
     inFlight,
-    unsettled,
+    reportedPaid,
     stale,
+    notReconfirmed,
+    statusConflicts,
     otherAccounts,
     unresolvedOps,
   ] = await Promise.all([
-    StripePayoutHistoryCoverageModel.findOne({ mode })
-      .lean<StripePayoutHistoryCoverageDocument>()
-      .exec(),
     count({}),
     count({ linkage: "VERIFIED_BOOKLY" }),
     count({ linkage: "NOT_VERIFIED" }),
     count({ linkage: "UNRESOLVED" }),
-    count({ status: { $nin: ["paid", ...TERMINAL_STATUSES] } }),
-    count(unsettledFilter(now)),
+    count({ status: { $nin: ["paid", ...ENDED_STATUSES] } }),
+    count({ status: "paid" }),
     count(staleFilter(now)),
+    asOf ? count(notReconfirmedFilter(asOf)) : Promise.resolve(0),
+    count(conflictFilter),
     accountId
       ? StripePayoutObservationModel.countDocuments({ mode, accountId: { $ne: accountId } }).exec()
       : Promise.resolve(0),
@@ -768,10 +796,7 @@ export async function readReconciliationReadiness(input: {
 
   const state: HistoryCoverageState = coverage?.state ?? "NEVER_RUN";
   const accountMatches = accountId && coverage?.accountId ? coverage.accountId === accountId : null;
-  const historyStale =
-    state === "COMPLETE" &&
-    !!coverage?.completeAsOf &&
-    coverage.completeAsOf.getTime() < now.getTime() - HISTORY_STALE_AFTER_MS;
+  const verificationStale = !!asOf && asOf.getTime() < now.getTime() - EVIDENCE_FRESHNESS_TARGET_MS;
 
   if (!accountId)
     blockers.push({
@@ -804,11 +829,25 @@ export async function readReconciliationReadiness(input: {
       code: "PROVIDER_ACCOUNT_UNVERIFIED",
       message: "The history coverage has no recorded Stripe account to compare with.",
     });
-  if (historyStale)
+  if (verificationStale)
     blockers.push({
-      code: "HISTORY_STALE",
-      message:
-        "The last complete history read is more than 24 hours old; payouts created since rely on webhook delivery.",
+      code: "STATUS_VERIFICATION_STALE",
+      message: `Payout statuses were last re-verified by a full Stripe read more than ${FRESHNESS_TARGET_HOURS} hours ago. Newer payouts and status changes (including paid → failed) rely on webhook delivery until the next full read.`,
+    });
+  if (notReconfirmed > 0)
+    blockers.push({
+      code: "PAYOUTS_NOT_RECONFIRMED",
+      message: `${notReconfirmed} recorded payout(s) were not listed by the last complete Stripe read; their current status is unverified.`,
+    });
+  if (statusConflicts > 0)
+    blockers.push({
+      code: "PROVIDER_STATUS_CONFLICT",
+      message: `${statusConflicts} payout(s) have a recorded status that Stripe's current list contradicts. Read the history again; investigate if it persists.`,
+    });
+  if (stale > 0)
+    blockers.push({
+      code: "OBSERVATIONS_STALE",
+      message: `${stale} payout(s) that Stripe can still change have not been re-confirmed in the last ${FRESHNESS_TARGET_HOURS} hours; a webhook may have been missed.`,
     });
   if (notVerified > 0)
     blockers.push({
@@ -830,21 +869,17 @@ export async function readReconciliationReadiness(input: {
       code: "PAYOUTS_IN_FLIGHT",
       message: `${inFlight} observed payout(s) are still pending or in transit at Stripe.`,
     });
-  if (unsettled - inFlight > 0)
-    blockers.push({
-      code: "PAYOUTS_WITHIN_FAILURE_WINDOW",
-      message: `${unsettled - inFlight} payout(s) were paid within the last ${FRESHNESS_POLICY.paidFailureWindowDays} days; Stripe can still report a paid payout as failed.`,
-    });
-  if (stale > 0)
-    blockers.push({
-      code: "OBSERVATIONS_STALE",
-      message: `${stale} unsettled payout(s) have not been re-confirmed by Stripe in the last ${FRESHNESS_POLICY.staleAfterHours} hours; a webhook may have been missed. Read the payout history again.`,
-    });
 
   return {
     mode,
     evidenceComplete: blockers.length === 0,
-    reviewNeeded: notVerified > 0 || unresolved > 0 || unresolvedOps > 0 || stale > 0,
+    reviewNeeded:
+      notVerified > 0 ||
+      unresolved > 0 ||
+      unresolvedOps > 0 ||
+      stale > 0 ||
+      notReconfirmed > 0 ||
+      statusConflicts > 0,
     accountVerified: Boolean(accountId),
     coverage: {
       state,
@@ -855,7 +890,7 @@ export async function readReconciliationReadiness(input: {
         ? {
             pages: coverage.run.pages,
             observed: coverage.run.observed,
-            windowStart: coverage.run.createdGte ?? null,
+            startedAt: coverage.run.startedAt,
           }
         : null,
       lastError: coverage?.lastError ?? null,
@@ -867,11 +902,18 @@ export async function readReconciliationReadiness(input: {
       notVerified,
       unresolved,
       inFlight,
-      unsettled,
+      reportedPaid,
       stale,
+      notReconfirmed,
+      statusConflicts,
       otherAccounts,
     },
-    freshness: { historyStale, ...FRESHNESS_POLICY },
+    freshness: {
+      statusVerifiedAsOf: asOf,
+      verificationStale,
+      freshnessTargetHours: FRESHNESS_TARGET_HOURS,
+    },
+    finality: FINALITY,
     unresolvedWithdrawalOperations: unresolvedOps,
     syncEnabled: input.syncEnabled,
     blockers,
@@ -880,7 +922,15 @@ export async function readReconciliationReadiness(input: {
 
 // --- Read-only observed-payout review ----------------------------------------------------------
 
-export type ObservedPayoutReviewReason = "NOT_VERIFIED" | "UNRESOLVED" | "STALE";
+export type ObservedPayoutReviewReason =
+  | "NOT_VERIFIED"
+  | "UNRESOLVED"
+  | "STALE"
+  | "NOT_RECONFIRMED"
+  | "STATUS_CONFLICT";
+
+/** Status-evidence state of one observation (never a finality statement). */
+export type StatusVerification = "CURRENT" | "STALE" | "NOT_RECONFIRMED" | "CONFLICT";
 
 /** Masked, non-monetary review row. No metadata, no bank ids, no provider free text. */
 export type ObservedPayoutView = {
@@ -888,7 +938,10 @@ export type ObservedPayoutView = {
   mode: CentralStripeMode;
   amountCents: number;
   currency: string;
+  /** Stripe's latest reported status as recorded by Bookly. */
   status: string;
+  /** IN_FLIGHT / REPORTED_PAID (not bank-confirmed, can still fail) / ENDED (failed, canceled). */
+  providerLifecycle: ProviderLifecycle;
   automatic: boolean;
   created: Date;
   arrivalDate: Date | null;
@@ -901,9 +954,14 @@ export type ObservedPayoutView = {
   namedOperationId: string | null;
   firstObservedVia: PayoutObservationSource;
   firstObservedAt: Date;
-  lastObservedAt: Date;
-  settlement: "SETTLED" | "UNSETTLED";
-  stale: boolean;
+  /** Last time Stripe confirmed the recorded status (webhook or list). */
+  lastVerifiedAt: Date;
+  lastVerifiedVia: PayoutObservationSource;
+  /** Last time a full history read listed this payout (null: never listed). */
+  lastListedAt: Date | null;
+  statusVerification: StatusVerification;
+  /** The lifecycle-earlier status Stripe's list reported, when it contradicts the record. */
+  listedStatusConflict: string | null;
   reviewReasons: ObservedPayoutReviewReason[];
 };
 
@@ -915,6 +973,8 @@ export type ObservedPayoutQuery = {
   needsReview?: boolean | undefined;
   createdFrom?: Date | undefined;
   createdBefore?: Date | undefined;
+  /** Completion time of the last full read of THIS account, if any (enables NOT_RECONFIRMED). */
+  verifiedAsOf?: Date | null | undefined;
   page: number;
   limit: number;
   now?: Date;
@@ -924,6 +984,7 @@ export async function listObservedPayouts(
   query: ObservedPayoutQuery,
 ): Promise<{ items: ObservedPayoutView[]; total: number }> {
   const now = query.now ?? new Date();
+  const asOf = query.verifiedAsOf ?? null;
   const conditions: ObservationFilter[] = [{ accountId: query.accountId, mode: query.mode }];
   if (query.linkage) conditions.push({ linkage: query.linkage });
   if (query.status) conditions.push({ status: query.status });
@@ -935,7 +996,14 @@ export async function listObservedPayouts(
       },
     });
   if (query.needsReview)
-    conditions.push({ $or: [{ linkage: { $ne: "VERIFIED_BOOKLY" } }, staleFilter(now)] });
+    conditions.push({
+      $or: [
+        { linkage: { $ne: "VERIFIED_BOOKLY" } },
+        staleFilter(now),
+        conflictFilter,
+        ...(asOf ? [notReconfirmedFilter(asOf)] : []),
+      ],
+    });
   const filter = { $and: conditions };
   const [rows, total] = await Promise.all([
     StripePayoutObservationModel.find(filter)
@@ -946,15 +1014,22 @@ export async function listObservedPayouts(
       .exec(),
     StripePayoutObservationModel.countDocuments(filter).exec(),
   ]);
-  const staleCutoff = now.getTime() - OBSERVATION_STALE_AFTER_MS;
+  const staleCutoff = now.getTime() - EVIDENCE_FRESHNESS_TARGET_MS;
   return {
     total,
     items: rows.map((row) => {
-      const unsettled = isUnsettled(row, now);
-      const stale = unsettled && row.lastObservedAt.getTime() < staleCutoff;
+      const lifecycle = lifecycleOf(row.status);
+      const stale = lifecycle !== "ENDED" && row.lastObservedAt.getTime() < staleCutoff;
+      const notReconfirmed =
+        !!asOf &&
+        row.providerCreatedAt.getTime() < asOf.getTime() - LIST_VISIBILITY_TOLERANCE_MS &&
+        (!row.lastListedAt || row.lastListedAt.getTime() < asOf.getTime());
+      const conflict = !!row.listedStatusConflict;
       const reviewReasons: ObservedPayoutReviewReason[] = [];
       if (row.linkage === "NOT_VERIFIED") reviewReasons.push("NOT_VERIFIED");
       if (row.linkage === "UNRESOLVED") reviewReasons.push("UNRESOLVED");
+      if (conflict) reviewReasons.push("STATUS_CONFLICT");
+      if (notReconfirmed) reviewReasons.push("NOT_RECONFIRMED");
       if (stale) reviewReasons.push("STALE");
       return {
         providerPayoutId: row.providerPayoutId,
@@ -962,6 +1037,7 @@ export async function listObservedPayouts(
         amountCents: row.amountCents,
         currency: row.currency,
         status: row.status,
+        providerLifecycle: lifecycle,
         automatic: row.automatic,
         created: row.providerCreatedAt,
         arrivalDate: row.arrivalDate ?? null,
@@ -976,11 +1052,21 @@ export async function listObservedPayouts(
             : null,
         firstObservedVia: row.firstObservedVia,
         firstObservedAt: row.firstObservedAt,
-        lastObservedAt: row.lastObservedAt,
-        settlement: unsettled ? "UNSETTLED" : "SETTLED",
-        stale,
+        lastVerifiedAt: row.lastObservedAt,
+        lastVerifiedVia: row.lastObservedVia,
+        lastListedAt: row.lastListedAt ?? null,
+        statusVerification: conflict
+          ? "CONFLICT"
+          : notReconfirmed
+            ? "NOT_RECONFIRMED"
+            : stale
+              ? "STALE"
+              : "CURRENT",
+        listedStatusConflict: row.listedStatusConflict ?? null,
         reviewReasons,
       };
     }),
   };
 }
+
+export { verifiedAsOf as coverageVerifiedAsOf };

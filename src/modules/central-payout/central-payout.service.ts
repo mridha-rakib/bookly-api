@@ -18,7 +18,8 @@ import {
 } from "./central-payout-operation.model.js";
 import {
   classifyPayoutLinkage,
-  HISTORY_STALE_AFTER_MS,
+  coverageVerifiedAsOf,
+  EVIDENCE_FRESHNESS_TARGET_MS,
   type HistorySyncResult,
   listObservedPayouts,
   type ObservedPayoutView,
@@ -49,7 +50,11 @@ export type ObservedPayoutPage = {
     coverageState: "NEVER_RUN" | "IN_PROGRESS" | "COMPLETE";
     completeAsOf: Date | null;
     coverageAccountMatches: boolean | null;
-    historyStale: boolean;
+    /** FG03B-3 — every listed payout's status was re-read from Stripe at/after this time. */
+    statusVerifiedAsOf: Date | null;
+    verificationStale: boolean;
+    verificationInProgress: boolean;
+    lastError: string | null;
     otherAccountObservations: number;
   };
 };
@@ -517,11 +522,13 @@ export class CentralPayoutService {
     }
     const mode = input.mode ?? currentMode;
     const now = new Date();
-    const [page, coverage, otherAccountObservations] = await Promise.all([
-      listObservedPayouts({ ...input, accountId, mode, now }),
-      StripePayoutHistoryCoverageModel.findOne({ mode })
-        .lean<StripePayoutHistoryCoverageDocument>()
-        .exec(),
+    const coverage = await StripePayoutHistoryCoverageModel.findOne({ mode })
+      .lean<StripePayoutHistoryCoverageDocument>()
+      .exec();
+    // Only a complete full read of THIS account vouches for statuses (FG03B-3).
+    const statusVerifiedAsOf = coverageVerifiedAsOf(coverage, accountId);
+    const [page, otherAccountObservations] = await Promise.all([
+      listObservedPayouts({ ...input, accountId, mode, now, verifiedAsOf: statusVerifiedAsOf }),
       StripePayoutObservationModel.countDocuments({ mode, accountId: { $ne: accountId } }).exec(),
     ]);
     const coverageState = coverage?.state ?? "NEVER_RUN";
@@ -535,10 +542,12 @@ export class CentralPayoutService {
         coverageState,
         completeAsOf: coverage?.completeAsOf ?? null,
         coverageAccountMatches: coverage?.accountId ? coverage.accountId === accountId : null,
-        historyStale:
-          coverageState === "COMPLETE" &&
-          !!coverage?.completeAsOf &&
-          coverage.completeAsOf.getTime() < now.getTime() - HISTORY_STALE_AFTER_MS,
+        statusVerifiedAsOf,
+        verificationStale:
+          !!statusVerifiedAsOf &&
+          statusVerifiedAsOf.getTime() < now.getTime() - EVIDENCE_FRESHNESS_TARGET_MS,
+        verificationInProgress: Boolean(coverage?.run),
+        lastError: coverage?.lastError ?? null,
         otherAccountObservations,
       },
     };
@@ -549,7 +558,7 @@ export class CentralPayoutService {
    * It only reads Stripe and writes observations/coverage: never a payout or a ledger row. */
   public async syncProviderHistory(
     actorUserId: string,
-    input: { maxPages?: number | undefined } = {},
+    input: { maxPages?: number | undefined; trigger?: "OPERATOR" | "WORKER" | undefined } = {},
   ): Promise<HistorySyncResult> {
     if (!this.deps.policy.historySyncEnabled)
       throw new CentralPayoutError(
@@ -560,6 +569,7 @@ export class CentralPayoutService {
     try {
       return await syncProviderPayoutHistory(this.deps.gateway, actorUserId, {
         ...(input.maxPages ? { maxPages: input.maxPages } : {}),
+        ...(input.trigger ? { trigger: input.trigger } : {}),
       });
     } catch (error) {
       if (error instanceof PayoutHistorySyncError)
