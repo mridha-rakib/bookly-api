@@ -94,6 +94,29 @@ The former hard-coded `CENTRAL_PAYOUT_RESERVE_POLICY_UNAPPROVED` denial is repla
 
 **External confirmation (category J) is not something code can verify:** Stripe's written confirmation of the custodial model, Cyprus legal advice and accountant sign-off. Keep `CENTRAL_PAYOUTS_LIVE_ENABLED=false` until they are obtained and a release is authorized.
 
+## Stripe TEST default destination (TEST only)
+
+Stripe refuses a TEST key the platform bank-account list with "Only live keys can access this
+method". Without a fallback every TEST withdrawal failed with `CENTRAL_PAYOUT_DESTINATION_UNREADABLE`.
+
+- The Stripe adapter reports `destinationReadIssue: "TEST_MODE_RESTRICTED"` only for that exact
+  message, only with an `sk_test_`/`rk_test_` key, and only before any bank page was read. Every
+  other failure keeps its existing classification.
+- The overview then offers `stripeTestDefaultDestination` (marker `stripe_test_default`, label
+  "Stripe TEST default destination — bank details unavailable in TEST mode."). No `ba_…` id or
+  bank detail is invented; the operation stores the marker, an empty last 4 and the TEST
+  account it was confirmed against (`testDefaultAccountId`).
+- The payout is created without `destination`, so Stripe uses the TEST account's default
+  external account for the currency, or refuses. A refusal is recorded as REJECTED with
+  Stripe's own message, and the reservation is released.
+- The marker is refused for a LIVE key, LIVE balance, unidentified account, readable bank list
+  or another read failure. At dispatch it is refused if the mode, account or bank-list state
+  changed, and then it is never sent. The adapter itself refuses the marker for any non-TEST key
+  before calling Stripe. Step-up, digest, eligibility, idempotency, the active slot and the audit
+  are unchanged.
+- A TEST payout is simulated by Stripe; it is never a bank-confirmed transfer.
+- LIVE destination verification is unchanged (a verified, unique default `ba_…` is required).
+
 ## Indexes (additive; production `autoIndex` is off)
 
 | Collection | Index |

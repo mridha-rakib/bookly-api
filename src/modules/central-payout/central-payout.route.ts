@@ -9,7 +9,11 @@ import { Argon2PasswordHasher } from "../auth/password-hasher.js";
 import { requireCurrentPassword } from "../auth/require-current-password.js";
 import type { UserRepository } from "../user/user.repository.js";
 import { CentralPayoutService } from "./central-payout.service.js";
-import { type CentralPayoutGateway, providerPayoutStatuses } from "./central-payout.types.js";
+import {
+  type CentralPayoutGateway,
+  providerPayoutStatuses,
+  STRIPE_TEST_DEFAULT_DESTINATION,
+} from "./central-payout.types.js";
 import type { CentralPayoutOperationDocument } from "./central-payout-operation.model.js";
 import { MAX_PAGES_PER_RUN } from "./payout-reconciliation.js";
 import { StripeCentralPayoutGateway } from "./stripe-central-payout-gateway.js";
@@ -21,7 +25,12 @@ export const initiateCentralPayoutBodySchema = z
     requestId: z.uuid(),
     amountCents: z.number().int().positive().max(99_999_999),
     currency: z.string().regex(/^[a-z]{3}$/, "Use a lowercase ISO currency code"),
-    destinationId: z.string().regex(/^ba_[A-Za-z0-9]{1,250}$/, "Choose the linked bank account"),
+    /** A linked `ba_...` bank account, or the TEST-only Stripe default marker (the service refuses
+     * the marker for any LIVE key, mode or account). */
+    destinationId: z.union([
+      z.string().regex(/^ba_[A-Za-z0-9]{1,250}$/, "Choose the linked bank account"),
+      z.literal(STRIPE_TEST_DEFAULT_DESTINATION),
+    ]),
     currentPassword: z.string().min(1).max(256),
     /** CW-1 — the eligibility digest the Super Admin reviewed (GET .../eligibility). */
     eligibilityDigest: z.string().regex(/^[a-f0-9]{64}$/, "Review the eligible amount first"),
@@ -67,7 +76,12 @@ export const toCentralPayoutOperationDto = (op: CentralPayoutOperationDocument) 
   mode: op.mode,
   amountCents: op.amountCents,
   currency: op.currency,
-  destination: { bankName: op.destinationBankName ?? null, last4: op.destinationLast4 },
+  destination: {
+    bankName: op.destinationBankName ?? null,
+    last4: op.destinationLast4,
+    /** TEST only: Stripe chose the TEST account's default destination; no bank details exist. */
+    stripeTestDefault: op.destinationId === STRIPE_TEST_DEFAULT_DESTINATION,
+  },
   state: op.state,
   providerPayoutId: op.providerPayoutId ?? null,
   providerStatus: op.providerStatus ?? null,

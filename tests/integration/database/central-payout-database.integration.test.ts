@@ -12,7 +12,11 @@ import { BookingFinancialTransactionModel } from "../../../src/modules/booking-f
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BookingFinancialTransactionType } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.types.js";
-import { createCentralPayoutRouter } from "../../../src/modules/central-payout/central-payout.route.js";
+import {
+  createCentralPayoutRouter,
+  initiateCentralPayoutBodySchema,
+  toCentralPayoutOperationDto,
+} from "../../../src/modules/central-payout/central-payout.route.js";
 import { CentralPayoutService } from "../../../src/modules/central-payout/central-payout.service.js";
 import {
   type CentralAccountPayoutState,
@@ -21,6 +25,8 @@ import {
   CentralPayoutProviderError,
   type CentralStripeMode,
   type ProviderPayout,
+  STRIPE_TEST_DEFAULT_DESTINATION,
+  STRIPE_TEST_DEFAULT_LABEL,
 } from "../../../src/modules/central-payout/central-payout.types.js";
 import { CentralPayoutOperationModel } from "../../../src/modules/central-payout/central-payout-operation.model.js";
 import {
@@ -74,6 +80,10 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
     ],
   };
   public readonly createCalls: string[] = [];
+  public readonly createDestinations: string[] = [];
+  /** Like Stripe for a payout without `destination`: the TEST account's default bank for the
+   * currency, or a definitive refusal when it has none (null). */
+  public testDefaultBank: string | null = "ba_stripechosendefault";
   public readonly payouts = new Map<string, ProviderPayout>();
   /** "lost" = Stripe creates the payout but the response never arrives. */
   public nextCreate: "ok" | "lost" | "network" | "rejected" = "ok";
@@ -108,11 +118,19 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
     metadata: Record<string, string>;
   }) {
     this.createCalls.push(input.idempotencyKey);
+    this.createDestinations.push(input.destinationId);
     const outcome = this.nextCreate;
     this.nextCreate = "ok";
     if (outcome === "network") throw new CentralPayoutProviderError("socket hang up", false);
     if (outcome === "rejected")
       throw new CentralPayoutProviderError("Insufficient funds", true, "balance_insufficient");
+    const testDefault = input.destinationId === STRIPE_TEST_DEFAULT_DESTINATION;
+    if (testDefault && !this.testDefaultBank)
+      throw new CentralPayoutProviderError(
+        `You do not have a default external account in ${input.currency}.`,
+        true,
+        "parameter_missing",
+      );
     const existing = this.payouts.get(input.idempotencyKey);
     const payout = existing ?? {
       id: `po_fake_${this.payouts.size + 1}`,
@@ -121,7 +139,7 @@ class FakeCentralPayoutGateway implements CentralPayoutGateway {
       status: "pending",
       arrivalDate: new Date("2030-01-03T00:00:00.000Z"),
       created: new Date(),
-      destinationId: input.destinationId,
+      destinationId: testDefault ? this.testDefaultBank : input.destinationId,
       failureCode: null,
       failureMessage: null,
       livemode: this.modeValue === "LIVE",
@@ -1567,5 +1585,253 @@ describe("P0.6 Super Admin central Stripe withdrawals", () => {
     expect(gateway.createCalls).toEqual([op.providerIdempotencyKey]);
     // A LIVE payout from the mocked gateway is the only money "moved"; no ledger row is written.
     expect(await BookingFinancialTransactionModel.countDocuments()).toBe(1);
+  });
+
+  // --- TEST default destination (Stripe TEST keys cannot list the platform's bank accounts) ---
+
+  /** What the Stripe adapter reports when a TEST key gets "Only live keys can access this method". */
+  const restrictTestBankList = () => {
+    gateway.account = {
+      ...gateway.account,
+      destinationsReadable: false,
+      destinationsComplete: false,
+      destinationReadIssue: "TEST_MODE_RESTRICTED",
+      destinations: [],
+    };
+  };
+  const withdrawTestDefault = (
+    amountCents: number,
+    eligibilityDigest: string,
+    over: Partial<Parameters<CentralPayoutService["initiate"]>[1]> = {},
+  ) =>
+    service.initiate(String(admin), {
+      requestId: randomUUID(),
+      amountCents,
+      currency: "eur",
+      destinationId: STRIPE_TEST_DEFAULT_DESTINATION,
+      currentPassword: "correct-password",
+      eligibilityDigest,
+      ...over,
+    });
+
+  it("TEST default destination: Stripe chooses it; step-up, digest, idempotency and liabilities preserved", async () => {
+    restrictTestBankList();
+    const overview = await service.getOverview();
+    expect(overview.stripeTestDefaultDestination).toEqual({
+      id: STRIPE_TEST_DEFAULT_DESTINATION,
+      label: STRIPE_TEST_DEFAULT_LABEL,
+    });
+    expect(overview.restrictions).toEqual([]);
+    expect(overview.destinations).toEqual([]); // never an invented bank
+    expect(await service.getBankAccountSummary()).toMatchObject({
+      state: "UNAVAILABLE",
+      unavailableReason: "TEST_MODE_RESTRICTED",
+      destinations: [],
+    });
+
+    const reviewed = await eur();
+    expect(reviewed).toMatchObject({ status: "AVAILABLE", eligibleCents: 50_000 });
+    // Existing controls are unchanged for the TEST default.
+    await expect(
+      withdrawTestDefault(1_000, reviewed.digest, { currentPassword: "wrong" }),
+    ).rejects.toThrow("INVALID_CURRENT_PASSWORD");
+    await expect(withdrawTestDefault(1_000, "0".repeat(64))).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_ELIGIBILITY_CHANGED" }],
+    });
+    await expect(withdrawTestDefault(50_001, reviewed.digest)).rejects.toMatchObject({
+      statusCode: 422,
+    });
+    expect(gateway.createCalls).toHaveLength(0);
+
+    const ledgerBefore = await BookingFinancialTransactionModel.countDocuments();
+    const requestId = randomUUID();
+    const op = await withdrawTestDefault(20_000, reviewed.digest, { requestId });
+    expect(op).toMatchObject({
+      mode: "TEST",
+      state: "SUBMITTED",
+      providerStatus: "pending",
+      destinationId: STRIPE_TEST_DEFAULT_DESTINATION,
+      destinationLast4: "",
+      testDefaultAccountId: "acct_platformtest",
+      eligibility: { digest: reviewed.digest },
+    });
+    expect(op.destinationBankName).toBeUndefined();
+    expect(op.audit.map((a) => a.kind)).not.toContain("MISMATCH");
+    expect(gateway.createDestinations).toEqual([STRIPE_TEST_DEFAULT_DESTINATION]);
+    expect(toCentralPayoutOperationDto(op).destination).toEqual({
+      bankName: null,
+      last4: "",
+      stripeTestDefault: true,
+    });
+    // A resubmission of the same confirmation returns the same operation: one Stripe payout.
+    expect(String((await withdrawTestDefault(20_000, reviewed.digest, { requestId }))._id)).toBe(
+      String(op._id),
+    );
+    expect(gateway.createCalls).toHaveLength(1);
+
+    // Webhook status updates apply even though Stripe chose the bank id; a LIVE payout never does.
+    const payout = gateway.payouts.get(op.providerIdempotencyKey) as ProviderPayout;
+    expect(payout.destinationId).toBe("ba_stripechosendefault");
+    await service.syncFromWebhook({ ...payout, status: "in_transit" }, "evt_td_transit");
+    expect((await service.get(String(op._id))).providerStatus).toBe("in_transit");
+    await service.syncFromWebhook({ ...payout, status: "paid", livemode: true }, "evt_td_live");
+    const after = await service.get(String(op._id));
+    expect(after.providerStatus).toBe("in_transit");
+    expect(after.audit.map((a) => a.kind)).toContain("MISMATCH");
+
+    // The withdrawal writes no ledger rows and no Business payout records: liabilities stay.
+    expect(await BookingFinancialTransactionModel.countDocuments()).toBe(ledgerBefore);
+    expect(await BusinessPayoutModel.countDocuments()).toBe(0);
+    // A TEST payout is counted as cash out of Stripe (never as a bank-confirmed transfer).
+    expect((await eur()).eligibleCents).toBe(30_000);
+  });
+
+  it("TEST default destination is refused for LIVE, readable banks, other failures, accounts and currencies", async () => {
+    // The route accepts only a `ba_…` id or the exact TEST marker.
+    const body = {
+      requestId: randomUUID(),
+      amountCents: 100,
+      currency: "eur",
+      currentPassword: "x",
+      eligibilityDigest: "a".repeat(64),
+    };
+    expect(
+      initiateCentralPayoutBodySchema.safeParse({
+        ...body,
+        destinationId: STRIPE_TEST_DEFAULT_DESTINATION,
+      }).success,
+    ).toBe(true);
+    for (const destinationId of ["stripe_test_default_x", "default", "", "card_123"])
+      expect(initiateCentralPayoutBodySchema.safeParse({ ...body, destinationId }).success).toBe(
+        false,
+      );
+
+    // A readable TEST bank list: the verified bank must be used, never the TEST default.
+    const readable = await eur();
+    await expect(withdrawTestDefault(1_000, readable.digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_DESTINATION_INVALID" }],
+    });
+    expect((await service.getOverview()).stripeTestDefaultDestination).toBeNull();
+
+    // Any other bank-list failure stays the existing unreadable restriction.
+    gateway.account = {
+      ...gateway.account,
+      destinationsReadable: false,
+      destinationsComplete: false,
+      destinationReadIssue: "PROVIDER",
+      destinations: [],
+    };
+    await expect(withdrawTestDefault(1_000, (await eur()).digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_DESTINATION_UNREADABLE" }],
+    });
+
+    // Wrong currency: no TEST balance in USD.
+    restrictTestBankList();
+    await expect(
+      withdrawTestDefault(1_000, "0".repeat(64), { currency: "usd" }),
+    ).rejects.toMatchObject({ statusCode: 422 });
+
+    // A TEST key whose balance is reported in LIVE mode: refused (mode mismatch).
+    const digest = (await eur()).digest;
+    gateway.balance = { ...gateway.balance, livemode: true };
+    await expect(withdrawTestDefault(1_000, digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_MODE_MISMATCH" }],
+    });
+    gateway.balance = { ...gateway.balance, livemode: false };
+
+    // Unidentified account: refused.
+    const identified = (await eur()).digest;
+    const { accountId: _identified, ...unidentified } = gateway.account;
+    gateway.account = unidentified;
+    await expect(withdrawTestDefault(1_000, identified)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_ACCOUNT_UNIDENTIFIED" }],
+    });
+    gateway.account = { ...gateway.account, accountId: "acct_platformtest" };
+
+    // LIVE key with the same restriction (LIVE enabled): no TEST default, LIVE checks unchanged.
+    gateway.modeValue = "LIVE";
+    gateway.balance = { ...gateway.balance, livemode: true };
+    liveEnabled = true;
+    const liveOverview = await service.getOverview();
+    expect(liveOverview.stripeTestDefaultDestination).toBeNull();
+    expect(liveOverview.restrictions.map((r) => r.code)).toContain(
+      "CENTRAL_PAYOUT_DESTINATION_UNREADABLE",
+    );
+    await expect(withdrawTestDefault(1_000, (await eur()).digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_DESTINATION_UNREADABLE" }],
+    });
+    // LIVE with a readable bank list: the TEST marker is still refused.
+    const { destinationReadIssue: _restricted, ...liveAccount } = gateway.account;
+    gateway.account = {
+      ...liveAccount,
+      destinationsReadable: true,
+      destinationsComplete: true,
+      destinations: [
+        {
+          id: BANK,
+          bankName: "Test Bank",
+          last4: "6789",
+          currency: "eur",
+          country: "CY",
+          status: "verified",
+          defaultForCurrency: true,
+        },
+      ],
+    };
+    await expect(withdrawTestDefault(1_000, (await eur()).digest)).rejects.toMatchObject({
+      details: [{ code: "CENTRAL_PAYOUT_DESTINATION_INVALID" }],
+    });
+    expect(gateway.createCalls).toHaveLength(0);
+    expect(await CentralPayoutOperationModel.countDocuments()).toBe(0);
+  });
+
+  it("TEST default destination: a different account at dispatch is never sent", async () => {
+    restrictTestBankList();
+    const reviewed = await eur();
+    const callsAtReview = gateway.balanceCalls;
+    // Between confirmation and the pre-dispatch revalidation the key now belongs to another account.
+    gateway.onRetrieveBalance = (call) => {
+      if (call === callsAtReview + 2)
+        gateway.account = { ...gateway.account, accountId: "acct_otherplatform" };
+    };
+    const op = await withdrawTestDefault(1_000, reviewed.digest);
+    gateway.onRetrieveBalance = null;
+    expect(op.state).toBe("REJECTED");
+    expect(op.failureMessage).toContain("TEST default destination no longer applies");
+    expect(op.audit.map((a) => a.kind)).toEqual(
+      expect.arrayContaining(["BLOCKED", "RESERVATION_RELEASED"]),
+    );
+    expect(op.activeSlot).toBeUndefined();
+    expect(gateway.createCalls).toHaveLength(0);
+  });
+
+  it("TEST default destination: Stripe's refusal is surfaced; an unknown outcome reconciles the same payout", async () => {
+    restrictTestBankList();
+    gateway.testDefaultBank = null; // the TEST account has no default bank for EUR
+    const refused = await withdrawTestDefault(1_000, (await eur()).digest);
+    expect(refused).toMatchObject({
+      state: "REJECTED",
+      failureCode: "parameter_missing",
+      failureMessage: "You do not have a default external account in eur.",
+    });
+    expect(refused.audit.map((a) => a.kind)).toEqual(
+      expect.arrayContaining(["PROVIDER_REJECTED", "RESERVATION_RELEASED"]),
+    );
+    expect(refused.activeSlot).toBeUndefined();
+    expect(gateway.payouts.size).toBe(0);
+    expect((await eur()).eligibleCents).toBe(50_000); // nothing left Stripe
+
+    gateway.testDefaultBank = "ba_stripechosendefault";
+    gateway.nextCreate = "lost";
+    const unknown = await withdrawTestDefault(2_000, (await eur()).digest);
+    expect(unknown.state).toBe("UNKNOWN");
+    await expect(withdrawTestDefault(1_000, (await eur()).digest)).rejects.toMatchObject({
+      statusCode: 409,
+    }); // one unresolved withdrawal at a time
+    const recovered = await service.refresh(String(unknown._id));
+    expect(recovered).toMatchObject({ state: "SUBMITTED", providerPayoutId: "po_fake_1" });
+    expect(recovered.audit.map((a) => a.kind)).not.toContain("MISMATCH");
+    expect(gateway.payouts.size).toBe(1);
+    expect(await BusinessPayoutModel.countDocuments()).toBe(0);
   });
 });

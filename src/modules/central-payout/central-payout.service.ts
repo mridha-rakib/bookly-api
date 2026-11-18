@@ -10,6 +10,8 @@ import {
   type ProviderPayout,
   type ProviderPayoutStatus,
   providerPayoutStatuses,
+  STRIPE_TEST_DEFAULT_DESTINATION,
+  STRIPE_TEST_DEFAULT_LABEL,
 } from "./central-payout.types.js";
 import {
   type CentralPayoutAuditEntry,
@@ -62,6 +64,9 @@ export type ObservedPayoutPage = {
     otherAccountObservations: number;
   };
 };
+
+/** Internal: the TEST default destination no longer applies at dispatch. */
+class TestDefaultRefused extends Error {}
 
 export class CentralPayoutError extends AppError {
   public constructor(code: string, message: string, statusCode: number) {
@@ -130,6 +135,13 @@ export type CentralPayoutOverview = {
   /** Sum of Stripe payouts still pending / in transit among the most recent 100, per currency. */
   payoutsInProgress: { currency: string; amountCents: number }[];
   destinations: (CentralBankDestination & { eligible: boolean })[];
+  /** TEST only — present when Stripe refuses the TEST key the bank-account list and the TEST
+   * account is identified: a withdrawal may then let Stripe choose the TEST default destination.
+   * Never present for a LIVE key. No bank details exist for it. */
+  stripeTestDefaultDestination: {
+    id: typeof STRIPE_TEST_DEFAULT_DESTINATION;
+    label: string;
+  } | null;
   scheduleInterval: string | null;
   /** Reasons a new withdrawal cannot be made right now (empty = permitted). */
   restrictions: Restriction[];
@@ -249,10 +261,13 @@ export class CentralPayoutService {
         ...d,
         eligible: this.isEligible(d, account),
       })),
+      stripeTestDefaultDestination: this.testDefaultPermitted(mode, balance.livemode, account)
+        ? { id: STRIPE_TEST_DEFAULT_DESTINATION, label: STRIPE_TEST_DEFAULT_LABEL }
+        : null,
       scheduleInterval: account.scheduleInterval,
       restrictions: [
         ...this.executionRestrictions(mode, balance.livemode),
-        ...this.accountRestrictions(account),
+        ...this.accountRestrictions(account, mode, balance.livemode),
         ...(await this.inFlightRestriction()),
       ],
       recentStripePayouts: await this.recentPayoutViews(
@@ -385,18 +400,30 @@ export class CentralPayoutService {
     const { eligibility, balance, account } = await this.evaluateEligibility();
     const blocking = [
       ...this.executionRestrictions(mode ?? null, balance.livemode),
-      ...this.accountRestrictions(account),
+      ...this.accountRestrictions(account, mode ?? null, balance.livemode),
     ];
     if (blocking[0]) throw new CentralPayoutError(blocking[0].code, blocking[0].message, 409);
 
-    const destination = account.destinations.find((d) => d.id === input.destinationId);
-    if (!destination || !this.isEligible(destination, account))
+    // TEST only: Stripe could not list bank accounts for the TEST key, so Stripe itself chooses
+    // the TEST default destination. Never selectable when a bank inventory was readable, and
+    // never for a LIVE key/mode (LIVE keeps the verified `ba_...` path below unchanged).
+    const testDefault = input.destinationId === STRIPE_TEST_DEFAULT_DESTINATION;
+    if (testDefault && !this.testDefaultPermitted(mode ?? null, balance.livemode, account))
+      throw new CentralPayoutError(
+        "CENTRAL_PAYOUT_DESTINATION_INVALID",
+        "The Stripe TEST default destination is only available in TEST mode when Stripe does not list the TEST account's bank accounts",
+        422,
+      );
+    const destination = testDefault
+      ? null
+      : account.destinations.find((d) => d.id === input.destinationId);
+    if (!testDefault && (!destination || !this.isEligible(destination, account)))
       throw new CentralPayoutError(
         "CENTRAL_PAYOUT_DESTINATION_INVALID",
         "Choose the bank account linked to Bookly's Stripe account",
         422,
       );
-    if (destination.currency !== input.currency)
+    if (destination && destination.currency !== input.currency)
       throw new CentralPayoutError(
         "CENTRAL_PAYOUT_CURRENCY_MISMATCH",
         "The bank account does not receive this currency",
@@ -444,9 +471,17 @@ export class CentralPayoutService {
           mode: mode as CentralStripeMode,
           amountCents: input.amountCents,
           currency: input.currency,
-          destinationId: destination.id,
-          destinationBankName: destination.bankName ?? undefined,
-          destinationLast4: destination.last4,
+          ...(destination
+            ? {
+                destinationId: destination.id,
+                destinationBankName: destination.bankName ?? undefined,
+                destinationLast4: destination.last4,
+              }
+            : {
+                destinationId: STRIPE_TEST_DEFAULT_DESTINATION,
+                destinationLast4: "",
+                testDefaultAccountId: account.accountId,
+              }),
           state: "PREPARED",
           // The unique slot admits one unresolved withdrawal: two requests can never both spend
           // the same eligibility.
@@ -676,7 +711,18 @@ export class CentralPayoutService {
     // must still cover the immutable amount.
     let revalidated: CentralPayoutOperationDocument | null = null;
     try {
-      const { eligibility } = await this.evaluateEligibility(op._id);
+      const { eligibility, balance, account } = await this.evaluateEligibility(op._id);
+      // TEST default destination: still TEST, still the restricted TEST account it was confirmed
+      // against. Anything else (LIVE key/mode/balance, another account, a now-readable bank
+      // list) is never sent with Stripe choosing the destination.
+      if (
+        op.destinationId === STRIPE_TEST_DEFAULT_DESTINATION &&
+        (op.mode !== "TEST" ||
+          !this.testDefaultPermitted(mode ?? null, balance.livemode, account) ||
+          !op.testDefaultAccountId ||
+          account.accountId !== op.testDefaultAccountId)
+      )
+        throw new TestDefaultRefused();
       const decision = eligibility.currencies.find((c) => c.currency === op.currency);
       if (decision?.status !== "AVAILABLE" || op.amountCents > decision.eligibleCents) {
         const why =
@@ -714,7 +760,29 @@ export class CentralPayoutService {
                 ),
               );
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof TestDefaultRefused) {
+        const reason =
+          "Stripe TEST default destination no longer applies (mode, account or bank list changed)";
+        return op.dispatchCount === 0
+          ? this.update(
+              op,
+              { state: "PREPARED", dispatchCount: 0 },
+              {
+                $set: { state: "REJECTED", failureMessage: `Not sent: ${reason}`.slice(0, 500) },
+                $unset: { activeSlot: 1 },
+                $push: {
+                  audit: {
+                    $each: [
+                      this.entry("BLOCKED", source, reason),
+                      this.entry("RESERVATION_RELEASED", source, "Never sent to Stripe"),
+                    ],
+                  },
+                },
+              },
+            )
+          : this.audit(op, this.entry("REQUIRES_REVIEW", source, `Not resent: ${reason}`));
+      }
       // Provider or evidence read failed: never send blind. The operation keeps its reservation
       // and identity; Refresh retries the same operation later.
       revalidated = await this.audit(
@@ -793,7 +861,11 @@ export class CentralPayoutService {
       payout.amountCents !== op.amountCents ||
       payout.currency !== op.currency ||
       payout.livemode !== (op.mode === "LIVE") ||
-      payout.destinationId !== op.destinationId ||
+      // The TEST default is chosen by Stripe, so its bank id cannot be known in advance; it is
+      // still bound to a TEST (non-livemode) payout.
+      (op.destinationId === STRIPE_TEST_DEFAULT_DESTINATION
+        ? op.mode !== "TEST" || payout.livemode
+        : payout.destinationId !== op.destinationId) ||
       payout.automatic ||
       (op.providerPayoutId !== undefined && op.providerPayoutId !== payout.id) ||
       (payout.metadata[METADATA_KEY] !== undefined &&
@@ -1007,7 +1079,28 @@ export class CentralPayoutService {
     return [];
   }
 
-  private accountRestrictions(account: CentralAccountPayoutState): Restriction[] {
+  /** TEST only, never LIVE: the TEST key, a TEST balance, an identified account, and Stripe's
+   * exact bank-list restriction (classified by the gateway) with no bank inventory read. */
+  private testDefaultPermitted(
+    mode: CentralStripeMode | null,
+    balanceLivemode: boolean,
+    account: CentralAccountPayoutState,
+  ): boolean {
+    return (
+      mode === "TEST" &&
+      balanceLivemode === false &&
+      !!account.accountId &&
+      account.destinationReadIssue === "TEST_MODE_RESTRICTED" &&
+      !account.destinationsReadable &&
+      account.destinations.length === 0
+    );
+  }
+
+  private accountRestrictions(
+    account: CentralAccountPayoutState,
+    mode: CentralStripeMode | null,
+    balanceLivemode: boolean,
+  ): Restriction[] {
     const restrictions: Restriction[] = [];
     if (!account.accountId)
       restrictions.push({
@@ -1030,7 +1123,9 @@ export class CentralPayoutService {
             ? "Stripe payout schedule could not be confirmed; manual withdrawals require a confirmed manual schedule"
             : `The Stripe account pays out automatically (${account.scheduleInterval} schedule). Manual withdrawals need a manual payout schedule; Bookly does not change this setting.`,
       });
-    if (!account.destinationsReadable)
+    if (this.testDefaultPermitted(mode, balanceLivemode, account)) {
+      // TEST only: Stripe selects its TEST default destination (or refuses the payout itself).
+    } else if (!account.destinationsReadable)
       restrictions.push({
         code: "CENTRAL_PAYOUT_DESTINATION_UNREADABLE",
         message: "Stripe did not return the account's bank accounts to this API key",

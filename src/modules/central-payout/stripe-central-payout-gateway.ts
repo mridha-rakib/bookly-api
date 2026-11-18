@@ -10,6 +10,8 @@ import {
   CentralPayoutProviderError,
   type CentralStripeMode,
   type ProviderPayout,
+  STRIPE_TEST_BANK_LIST_RESTRICTION,
+  STRIPE_TEST_DEFAULT_DESTINATION,
 } from "./central-payout.types.js";
 
 /** Stripe error types that prove no object was created. Anything else is treated as unknown. */
@@ -23,6 +25,10 @@ const DEFINITIVE_ERROR_TYPES = new Set([
 const isReadPermissionsError = (error: unknown): boolean => {
   const type = (error as { type?: unknown } | null)?.type;
   return type === "StripePermissionError" || type === "StripeAuthenticationError";
+};
+const isTestBankListRestriction = (error: unknown): boolean => {
+  const message = (error as { message?: unknown } | null)?.message;
+  return typeof message === "string" && STRIPE_TEST_BANK_LIST_RESTRICTION.test(message.trim());
 };
 const BANK_STATUSES = new Set(["new", "validated", "verified", "verification_failed", "errored"]);
 
@@ -160,7 +166,14 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
         if (!complete) issue = "INCOMPLETE";
       } catch (error) {
         if (pages.length) external = pages;
-        issue = isReadPermissionsError(error) ? "PERMISSIONS" : "PROVIDER";
+        // Only Stripe's exact TEST-key restriction, only for a TEST key, and only before any
+        // bank page was read: Stripe will then choose the TEST default destination itself.
+        issue =
+          !pages.length && this.mode() === "TEST" && isTestBankListRestriction(error)
+            ? "TEST_MODE_RESTRICTED"
+            : isReadPermissionsError(error)
+              ? "PERMISSIONS"
+              : "PROVIDER";
       }
     }
     return {
@@ -203,12 +216,23 @@ export class StripeCentralPayoutGateway implements CentralPayoutGateway {
     idempotencyKey: string;
     metadata: Record<string, string>;
   }): Promise<ProviderPayout> {
+    const testDefault = input.destinationId === STRIPE_TEST_DEFAULT_DESTINATION;
+    // Defence in depth: the marker never reaches Stripe with anything but a TEST key. Refused
+    // before any request, so no payout can exist (definitive).
+    if (testDefault && this.mode() !== "TEST")
+      throw new CentralPayoutProviderError(
+        "The Stripe TEST default destination can only be used with a TEST key",
+        true,
+        "central_payout_test_default_not_test",
+      );
     try {
       const payout = await this.client.payouts.create(
         {
           amount: input.amountCents,
           currency: input.currency,
-          destination: input.destinationId,
+          // Without `destination`, Stripe uses the TEST account's default external account for
+          // this currency (or refuses if none exists).
+          ...(testDefault ? {} : { destination: input.destinationId }),
           metadata: input.metadata,
         },
         { idempotencyKey: input.idempotencyKey },

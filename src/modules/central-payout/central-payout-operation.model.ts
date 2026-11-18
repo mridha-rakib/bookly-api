@@ -1,5 +1,9 @@
 import { model, Schema, type Types } from "mongoose";
-import { type ProviderPayoutStatus, providerPayoutStatuses } from "./central-payout.types.js";
+import {
+  type ProviderPayoutStatus,
+  providerPayoutStatuses,
+  STRIPE_TEST_DEFAULT_DESTINATION,
+} from "./central-payout.types.js";
 
 /**
  * One Super Admin withdrawal request from Bookly's central Stripe balance (P0.6).
@@ -63,7 +67,11 @@ export type CentralPayoutOperationDocument = {
   currency: string;
   destinationId: string;
   destinationBankName?: string | undefined;
+  /** Empty only for STRIPE_TEST_DEFAULT_DESTINATION (TEST: Stripe exposes no bank details). */
   destinationLast4: string;
+  /** TEST default destination only — the Stripe platform account this request was confirmed
+   * against; dispatch refuses to send under any other account. */
+  testDefaultAccountId?: string | undefined;
   state: CentralPayoutState;
   activeSlot?: "CENTRAL" | undefined;
   providerIdempotencyKey: string;
@@ -105,7 +113,14 @@ const schema = new Schema<CentralPayoutOperationDocument>(
     currency: { type: String, required: true, match: /^[a-z]{3}$/ },
     destinationId: { type: String, required: true },
     destinationBankName: { type: String },
-    destinationLast4: { type: String, required: true },
+    destinationLast4: {
+      type: String,
+      // A real bank destination always has a masked last 4; the TEST default has none.
+      required: function (this: { destinationId?: string }) {
+        return this.destinationId !== STRIPE_TEST_DEFAULT_DESTINATION;
+      },
+    },
+    testDefaultAccountId: { type: String, match: /^acct_[A-Za-z0-9]+$/ },
     state: {
       type: String,
       enum: ["PREPARED", "UNKNOWN", "SUBMITTED", "REJECTED"],

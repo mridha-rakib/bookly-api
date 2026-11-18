@@ -47,9 +47,23 @@ export type CentralAccountPayoutState = {
   destinationsReadable: boolean;
   /** False means the returned destinations are only a partial/uncertain inventory. */
   destinationsComplete?: boolean;
-  destinationReadIssue?: "PERMISSIONS" | "PROVIDER" | "INCOMPLETE";
+  /** TEST_MODE_RESTRICTED — only with a TEST key, when Stripe refuses the bank-account list with
+   * its exact "Only live keys can access this method" restriction (see STRIPE_TEST_DEFAULT_*). */
+  destinationReadIssue?: "PERMISSIONS" | "PROVIDER" | "INCOMPLETE" | "TEST_MODE_RESTRICTED";
   destinations: CentralBankDestination[];
 };
+
+/**
+ * TEST-only destination marker. Stripe TEST keys cannot list the platform's bank accounts, so
+ * Bookly cannot name or verify one; a TEST payout created WITHOUT `destination` goes to the TEST
+ * account's default external account for that currency (chosen by Stripe). This is not a bank
+ * id (never `ba_…`), carries no bank details, and is refused for any LIVE key, mode or account.
+ */
+export const STRIPE_TEST_DEFAULT_DESTINATION = "stripe_test_default";
+export const STRIPE_TEST_DEFAULT_LABEL =
+  "Stripe TEST default destination — bank details unavailable in TEST mode.";
+/** The exact Stripe refusal of the bank-account list for a TEST key (optional trailing period). */
+export const STRIPE_TEST_BANK_LIST_RESTRICTION = /^Only live keys can access this method\.?$/;
 
 export type ProviderPayout = {
   id: string;
@@ -75,6 +89,8 @@ export interface CentralPayoutGateway {
    * Stripe itself (never from payload metadata). Throws when it cannot be established, so callers
    * fail closed. */
   platformAccountId(): Promise<string>;
+  /** `destinationId` is a verified `ba_…` id, or STRIPE_TEST_DEFAULT_DESTINATION (TEST key only:
+   * the adapter then omits `destination` and refuses before calling Stripe for any other key). */
   createPayout(input: {
     amountCents: number;
     currency: string;
