@@ -8,6 +8,12 @@ import {
 } from "../auth/auth.schema.js";
 import { businessCities } from "./business.types.js";
 
+/** Saved Business social accounts. Shared with the public catalog, which only exposes values
+ * that still satisfy these save rules. */
+export const INSTAGRAM_HANDLE_MAX_LENGTH = 60;
+export const INSTAGRAM_HANDLE_PATTERN = /^@?[A-Za-z0-9._]+$/;
+export const FACEBOOK_PAGE_URL_PATTERN = /^https:\/\/(www\.)?facebook\.com\//i;
+
 export const businessIdParamsSchema = z
   .object({
     businessId: z.string().regex(/^[a-f\d]{24}$/i, "Invalid business id"),
@@ -54,14 +60,14 @@ export const updateBusinessBodySchema = z
       .string()
       .trim()
       .min(1)
-      .max(60)
-      .regex(/^@?[A-Za-z0-9._]+$/, "Enter a valid Instagram handle")
+      .max(INSTAGRAM_HANDLE_MAX_LENGTH)
+      .regex(INSTAGRAM_HANDLE_PATTERN, "Enter a valid Instagram handle")
       .optional(),
     facebookPageUrl: z
       .string()
       .trim()
       .url()
-      .regex(/^https:\/\/(www\.)?facebook\.com\//i, "Enter a valid Facebook Page URL")
+      .regex(FACEBOOK_PAGE_URL_PATTERN, "Enter a valid Facebook Page URL")
       .optional(),
     coordinates: z
       .object({

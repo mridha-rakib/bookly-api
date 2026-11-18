@@ -1,5 +1,10 @@
 import type { AddonDocument } from "../addons/addon.model.js";
 import type { BusinessAddress, BusinessDocument } from "../business/business.model.js";
+import {
+  FACEBOOK_PAGE_URL_PATTERN,
+  INSTAGRAM_HANDLE_MAX_LENGTH,
+  INSTAGRAM_HANDLE_PATTERN,
+} from "../business/business.schema.js";
 import type { BusinessVisitType } from "../business/business.types.js";
 import type {
   BusinessCancellationPolicyDocument,
@@ -75,6 +80,12 @@ export type CatalogBusinessDto = {
    * the policy in effect when it is created, and the preview's own `cancellationPolicy` is the
    * authoritative read for the Booking being made. Rates only — no customer data. */
   cancellationPolicy?: CatalogCancellationPolicyDto | null;
+  /** The Business's saved Instagram handle, without a leading "@". Omitted when none is saved or
+   * the stored value no longer satisfies the Business Profile's save rule. */
+  instagramHandle?: string | undefined;
+  /** The Business's saved Facebook Page URL (https://facebook.com/… or https://www.facebook.com/…).
+   * Omitted when none is saved or the stored value is not a valid Facebook Page URL. */
+  facebookPageUrl?: string | undefined;
 };
 
 export type CatalogCancellationPolicyDto = {
@@ -100,6 +111,34 @@ export const toCatalogCancellationPolicyDto = (
  * and never passed through as-is if the stored document happens to hold a malformed value. Same
  * validation as discovery.repository.ts's own `validLocation` (kept local here rather than
  * shared, matching this module's existing standalone-DTO style). */
+/** Public social accounts: only values that satisfy the same rules as the Business Profile save
+ * (business.schema.ts), so a legacy or malformed stored value is never published. */
+const validInstagramHandle = (value: string | undefined): string | undefined => {
+  const handle = value?.trim();
+  if (
+    !handle ||
+    handle.length > INSTAGRAM_HANDLE_MAX_LENGTH ||
+    !INSTAGRAM_HANDLE_PATTERN.test(handle)
+  )
+    return undefined;
+  const bare = handle.replace(/^@/, "");
+  return bare || undefined;
+};
+
+const validFacebookPageUrl = (value: string | undefined): string | undefined => {
+  const raw = value?.trim();
+  if (!raw || !FACEBOOK_PAGE_URL_PATTERN.test(raw)) return undefined;
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.username || url.password) return undefined;
+    if (host !== "facebook.com" && host !== "www.facebook.com") return undefined;
+    return raw;
+  } catch {
+    return undefined;
+  }
+};
+
 const validLocation = (
   location: BusinessDocument["location"],
 ): { lat: number; lng: number } | undefined => {
@@ -144,7 +183,17 @@ export const toCatalogBusinessDto = (
   ...(extra.cancellationPolicy !== undefined
     ? { cancellationPolicy: extra.cancellationPolicy }
     : {}),
+  ...socialAccounts(business),
 });
+
+const socialAccounts = (business: BusinessDocument) => {
+  const instagramHandle = validInstagramHandle(business.instagramHandle);
+  const facebookPageUrl = validFacebookPageUrl(business.facebookPageUrl);
+  return {
+    ...(instagramHandle ? { instagramHandle } : {}),
+    ...(facebookPageUrl ? { facebookPageUrl } : {}),
+  };
+};
 
 export type CatalogServiceDto = {
   id: string;

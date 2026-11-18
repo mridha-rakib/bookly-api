@@ -22,7 +22,9 @@ import { BookingFinancialTransactionService } from "../../../src/modules/booking
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { updateBusinessBodySchema } from "../../../src/modules/business/business.schema.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
@@ -465,6 +467,46 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     expect(response.body.data.business.email).toBeUndefined();
     expect(response.body.data.business.phone).toBeUndefined();
     expect(response.body.data.business.ownerUserId).toBeUndefined();
+  });
+
+  it("publishes the Business's saved Instagram and Facebook accounts on the public venue catalog", async () => {
+    const { business } = await setupBookableBusiness(8000);
+    const app = buildCatalogApp();
+    const read = async () =>
+      (await request(app).get(`/catalog/businesses/${business._id}`).expect(200)).body.data
+        .business;
+
+    // None saved: no social fields at all.
+    const none = await read();
+    expect(none).not.toHaveProperty("instagramHandle");
+    expect(none).not.toHaveProperty("facebookPageUrl");
+
+    // Saved through the Business Profile's own save contract, then read publicly.
+    const saved = updateBusinessBodySchema.parse({
+      instagramHandle: "@aurelia.studio",
+      facebookPageUrl: "https://www.facebook.com/aurelia.studio",
+    });
+    await BusinessModel.updateOne({ _id: business._id }, { $set: saved }).exec();
+    const published = await read();
+    expect(published.instagramHandle).toBe("aurelia.studio");
+    expect(published.facebookPageUrl).toBe("https://www.facebook.com/aurelia.studio");
+    // Still public-safe: never email/phone/ownerUserId.
+    expect(published.email).toBeUndefined();
+    expect(published.phone).toBeUndefined();
+
+    // Legacy/malformed stored values (bypassing the save rule) are never published.
+    await BusinessModel.updateOne(
+      { _id: business._id },
+      {
+        $set: {
+          instagramHandle: "not a handle!",
+          facebookPageUrl: "https://facebook.com.evil.example/aurelia",
+        },
+      },
+    ).exec();
+    const malformed = await read();
+    expect(malformed).not.toHaveProperty("instagramHandle");
+    expect(malformed).not.toHaveProperty("facebookPageUrl");
   });
 
   it("still serves the public venue catalog to a logged-in Business Owner / Staff (no role gate on the read)", async () => {
