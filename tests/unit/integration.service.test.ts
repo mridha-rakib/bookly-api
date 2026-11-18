@@ -455,6 +455,7 @@ describe("IntegrationService (Google Calendar)", () => {
       } as unknown as BusinessRepository;
       const integrationRepository = {
         upsert: vi.fn().mockResolvedValue(buildIntegration()),
+        findByGoogleAccountForOtherBusiness: vi.fn().mockResolvedValue(null),
       } as unknown as IntegrationRepository;
       const service = new IntegrationService(integrationRepository, businessRepository);
 
@@ -466,6 +467,7 @@ describe("IntegrationService (Google Calendar)", () => {
         refreshToken: "raw-refresh-token",
         expiresAt: new Date(Date.now() + 3600_000),
         googleAccountEmail: "owner@gmail.com",
+        googleAccountId: "google-sub-1",
       });
 
       await service.handleOAuthCallback("auth-code", stateParam);

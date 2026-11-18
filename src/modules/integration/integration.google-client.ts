@@ -68,18 +68,22 @@ export function buildGoogleAuthUrl(state: string): string {
 
   return client.generateAuthUrl({
     access_type: "offline",
-    prompt: "consent",
+    // `select_account` always shows Google's account chooser, so the Owner picks ANY eligible
+    // Google account (personal Gmail or Workspace) — never silently the browser's signed-in one
+    // and never tied to the Bookly login email (no login_hint / hd). `consent` keeps Google
+    // issuing the refresh token this offline, one-way sync needs.
+    prompt: "consent select_account",
     scope: ["openid", CALENDAR_EVENTS_SCOPE, USERINFO_SCOPE, CALENDAR_METADATA_SCOPE],
     state,
   });
 }
 
-/** Exchanges an authorization `code` for tokens. Google only returns a refresh_token on the
- * FIRST consent (subsequent re-consents may omit it) — callers must not overwrite a
- * previously-stored refresh_token with an empty one. */
+/** Exchanges an authorization `code` for tokens and the chosen Google account's identity.
+ * `prompt=consent` makes Google return a refresh_token on every connection; a response without
+ * one (or without a stable account id and email) is refused rather than stored half-complete. */
 export async function exchangeGoogleAuthCode(
   code: string,
-): Promise<GoogleTokenSet & { googleAccountEmail: string; googleAccountId?: string }> {
+): Promise<GoogleTokenSet & { googleAccountEmail: string; googleAccountId: string }> {
   const client = createOAuthClient();
 
   let tokens: Credentials;
@@ -113,11 +117,12 @@ async function fetchGoogleAccountEmail(accessToken: string) {
   }
 
   const body = (await response.json()) as { email?: string; sub?: string; id?: string };
-  const accountId = body.sub ?? body.id;
-  return {
-    googleAccountEmail: body.email ?? "unknown",
-    ...(accountId ? { googleAccountId: accountId } : {}),
-  };
+  const accountId = (body.sub ?? body.id)?.trim();
+  const email = body.email?.trim();
+  // The account id identifies the connection (one Business per Google account); the email is
+  // what the Owner sees. Never store a placeholder for either.
+  if (!accountId || !email) throw new IntegrationError("GOOGLE_CALENDAR_OAUTH_FAILED", 502);
+  return { googleAccountEmail: email, googleAccountId: accountId };
 }
 
 export async function refreshGoogleAccessToken(refreshToken: string): Promise<GoogleTokenSet> {

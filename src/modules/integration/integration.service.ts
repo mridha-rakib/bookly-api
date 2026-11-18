@@ -141,10 +141,21 @@ export class IntegrationService {
 
     const tokens = await exchangeGoogleAuthCode(code);
 
+    // One Google account serves one Business: linking it to a second Business would let either
+    // Owner's actions write into the other's calendar. Reconnecting the same Business (same or a
+    // different account) replaces its own single connection below.
+    if (
+      await this.integrationRepository.findByGoogleAccountForOtherBusiness(
+        tokens.googleAccountId,
+        businessId,
+      )
+    )
+      throw new IntegrationError("GOOGLE_CALENDAR_ACCOUNT_IN_USE", 409);
+
     await this.integrationRepository.upsert({
       businessId: new Types.ObjectId(businessId),
       googleAccountEmail: tokens.googleAccountEmail,
-      ...(tokens.googleAccountId ? { googleAccountId: tokens.googleAccountId } : {}),
+      googleAccountId: tokens.googleAccountId,
       calendarId: "primary",
       encryptedAccessToken: encryptSecret(tokens.accessToken),
       encryptedRefreshToken: encryptSecret(tokens.refreshToken),

@@ -23,6 +23,17 @@ export class IntegrationRepository {
     return GoogleCalendarIntegrationModel.findOne({ businessId }).exec();
   }
 
+  /** The connection (if any) that already uses this Google account for a DIFFERENT Business. */
+  public async findByGoogleAccountForOtherBusiness(
+    googleAccountId: string,
+    businessId: Types.ObjectId | string,
+  ): Promise<GoogleCalendarIntegrationDocument | null> {
+    return GoogleCalendarIntegrationModel.findOne({
+      googleAccountId,
+      businessId: { $ne: businessId },
+    }).exec();
+  }
+
   /** Reconnecting overwrites the existing row (unique {businessId:1} index) rather than
    * accumulating stale connections. */
   public async upsert(

@@ -4,6 +4,7 @@ import { sendSuccess } from "../../common/http/responses.js";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { AuthError } from "../auth/auth.errors.js";
+import { IntegrationError } from "./integration.errors.js";
 import type {
   GoogleCalendarCallbackQuery,
   IntegrationBusinessParams,
@@ -13,11 +14,21 @@ import type { IntegrationService } from "./integration.service.js";
 // The single Business-facing frontend origin bookings/settings live on — reuses the already-
 // configured CORS allow-list's first entry rather than introducing a second "our frontend URL"
 // env var (no such var exists in this codebase yet; see env.ts's own CORS_ORIGINS).
-function frontendSettingsUrl(status: "connected" | "error"): string {
+function frontendSettingsUrl(
+  status: "connected" | "error",
+  reason?: "account_in_use" | "cancelled",
+): string {
   const origin = env.CORS_ORIGINS[0] ?? "http://localhost:3000";
 
-  return `${origin}/business-dashboard?section=settings&settingsTab=Integration&googleCalendar=${status}`;
+  return `${origin}/business-dashboard?section=settings&settingsTab=Integration&googleCalendar=${status}${reason ? `&reason=${reason}` : ""}`;
 }
+
+/** A fixed, non-sensitive reason code for the redirect (never a provider message). */
+const callbackFailureReason = (error: unknown): "account_in_use" | undefined =>
+  error instanceof IntegrationError &&
+  error.details?.some((detail) => detail.code === "GOOGLE_CALENDAR_ACCOUNT_IN_USE")
+    ? "account_in_use"
+    : undefined;
 
 export class IntegrationController {
   public constructor(private readonly integrationService: IntegrationService) {}
@@ -46,7 +57,10 @@ export class IntegrationController {
     const query = request.validated?.query as GoogleCalendarCallbackQuery;
 
     if (query.error || !query.code) {
-      response.redirect(frontendSettingsUrl("error"));
+      // `access_denied` = the Owner closed or declined Google's account/consent screen.
+      response.redirect(
+        frontendSettingsUrl("error", query.error === "access_denied" ? "cancelled" : undefined),
+      );
       return;
     }
 
@@ -55,7 +69,7 @@ export class IntegrationController {
       response.redirect(frontendSettingsUrl("connected"));
     } catch (error) {
       logger.warn({ err: error }, "Google Calendar OAuth callback failed");
-      response.redirect(frontendSettingsUrl("error"));
+      response.redirect(frontendSettingsUrl("error", callbackFailureReason(error)));
     }
   };
 
