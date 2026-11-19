@@ -34,8 +34,11 @@ describe("customer Google OAuth state", () => {
   it("rejects a token whose signature was tampered with", async () => {
     const good = await signCustomerGoogleState({ nonce: "n" });
     const parts = good.split(".");
-    const flipped = parts[2]?.slice(-1) === "A" ? "B" : "A";
-    parts[2] = `${parts[2]?.slice(0, -1)}${flipped}`;
+    // Change the FIRST signature character: the last base64url character of a 32-byte HS256
+    // signature carries padding bits, so swapping A<->B there can leave the signature valid.
+    const signature = parts[2] ?? "";
+    const flipped = signature[0] === "A" ? "B" : "A";
+    parts[2] = `${flipped}${signature.slice(1)}`;
 
     await expect(verifyCustomerGoogleState(parts.join("."))).rejects.toMatchObject({
       statusCode: 400,

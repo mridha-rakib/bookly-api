@@ -803,6 +803,10 @@ describe("P1 — universal customer↔business financial relationship + Financia
         .orFail()
         .exec();
 
+      // The webhook re-reads the authoritative PaymentIntent before acting on an event, so the
+      // provider must actually report the failure (Stripe `requires_payment_method`, i.e. the
+      // gateway's "failed") — an event alone never releases a still-requires_action claim.
+      paymentGateway.setPaymentIntentStatus(first.paymentIntentId, "failed");
       await webhookService.process({
         id: `evt_${new Types.ObjectId().toString()}`,
         type: "payment_intent.payment_failed",
@@ -4658,9 +4662,19 @@ describe("P1 — universal customer↔business financial relationship + Financia
         expect(final.eventHistory.filter((event) => event.type === "STATUS_CHANGED")).toHaveLength(
           1,
         );
-        expect((await relationshipOf(client._id)).financialRelationship?.state).toBe(
-          businessWon ? "ELIGIBLE" : "CONSUMED",
-        );
+        const relationship = (await relationshipOf(client._id)).financialRelationship;
+        if (businessWon) {
+          expect(relationship?.state).toBe("ELIGIBLE");
+        } else {
+          // The Customer won: this €0 FIRST Normal Booking is cancelled more than 24 h ahead, so the
+          // Owner-approved v2 rule (2026-11-05, restoreFirstAfterCustomerCancellation) returns the
+          // relationship to ELIGIBLE at cancellation — never via the losing business transition.
+          // Rarely exercised: the business usually wins this race outside heavy parallel load.
+          expect(final.status).toBe("CANCELLED_BY_CUSTOMER");
+          expect(final.cancellationOutcome?.tier).toBe("MORE_THAN_24_HOURS");
+          expect(relationship?.state).toBe("ELIGIBLE");
+          expect(relationship?.lastRelease?.reason).toBe("CUSTOMER_EARLY_CANCELLATION");
+        }
         expect((await new PromoRepository().findById(promo._id))?.redeemedCount).toBe(
           businessWon ? 0 : 1,
         );

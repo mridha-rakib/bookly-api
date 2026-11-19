@@ -92,10 +92,16 @@ describe("HTTP-level Customer Apple auth (GET start + POST form_post callback)",
     expect(String(res.headers["set-cookie"] ?? "")).not.toMatch(/nonce/i);
   });
 
-  it("start redirects status=error when not configured", async () => {
+  // Since 47b0eea (docs/STAGING-OPTIONAL-PROVIDERS.md) a disabled/unconfigured Apple flow is
+  // rejected with 503 by requireAppleOAuth before any session, state or provider work.
+  it("start is rejected with 503 APPLE_OAUTH_UNAVAILABLE when not configured", async () => {
     isCustomerAppleAuthConfigured.mockReturnValue(false);
     const res = await request(buildApp()).get(START_URL);
-    expect(res.headers["location"]).toBe(`${FRONTEND_CB}?status=error`);
+    expect(res.status).toBe(503);
+    expect(res.body.errors).toEqual([expect.objectContaining({ code: "APPLE_OAUTH_UNAVAILABLE" })]);
+    expect(res.headers["location"]).toBeUndefined();
+    expect(res.headers["set-cookie"]).toBeUndefined();
+    expect(buildCustomerAppleAuthUrl).not.toHaveBeenCalled();
   });
 
   it("new Apple customer: creates User(authProviders=[APPLE], no passwordHash) + profile + link, refresh cookie, status=onboarding", async () => {

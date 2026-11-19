@@ -5,7 +5,9 @@ import { resolve } from "node:path";
 /** Bundle existing application components without Next or operational environment loading.
  * Only decorative header/images/notification bell are substituted. API transport and hooks are real. */
 export async function buildManualBookingBrowser(): Promise<string> {
-  const client = resolve(process.cwd(), "../client");
+  // The Client checkout under test. Defaults to the sibling ../client; BOOKLY_CLIENT_ROOT pins an
+  // explicit (e.g. release) Client so results never depend on an unrelated working checkout.
+  const client = resolve(process.env["BOOKLY_CLIENT_ROOT"] ?? resolve(process.cwd(), "../client"));
   const artifacts = resolve(client, "tests/visual");
   const require = createRequire(
     realpathSync(resolve(process.cwd(), "node_modules/tsx/package.json")),

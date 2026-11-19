@@ -1135,9 +1135,30 @@ describe("database-backed authentication integration", () => {
         revokedAt: { $exists: false },
       }),
     ).toBe(0);
+    // Regression (359d49d moved the active-user check into rotation, which rolled back before
+    // the family could be revoked): the family is revoked as ADMIN_SUSPENSION, so a repeat
+    // refresh still reports the suspension — never a false token-reuse signal — and the
+    // session cannot be resumed after reactivation.
+    expect(
+      await SessionModel.findOne({ refreshTokenHash: sha256(suspended.refreshToken) })
+        .select("+refreshTokenHash")
+        .lean()
+        .then((row) => row?.revocationReason),
+    ).toBe("ADMIN_SUSPENSION");
+    await expect(parts.authService.refresh(suspended.refreshToken)).rejects.toMatchObject({
+      statusCode: 403,
+      details: [{ code: "USER_SUSPENDED" }],
+    });
+    await UserModel.updateOne({ _id: user._id }, { $set: { status: "ACTIVE" } });
+    await expect(parts.authService.refresh(suspended.refreshToken)).rejects.toMatchObject({
+      statusCode: 401,
+      details: [{ code: "SESSION_EXPIRED" }],
+    });
 
-    await UserModel.deleteOne({ _id: user._id });
+    // Sessions can only be issued to an existing active account (lockActiveUser, 359d49d), so
+    // the missing-user session is issued first and the account removed afterwards.
     const missingUserToken = await tokenService.createRefreshSession({ userId: user._id });
+    await UserModel.deleteOne({ _id: user._id });
     await expect(parts.authService.refresh(missingUserToken.refreshToken)).rejects.toMatchObject({
       statusCode: 401,
     });
@@ -1506,7 +1527,14 @@ describe("database-backed authentication integration", () => {
     }
     const repository = new GatedRepository();
     const tokens = new TokenService(repository);
-    const initial = await tokens.createRefreshSession({ userId: new mongoose.Types.ObjectId() });
+    // Sessions are only issued to an existing active account (lockActiveUser, 359d49d).
+    const owner = await new UserRepository().create({
+      normalizedEmail: `rotation-${new mongoose.Types.ObjectId().toString()}@example.com`,
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    const initial = await tokens.createRefreshSession({ userId: owner._id });
     const pending = tokens.rotateRefreshToken(initial.refreshToken);
     await ready;
     const logout = tokens.revokeRefreshToken(initial.refreshToken);
@@ -1528,7 +1556,14 @@ describe("database-backed authentication integration", () => {
       }
     }
     const tokens = new TokenService(new FailingSuccessorRepository());
-    const initial = await tokens.createRefreshSession({ userId: new mongoose.Types.ObjectId() });
+    // Sessions are only issued to an existing active account (lockActiveUser, 359d49d).
+    const owner = await new UserRepository().create({
+      normalizedEmail: `rotation-${new mongoose.Types.ObjectId().toString()}@example.com`,
+      passwordHash: "unused",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    const initial = await tokens.createRefreshSession({ userId: owner._id });
     await expect(tokens.rotateRefreshToken(initial.refreshToken)).rejects.toThrow(
       "forced successor insert failure",
     );
@@ -2311,9 +2346,11 @@ describe("database-backed authentication integration", () => {
         ),
       ).resolves.toMatchObject({ user: { email: "email-change-dst@example.com" } });
 
-      // The session that existed before the change was revoked.
+      // The session that existed before the change was revoked. Since a263afb a LOGOUT/REVOKE_ALL
+      // revocation answers SESSION_EXPIRED (401) rather than a false token-theft signal.
       await expect(authService.refresh(refreshToken)).rejects.toMatchObject({
-        details: [{ code: "REFRESH_TOKEN_REUSED" }],
+        statusCode: 401,
+        details: [{ code: "SESSION_EXPIRED" }],
       });
 
       // The consumed challenge slot is gone (replay-safe / no leftover row).

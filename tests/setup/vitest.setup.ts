@@ -1,3 +1,19 @@
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Hermetic suite: src/config/env.ts runs `import "dotenv/config"`, which would load an
+// operational api/.env (real database URI, provider keys) into every test process. Point dotenv
+// at a path that cannot exist so results never depend on, or touch, a developer's .env —
+// the same isolation the P4K interactive lane already uses.
+process.env["DOTENV_CONFIG_PATH"] = join(
+  tmpdir(),
+  `bookly-vitest-no-dotenv-${randomUUID()}`,
+  ".env",
+);
+process.env["DOTENV_CONFIG_QUIET"] = "true";
+delete process.env["DOTENV_CONFIG_OVERRIDE"];
+
 process.env["NODE_ENV"] = "test";
 process.env["APP_NAME"] = "Bookly API";
 process.env["API_VERSION"] = "v1";

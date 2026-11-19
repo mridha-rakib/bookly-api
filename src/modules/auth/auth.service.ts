@@ -672,7 +672,7 @@ export class AuthService {
 
   public async refresh(refreshToken: string): Promise<AuthResult> {
     try {
-      const rotated = await this.tokenService.rotateRefreshToken(refreshToken);
+      const rotated = await this.rotateOrRevokeInactive(refreshToken);
       const user = await this.userRepository.findById(rotated.userId);
 
       if (!user) {
@@ -716,6 +716,25 @@ export class AuthService {
         throw new AuthError("SESSION_EXPIRED", 401);
       }
 
+      throw error;
+    }
+  }
+
+  /**
+   * Rotation locks an active user inside its transaction, so a suspended, deleted, missing or
+   * credential-changed account is refused there and the rotation rolls back — before the
+   * post-rotation revocations below it could run. Keep the refresh contract: the presented
+   * family is revoked (suspension with ADMIN_SUSPENSION, so later refreshes keep reporting the
+   * suspension rather than token reuse) and can never be resumed after reactivation.
+   */
+  private async rotateOrRevokeInactive(refreshToken: string) {
+    try {
+      return await this.tokenService.rotateRefreshToken(refreshToken);
+    } catch (error) {
+      const code = error instanceof AuthError ? error.details?.[0]?.code : undefined;
+      if (code === "USER_SUSPENDED")
+        await this.tokenService.revokeRefreshToken(refreshToken, "ADMIN_SUSPENSION");
+      else if (code === "SESSION_EXPIRED") await this.tokenService.revokeRefreshToken(refreshToken);
       throw error;
     }
   }

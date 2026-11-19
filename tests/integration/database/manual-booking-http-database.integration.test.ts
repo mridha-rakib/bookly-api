@@ -31,6 +31,7 @@ import { CustomerPaymentProfileModel } from "../../../src/modules/payment/custom
 import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { StripePaymentGateway } from "../../../src/modules/payment/stripe-payment-gateway.js";
 import { PlatformSettingsRepository } from "../../../src/modules/platform-settings/platform-settings.repository.js";
+import { createPlatformConfigRoute } from "../../../src/modules/platform-settings/platform-settings.route.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { SessionRepository } from "../../../src/modules/session/session.repository.js";
@@ -285,6 +286,9 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
     app.use("/businesses", createAvailabilityRoute());
     app.use("/businesses", createBusinessBookingRoute());
     app.use("/me", createCustomerBookingRoute());
+    // Same public mount as api-router: the real booking form reads the server-authoritative
+    // max-services limit here before a service can be selected.
+    app.use("/platform", createPlatformConfigRoute());
     app.use(createErrorHandler({ isProduction: true }));
     return app;
   };

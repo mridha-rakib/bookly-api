@@ -29,13 +29,21 @@ const fixture = () => {
 it("launches copied clients with Webpack and local fonts without inheriting provider settings", async () => {
   const input = fixture();
   vi.stubEnv("STRIPE_SECRET_KEY", "synthetic-must-not-reach-child");
-  const child = {
+  // stop() tears down the whole process tree of a running child (it needs a pid): taskkill /T /F
+  // on Windows, child.kill() elsewhere — so the fake child is an emitter with a pid.
+  const child = Object.assign(new EventEmitter(), {
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     exitCode: null,
-    kill: vi.fn(),
-  };
-  launched.spawn.mockImplementation(() => {
+    pid: 4242,
+    kill: vi.fn(() => queueMicrotask(() => child.emit("exit", 0))),
+  });
+  launched.spawn.mockImplementation((command: string) => {
+    if (command === "taskkill") {
+      const killer = new EventEmitter();
+      queueMicrotask(() => killer.emit("exit", 0));
+      return killer;
+    }
     queueMicrotask(() => child.stdout.emit("data", "Ready in 1ms"));
     return child;
   });
@@ -49,8 +57,17 @@ it("launches copied clients with Webpack and local fonts without inheriting prov
   const font = options.env.NEXT_FONT_GOOGLE_MOCKED_RESPONSES;
   owned.push(dirname(font));
   expect(readFileSync(font, "utf8")).toContain("src: local('Arial')");
-  client.stop();
-  expect(child.kill).toHaveBeenCalledOnce();
+  await client.stop();
+  if (process.platform === "win32") {
+    expect(launched.spawn).toHaveBeenCalledTimes(2);
+    expect(launched.spawn.mock.calls[1]?.slice(0, 2)).toEqual([
+      "taskkill",
+      ["/PID", "4242", "/T", "/F"],
+    ]);
+    expect(child.kill).not.toHaveBeenCalled();
+  } else {
+    expect(child.kill).toHaveBeenCalledOnce();
+  }
 });
 
 it("refuses a client with dotenv files before spawning Next", async () => {

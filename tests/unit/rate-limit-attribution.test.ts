@@ -5,7 +5,7 @@ import path from "node:path";
 import express, { type Express, type RequestHandler } from "express";
 import rateLimit from "express-rate-limit";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   RateLimitRejectionEvent,
@@ -72,6 +72,16 @@ afterEach(() => {
 });
 
 describe("rate-limit attribution — real Bookly limiters", () => {
+  // The first full-app import transforms the whole application graph (several seconds on a cold
+  // Windows worker). Do that once here with an explicit budget so each test below measures only
+  // its own behaviour under the default per-test timeout; every test still re-imports a fresh graph.
+  beforeAll(async () => {
+    await loadModules();
+    await import("../../src/app/app.js");
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }, 60_000);
+
   it("global limiter rejection logs exactly one global-api event with a sanitized endpoint", async () => {
     const { events } = await loadModules({ RATE_LIMIT_MAX: "2" });
     const { ExpressApplication } = await import("../../src/app/app.js");

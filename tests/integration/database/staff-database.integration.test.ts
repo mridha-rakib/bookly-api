@@ -49,7 +49,7 @@ import { StaffInvitationModel } from "../../../src/modules/staff-invitation/staf
 import { StaffInvitationRepository } from "../../../src/modules/staff-invitation/staff-invitation.repository.js";
 import { StaffInvitationService } from "../../../src/modules/staff-invitation/staff-invitation.service.js";
 import { StaffInvitationAcceptService } from "../../../src/modules/staff-invitation/staff-invitation-accept.service.js";
-import { createDeferredStorageServiceFromEnv } from "../../../src/modules/storage/storage.service.js";
+import type { StorageService } from "../../../src/modules/storage/storage.service.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserModel, UserProfileModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
@@ -150,14 +150,23 @@ describe("database-backed StaffMembership integration", () => {
     staffScheduleRepository = new StaffScheduleRepository();
     staffTimeOffRepository = new StaffTimeOffRepository();
     emailProvider = new CapturingEmailOtpProvider();
-    // No StaffAvatar rows are created in these tests, so getAvatarUrlsByUserIds always
-    // short-circuits on an empty repository result and never touches the (unconfigured in
-    // test) storage service — matches how the real staff.route.ts wires this dependency.
+    // Object storage is never configured in tests. Most tests create no StaffAvatar rows, so
+    // getAvatarUrlsByUserIds short-circuits; the Owner-avatar tests below persist real rows and
+    // need a read URL, which this deterministic in-test double derives from the storage key
+    // (same pattern as customer-avatar-database). No S3 client or network is involved.
+    const avatarStorage: StorageService = {
+      bucket: "test-bucket",
+      ensureBucket: async () => undefined,
+      putObject: async () => undefined,
+      deleteObject: async () => undefined,
+      getObjectUrl: async ({ key }) => `https://storage.test.invalid/${key}`,
+      objectExists: async () => true,
+    };
     const staffAvatarService = new StaffAvatarService(
       new StaffAvatarRepository(),
       businessRepository,
       staffRepository,
-      createDeferredStorageServiceFromEnv(),
+      avatarStorage,
       { maxUploadBytes: 5 * 1024 * 1024 },
     );
     staffService = new StaffService(

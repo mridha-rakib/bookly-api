@@ -44,10 +44,12 @@ describe("linked-account OAuth state", () => {
   it("rejects a token signed with a different secret (signature mismatch)", async () => {
     const good = await signGoogleLinkState({ userId: "abc" });
 
-    // Flip the final character of the signature segment.
     const parts = good.split(".");
-    const lastChar = parts[2]?.slice(-1) === "A" ? "B" : "A";
-    parts[2] = `${parts[2]?.slice(0, -1)}${lastChar}`;
+    // Change the FIRST signature character: the last base64url character of a 32-byte HS256
+    // signature carries padding bits, so swapping A<->B there can leave the signature valid.
+    const signature = parts[2] ?? "";
+    const lastChar = signature[0] === "A" ? "B" : "A";
+    parts[2] = `${lastChar}${signature.slice(1)}`;
 
     await expect(verifyGoogleLinkState(parts.join("."))).rejects.toMatchObject({
       statusCode: 400,

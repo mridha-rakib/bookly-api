@@ -40,6 +40,7 @@ import { ensureRefundAccounting } from "../../../src/modules/payment/refund-acco
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { StripePaymentGateway } from "../../../src/modules/payment/stripe-payment-gateway.js";
+import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
@@ -54,6 +55,7 @@ import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-of
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
+import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
   clearIsolatedDatabase,
   connectIsolatedDatabase,
@@ -157,6 +159,13 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
       paymentService,
       financialTransactionService,
       promoApplicationService,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // Production always wires Cyprus VAT; positive-charge previews fail closed without it.
+      new CyprusTaxService(new FakeTaxGateway()),
     );
   });
 

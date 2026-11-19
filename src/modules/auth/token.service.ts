@@ -203,12 +203,16 @@ export class TokenService {
     return addMinutes(new Date(), env.JWT_ACCESS_TOKEN_TTL_MINUTES);
   }
 
-  public async revokeRefreshToken(refreshToken: string): Promise<void> {
+  public async revokeRefreshToken(
+    refreshToken: string,
+    reason: "LOGOUT" | "ADMIN_SUSPENSION" = "LOGOUT",
+  ): Promise<void> {
     const existing = await this.sessionRepository.findByRefreshTokenHash(sha256(refreshToken));
 
     if (existing) {
       // Logout is local to the cookie's device session, including all rotated successors.
-      await this.sessionRepository.revokeFamily(existing.tokenFamilyId, "LOGOUT");
+      // ADMIN_SUSPENSION keeps later refreshes reporting the suspension, never token reuse.
+      await this.sessionRepository.revokeFamily(existing.tokenFamilyId, reason);
     }
   }
 

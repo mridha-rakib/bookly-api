@@ -365,11 +365,15 @@ describe("G9 — Staff/Supervisor Overview range and employment", () => {
     const from = businessLocalToUtc(business.timezone, "2030-03-03", "00:00");
     const to = businessLocalToUtc(business.timezone, "2030-04-02", "00:00");
     expect(schedule).toHaveBeenCalledWith(business._id, from, to, membershipId);
-    expect(totals).toHaveBeenCalledWith(business._id, from, to, expect.any(Date), membershipId);
+    // Since 359d49d Staff counts come from the member's own schedule, each booking passing the
+    // First-Class purchase-delivery check; the range aggregate cannot apply that per-booking
+    // check, so it is never used for Staff (the DB-level staff test covers real bookings).
+    expect(totals).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       scope: "STAFF_SCOPED",
       financials: null,
-      todayBookingsCount: 12,
+      todayBookingsCount: 0,
+      todayRemainingCount: 0,
       period: { fromDate: "2030-03-03", toDate: "2030-04-01" },
     });
   });

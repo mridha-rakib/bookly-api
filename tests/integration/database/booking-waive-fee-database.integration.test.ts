@@ -37,6 +37,7 @@ import { BusinessCancellationPolicyRepository } from "../../../src/modules/busin
 import { BusinessHoursRepository } from "../../../src/modules/business-hours/business-hours.repository.js";
 import { BusinessHoursService } from "../../../src/modules/business-hours/business-hours.service.js";
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
+import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
@@ -1302,7 +1303,15 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
 
     it("a Business refund without exact ordinary PaymentAttempt evidence is not opted in", async () => {
       const { owner, business, booking } = await bookUpcomingPaidBooking();
+      // A legacy paid booking: no exact PaymentAttempt evidence and no P1 relationship record.
+      // (A FIRST booking that still has a CONSUMED relationship but lost its attempt evidence is
+      // refused by FinancialRelationshipService.beginBusinessCancellation — fail-closed money
+      // handling that this notification test must not depend on.)
       await PaymentAttemptModel.deleteMany({ bookingId: booking._id });
+      await BusinessClientModel.updateOne(
+        { _id: booking.customer.businessClientId },
+        { $unset: { financialRelationship: 1 } },
+      );
       await notifyingLifecycle().cancelByBusiness(
         String(owner._id),
         "BUSINESS_OWNER",

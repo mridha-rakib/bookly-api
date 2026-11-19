@@ -44,6 +44,9 @@ const SEAMS = [
 
 const ACTIVATION_ENVIRONMENT = {
   NODE_ENV: "development",
+  // Outside NODE_ENV=test the env schema requires a database URI. Supply a synthetic,
+  // never-contacted one instead of relying on whatever an operational .env provides.
+  MONGODB_URI: "mongodb://127.0.0.1:1/phase4-activation-boundary-never-connects",
   PACKAGE_CONSENT_ENABLED: "true",
   PACKAGE_CONSENT_QUOTE_LIFETIME_MS: "1800000",
   BOOKLY_MAIN_PURCHASE_CONTRACT: MAIN_DEVELOPMENT_CONTRACT,

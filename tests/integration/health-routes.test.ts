@@ -76,14 +76,22 @@ describe("health and infrastructure routes", () => {
   it("returns a consistent 404 response", async () => {
     const app = createApp();
 
-    const response = await request(app).get("/missing").expect(404);
+    // Unknown paths can carry OAuth codes or tokens, so the 404 names only the method and never
+    // echoes the path or query string back (contract since 47b0eea).
+    const response = await request(app)
+      .get("/missing/oauth-code-abc123?code=secret-oauth-code&state=xyz")
+      .expect(404);
 
     expect(response.body).toMatchObject({
       success: false,
-      message: "Route GET /missing not found",
+      message: "Route GET not found",
     });
     expect(response.body.requestId).toBeTruthy();
     expect(response.body.errors).toBeUndefined();
+    const serialized = JSON.stringify(response.body);
+    expect(serialized).not.toContain("/missing");
+    expect(serialized).not.toContain("oauth-code-abc123");
+    expect(serialized).not.toContain("secret-oauth-code");
   });
 
   it("exposes Retry-After to the cross-origin frontend (Phase 1B logout retry)", async () => {

@@ -1,8 +1,32 @@
+// Developer diagnostic: look up one Twilio message's delivery status by SID.
+//   node check-sms-status.mjs SM...
+// Reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN from ./.env next to this file. Credentials are
+// never printed. Exits non-zero on bad usage, missing credentials or a failed lookup.
 import { readFileSync } from "node:fs";
 import twilio from "twilio";
 
+const formatValue = (value) => (value instanceof Date ? value.toISOString() : String(value));
+const writeLine = (stream, label, ...values) => {
+  stream.write(`${[label, ...values.map(formatValue)].join(" ")}\n`);
+};
+const out = (label, ...values) => writeLine(process.stdout, label, ...values);
+const err = (label, ...values) => writeLine(process.stderr, label, ...values);
+
+const sid = process.argv[2];
+if (!sid) {
+  err("Usage: node check-sms-status.mjs SM...");
+  process.exit(1);
+}
+
 const envPath = new URL("./.env", import.meta.url);
-const raw = readFileSync(envPath, "utf8");
+let raw;
+try {
+  raw = readFileSync(envPath, "utf8");
+} catch {
+  err("FAILED");
+  err("Message:", "could not read .env next to check-sms-status.mjs");
+  process.exit(1);
+}
 const env = {};
 for (const line of raw.split("\n")) {
   const trimmed = line.trim();
@@ -14,10 +38,9 @@ for (const line of raw.split("\n")) {
 
 const accountSid = env.TWILIO_ACCOUNT_SID;
 const authToken = env.TWILIO_AUTH_TOKEN;
-
-const sid = process.argv[2];
-if (!sid) {
-  console.error("Usage: node check-sms-status.mjs SM...");
+if (!accountSid || !authToken) {
+  err("FAILED");
+  err("Message:", "TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set in .env");
   process.exit(1);
 }
 
@@ -25,18 +48,19 @@ const client = twilio(accountSid, authToken);
 
 try {
   const message = await client.messages(sid).fetch();
-  console.log("SID:", message.sid);
-  console.log("Status:", message.status);
-  console.log("To:", message.to);
-  console.log("From:", message.from);
-  console.log("MessagingServiceSid:", message.messagingServiceSid);
-  console.log("ErrorCode:", message.errorCode);
-  console.log("ErrorMessage:", message.errorMessage);
-  console.log("DateSent:", message.dateSent);
-  console.log("DateUpdated:", message.dateUpdated);
-  console.log("Price:", message.price, message.priceUnit);
+  out("SID:", message.sid);
+  out("Status:", message.status);
+  out("To:", message.to);
+  out("From:", message.from);
+  out("MessagingServiceSid:", message.messagingServiceSid);
+  out("ErrorCode:", message.errorCode);
+  out("ErrorMessage:", message.errorMessage);
+  out("DateSent:", message.dateSent);
+  out("DateUpdated:", message.dateUpdated);
+  out("Price:", message.price, message.priceUnit);
 } catch (error) {
-  console.error("FAILED");
-  console.error("Code:", error.code);
-  console.error("Message:", error.message);
+  err("FAILED");
+  err("Code:", error?.code);
+  err("Message:", error?.message);
+  process.exitCode = 1;
 }

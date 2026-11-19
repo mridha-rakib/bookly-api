@@ -98,10 +98,16 @@ describe("HTTP-level Business Owner Apple auth (GET start + POST callback + comp
     expect(String(ok.headers["set-cookie"] ?? "")).not.toMatch(/nonce/i);
   });
 
-  it("start redirects status=error (flow=professional) when not configured", async () => {
+  // Since 47b0eea (docs/STAGING-OPTIONAL-PROVIDERS.md) a disabled/unconfigured Apple flow is
+  // rejected with 503 by requireAppleOAuth before any session, state or provider work.
+  it("start is rejected with 503 APPLE_OAUTH_UNAVAILABLE (flow=professional) when not configured", async () => {
     isProfessionalAppleAuthConfigured.mockReturnValue(false);
     const res = await request(buildApp()).get(START);
-    expect(res.headers["location"]).toBe(`${FRONTEND_CB}?flow=professional&status=error`);
+    expect(res.status).toBe(503);
+    expect(res.body.errors).toEqual([expect.objectContaining({ code: "APPLE_OAUTH_UNAVAILABLE" })]);
+    expect(res.headers["location"]).toBeUndefined();
+    expect(res.headers["set-cookie"]).toBeUndefined();
+    expect(buildProfessionalAppleAuthUrl).not.toHaveBeenCalled();
   });
 
   it("CASE 1 — new owner: seeds PROFESSIONAL/APPLE RegistrationSession (no User); onboarding completes into User(authProviders=[APPLE]) + LinkedAccount(APPLE) + Business", async () => {

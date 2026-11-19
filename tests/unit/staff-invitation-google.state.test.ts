@@ -41,8 +41,13 @@ describe("staff invitation Google OAuth state", () => {
   it("rejects a token whose signature was tampered with", async () => {
     const good = await signStaffInvitationGoogleState({ nonce: "n", invitationId: VALID_ID });
     const parts = good.split(".");
-    const flipped = parts[2]?.slice(-1) === "A" ? "B" : "A";
-    parts[2] = `${parts[2]?.slice(0, -1)}${flipped}`;
+    // Change the FIRST signature character. The last base64url character of a 32-byte HS256
+    // signature carries padding bits, so swapping A<->B there can leave the decoded signature
+    // unchanged (a still-valid token, ~6% of iat values) — not a real tamper.
+    const signature = parts[2] ?? "";
+    const flipped = signature[0] === "A" ? "B" : "A";
+    parts[2] = `${flipped}${signature.slice(1)}`;
+    expect(parts.join(".")).not.toBe(good);
     await expect(verifyStaffInvitationGoogleState(parts.join("."))).rejects.toMatchObject({
       statusCode: 400,
     });
