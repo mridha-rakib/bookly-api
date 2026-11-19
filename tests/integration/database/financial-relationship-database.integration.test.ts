@@ -1990,6 +1990,253 @@ describe("P1 — universal customer↔business financial relationship + Financia
       expect(after.financialRelationship?.revision).toBe(consumed.financialRelationship?.revision);
     });
 
+    // --- Option A: generic recovery owns requires_action only under the expiry policy ----------
+
+    describe("Option A — requires_action recovery ownership (PAYMENT_AUTHENTICATION_MAX_AGE_MS)", () => {
+      // Below the 30-minute dedicated FIRST threshold, so the generic expiry branch is reachable.
+      const MAX_AGE_MS = 10 * 60_000;
+
+      const recoveryWithExpiry = (maximumAgeMs: number) =>
+        new MoneyRecoveryService(
+          paymentService,
+          paymentAttemptRepository,
+          refundOperationRepository,
+          bookingRepository,
+          financialTransactionService,
+          webhookService,
+          packageProgressRepository,
+          relationshipService,
+          undefined,
+          undefined,
+          undefined,
+          maximumAgeMs,
+        );
+
+      const ageAttempt = (attemptId: Types.ObjectId, ageMs: number) =>
+        PaymentAttemptModel.collection.updateOne(
+          { _id: attemptId },
+          { $set: { createdAt: new Date(Date.now() - ageMs) } },
+        );
+
+      /** A pre-P3 RETURNING requires_action attempt (see the RETURNING test above). */
+      const startReturningRequiresAction = async (tag: string) => {
+        const fixture = await setupFixture();
+        const { customer, client } = await createLinkedCustomer(fixture, tag);
+        confirmed(await finalizeNormal(fixture, customer._id, normalInput(fixture, "10:00")));
+        const consumed = await relationshipOf(client._id);
+        const idempotencyKey = `option-a-returning-${new Types.ObjectId().toString()}`;
+        paymentGateway.queueNextChargeOutcome("requires_action");
+        const result = await paymentService.chargeBookingDeposit({
+          userId: customer._id,
+          amountCents: 2_000,
+          idempotencyKey,
+          metadata: buildPaymentIntentMetadata({
+            bookingId: new Types.ObjectId().toString(),
+            businessId: String(fixture.business._id),
+            businessClientId: String(client._id),
+            purpose: "BOOKING_DEPOSIT",
+            preTaxChargeCents: 2_000,
+            taxCents: 0,
+            chargedAmountCents: 2_000,
+            taxMode: "PRE_ACTIVATION",
+            financialContract: {
+              version: 3,
+              classification: "RETURNING",
+              productKind: "NORMAL_BOOKING",
+            },
+          }),
+          financialContract: {
+            version: 3,
+            classification: "RETURNING",
+            productKind: "NORMAL_BOOKING",
+            businessClientId: client._id,
+          },
+        });
+        if (result.status !== "requires_action") throw new Error("expected requires_action");
+        const attempt = await PaymentAttemptModel.findOne({ logicalIdempotencyKey: idempotencyKey })
+          .orFail()
+          .exec();
+        expect(attempt.relationshipClassification).toBe("RETURNING");
+        return {
+          client,
+          attempt,
+          paymentIntentId: result.paymentIntentId,
+          consumedRevision: consumed.financialRelationship?.revision as number,
+        };
+      };
+
+      it("policy unset: repeated runs never read, cancel or settle an old RETURNING requires_action attempt", async () => {
+        const { client, attempt, paymentIntentId, consumedRevision } =
+          await startReturningRequiresAction("option-a-unset-returning");
+        await ageAttempt(attempt._id, 7 * 24 * 60 * 60_000);
+        const created = paymentGateway.createdPaymentIntentIds().length;
+
+        for (let run = 0; run < 3; run += 1) await recoveryService.runOnce();
+
+        expect(paymentGateway.retrievedPaymentIntentIds).not.toContain(paymentIntentId);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([]);
+        expect(await attemptOf(attempt._id)).toMatchObject({
+          providerStatus: "REQUIRES_ACTION",
+          persistenceStatus: "NOT_STARTED",
+          compensationStatus: "NOT_REQUIRED",
+        });
+        expect(paymentGateway.createdPaymentIntentIds()).toHaveLength(created);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        expect(await ledgerCount({ providerReference: paymentIntentId })).toBe(0);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(row.financialRelationship?.revision).toBe(consumedRevision);
+      });
+
+      it("policy unset: a stale bound FIRST claim is read only by the dedicated pass, once per back-off, never canceled or released", async () => {
+        const { client, attempt, paymentIntentId, revision } =
+          await startFirstRequiresAction("option-a-unset-first");
+        await makeStale(attempt._id);
+
+        for (let run = 0; run < 3; run += 1) await recoveryService.runOnce();
+
+        expect(paymentGateway.retrievedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([]);
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(row.financialRelationship?.revision).toBe(revision);
+        expect(await ledgerCount()).toBe(0);
+        expect(await BookingModel.countDocuments()).toBe(0);
+      });
+
+      it("policy configured: an attempt younger than the maximum age is not scanned generically", async () => {
+        const returning = await startReturningRequiresAction("option-a-young-returning");
+        await ageAttempt(returning.attempt._id, MAX_AGE_MS - 60_000);
+        const first = await startFirstRequiresAction("option-a-young-first");
+        await ageAttempt(first.attempt._id, MAX_AGE_MS - 60_000);
+        const recovery = recoveryWithExpiry(MAX_AGE_MS);
+
+        await recovery.runOnce();
+        await recovery.runOnce();
+
+        expect(paymentGateway.retrievedPaymentIntentIds).toEqual([]);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([]);
+        expect((await attemptOf(returning.attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+        expect((await attemptOf(first.attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+        const row = await relationshipOf(first.client._id);
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(row.financialRelationship?.revision).toBe(first.revision);
+      });
+
+      it("policy configured: an expired RETURNING attempt is canceled once, only after Stripe confirms requires_action, without touching the relationship or ledger", async () => {
+        const { client, attempt, paymentIntentId, consumedRevision } =
+          await startReturningRequiresAction("option-a-expired-returning");
+        await ageAttempt(attempt._id, MAX_AGE_MS + 60_000);
+        const created = paymentGateway.createdPaymentIntentIds().length;
+        const recovery = recoveryWithExpiry(MAX_AGE_MS);
+
+        await recovery.runOnce();
+
+        expect(paymentGateway.retrievedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("CANCELED");
+
+        // Repeated runs: CANCELED is terminal and never re-scanned, canceled or re-dispatched.
+        await recovery.runOnce();
+        await recovery.runOnce();
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect(paymentGateway.createdPaymentIntentIds()).toHaveLength(created);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+        expect(await ledgerCount({ providerReference: paymentIntentId })).toBe(0);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("CONSUMED");
+        expect(row.financialRelationship?.revision).toBe(consumedRevision);
+      });
+
+      it("policy configured: an expired bound FIRST claim is released exactly once, and only from Stripe's authoritative cancellation", async () => {
+        const { client, attempt, paymentIntentId, revision } =
+          await startFirstRequiresAction("option-a-expired-first");
+        await ageAttempt(attempt._id, MAX_AGE_MS + 60_000);
+        const recovery = recoveryWithExpiry(MAX_AGE_MS);
+
+        await recovery.runOnce();
+
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("CANCELED");
+        let row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(row.financialRelationship?.lastRelease).toMatchObject({
+          reason: "PROVIDER_CANCELED",
+          idempotencyKey: attempt.logicalIdempotencyKey,
+        });
+
+        await recovery.runOnce();
+        await webhookService.process(piEvent("payment_intent.canceled", attempt, paymentIntentId));
+        row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect(await ledgerCount()).toBe(0);
+        expect(await BookingModel.countDocuments()).toBe(0);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+      });
+
+      it("policy configured, race: authentication completes while the expiry cancel is in flight — success is recorded and nothing is canceled or released", async () => {
+        const { client, attempt, paymentIntentId, revision } =
+          await startFirstRequiresAction("option-a-race-success");
+        await ageAttempt(attempt._id, MAX_AGE_MS + 60_000);
+        const created = paymentGateway.createdPaymentIntentIds().length;
+        paymentGateway.onBeforeNextCancel(() =>
+          paymentGateway.succeedPaymentIntent(paymentIntentId),
+        );
+
+        await recoveryWithExpiry(MAX_AGE_MS).runOnce();
+
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("SUCCEEDED");
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(row.financialRelationship?.revision).toBe(revision);
+        expect(row.financialRelationship?.lastRelease?.idempotencyKey).not.toBe(
+          attempt.logicalIdempotencyKey,
+        );
+        expect(paymentGateway.createdPaymentIntentIds()).toHaveLength(created);
+        expect(paymentGateway.refundInputs).toHaveLength(0);
+      });
+
+      it("policy configured, race: a canceled webhook that wins leaves nothing for the worker to cancel or release again", async () => {
+        const { client, attempt, paymentIntentId, revision } =
+          await startFirstRequiresAction("option-a-race-webhook");
+        await ageAttempt(attempt._id, MAX_AGE_MS + 60_000);
+        paymentGateway.setPaymentIntentStatus(paymentIntentId, "canceled");
+        await webhookService.process(piEvent("payment_intent.canceled", attempt, paymentIntentId));
+
+        const recovery = recoveryWithExpiry(MAX_AGE_MS);
+        await recovery.runOnce();
+        await recovery.runOnce();
+
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([]);
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("ELIGIBLE");
+        expect(row.financialRelationship?.revision).toBe(revision + 1);
+        expect(await ledgerCount()).toBe(0);
+      });
+
+      it("policy configured: a FIRST attempt past the 30-minute threshold stays owned by the dedicated pass (read and backed off, never canceled)", async () => {
+        const { client, attempt, paymentIntentId, revision } = await startFirstRequiresAction(
+          "option-a-dedicated-first",
+        );
+        await makeStale(attempt._id);
+        const recovery = recoveryWithExpiry(MAX_AGE_MS);
+
+        await recovery.runOnce();
+        await recovery.runOnce();
+
+        expect(paymentGateway.retrievedPaymentIntentIds).toEqual([paymentIntentId]);
+        expect(paymentGateway.cancelRequestedPaymentIntentIds).toEqual([]);
+        expect((await attemptOf(attempt._id)).providerStatus).toBe("REQUIRES_ACTION");
+        const row = await relationshipOf(client._id);
+        expect(row.financialRelationship?.state).toBe("FIRST_PENDING");
+        expect(row.financialRelationship?.revision).toBe(revision);
+      });
+    });
+
     // --- P1.1.1 Gap 2: bound FIRST attempt with no recorded PaymentIntent ---------------------
 
     describe("P1.1.1 — bound FIRST attempt with no recorded PaymentIntent", () => {

@@ -111,7 +111,13 @@ export class MoneyRecoveryService {
     const staleExtras = await this.resolveStaleSessionExtrasUnsent(limit);
     errors += staleExtras.errors;
 
-    const attempts = await this.paymentAttemptRepository.listRecoverable(limit);
+    // P1.1 / Option A — requires_action is scanned generically ONLY under the explicitly
+    // configured authentication-expiry policy, and only once an attempt reached that age.
+    const authenticationExpiredBefore = this.authenticationExpiryCutoff();
+    const attempts = await this.paymentAttemptRepository.listRecoverable(
+      limit,
+      authenticationExpiredBefore ? { authenticationExpiredBefore } : {},
+    );
     for (const candidate of attempts) {
       try {
         if (hasLifecyclePaymentEvidence(candidate)) {
@@ -791,6 +797,16 @@ export class MoneyRecoveryService {
       }
     }
     return { reconciled, errors };
+  }
+
+  /** Creation-time cutoff for the configured expiry policy; undefined when the policy is unset,
+   * invalid, or the clock cannot establish one (then no requires_action is scanned). */
+  private authenticationExpiryCutoff(): Date | undefined {
+    const maximumAgeMs = this.authenticationMaximumAgeMs;
+    if (maximumAgeMs === undefined || !Number.isSafeInteger(maximumAgeMs) || maximumAgeMs <= 0)
+      return undefined;
+    const cutoff = Date.now() - maximumAgeMs;
+    return Number.isSafeInteger(cutoff) ? new Date(cutoff) : undefined;
   }
 
   private reconcileAuthentication(id: PaymentAttemptDocument["_id"]) {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { type ClientSession, Types } from "mongoose";
+import { type ClientSession, type QueryFilter, Types } from "mongoose";
 import { verifyPackageBatchActivation } from "../booking/package-batch-authority.js";
 import { isCanonicalRetainedBatch } from "../booking/package-batch-payment-recovery.js";
 import { PaymentError } from "./payment.errors.js";
@@ -466,29 +466,46 @@ export class PaymentAttemptRepository {
     ).exec();
   }
 
-  public async listRecoverable(limit: number): Promise<PaymentAttemptDocument[]> {
+  /**
+   * Generic recovery scan. `requires_action` is NOT generically recoverable (P1.1): FIRST charges
+   * have their dedicated stale pass and every other charge converges from Stripe webhooks. The
+   * only exception is the explicitly configured authentication-expiry policy
+   * (`PAYMENT_AUTHENTICATION_MAX_AGE_MS`): when `authenticationExpiredBefore` is given, non-penalty
+   * attempts created at or before it are included so the worker can re-read the original
+   * PaymentIntent and cancel it at Stripe only if Stripe still reports requires_action. Age alone
+   * never settles or releases anything.
+   */
+  public async listRecoverable(
+    limit: number,
+    options: { authenticationExpiredBefore?: Date } = {},
+  ): Promise<PaymentAttemptDocument[]> {
     const staleUnsentCutoff = new Date(Date.now() - 60_000);
+    const recoverable: QueryFilter<PaymentAttemptDocument>[] = [
+      { providerStatus: "NOT_CREATED", createdAt: { $lte: staleUnsentCutoff } },
+      { providerStatus: "UNKNOWN" },
+      { providerStatus: "PROCESSING" },
+      {
+        providerStatus: "SUCCEEDED",
+        persistenceStatus: { $in: ["NOT_STARTED", "PERSISTING", "FAILED"] },
+      },
+      {
+        compensationStatus: {
+          $in: ["REQUIRED", "REFUND_PENDING", "RECONCILIATION_REQUIRED"],
+        },
+      },
+    ];
+    if (options.authenticationExpiredBefore) {
+      // Off-session penalty authentication failures have their own convergence pass.
+      recoverable.push({
+        providerStatus: "REQUIRES_ACTION",
+        purpose: { $nin: PENALTY_PURPOSES },
+        createdAt: { $lte: options.authenticationExpiredBefore },
+      });
+    }
     return PaymentAttemptModel.find({
       $and: [
         { $or: [{ nextRecoveryAt: { $lte: new Date() } }, { nextRecoveryAt: { $exists: false } }] },
-        {
-          $or: [
-            { providerStatus: "NOT_CREATED", createdAt: { $lte: staleUnsentCutoff } },
-            { providerStatus: "UNKNOWN" },
-            { providerStatus: "PROCESSING" },
-            // Off-session penalty authentication failures have their own convergence pass.
-            { providerStatus: "REQUIRES_ACTION", purpose: { $nin: PENALTY_PURPOSES } },
-            {
-              providerStatus: "SUCCEEDED",
-              persistenceStatus: { $in: ["NOT_STARTED", "PERSISTING", "FAILED"] },
-            },
-            {
-              compensationStatus: {
-                $in: ["REQUIRED", "REFUND_PENDING", "RECONCILIATION_REQUIRED"],
-              },
-            },
-          ],
-        },
+        { $or: recoverable },
       ],
     })
       .sort({ updatedAt: 1 })

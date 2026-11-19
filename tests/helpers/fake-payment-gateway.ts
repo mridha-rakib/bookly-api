@@ -254,6 +254,32 @@ export class FakePaymentGateway implements PaymentGateway {
     return this.snapshotOf(paymentIntentId);
   }
 
+  /** Every PaymentIntent id `cancelPaymentIntent` was asked to cancel, in order. */
+  public cancelRequestedPaymentIntentIds: string[] = [];
+  private beforeNextCancel: (() => void) | undefined;
+
+  /** Test control: runs once just before the next cancel reaches the "provider" — e.g. the
+   * customer completes 3DS (`succeedPaymentIntent`) while the expiry cancel is in flight. */
+  public onBeforeNextCancel(hook: () => void): void {
+    this.beforeNextCancel = hook;
+  }
+
+  /** Mirrors Stripe: only a not-yet-settled PaymentIntent can be canceled; a succeeded or
+   * already-canceled one rejects the request and is left unchanged. */
+  public async cancelPaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot> {
+    this.cancelRequestedPaymentIntentIds.push(paymentIntentId);
+    const hook = this.beforeNextCancel;
+    this.beforeNextCancel = undefined;
+    hook?.();
+    const current = this.snapshotOf(paymentIntentId);
+    if (current.status === "succeeded" || current.status === "canceled")
+      throw new Error(
+        `You cannot cancel this PaymentIntent because it has a status of ${current.status} (test).`,
+      );
+    this.setPaymentIntentStatus(paymentIntentId, "canceled");
+    return this.snapshotOf(paymentIntentId);
+  }
+
   private snapshotOf(paymentIntentId: string): PaymentIntentSnapshot {
     const found = [...this.idempotentPaymentIntents.values()].find(
       (entry) => entry.paymentIntentId === paymentIntentId,
