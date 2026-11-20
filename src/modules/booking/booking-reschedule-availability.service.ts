@@ -114,6 +114,8 @@ export class BookingRescheduleAvailabilityService {
             booking.customerRescheduleCount >= MAX_CUSTOMER_RESCHEDULE_COUNT
           )
             throw new BookingError("BOOKING_RESCHEDULE_LIMIT_REACHED", 409);
+          if (actor.role === "CUSTOMER" && booking.schedule.startAt.getTime() <= Date.now())
+            throw new BookingError("BOOKING_ALREADY_STARTED", 409);
           if (business.timezone !== booking.schedule.timezone)
             throw new BookingError("BOOKING_SCHEDULING_CHANGED", 409);
           const lines: BookedAvailabilityLine[] = [];

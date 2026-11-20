@@ -338,7 +338,8 @@ export class BookingCreationService {
     // Optional (like BusinessService's own trailing optional deps) so the many existing
     // integration test suites that construct this service directly, without Google Calendar in
     // scope, don't all need updating just to pass a mock — see syncBookingCreatedToGoogleCalendar.
-    private readonly integrationService?: Pick<IntegrationService, "createEventForBooking">,
+    private readonly integrationService?: Pick<IntegrationService, "createEventForBooking"> &
+      Partial<Pick<IntegrationService, "deleteEventForBooking">>,
     // Optional trailing dep (same rationale). When absent, max-services falls back to the
     // structural Zod ceiling only and no noShowEligibilitySnapshot is written (legacy
     // behavior) — a safe no-op for the pre-existing test suites.
@@ -4005,9 +4006,15 @@ export class BookingCreationService {
     // call lands (e.g. a fast concurrent cancellation), leave it alone rather than resurrecting
     // a googleCalendarEventId onto a booking whose event may already be in the process of being
     // deleted by the cancellation path.
-    await this.bookingRepository.casUpdate(created.businessId, created._id, ["UPCOMING"], {
-      set: { googleCalendarEventId: eventId },
-    });
+    const linked = await this.bookingRepository.casUpdate(
+      created.businessId,
+      created._id,
+      ["UPCOMING"],
+      { set: { googleCalendarEventId: eventId } },
+    );
+    // The Booking left UPCOMING before the link landed, so its cancellation path saw no event
+    // to delete. Remove the event just created rather than orphaning it (best effort, never throws).
+    if (!linked) await this.integrationService.deleteEventForBooking?.(created.businessId, eventId);
   }
 
   /**

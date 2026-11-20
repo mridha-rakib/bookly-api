@@ -113,9 +113,17 @@ class FakeIntegrationService {
     this.appliedStartIso = schedule.startAt.toISOString();
   }
 
-  public async deleteEventForBooking(_businessId: unknown, eventId: string): Promise<void> {
+  /** Test control: the next delete reports that Google did not confirm removal. */
+  public failNextDelete = false;
+
+  public async deleteEventForBooking(_businessId: unknown, eventId: string): Promise<boolean> {
     this.deleteCalls.push(eventId);
+    if (this.failNextDelete) {
+      this.failNextDelete = false;
+      return false;
+    }
     this.appliedStartIso = null;
+    return true;
   }
 }
 
@@ -1878,6 +1886,156 @@ describe("database-backed Booking creation + lifecycle integration", () => {
           .lean(),
       ).toEqual(originalClaims);
       expect(await EmailOutboxModel.find({}).sort({ _id: 1 }).lean()).toEqual(originalOutbox);
+    });
+  });
+
+  // --- Booking-completion audit (2026-11-20) regressions -------------------------------------
+
+  describe("lifecycle timing guards and calendar delete outcomes", () => {
+    const linkCustomerTo = async (clientId: Types.ObjectId, bookingId: Types.ObjectId) => {
+      const customer = await userRepository.create({
+        normalizedEmail: `cust-guard-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      await clientRepository.setLinkState(clientId, {
+        linkState: "LINKED",
+        linkedUserId: customer._id,
+      });
+      await BookingModel.updateOne(
+        { _id: bookingId },
+        { $set: { "customer.customerUserId": customer._id } },
+      ).exec();
+      return customer;
+    };
+    const moveStart = (bookingId: Types.ObjectId, startAt: Date, endAt: Date) =>
+      BookingModel.updateOne(
+        { _id: bookingId },
+        { $set: { "schedule.startAt": startAt, "schedule.endAt": endAt } },
+      ).exec();
+
+    it("a Customer cannot reschedule an appointment that has already started; nothing changes", async () => {
+      const { booking, client } = await createUpcomingBooking("10:00");
+      const customer = await linkCustomerTo(client._id, booking._id);
+      const startedAt = new Date(Date.now() - 30 * 60_000);
+      await moveStart(booking._id, startedAt, new Date(startedAt.getTime() + 60 * 60_000));
+
+      await expect(
+        lifecycleService.rescheduleByCustomer(
+          String(customer._id),
+          String(booking._id),
+          startAtFor("13:00"),
+        ),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        details: [expect.objectContaining({ code: "BOOKING_ALREADY_STARTED" })],
+      });
+      const persisted = await BookingModel.findById(booking._id).orFail().lean();
+      expect(persisted.status).toBe("UPCOMING");
+      expect(persisted.schedule.startAt.getTime()).toBe(startedAt.getTime());
+      expect(persisted.customerRescheduleCount).toBe(0);
+    });
+
+    it("a future appointment is still reschedulable by its Customer", async () => {
+      const { booking, client } = await createUpcomingBooking("10:00");
+      const customer = await linkCustomerTo(client._id, booking._id);
+      const moved = await lifecycleService.rescheduleByCustomer(
+        String(customer._id),
+        String(booking._id),
+        startAtFor("13:00"),
+      );
+      expect(moved.schedule.startAt.toISOString()).toBe(startAtFor("13:00"));
+    });
+
+    it("cancellation unlinks the Google event only after the delete is confirmed", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await BookingModel.updateOne(
+        { _id: booking._id },
+        { $set: { googleCalendarEventId: "gcal-evt-confirmed" } },
+      ).exec();
+
+      await lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      );
+
+      expect(fakeIntegration.deleteCalls).toContain("gcal-evt-confirmed");
+      const persisted = await BookingModel.findById(booking._id).orFail().lean();
+      expect(persisted.googleCalendarEventId).toBeUndefined();
+    });
+
+    it("[race] an event created after the Booking was already cancelled is deleted, not orphaned", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      );
+      const calendar = {
+        createEventForBooking: vi.fn(async () => "gcal-evt-late"),
+        deleteEventForBooking: vi.fn(async () => true),
+      };
+      // Drive the post-commit tail exactly as it runs after the creation transaction, with the
+      // cancellation having landed first (its cancel path saw no event id to delete).
+      const tail = (
+        BookingCreationService.prototype as unknown as {
+          syncBookingCreatedToGoogleCalendar: (created: unknown) => Promise<void>;
+        }
+      ).syncBookingCreatedToGoogleCalendar;
+      await tail.call({ integrationService: calendar, bookingRepository }, booking);
+
+      expect(calendar.createEventForBooking).toHaveBeenCalledTimes(1);
+      expect(calendar.deleteEventForBooking).toHaveBeenCalledWith(business._id, "gcal-evt-late");
+      const persisted = await BookingModel.findById(booking._id).orFail().lean();
+      expect(persisted.status).toBe("CANCELLED_BY_BUSINESS");
+      expect(persisted.googleCalendarEventId).toBeUndefined();
+    });
+
+    it("a successful create on a still-UPCOMING Booking links the event and deletes nothing", async () => {
+      const { booking } = await createUpcomingBooking("11:00");
+      const calendar = {
+        createEventForBooking: vi.fn(async () => "gcal-evt-live"),
+        deleteEventForBooking: vi.fn(async () => true),
+      };
+      const tail = (
+        BookingCreationService.prototype as unknown as {
+          syncBookingCreatedToGoogleCalendar: (created: unknown) => Promise<void>;
+        }
+      ).syncBookingCreatedToGoogleCalendar;
+      await tail.call({ integrationService: calendar, bookingRepository }, booking);
+
+      expect(calendar.deleteEventForBooking).not.toHaveBeenCalled();
+      const persisted = await BookingModel.findById(booking._id).orFail().lean();
+      expect(persisted.googleCalendarEventId).toBe("gcal-evt-live");
+    });
+
+    it("a failed Google delete keeps the event link instead of orphaning the event", async () => {
+      const { owner, business, booking } = await createUpcomingBooking("10:00");
+      await BookingModel.updateOne(
+        { _id: booking._id },
+        { $set: { googleCalendarEventId: "gcal-evt-failed" } },
+      ).exec();
+      fakeIntegration.failNextDelete = true;
+
+      const cancelled = await lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(booking._id),
+        undefined,
+      );
+
+      expect(cancelled.status).toBe("CANCELLED_BY_BUSINESS");
+      expect(fakeIntegration.deleteCalls).toContain("gcal-evt-failed");
+      const persisted = await BookingModel.findById(booking._id).orFail().lean();
+      expect(persisted.status).toBe("CANCELLED_BY_BUSINESS");
+      expect(persisted.googleCalendarEventId).toBe("gcal-evt-failed");
     });
   });
 

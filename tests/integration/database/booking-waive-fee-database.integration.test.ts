@@ -1362,7 +1362,7 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
       createEventForBooking: vi.fn(
         async (..._args: unknown[]) => "legacy-event-1" as string | undefined,
       ),
-      deleteEventForBooking: vi.fn(async (..._args: unknown[]) => undefined),
+      deleteEventForBooking: vi.fn(async (..._args: unknown[]) => true),
       updateEventScheduleForBooking: vi.fn(async (..._args: unknown[]) => undefined),
     });
 

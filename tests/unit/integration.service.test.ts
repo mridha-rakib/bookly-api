@@ -624,10 +624,37 @@ describe("IntegrationService (Google Calendar)", () => {
       deleteGoogleCalendarEvent.mockRejectedValue(new Error("network error"));
       const service = new IntegrationService(integrationRepository, businessRepository);
 
+      // Never throws; reports that the event was NOT confirmed deleted so the caller keeps it.
       await expect(
         service.deleteEventForBooking(integration.businessId, "some-event-id"),
-      ).resolves.toBeUndefined();
+      ).resolves.toBe(false);
       expect(integrationRepository.markSyncError).toHaveBeenCalledTimes(1);
+    });
+
+    it("deleteEventForBooking reports success only when Google confirms the delete", async () => {
+      const { encryptSecret } = await import("../../src/modules/integration/integration.crypto.js");
+      const integration = buildIntegration({
+        encryptedAccessToken: encryptSecret("valid-access-token"),
+        encryptedRefreshToken: encryptSecret("valid-refresh-token"),
+      });
+      const integrationRepository = {
+        findByBusinessId: vi.fn().mockResolvedValue(integration),
+        markSyncError: vi.fn(),
+        markSyncSucceeded: vi.fn(),
+      } as unknown as IntegrationRepository;
+      deleteGoogleCalendarEvent.mockResolvedValue(undefined);
+      const service = new IntegrationService(integrationRepository, {} as BusinessRepository);
+      await expect(service.deleteEventForBooking(integration.businessId, "evt")).resolves.toBe(
+        true,
+      );
+
+      const noConnection = new IntegrationService(
+        { findByBusinessId: vi.fn().mockResolvedValue(null) } as unknown as IntegrationRepository,
+        {} as BusinessRepository,
+      );
+      await expect(noConnection.deleteEventForBooking(integration.businessId, "evt")).resolves.toBe(
+        false,
+      );
     });
 
     it("updateEventScheduleForBooking no-ops when the business has no Google Calendar connection", async () => {

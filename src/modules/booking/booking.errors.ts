@@ -56,6 +56,8 @@ const defaultMessages: Record<string, string> = {
   BOOKING_ALREADY_IN_TERMINAL_STATUS: "This booking has already reached a final status",
   BOOKING_RESCHEDULE_LIMIT_REACHED:
     "This booking has already been rescheduled the maximum number of times",
+  BOOKING_ALREADY_STARTED:
+    "This appointment has already started and can no longer be rescheduled online. Please contact the business.",
   BOOKING_NOT_OWNED_BY_CUSTOMER: "This booking does not belong to you",
   BOOKING_CANCELLATION_POLICY_NOT_AVAILABLE:
     "A cancellation policy was not on file for this booking at creation time",

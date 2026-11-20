@@ -187,7 +187,7 @@ async function lastBooking(venueId = h.seed.venue.id) {
 }
 async function cardAction(p: P4kPage, reference: string, action: string) {
   await p.evaluate(
-    `(() => { let node=Array.from(document.querySelectorAll('span')).find(e=>e.textContent===${JSON.stringify(reference)}); while(node) { const b=Array.from(node.querySelectorAll('button')).find(b=>b.textContent.trim()===${JSON.stringify(action)});if(b){b.click();return;}node=node.parentElement;} throw Error('No booking card action'); })()`,
+    `(() => { let node=Array.from(document.querySelectorAll('span')).find(e=>e.textContent===${JSON.stringify(reference)}||e.textContent===${JSON.stringify(`Ref: ${reference}`)}); while(node) { const b=Array.from(node.querySelectorAll('button')).find(b=>b.textContent.trim()===${JSON.stringify(action)});if(b){b.click();return;}node=node.parentElement;} throw Error('No booking card action'); })()`,
   );
 }
 async function openOwnerBooking(booking: { reference: string }) {
@@ -205,18 +205,26 @@ async function openOwnerBooking(booking: { reference: string }) {
     120000,
   );
 }
+/** Selects a Business calendar view through its view menu toggle (not the date-nav "Today"). */
+async function calendarView(mode: "Today" | "Weekly" | "Monthly") {
+  const toggle = "document.querySelector('button[data-calendar-view-toggle]')";
+  const isMode = `${toggle}.textContent.trim()===${JSON.stringify(mode)}`;
+  const menuItem = `Array.from(${toggle}.parentElement.querySelectorAll('div button')).find(b=>b.textContent.trim()===${JSON.stringify(mode)})`;
+  await ownerPage.waitFor(toggle, 180000);
+  await ownerPage.evaluate(
+    `(() => { if (${isMode}) return; const t=${toggle}; if (t.getAttribute('aria-expanded')!=='true') t.click(); })()`,
+  );
+  await ownerPage.waitFor(`${isMode} || Boolean(${menuItem})`);
+  await ownerPage.evaluate(`(() => { if (${isMode}) return; ${menuItem}.click(); })()`);
+  await ownerPage.waitFor(isMode);
+}
 async function calendarRead(
   booking: { reference: string; schedule: { startAt: Date; timezone: string } },
   serviceName: string,
   artifact: string,
 ) {
   await ownerPage.goto(`${h.uiOrigin}/business-dashboard?section=calendar`);
-  await ownerPage.waitFor(
-    "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.includes('Weekly'))",
-    180000,
-  );
-  await ownerPage.click("Weekly");
-  await ownerPage.click("Monthly");
+  await calendarView("Monthly");
   const dateNumber = new Intl.DateTimeFormat("en-US", {
     timeZone: booking.schedule.timezone,
     day: "numeric",
@@ -227,11 +235,7 @@ async function calendarRead(
   await ownerPage.evaluate(
     `Array.from(document.querySelectorAll('span')).filter(e=>e.textContent.trim()===${JSON.stringify(dateNumber)}).at(-1).parentElement.parentElement.click()`,
   );
-  await ownerPage.waitFor(
-    "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.includes('Today'))",
-  );
-  await ownerPage.click("Today");
-  await ownerPage.click("Weekly");
+  await calendarView("Weekly");
   await ownerPage.waitFor(
     `Array.from(document.querySelectorAll('div')).some(d=>d.textContent===${JSON.stringify(serviceName)})`,
     120000,
@@ -290,12 +294,17 @@ async function redeemUi(extra = false, drop = false, travel = false) {
       "document.querySelector('[aria-label=\"Add Synthetic scalp treatment\"]').click()",
     );
   }
+  // The step's Continue stays disabled until its own reads settle; wait instead of racing it.
+  const continueReady =
+    "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.trim()==='Continue'&&!b.disabled)";
+  await page.waitFor(continueReady);
   await page.click("Continue");
   if (travel) await travelUi(true);
   await page.waitFor("document.body.innerText.includes('Select Professional')");
   await page.evaluate(
     "Array.from(document.querySelectorAll('h4')).find(e=>e.textContent==='No Preference').parentElement.parentElement.parentElement.click()",
   );
+  await page.waitFor(continueReady);
   await page.click("Continue");
   // Travel appointments consume setup/transfer time. Use a mid-day slot rather than one near
   // closing, where the UI's broad slot list can exceed the travel-buffer rules.
@@ -1451,18 +1460,14 @@ describe.skipIf(!artifacts || !clientRoot)("BC-F06 real Next booking integration
           "professional",
           "/business-dashboard?section=calendar",
         );
-        await ownerPage.waitFor(
-          "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.includes('Weekly'))",
-          180000,
-        );
-        await ownerPage.click("Weekly");
-        await ownerPage.click("Today");
+        await calendarView("Today");
         await ownerPage.waitFor(
           "document.querySelector('h4') && document.body.innerText.includes('Hair')",
           180000,
         );
+        // Open THIS journey's 10:00 AM upcoming appointment (other Customer A cards share the day).
         await ownerPage.evaluate(
-          "Array.from(document.querySelectorAll('h4')).find(e=>e.textContent.includes('Customer A')).closest('div.absolute').click()",
+          "Array.from(document.querySelectorAll('h4')).filter(e=>e.textContent.includes('Customer A')).map(e=>e.closest('div.absolute')).find(c=>c && c.innerText.includes('10:00 AM') && c.innerText.includes('Upcoming')).click()",
         );
         await ownerPage.click("No-show");
         await ownerPage.waitFor("document.body.innerText.includes('Internal note')");
@@ -1677,5 +1682,108 @@ describe.skipIf(!artifacts || !clientRoot)("BC-F06 real Next booking integration
         await page.screenshot("C4-travel.png");
       }),
     360000,
+  );
+  // 2026-11-20 completion audit: re-opening the wizard after a confirmation must start a NEW
+  // logical booking. Before the fix it reused the spent key and the server replayed the
+  // previous booking as a "new" confirmation, so no second booking was ever created.
+  it(
+    "A9 Book now after a confirmation creates a second booking and never replays the first",
+    () =>
+      journey("A9", async () => {
+        const venue = h.seed.venue.id;
+        // The synthetic clock was rewound by C4-travel, so createdAt ordering cannot identify
+        // this journey's bookings; use the exact set difference of persisted ids instead.
+        const ids = async () =>
+          new Set(
+            (await BookingModel.find({ businessId: venue }).select("_id").lean()).map((b) =>
+              String(b._id),
+            ),
+          );
+        const newOne = async (before: Set<string>) => {
+          const added = [...(await ids())].filter((id) => !before.has(id));
+          expect(added).toHaveLength(1);
+          return BookingModel.findById(added[0]).orFail();
+        };
+        const initial = await ids();
+        await checkout(String(h.seed.venue.services.facial));
+        const first = await newOne(initial);
+        const afterFirst = await ids();
+        const before = afterFirst.size;
+        const intentsBefore = harnessGateway.createdPaymentIntentIds().length;
+
+        await page.click("Back to Explore");
+        // The selection survives; the checkout summary offers to continue it.
+        await page.waitFor(
+          "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.trim()==='Continue →')",
+        );
+        await page.click("Continue →");
+        await page.waitFor("document.body.innerText.includes('Add-ons')");
+        await page.click("Continue →");
+        await page.waitFor("document.body.innerText.includes('Select Professional')");
+        await page.evaluate(
+          "Array.from(document.querySelectorAll('h4')).find(e=>e.textContent==='No Preference').parentElement.parentElement.parentElement.click()",
+        );
+        await page.click("Continue →");
+        await chooseTime(page, true, true);
+        await page.click("Continue →");
+        await page.waitFor(
+          "Array.from(document.querySelectorAll('button')).some(b=>b.textContent.trim()==='Confirm' && !b.disabled)",
+          120000,
+        );
+        await page.click("Confirm");
+        await page.waitFor("document.body.innerText.includes('Booking Confirmed!')", 120000);
+
+        const second = await newOne(afterFirst);
+        expect(String(second._id)).not.toBe(String(first._id));
+        expect(await BookingModel.countDocuments({ businessId: venue })).toBe(before + 1);
+        expect(second.schedule.startAt.getTime()).not.toBe(first.schedule.startAt.getTime());
+        const text = await page.text();
+        expect(text).toContain(second.reference);
+        expect(text).not.toContain(first.reference);
+        // Both are RETURNING (€0 online): re-booking moved no money.
+        expect(second.financialContract?.classification).toBe("RETURNING");
+        expect(harnessGateway.createdPaymentIntentIds()).toHaveLength(intentsBefore);
+        await page.screenshot("A9-second-confirmed.png");
+      }),
+    300000,
+  );
+  // 2026-11-20: the same real checkout and cancellation at a phone-sized viewport (390px).
+  it(
+    "M1 mobile viewport checkout, history and cancellation through the real UI",
+    () =>
+      journey("M1", async () => {
+        const venue = h.seed.venue.id;
+        const known = new Set(
+          (await BookingModel.find({ businessId: venue }).select("_id").lean()).map((b) =>
+            String(b._id),
+          ),
+        );
+        // Switches the emulated device to a 390px mobile viewport for the rest of the journey.
+        await page.screenshot("M1-mobile-start.png", 390);
+        try {
+          expect(await page.evaluate<number>("window.innerWidth")).toBeLessThan(600);
+          await checkout(String(h.seed.venue.services.hair));
+          await page.screenshot("M1-mobile-confirmed.png", 390);
+          const added = (await BookingModel.find({ businessId: venue }).select("_id").lean())
+            .map((b) => String(b._id))
+            .filter((id) => !known.has(id));
+          expect(added).toHaveLength(1);
+          const b = await BookingModel.findById(added[0]).orFail();
+          expect(b.status).toBe("UPCOMING");
+          expect(b.financialContract?.classification).toBe("RETURNING");
+
+          await page.goto(`${h.uiOrigin}/customer/bookings`);
+          await page.waitFor(`document.body.innerText.includes(${JSON.stringify(b.reference)})`);
+          await page.screenshot("M1-mobile-history.png", 390);
+          await cardAction(page, b.reference, "Cancel");
+          await page.click("Yes, cancel");
+          await page.waitFor("document.body.innerText.includes('Cancellation Confirmed')");
+          expect((await BookingModel.findById(b._id))?.status).toBe("CANCELLED_BY_CUSTOMER");
+          await page.screenshot("M1-mobile-cancelled.png", 390);
+        } finally {
+          await page.screenshot("M1-desktop-restored.png", 1280);
+        }
+      }),
+    300000,
   );
 });

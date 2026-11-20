@@ -344,10 +344,13 @@ export class BookingLifecycleService {
     )
       return;
 
-    await this.integrationService.deleteEventForBooking(
+    const deleted = await this.integrationService.deleteEventForBooking(
       booking.businessId,
       booking.googleCalendarEventId,
     );
+    // Keep the only link to the event when Google did not confirm the delete, so it is never
+    // silently orphaned (it remains visible on the cancelled Booking for a later cleanup).
+    if (deleted === false) return;
     await this.bookingRepository.casUpdate(booking.businessId, booking._id, [booking.status], {
       unset: { googleCalendarEventId: "" },
     });
@@ -2308,6 +2311,11 @@ export class BookingLifecycleService {
 
     if (booking.customerRescheduleCount >= MAX_CUSTOMER_RESCHEDULE_COUNT) {
       throw new BookingError("BOOKING_RESCHEDULE_LIMIT_REACHED", 409);
+    }
+    // A started appointment is no longer movable by the Customer: otherwise rescheduling after
+    // the start would sidestep the business's no-show window. The business can still move it.
+    if (booking.schedule.startAt.getTime() <= Date.now()) {
+      throw new BookingError("BOOKING_ALREADY_STARTED", 409);
     }
 
     const business = await this.businessRepository.findById(booking.businessId);

@@ -336,23 +336,28 @@ export class IntegrationService {
     }
   }
 
-  /** Deletes a previously-synced event. Never throws — see createEventForBooking. */
+  /** Deletes a previously-synced event. Never throws — see createEventForBooking. Resolves `true`
+   * only when Google confirmed the event is gone (deleted now, or already 404/410); `false` when
+   * nothing could be deleted (no usable connection or a provider failure), so the caller keeps
+   * its link to the event instead of orphaning it. */
   public async deleteEventForBooking(
     businessId: Types.ObjectId | string,
     googleCalendarEventId: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const integration = await this.integrationRepository.findByBusinessId(businessId);
 
     if (!integration || integration.status === "RECONNECT_REQUIRED") {
-      return;
+      return false;
     }
 
     try {
       const accessToken = await this.getValidAccessToken(integration);
       await deleteGoogleCalendarEvent(accessToken, integration.calendarId, googleCalendarEventId);
       await this.recordSyncSuccess(businessId, integration);
+      return true;
     } catch (error) {
       await this.recordSyncFailure(businessId, error);
+      return false;
     }
   }
 
