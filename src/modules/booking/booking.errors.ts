@@ -32,6 +32,10 @@ const defaultMessages: Record<string, string> = {
   BOOKING_RANGE_TOO_WIDE: "The requested date range is too wide",
   BOOKING_NO_SERVICE_LINES: "A booking must include at least one service line",
   BOOKING_TOO_MANY_SERVICE_LINES: "This booking has more services than the platform allows",
+  BOOKING_COMPLETION_TOO_EARLY:
+    "This appointment has not started yet. It can be completed from its scheduled start time",
+  BOOKING_NO_SHOW_BEFORE_START:
+    "This appointment has not started yet. A no-show can only be recorded after its scheduled start time",
   BOOKING_NO_SHOW_WINDOW_NOT_OPEN:
     "The no-show window for this booking's category has not opened yet",
   BOOKING_NO_SHOW_WINDOW_CLOSED:

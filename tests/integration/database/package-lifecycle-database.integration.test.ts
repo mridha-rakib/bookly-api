@@ -410,9 +410,31 @@ describe("S5 internal first-class lifecycle", () => {
     const r = await t.business(t.intent("CANCEL", { bookingId: t.first._id }));
     expect(r?.booking?.status).toBe("CANCELLED_BY_BUSINESS");
   });
+  it("Fix #5 early First-Class completion is refused before any operation, credit or booking change", async () => {
+    const t = await fixture();
+    const progressBefore = (
+      await PackageProgressV2Model.findById(t.progress._id).orFail()
+    ).toObject();
+    const operationsBefore = await PackageLifecycleOperationModel.countDocuments();
+    t.advance(new Date(t.first.schedule.startAt.getTime() - 1));
+    const req = t.intent("COMPLETE", { bookingId: t.first._id });
+    await expect(t.business(req)).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("has not started yet"),
+    });
+    expect(await PackageLifecycleOperationModel.countDocuments()).toBe(operationsBefore);
+    expect((await PackageProgressV2Model.findById(t.progress._id).orFail()).toObject()).toEqual(
+      progressBefore,
+    );
+    expect((await BookingModel.findById(t.first._id))?.status).toBe("UPCOMING");
+    t.advance(t.first.schedule.startAt);
+    const done = await t.business(req);
+    expect(done?.booking?.status).toBe("COMPLETED");
+  });
   it("S5-35/36 completion resolves Scheduled to Completed once and keeps occupancy", async () => {
     const t = await fixture();
     const old = await BookingSlotReservationModel.find().lean();
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const req = t.intent("COMPLETE", { bookingId: t.first._id });
     const r = await t.business(req);
     await t.business(req);
@@ -724,6 +746,7 @@ describe("S5 internal first-class lifecycle", () => {
   });
   it("S5-39 conflicting completion and cancellation resolve at most one terminal attempt", async () => {
     const t = await fixture();
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const r = await Promise.allSettled([
       t.business(t.intent("COMPLETE", { bookingId: t.first._id })),
       t.customer(t.intent("CANCEL", { bookingId: t.first._id })),
@@ -957,6 +980,7 @@ describe("S5 internal first-class lifecycle", () => {
     const t = await fixture({ group: true });
     const redeemed = await t.customer(t.redeem());
     await t.customer(t.intent("CANCEL", { bookingId: t.first._id }));
+    t.advance(must(t.full.bookings[1]).schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     await t.business(t.intent("COMPLETE", { bookingId: must(t.full.bookings[1])._id }));
     const r = await t.customer(t.intent("CANCEL", { bookingId: must(redeemed?.booking)._id }));
     const p = must(r?.progress);
@@ -1025,6 +1049,7 @@ describe("S5 internal first-class lifecycle", () => {
   });
   it("S5F1 venue NOT_PAID and completion alone never unlock an unpaid origin", async () => {
     const t = await fixture({ bundlePriceCents: 1000 });
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const completed = await t.business(
       t.intent("COMPLETE", { bookingId: t.first._id, venuePayment: { settlement: "NOT_PAID" } }),
     );
@@ -1076,6 +1101,7 @@ describe("S5 internal first-class lifecycle", () => {
     vi.spyOn(BookingFinancialTransactionService.prototype, "record").mockRejectedValueOnce(
       Error("injected ledger abort"),
     );
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     await expect(
       t.business(
         t.intent("COMPLETE", { bookingId: t.first._id, venuePayment: { settlement: "FULL" } }),
@@ -1434,6 +1460,7 @@ describe("S5 internal first-class lifecycle", () => {
   });
   it("S5F1 missing existing Calendar id stays blocked without dispatch while committed owner email is durable", async () => {
     const t = await fixture();
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const request = t.intent("COMPLETE", { bookingId: t.first._id });
     await t.business(request);
     const op = await PackageLifecycleOperationModel.findOne({ "intent.key": request.key }).orFail();
@@ -2728,6 +2755,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
         h.owner,
       )
       .expect(200);
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const body = h.body(t.intent("COMPLETE", { bookingId: t.first._id }));
     await h.post("complete", body, h.owner).expect(200);
     await h.post("complete", body, h.owner).expect(200);
@@ -3331,6 +3359,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
       const t = await fixture(),
         h = await surface(t),
         s = await managementSupervisor(t);
+      t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
       const request = t.intent("COMPLETE", { bookingId: t.first._id });
       await h.post("complete", h.body(request), s.authorization).expect(200);
       const after = await managementEffects(t.progress._id);
@@ -3371,6 +3400,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
   it("package transaction rechecks deactivation that commits after shared entry authorization", async () => {
     const t = await fixture(),
       s = await managementSupervisor(t);
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const request = t.intent("COMPLETE", { bookingId: t.first._id });
     const before = (await PackageProgressV2Model.findById(t.progress._id).orFail()).toObject();
     const original = PackageLifecycleOperations.prototype.claim;
@@ -3402,6 +3432,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
   it("P4K-5 Owner completion: complete-status returns the committed result read-only", async () => {
     const t = await fixture(),
       h = await surface(t);
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const body = h.body(t.intent("COMPLETE", { bookingId: t.first._id }));
     const committed = (await h.post("complete", body, h.owner).expect(200)).body.data;
     const after = await managementEffects(t.progress._id);
@@ -3417,6 +3448,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
     const t = await fixture(),
       h = await surface(t),
       request = t.intent("COMPLETE", { bookingId: t.first._id });
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     const committed = await t.business(request);
     const before = await managementEffects(t.progress._id);
     expect(
@@ -3475,6 +3507,7 @@ describe("P2D actual lifecycle HTTP composition on synthetic purchases", () => {
     const t = await fixture(),
       h = await surface(t),
       request = t.intent("COMPLETE", { bookingId: t.first._id });
+    t.advance(t.first.schedule.startAt); // Fix #5: completion is allowed from the scheduled start
     vi.spyOn(PackageLifecycleOperations.prototype, "complete").mockRejectedValueOnce(
       Object.assign(Error("unknown"), { errorLabels: ["UnknownTransactionCommitResult"] }),
     );

@@ -84,6 +84,7 @@ import type { StripeWebhookService } from "../../../src/modules/stripe-webhook/s
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
+import { startScheduledAppointmentsBeforeLifecycleActions } from "../../helpers/appointment-start.js";
 import { FakePaymentGateway } from "../../helpers/fake-payment-gateway.js";
 import { FakeTaxGateway } from "../../helpers/fake-tax-gateway.js";
 import {
@@ -91,6 +92,9 @@ import {
   connectIsolatedDatabase,
   stopIsolatedReplicaSet,
 } from "./mongo-replset-helper.js";
+
+// Fix #5 fixture: far-future appointments are started before completion / legacy no-show.
+startScheduledAppointmentsBeforeLifecycleActions();
 
 const TIMEZONE = "Europe/Nicosia";
 const DATE = "2030-08-20"; // a Tuesday, safely in the future relative to any real "now"

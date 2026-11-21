@@ -1,5 +1,12 @@
 import { Types } from "mongoose";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  startAppointment,
+  startScheduledAppointmentsBeforeLifecycleActions,
+} from "../../helpers/appointment-start.js";
+
+// Fix #5 fixture: far-future appointments are started before completion / legacy no-show.
+startScheduledAppointmentsBeforeLifecycleActions();
 
 // P4B-2A/2C — both ordinary Calendar rollout authorities are default-denied; only tests toggle them.
 const calendarAuthority = vi.hoisted(() => ({ enabled: false, delivery: false }));
@@ -689,7 +696,14 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
         finalizeInput(f.service._id, f.membership._id),
       );
       if (result.status !== "confirmed") throw Error("confirmed fixture required");
-      return { ...f, booking: result.booking };
+      // Fix #5: completion requires a started appointment; start it before any test snapshot.
+      await startAppointment(result.booking._id);
+      return {
+        ...f,
+        booking: (await BookingModel.findById(
+          result.booking._id,
+        ).orFail()) as typeof result.booking,
+      };
     };
     const venueEntries = async (id: Types.ObjectId) =>
       (await financialTransactionService.listForBooking(id)).filter(
@@ -881,6 +895,8 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
             expect(update.extraFilter).toEqual({
               "financials.balanceDueCents": 8000,
               completionPayment: null,
+              // Fix #5: completion also guards the start time it was admitted against.
+              "schedule.startAt": expect.any(Date),
             });
             await BookingModel.updateOne(
               { _id: id },
@@ -1027,6 +1043,8 @@ describe("database-backed Booking Waive Fee + completion venue-payment integrati
           expect(update.extraFilter).toEqual({
             "financials.balanceDueCents": 8000,
             completionPayment: null,
+            // Fix #5: completion also guards the start time it was admitted against.
+            "schedule.startAt": expect.any(Date),
           });
           // Deterministic persistence seam: move the stored balance after service validation,
           // inside its transaction, then exercise the real CAS predicate and rollback.

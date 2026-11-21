@@ -30,6 +30,7 @@ import { PaymentAttemptRepository } from "../payment/payment-attempt.repository.
 import { ServiceModel } from "../services/service.model.js";
 import { StaffMembershipModel } from "../staff/staff.model.js";
 import { UserModel, UserProfileModel } from "../user/user.model.js";
+import { BookingError } from "./booking.errors.js";
 import { type BookingDocument, BookingModel } from "./booking.model.js";
 import { BookingRepository } from "./booking.repository.js";
 import type { BookingService } from "./booking.service.js";
@@ -201,6 +202,19 @@ export class PackageLifecycleService {
       actorRole,
       String(request.businessId),
     );
+    // Fix #5 — refuse an early completion before any lifecycle operation is prepared, so no
+    // operation, credit or payment state is created. Re-checked inside the transaction below.
+    if (request.action === "COMPLETE" && request.bookingId) {
+      const target = await BookingModel.findOne(
+        { _id: request.bookingId, businessId: request.businessId },
+        { status: 1, schedule: 1 },
+      );
+      if (
+        target?.status === "UPCOMING" &&
+        this.clock().getTime() < target.schedule.startAt.getTime()
+      )
+        throw new BookingError("BOOKING_COMPLETION_TOO_EARLY", 409);
+    }
     return this.#execute(
       lifecycleIntentSchema.parse({
         ...request,
@@ -851,7 +865,11 @@ export class PackageLifecycleService {
                 now.getTime() + NO_SHOW_RESOLUTION_WINDOW_MINUTES * 60000,
               );
             } else if (intent.action === "COMPLETE") {
-              if (intent.actorRole === "CUSTOMER" || booking.status !== "UPCOMING")
+              if (
+                intent.actorRole === "CUSTOMER" ||
+                booking.status !== "UPCOMING" ||
+                now.getTime() < booking.schedule.startAt.getTime()
+              )
                 throw batchConflict();
               booking.status = "COMPLETED";
               await credits.resolveWithResult(scope, booking._id, "COMPLETED", session);

@@ -416,6 +416,12 @@ export class BookingLifecycleService {
       throw new BookingError("BOOKING_COMPLETION_PAYMENT_ALREADY_RECORDED", 409);
     }
     const now = new Date();
+    // Fix #5 — an appointment can never be completed (or have its venue payment attested
+    // through completion) before its authoritative scheduled start. Server clock only; the start
+    // boundary itself is allowed. No end-time wait is imposed.
+    if (now.getTime() < booking.schedule.startAt.getTime()) {
+      throw new BookingError("BOOKING_COMPLETION_TOO_EARLY", 409);
+    }
 
     const event: BookingEventHistoryEntry = {
       type: "STATUS_CHANGED",
@@ -494,6 +500,8 @@ export class BookingLifecycleService {
               // no record). A racing record insertion loses CAS before any ledger write.
               completionPayment: null,
               "financials.balanceDueCents": booking.financials.balanceDueCents,
+              // A concurrent reschedule must not let a completion through on the old start time.
+              "schedule.startAt": booking.schedule.startAt,
             },
           },
           dbSession,
@@ -1768,6 +1776,10 @@ export class BookingLifecycleService {
       if (nowMs >= closesAtMs) {
         throw new BookingError("BOOKING_NO_SHOW_WINDOW_CLOSED", 409);
       }
+    } else if (now.getTime() < booking.schedule.startAt.getTime()) {
+      // Fix #5 — legacy bookings (no category window) gain only a minimum boundary: never before
+      // the scheduled start. No grace period or maximum window is invented for them.
+      throw new BookingError("BOOKING_NO_SHOW_BEFORE_START", 409);
     }
 
     // The 90-minute resolution timer begins NOW (the confirmation/mark instant), never at
@@ -1780,6 +1792,8 @@ export class BookingLifecycleService {
       ["UPCOMING"],
       {
         set: { status: "PENDING", noShowStartedAt: now, noShowDeadlineAt: deadline },
+        // The eligibility decision above used this start time; a concurrent reschedule loses.
+        extraFilter: { "schedule.startAt": booking.schedule.startAt },
         pushEvent: {
           type: "STATUS_CHANGED",
           previousStatus: "UPCOMING",
