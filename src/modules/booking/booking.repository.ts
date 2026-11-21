@@ -596,6 +596,38 @@ export class BookingRepository {
   }
 
   /**
+   * Fix #8 — Book Again. The distinct Businesses behind this Customer's matching history: bounded
+   * by how many Businesses the Customer ever booked, never by history length. Served by the
+   * sparse `{customer.customerUserId, schedule.startAt}` index.
+   */
+  public async distinctBusinessIdsForCustomer(
+    customerUserId: Types.ObjectId | string,
+    filter: Pick<BookingListFilter, "status" | "source">,
+  ): Promise<Types.ObjectId[]> {
+    const query = this.buildListQuery({ "customer.customerUserId": customerUserId, ...filter });
+    return BookingModel.distinct("businessId", query).exec() as Promise<Types.ObjectId[]>;
+  }
+
+  /**
+   * Fix #8 — Book Again page restricted, IN THE QUERY, to the given (visible) Businesses and to
+   * Bookings that have a primary service line, so `total`, skip and limit all count exactly the
+   * candidates the Customer can see. Same sort and pagination as `listForCustomer`.
+   */
+  public async listForCustomerInBusinesses(
+    customerUserId: Types.ObjectId | string,
+    filter: Pick<BookingListFilter, "status" | "source">,
+    businessIds: Types.ObjectId[],
+    pagination: BookingListPagination,
+  ): Promise<BookingListResult> {
+    const query = {
+      ...this.buildListQuery({ "customer.customerUserId": customerUserId, ...filter }),
+      businessId: { $in: businessIds },
+      "serviceLines.0": { $exists: true },
+    };
+    return this.runPaginatedQuery(query, pagination);
+  }
+
+  /**
    * Account-closure guard — does this Customer have any still-active booking dated in the
    * future? "Active" = UPCOMING or PENDING (the non-terminal statuses); COMPLETED / NO_SHOW_* /
    * CANCELLED_* / LATE_CANCELLATION never block. Served by the sparse

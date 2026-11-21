@@ -36,18 +36,37 @@ export class BookAgainService {
     customerUserId: string,
     pagination: BookingListPagination,
   ): Promise<BookAgainListResult> {
-    const { bookings, total } = await this.bookingRepository.listForCustomer(
+    // Fix #8 — visibility is decided BEFORE pagination. Previously the page was selected first
+    // and hidden Businesses were dropped afterwards, so `total` counted invisible history and
+    // pages came back short or empty. Now: the Customer's distinct Businesses -> the visible ones
+    // (one read, reused below so a page can never disagree with the visibility it was built on)
+    // -> one indexed, server-side paginated query restricted to them.
+    const eligibility = { status: ["COMPLETED"], source: ["BOOKLY_MANAGED"] } as const;
+    const candidateBusinessIds = await this.bookingRepository.distinctBusinessIdsForCustomer(
       customerUserId,
-      { status: ["COMPLETED"], source: ["BOOKLY_MANAGED"] },
+      { status: [...eligibility.status], source: [...eligibility.source] },
+    );
+    const visibleBusinesses = (
+      candidateBusinessIds.length
+        ? await this.businessRepository.findManyByIds(candidateBusinessIds.map(String))
+        : []
+    ).filter((business) => PUBLICLY_VISIBLE_STATUSES.has(business.status));
+    const businessById = new Map(visibleBusinesses.map((b) => [String(b._id), b]));
+    if (businessById.size === 0) {
+      return {
+        candidates: [],
+        pagination: { page: pagination.page, limit: pagination.limit, total: 0 },
+      };
+    }
+    const { bookings, total } = await this.bookingRepository.listForCustomerInBusinesses(
+      customerUserId,
+      { status: [...eligibility.status], source: [...eligibility.source] },
+      visibleBusinesses.map((business) => business._id),
       pagination,
     );
 
     const businessIds = [...new Set(bookings.map((b) => String(b.businessId)))];
-    const [businesses, profileMedia] = await Promise.all([
-      this.businessRepository.findManyByIds(businessIds),
-      this.businessMediaRepository.listProfileByBusinessIds(businessIds),
-    ]);
-    const businessById = new Map(businesses.map((b) => [String(b._id), b]));
+    const profileMedia = await this.businessMediaRepository.listProfileByBusinessIds(businessIds);
     const imageUrlByBusinessId = new Map(
       await Promise.all(
         profileMedia.map(async (media) => {

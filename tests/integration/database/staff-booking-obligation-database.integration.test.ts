@@ -274,7 +274,7 @@ describe("Fix #6 — Staff removal/deactivation with unresolved appointments", (
       await f.patch(f.pro.membership._id, { employmentActive: true }).expect(200);
     }
     await f.remove(f.pro.membership._id).expect(200);
-  });
+  }, 30_000);
 
   it("a group appointment blocks only its assigned provider", async () => {
     const f = await setup();

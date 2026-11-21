@@ -5,6 +5,7 @@ import { AddonRepository } from "../../../src/modules/addons/addon.repository.js
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
 import { BookAgainService } from "../../../src/modules/booking/book-again.service.js";
+import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
@@ -14,6 +15,7 @@ import { BookingFinancialTransactionRepository } from "../../../src/modules/book
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationRepository } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.repository.js";
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
+import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
@@ -604,5 +606,150 @@ describe("database-backed Book Again domain (Batch 16)", () => {
     const stillThere = await bookingRepository.findByIdForCustomer(booking._id, customer._id);
     expect(stillThere?.status).toBe("COMPLETED");
     expect(stillThere?.financials.totalCents).toBe(booking.financials.totalCents);
+  });
+
+  // --- Fix #8: visibility is applied before pagination -----------------------------------------
+
+  describe("Fix #8 — filtered pagination", () => {
+    type Visibility = "APPROVED" | "WARNING" | "PENDING" | "SUSPENDED" | "MISSING";
+    const at = (hoursAgo: number) => new Date(Date.UTC(2026, 0, 31, 12) - hoursAgo * 3_600_000);
+
+    /**
+     * One real completed booking, then deterministic copies (distinct start instants, newest
+     * first = index 0) spread over Businesses in every visibility state. Returns the expected
+     * visible booking ids in the service's own order (schedule.startAt desc, _id desc).
+     */
+    const history = async (customerId: Types.ObjectId, plan: Visibility[]) => {
+      const seed = await createCompletedBooking(customerId, "Seed Salon");
+      const template = (await BookingModel.findById(seed.booking._id).orFail().lean()) as Record<
+        string,
+        unknown
+      >;
+      const businessFor = new Map<Visibility, Types.ObjectId>();
+      for (const state of ["APPROVED", "WARNING", "PENDING", "SUSPENDED"] as const) {
+        const { business } = await createBusiness(`${state} Salon`);
+        if (state !== "APPROVED")
+          await BusinessModel.updateOne({ _id: business._id }, { $set: { status: state } }).exec();
+        businessFor.set(state, business._id);
+      }
+      businessFor.set("MISSING", new Types.ObjectId());
+      await BookingModel.deleteOne({ _id: seed.booking._id }).exec();
+      const docs = plan.map((state, index) => {
+        const startAt = at(index);
+        return {
+          ...template,
+          _id: new Types.ObjectId(),
+          reference: `BK-F8${new Types.ObjectId().toHexString().slice(-8).toUpperCase()}${index}`,
+          businessId: businessFor.get(state),
+          schedule: {
+            ...(template["schedule"] as object),
+            startAt,
+            endAt: new Date(startAt.getTime() + 3_600_000),
+          },
+        };
+      });
+      await BookingModel.collection.insertMany(docs);
+      const visible = docs
+        .filter((_, index) => plan[index] === "APPROVED" || plan[index] === "WARNING")
+        .map((doc) => String(doc._id));
+      return { visible, businessFor, docs };
+    };
+    const pageIds = async (customerId: Types.ObjectId, page: number, limit: number) => {
+      const result = await bookAgainService.listCandidates(String(customerId), { page, limit });
+      return {
+        ids: result.candidates.map((c) => c.originalBookingId),
+        total: result.pagination.total,
+      };
+    };
+
+    it("all-visible history paginates contiguously with an exact total", async () => {
+      const customer = await createCustomer("f8-all");
+      const { visible } = await history(customer._id, Array(7).fill("APPROVED"));
+      const pages = [
+        await pageIds(customer._id, 1, 3),
+        await pageIds(customer._id, 2, 3),
+        await pageIds(customer._id, 3, 3),
+      ];
+      expect(pages.map((p) => p.total)).toEqual([7, 7, 7]);
+      expect(pages.map((p) => p.ids.length)).toEqual([3, 3, 1]);
+      expect(pages.flatMap((p) => p.ids)).toEqual(visible);
+    });
+
+    it("mixed APPROVED/WARNING/PENDING/SUSPENDED/missing: total counts only visible, pages fill and never skip or repeat", async () => {
+      const customer = await createCustomer("f8-mixed");
+      const plan: Visibility[] = [
+        "PENDING",
+        "APPROVED",
+        "SUSPENDED",
+        "WARNING",
+        "MISSING",
+        "APPROVED",
+        "PENDING",
+        "APPROVED",
+        "WARNING",
+        "SUSPENDED",
+        "APPROVED",
+        "MISSING",
+        "WARNING",
+      ];
+      const { visible } = await history(customer._id, plan);
+      expect(visible).toHaveLength(7);
+      const limit = 3;
+      const pages = [];
+      for (let page = 1; page <= 3; page += 1) pages.push(await pageIds(customer._id, page, limit));
+      expect(pages.map((p) => p.total)).toEqual([7, 7, 7]);
+      expect(pages.map((p) => p.ids.length)).toEqual([3, 3, 1]); // the first page is full
+      const all = pages.flatMap((p) => p.ids);
+      expect(all).toEqual(visible); // contiguous, newest first, no gaps
+      expect(new Set(all).size).toBe(all.length); // no duplicates
+      // Several completed visits to the SAME Business stay separate candidates.
+      const candidates = await bookAgainService.listCandidates(String(customer._id), {
+        page: 1,
+        limit: 50,
+      });
+      expect(new Set(candidates.candidates.map((c) => c.businessId)).size).toBe(2);
+      expect(candidates.candidates).toHaveLength(7);
+      // Beyond the last page: empty, but the total stays truthful (no artificial pages).
+      expect(await pageIds(customer._id, 4, limit)).toEqual({ ids: [], total: 7 });
+    });
+
+    it("a Business becoming hidden between page requests re-paginates the remaining visible history", async () => {
+      const customer = await createCustomer("f8-change");
+      const { visible, businessFor, docs } = await history(customer._id, [
+        "APPROVED",
+        "WARNING",
+        "APPROVED",
+        "WARNING",
+        "APPROVED",
+        "WARNING",
+      ]);
+      const first = await pageIds(customer._id, 1, 2);
+      expect(first).toEqual({ ids: visible.slice(0, 2), total: 6 });
+      await BusinessModel.updateOne(
+        { _id: businessFor.get("WARNING") as Types.ObjectId },
+        { $set: { status: "SUSPENDED" } },
+      ).exec();
+      const approvedOnly = docs
+        .filter((d) => String(d.businessId) === String(businessFor.get("APPROVED")))
+        .map((d) => String(d._id));
+      expect(await pageIds(customer._id, 1, 2)).toEqual({
+        ids: approvedOnly.slice(0, 2),
+        total: 3,
+      });
+      expect(await pageIds(customer._id, 2, 2)).toEqual({ ids: approvedOnly.slice(2), total: 3 });
+      await BusinessModel.updateOne(
+        { _id: businessFor.get("APPROVED") as Types.ObjectId },
+        { $set: { status: "PENDING" } },
+      ).exec();
+      expect(await pageIds(customer._id, 1, 2)).toEqual({ ids: [], total: 0 });
+    });
+
+    it("another Customer's history never contributes candidates or to the total", async () => {
+      const customer = await createCustomer("f8-mine");
+      const other = await createCustomer("f8-other");
+      await history(other._id, ["APPROVED", "APPROVED", "WARNING"]);
+      const { visible } = await history(customer._id, ["APPROVED", "PENDING"]);
+      expect(await pageIds(customer._id, 1, 10)).toEqual({ ids: visible, total: 1 });
+    });
   });
 });
