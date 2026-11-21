@@ -88,6 +88,7 @@ import {
   packagePurchaseBodySchema,
   packagePurchaseFinalizeBodySchema,
   packageRedemptionPreviewBodySchema,
+  recordLegacyPackageBalanceBodySchema,
   redeemPackageSessionBodySchema,
   rescheduleAvailabilityQuerySchema,
   rescheduleBookingBodySchema,
@@ -101,6 +102,7 @@ import { BookingLifecycleService } from "./booking-lifecycle.service.js";
 import { BookingRecoveryInbox } from "./booking-recovery-inbox.js";
 import { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
 import { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
+import { LegacyPackageBalanceService } from "./legacy-package-balance.service.js";
 import { OrdinaryCalendarJournal } from "./ordinary-calendar-journal.js";
 import { createPenaltyCollectionService } from "./penalty-collection.factory.js";
 
@@ -275,6 +277,7 @@ const buildController = (): BookingController => {
     new BookingRescheduleAvailabilityService(bookingService, availabilityService),
     new CustomerFinancialOutcomeRead(),
     new BookingRecoveryInbox(creationService),
+    new LegacyPackageBalanceService(bookingService, financialTransactionService),
   );
 };
 
@@ -568,6 +571,27 @@ export const createBusinessBookingRoute = (): Router => {
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
     validateRequest({ params: packageProgressBusinessParamsSchema }),
     asyncHandler(controller.getPackageForBusiness),
+  );
+  // Fix #3 — Owner-only Legacy Package purchase balance (read + record a real venue payment
+  // independently of the origin appointment's lifecycle). See LegacyPackageBalanceService.
+  router.get(
+    "/:businessId/bookings/packages/:packageProgressId/balance",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER"]),
+    validateRequest({ params: packageProgressBusinessParamsSchema }),
+    asyncHandler(controller.getLegacyPackageBalance),
+  );
+  router.post(
+    "/:businessId/bookings/packages/:packageProgressId/balance-payments",
+    authenticate,
+    requireActiveUser(),
+    requireRoles(["BUSINESS_OWNER"]),
+    validateRequest({
+      params: packageProgressBusinessParamsSchema,
+      body: recordLegacyPackageBalanceBodySchema,
+    }),
+    asyncHandler(controller.recordLegacyPackageBalance),
   );
   router.post(
     "/:businessId/bookings/packages/:packageProgressId/cancel-future",

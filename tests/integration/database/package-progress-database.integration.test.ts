@@ -20,6 +20,7 @@ import { BookingCreationService } from "../../../src/modules/booking/booking-cre
 import { BookingCreationClaimRepository } from "../../../src/modules/booking/booking-creation-claim.repository.js";
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
 import { BookingRescheduleAvailabilityService } from "../../../src/modules/booking/booking-reschedule-availability.service.js";
+import { LegacyPackageBalanceService } from "../../../src/modules/booking/legacy-package-balance.service.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -1926,6 +1927,450 @@ describe("database-backed Package Deal integration", () => {
   });
 
   // --- Redemption ------------------------------------------------------------------------------
+
+  // --- Fix #3: Legacy Package purchase balance after session 1 leaves UPCOMING -----------------
+
+  describe("Fix #3 — Legacy Package purchase balance recorder", () => {
+    const balanceService = () =>
+      new LegacyPackageBalanceService(bookingService, financialTransactionService);
+    type Fixture = Awaited<ReturnType<typeof setUpPurchasedPackage>>;
+    const view = (f: Pick<Fixture, "owner" | "business" | "progress">) =>
+      balanceService().getBalance(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.progress._id),
+      );
+    const record = (
+      f: Pick<Fixture, "owner" | "business" | "progress">,
+      body: {
+        settlement: "FULL" | "PARTIAL";
+        amountCents?: number;
+        expectedOutstandingCents: number;
+        idempotencyKey?: string;
+        note?: string;
+      },
+    ) =>
+      balanceService().recordPayment(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.progress._id),
+        { idempotencyKey: `bal-${new Types.ObjectId()}`, ...body },
+      );
+    const redeem = (f: Fixture) =>
+      creationService.redeemPackageSession(
+        String(f.customer._id),
+        String(f.business._id),
+        String(f.progress._id),
+        redeemInput(f.staff[0]!.membership._id),
+      );
+    const balanceRows = (bookingId: Types.ObjectId) =>
+      BookingFinancialTransactionModel.find({
+        bookingId,
+        type: "PAYMENT",
+        "metadata.legacyPackageBalance": true,
+      }).lean();
+    const cancelOriginOnTime = async (f: Fixture) =>
+      lifecycleService.cancelByCustomer(String(f.customer._id), String(f.purchase._id), undefined);
+
+    it("reproduction: before recording, a cancelled session 1 leaves completion and redemption closed", async () => {
+      const f = await setUpPurchasedPackage();
+      await cancelOriginOnTime(f);
+      await expect(
+        lifecycleService.completeBooking(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.purchase._id),
+          { settlement: "FULL" },
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      await expect(redeem(f)).rejects.toMatchObject({ statusCode: 409 });
+      const detail = await getPackageDetail(f.customer._id, f.progress._id);
+      expect(detail).toMatchObject({
+        status: "AWAITING_BALANCE",
+        outstandingBalanceCents: 41_500,
+        remainingSessions: 5,
+        balancePaymentRecorded: false,
+      });
+      expect(await view(f)).toMatchObject({
+        originBookingStatus: "CANCELLED_BY_CUSTOMER",
+        originalBalanceCents: 41_500,
+        paidCents: 0,
+        outstandingCents: 41_500,
+        settlementStatus: "NOT_RECORDED",
+        recordable: true,
+        payments: [],
+      });
+    });
+
+    it("FIRST: partial payment keeps scheduling locked; full settlement unlocks; session 1 stays cancelled", async () => {
+      const f = await setUpPurchasedPackage();
+      expect(f.purchase.financialContract?.classification).toBe("FIRST");
+      await cancelOriginOnTime(f);
+
+      const partial = await record(f, {
+        settlement: "PARTIAL",
+        amountCents: 10_000,
+        expectedOutstandingCents: 41_500,
+        note: "Cash at desk",
+      });
+      expect(partial).toMatchObject({
+        paidCents: 10_000,
+        outstandingCents: 31_500,
+        settlementStatus: "PARTIALLY_PAID",
+        balanceSettled: false,
+        recordable: true,
+      });
+      await expect(redeem(f)).rejects.toMatchObject({ statusCode: 409 });
+      expect((await getPackageDetail(f.customer._id, f.progress._id)).status).toBe(
+        "AWAITING_BALANCE",
+      );
+
+      const full = await record(f, { settlement: "FULL", expectedOutstandingCents: 31_500 });
+      expect(full).toMatchObject({
+        paidCents: 41_500,
+        outstandingCents: 0,
+        settlementStatus: "PAID_IN_FULL",
+        balanceSettled: true,
+        recordable: false,
+        blockedReason: "SETTLED",
+      });
+      expect(full.payments.map((p) => [p.amountCents, p.source])).toEqual([
+        [10_000, "BALANCE_RECORDING"],
+        [31_500, "BALANCE_RECORDING"],
+      ]);
+
+      const origin = await BookingModel.findById(f.purchase._id).orFail().lean();
+      expect(origin.status).toBe("CANCELLED_BY_CUSTOMER");
+      expect(origin.completionPayment).toMatchObject({ paid: true, amountCents: 41_500 });
+      expect(
+        origin.eventHistory.filter((event) => event.type === "VENUE_PAYMENT_RECORDED"),
+      ).toHaveLength(2);
+      const rows = await balanceRows(f.purchase._id);
+      expect(rows.map((row) => row.amountCents).sort()).toEqual([10_000, 31_500]);
+      expect(rows.every((row) => row.status === "SUCCEEDED" && row.direction === "DEBIT")).toBe(
+        true,
+      );
+      // No provider call was made: the only PaymentIntent is the original purchase deposit.
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+
+      const detail = await getPackageDetail(f.customer._id, f.progress._id);
+      expect(detail).toMatchObject({
+        status: "ACTIVE",
+        balanceSettled: true,
+        balancePaymentRecorded: true,
+      });
+      const session = await redeem(f);
+      expect(session.status).toBe("confirmed");
+      const after = await PackageProgressModel.findById(f.progress._id).orFail().lean();
+      expect(after.remainingSessions).toBe(4);
+      expect((await BookingModel.findById(f.purchase._id).orFail().lean()).status).toBe(
+        "CANCELLED_BY_CUSTOMER",
+      );
+    });
+
+    it("RETURNING: a zero-upfront package's whole bundle balance is recordable after session 1 is cancelled", async () => {
+      const f = await setUpPurchasedPackage();
+      const nextInput = purchaseInput(f.service._id, f.staff[0]!.membership._id, DATE_2);
+      const second = await creationService.finalizePackagePurchase(
+        String(f.customer._id),
+        String(f.business._id),
+        nextInput,
+      );
+      if (second.status !== "confirmed") throw Error("expected RETURNING purchase");
+      expect(second.booking.financialContract?.classification).toBe("RETURNING");
+      const progress = await PackageProgressModel.findOne({ originBookingId: second.booking._id })
+        .orFail()
+        .exec();
+      const g = { ...f, purchase: second.booking, progress };
+      await cancelOriginOnTime(g);
+      const before = await view(g);
+      expect(before).toMatchObject({ originalBalanceCents: 45_000, outstandingCents: 45_000 });
+      await record(g, { settlement: "FULL", expectedOutstandingCents: 45_000 });
+      expect((await redeem(g)).status).toBe("confirmed");
+      // The first package's own balance is untouched by recording the second's.
+      expect((await view(f)).outstandingCents).toBe(41_500);
+    });
+
+    it("a forfeited (no-show) session 1 keeps its forfeit; recording unlocks only the remaining sessions", async () => {
+      const f = await setUpPurchasedPackage();
+      await lifecycleService.markNoShow(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.purchase._id),
+      );
+      const resolved = await lifecycleService.waiveFee(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.purchase._id),
+        "Package purchase session",
+        undefined,
+      );
+      expect(resolved.status).toBe("NO_SHOW_WAIVED");
+      await record(f, { settlement: "FULL", expectedOutstandingCents: 41_500 });
+      const after = await PackageProgressModel.findById(f.progress._id).orFail().lean();
+      expect(after.remainingSessions).toBe(4);
+      expect(after.sessions[0]?.status).toBe("FORFEITED");
+      expect((await redeem(f)).status).toBe("confirmed");
+      expect((await BookingModel.findById(f.purchase._id).orFail().lean()).status).toBe(
+        "NO_SHOW_WAIVED",
+      );
+    });
+
+    it("a COMPLETED session 1 with a PARTIAL attestation can be topped up to unlock", async () => {
+      const f = await setUpPurchasedPackage();
+      await lifecycleService.completeBooking(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.purchase._id),
+        { settlement: "PARTIAL", amountCents: 1_500 },
+      );
+      expect(await view(f)).toMatchObject({ paidCents: 1_500, outstandingCents: 40_000 });
+      const settled = await record(f, { settlement: "FULL", expectedOutstandingCents: 40_000 });
+      expect(settled.payments.map((p) => [p.amountCents, p.source])).toEqual([
+        [1_500, "COMPLETION"],
+        [40_000, "BALANCE_RECORDING"],
+      ]);
+      expect((await redeem(f)).status).toBe("confirmed");
+    });
+
+    it("a same-key retry is a replay, never a second payment; stale and over-limit requests are refused", async () => {
+      const f = await setUpPurchasedPackage();
+      await cancelOriginOnTime(f);
+      const body = {
+        settlement: "PARTIAL" as const,
+        amountCents: 5_000,
+        expectedOutstandingCents: 41_500,
+        idempotencyKey: "lost-response-key",
+      };
+      await record(f, body);
+      const replay = await record(f, body);
+      expect(replay).toMatchObject({ paidCents: 5_000, outstandingCents: 36_500 });
+      expect(await balanceRows(f.purchase._id)).toHaveLength(1);
+      await expect(record(f, { ...body, amountCents: 6_000 })).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining("different payment"),
+      });
+      await expect(
+        record(f, { settlement: "PARTIAL", amountCents: 5_000, expectedOutstandingCents: 41_500 }),
+      ).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining("changed") });
+      for (const amountCents of [0, 36_500, 50_000]) {
+        await expect(
+          record(f, { settlement: "PARTIAL", amountCents, expectedOutstandingCents: 36_500 }),
+        ).rejects.toMatchObject({ statusCode: 400 });
+      }
+      await record(f, { settlement: "FULL", expectedOutstandingCents: 36_500 });
+      await expect(
+        record(f, { settlement: "FULL", expectedOutstandingCents: 0 }),
+      ).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining("already") });
+      const rows = await balanceRows(f.purchase._id);
+      expect(rows.reduce((sum, row) => sum + row.amountCents, 0)).toBe(41_500);
+    });
+
+    it("concurrent recordings (distinct and identical keys) never double-count", async () => {
+      const f = await setUpPurchasedPackage();
+      await cancelOriginOnTime(f);
+      const results = await Promise.allSettled([
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500 }),
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500 }),
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500, idempotencyKey: "same" }),
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500, idempotencyKey: "same" }),
+      ]);
+      expect(results.some((result) => result.status === "fulfilled")).toBe(true);
+      const rows = await balanceRows(f.purchase._id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.amountCents).toBe(41_500);
+      const origin = await BookingModel.findById(f.purchase._id).orFail().lean();
+      expect(origin.completionPayment?.amountCents).toBe(41_500);
+      expect(
+        origin.eventHistory.filter((event) => event.type === "VENUE_PAYMENT_RECORDED"),
+      ).toHaveLength(1);
+    });
+
+    it("an UPCOMING session 1 stays with the ordinary completion flow", async () => {
+      const f = await setUpPurchasedPackage();
+      expect(await view(f)).toMatchObject({
+        recordable: false,
+        blockedReason: "ORIGIN_NOT_FINAL",
+      });
+      await expect(
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500 }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await balanceRows(f.purchase._id)).toHaveLength(0);
+      await settleOriginBalance(f.owner, f.business, f.purchase._id);
+      expect((await redeem(f)).status).toBe("confirmed");
+    });
+
+    it("a voided package is never reactivated, and a paid-at-venue package is never void-refunded", async () => {
+      const voided = await setUpPurchasedPackage();
+      await cancelOriginOnTime(voided);
+      await lifecycleService.voidUnusedPackage(
+        String(voided.customer._id),
+        String(voided.business._id),
+        String(voided.progress._id),
+        undefined,
+      );
+      expect(await view(voided)).toMatchObject({
+        recordable: false,
+        blockedReason: "PACKAGE_VOIDED",
+      });
+      await expect(
+        record(voided, { settlement: "FULL", expectedOutstandingCents: 41_500 }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await balanceRows(voided.purchase._id)).toHaveLength(0);
+      expect((await getPackageDetail(voided.customer._id, voided.progress._id)).status).toBe(
+        "VOIDED",
+      );
+
+      const paid = await setUpPurchasedPackage();
+      await cancelOriginOnTime(paid);
+      await record(paid, {
+        settlement: "PARTIAL",
+        amountCents: 1_000,
+        expectedOutstandingCents: 41_500,
+      });
+      const refundsBefore = await BookingFinancialTransactionModel.countDocuments({
+        type: "REFUND",
+      });
+      await expect(
+        lifecycleService.voidUnusedPackage(
+          String(paid.customer._id),
+          String(paid.business._id),
+          String(paid.progress._id),
+          undefined,
+        ),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await BookingFinancialTransactionModel.countDocuments({ type: "REFUND" })).toBe(
+        refundsBefore,
+      );
+      expect(
+        (await PackageProgressModel.findById(paid.progress._id).orFail().lean()).voidedAt,
+      ).toBeUndefined();
+    });
+
+    it("a Business-cancelled session 1 whose deposit was refunded is isolated for an Owner decision", async () => {
+      const f = await setUpPurchasedPackage();
+      const cancelled = await lifecycleService.cancelByBusiness(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.purchase._id),
+        undefined,
+      );
+      expect(cancelled.cancellationOutcome?.refundOwedCents).toBeGreaterThan(0);
+      expect(await view(f)).toMatchObject({
+        recordable: false,
+        blockedReason: "UPFRONT_REVERSED",
+        outstandingCents: 41_500,
+      });
+      await expect(
+        record(f, { settlement: "FULL", expectedOutstandingCents: 41_500 }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(await balanceRows(f.purchase._id)).toHaveLength(0);
+      await expect(redeem(f)).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("HTTP: Owner-only; unrelated, cross-business, Supervisor, Staff and Customer callers are denied", async () => {
+      const f = await setUpPurchasedPackage();
+      await cancelOriginOnTime(f);
+      const other = await setUpPurchasedPackage();
+      const supervisor = await userRepository.create({
+        normalizedEmail: `fix3-supervisor-${new Types.ObjectId()}@example.com`,
+        passwordHash: "hash",
+        role: "SUPERVISOR",
+        status: "ACTIVE",
+      });
+      await staffRepository.create({
+        userId: supervisor._id,
+        businessId: f.business._id,
+        role: "SUPERVISOR",
+        createdByUserId: f.owner._id,
+      });
+      const app = express();
+      app.use(express.json());
+      app.use("/businesses", createBusinessBookingRoute());
+      app.use(createErrorHandler({ isProduction: true }));
+      const tokens = new TokenService(new SessionRepository());
+      const bearer = async (
+        userId: Types.ObjectId,
+        role: "SUPERVISOR" | "BUSINESS_OWNER" | "CUSTOMER" | "STAFF",
+      ) => `Bearer ${await issueTestAccessToken(tokens, { userId, role })}`;
+      const path = `/businesses/${f.business._id}/bookings/packages/${f.progress._id}`;
+      const body = { settlement: "FULL", expectedOutstandingCents: 41_500, idempotencyKey: "h1" };
+      const ownerAuth = await bearer(f.owner._id, "BUSINESS_OWNER");
+
+      const read = await request(app).get(`${path}/balance`).set("Authorization", ownerAuth);
+      expect(read.status).toBe(200);
+      expect(read.headers["cache-control"]).toBe("private, no-store");
+      expect(read.body.data).toMatchObject({ outstandingCents: 41_500, recordable: true });
+
+      const denied = [
+        [await bearer(other.owner._id, "BUSINESS_OWNER"), path, 404],
+        [
+          await bearer(other.owner._id, "BUSINESS_OWNER"),
+          `/businesses/${other.business._id}/bookings/packages/${f.progress._id}`,
+          404,
+        ],
+        [ownerAuth, `/businesses/${f.business._id}/bookings/packages/${other.progress._id}`, 404],
+        [ownerAuth, `/businesses/${f.business._id}/bookings/packages/${new Types.ObjectId()}`, 404],
+        [await bearer(supervisor._id, "SUPERVISOR"), path, 403],
+        [await bearer(f.staff[0]!.user._id, "STAFF"), path, 403],
+        [await bearer(f.customer._id, "CUSTOMER"), path, 403],
+      ] as const;
+      for (const [auth, target, status] of denied) {
+        expect(
+          (await request(app).get(`${target}/balance`).set("Authorization", auth)).status,
+        ).toBe(status);
+        expect(
+          (
+            await request(app)
+              .post(`${target}/balance-payments`)
+              .set("Authorization", auth)
+              .send(body)
+          ).status,
+        ).toBe(status);
+      }
+      expect(
+        (
+          await request(app)
+            .post(`${path}/balance-payments`)
+            .set("Authorization", ownerAuth)
+            .send({ ...body, amountCents: 100 })
+        ).status,
+      ).toBe(400);
+      expect(
+        await BookingFinancialTransactionModel.countDocuments({
+          "metadata.legacyPackageBalance": true,
+        }),
+      ).toBe(0);
+
+      const ok = await request(app)
+        .post(`${path}/balance-payments`)
+        .set("Authorization", ownerAuth)
+        .send(body);
+      expect(ok.status).toBe(200);
+      expect(ok.body.data).toMatchObject({ balanceSettled: true, outstandingCents: 0 });
+      expect((await view(other)).outstandingCents).toBe(41_500);
+    });
+
+    it("historical packages remain readable and gain no stored field", async () => {
+      const f = await setUpSettledPackage();
+      const detail = await getPackageDetail(f.customer._id, f.progress._id);
+      expect(detail).toMatchObject({ status: "ACTIVE", balancePaymentRecorded: true });
+      const raw = await PackageProgressModel.findById(f.progress._id).lean();
+      expect(raw).not.toHaveProperty("balancePaymentRecorded");
+      expect(await view(f)).toMatchObject({
+        balanceSettled: true,
+        blockedReason: "SETTLED",
+        payments: [{ amountCents: 41_500, source: "COMPLETION" }],
+      });
+    });
+  });
 
   describe("Package session redemption", () => {
     it("is blocked until the origin purchase's venue balance is settled (approved unlock rule)", async () => {

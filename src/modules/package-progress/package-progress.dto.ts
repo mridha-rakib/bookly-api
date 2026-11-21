@@ -97,6 +97,9 @@ export type PackageProgressDto = {
   balanceSettled: boolean;
   outstandingBalanceCents: number | null;
   settlementAvailable: boolean;
+  /** Fix #3 — true once any real venue payment is recorded against the purchase balance (the
+   * unused-package refund is then refused). Derived from the origin Booking, never stored. */
+  balancePaymentRecorded: boolean;
   sessions: PackageProgressSessionDto[];
   originBookingId: string;
   purchaseSnapshot: {
@@ -147,6 +150,7 @@ export const toPackageProgressDto = (
     balanceSettled: settlement.balanceSettled,
     outstandingBalanceCents: settlement.outstandingBalanceCents,
     settlementAvailable: settlement.outstandingBalanceCents !== null,
+    balancePaymentRecorded: originBooking?.completionPayment?.paid === true,
     // Session indices are intentionally not unique across cancellation/rebooking attempts: a
     // restored entitlement can be claimed again as the same logical session number. Preserve
     // all Booking history, ordered deterministically by logical index then persisted session

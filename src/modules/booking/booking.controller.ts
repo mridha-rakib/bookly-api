@@ -27,6 +27,7 @@ import type {
   PackagePurchaseBody,
   PackagePurchaseFinalizeBody,
   PackageRedemptionPreviewBody,
+  RecordLegacyPackageBalanceBody,
   RedeemPackageSessionBody,
   RescheduleAvailabilityQuery,
   RescheduleBookingBody,
@@ -45,6 +46,7 @@ import type { BookingLifecycleService } from "./booking-lifecycle.service.js";
 import type { BookingRecoveryInbox } from "./booking-recovery-inbox.js";
 import type { BookingRescheduleAvailabilityService } from "./booking-reschedule-availability.service.js";
 import type { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
+import type { LegacyPackageBalanceService } from "./legacy-package-balance.service.js";
 
 export class BookingController {
   public readLegacyPackageOperation = async (
@@ -103,6 +105,7 @@ export class BookingController {
     private readonly rescheduleAvailability?: BookingRescheduleAvailabilityService,
     private readonly financialOutcomeRead?: CustomerFinancialOutcomeRead,
     private readonly recoveryInbox?: BookingRecoveryInbox,
+    private readonly legacyPackageBalance?: LegacyPackageBalanceService,
   ) {}
 
   // --- Business-side ------------------------------------------------------------------------
@@ -526,6 +529,7 @@ export class BookingController {
         balanceSettled,
         outstandingBalanceCents,
         settlementAvailable,
+        balancePaymentRecorded,
         voidRefundSettlement,
         purchaseSnapshot,
         fulfilmentEntitlement,
@@ -574,6 +578,41 @@ export class BookingController {
         },
       );
     };
+
+  /** Fix #3 — Owner-only Legacy Package purchase balance read. */
+  public getLegacyPackageBalance = async (request: Request, response: Response): Promise<void> => {
+    const actor = this.requireBusinessActor(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    if (!this.legacyPackageBalance) throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+    const view = await this.legacyPackageBalance.getBalance(
+      actor.userId,
+      actor.role,
+      params.businessId,
+      params.packageProgressId,
+    );
+    response.setHeader("Cache-Control", "private, no-store");
+    sendSuccess(response, 200, "Package balance", view);
+  };
+
+  /** Fix #3 — Owner records a real off-platform payment against the purchase balance. */
+  public recordLegacyPackageBalance = async (
+    request: Request,
+    response: Response,
+  ): Promise<void> => {
+    const actor = this.requireBusinessActor(request);
+    const params = request.validated?.params as PackageProgressBusinessParams;
+    const body = request.validated?.body as RecordLegacyPackageBalanceBody;
+    if (!this.legacyPackageBalance) throw new BookingError("BOOKING_TRANSACTION_UNAVAILABLE", 503);
+    const view = await this.legacyPackageBalance.recordPayment(
+      actor.userId,
+      actor.role,
+      params.businessId,
+      params.packageProgressId,
+      body,
+    );
+    response.setHeader("Cache-Control", "private, no-store");
+    sendSuccess(response, 200, "Package balance payment recorded", view);
+  };
 
   public voidPackage = async (request: Request, response: Response): Promise<void> => {
     const userId = this.requireCustomerId(request);

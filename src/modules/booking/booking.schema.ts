@@ -319,3 +319,27 @@ export type CompleteBookingBody = z.infer<typeof completeBookingBodySchema>;
 export type ListBusinessBookingsQuery = z.infer<typeof listBusinessBookingsQuerySchema>;
 export type ListCustomerBookingsQuery = z.infer<typeof listCustomerBookingsQuerySchema>;
 export type CalendarQuery = z.infer<typeof calendarQuerySchema>;
+
+/** Fix #3 — Owner records a real off-platform payment against a Legacy Package purchase
+ * balance. `expectedOutstandingCents` is the outstanding amount the Owner was shown; the server
+ * rejects the request if it no longer matches (never a pricing input). */
+export const recordLegacyPackageBalanceBodySchema = z
+  .object({
+    settlement: z.enum(["FULL", "PARTIAL"]),
+    amountCents: z.number().int().positive().optional(),
+    expectedOutstandingCents: z.number().int().min(0),
+    idempotencyKey: z.string().trim().min(1).max(200),
+    note: z.string().trim().max(500).optional(),
+  })
+  .strict()
+  .superRefine((body, context) => {
+    if (body.settlement === "PARTIAL" && body.amountCents === undefined)
+      context.addIssue({ code: "custom", path: ["amountCents"], message: "Amount is required" });
+    if (body.settlement === "FULL" && body.amountCents !== undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["amountCents"],
+        message: "A full settlement records the server's outstanding balance",
+      });
+  });
+export type RecordLegacyPackageBalanceBody = z.infer<typeof recordLegacyPackageBalanceBodySchema>;

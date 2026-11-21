@@ -59,6 +59,9 @@ export const bookingEventTypes = [
   "STATUS_CHANGED",
   "RESCHEDULED",
   "FEE_WAIVED",
+  /** Fix #3 — an off-platform venue payment recorded against a Booking's balance without any
+   * status change (Legacy Package purchase balance recorder). */
+  "VENUE_PAYMENT_RECORDED",
 ] as const;
 export type BookingEventType = (typeof bookingEventTypes)[number];
 

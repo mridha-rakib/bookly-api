@@ -972,6 +972,11 @@ export class BookingLifecycleService {
           )
         )
           throw new PackageProgressError("PACKAGE_PROGRESS_NOT_FOUND", 404);
+        // Fix #3 — a venue payment recorded against the purchase balance means the package has
+        // been paid for at the venue ("settling the venue balance already means used"); the
+        // unused-package refund only returns the online upfront, so it must not apply then.
+        if (unusedOnly && !progress.voidedAt && origin.completionPayment?.paid === true)
+          throw new PackageProgressError("PACKAGE_PROGRESS_NOT_ELIGIBLE_FOR_REFUND", 409);
         if (progress.voidedAt) {
           if (action === "CANCEL_FUTURE")
             throw new PackageProgressError("PACKAGE_PROGRESS_VOIDED", 409);
