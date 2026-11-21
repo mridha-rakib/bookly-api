@@ -1741,4 +1741,218 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
 
     expect(completeResponse.status).not.toBe(403);
   });
+
+  // --- Fix #2: ownership is decided before any private Business status is disclosed ----------
+
+  describe("Fix #2 — authorization precedes Business approval status", () => {
+    type TargetState = "APPROVED" | "WARNING" | "PENDING" | "SUSPENDED";
+    const STATES: TargetState[] = ["APPROVED", "WARNING", "PENDING", "SUSPENDED"];
+
+    const setState = async (businessId: Types.ObjectId, state: TargetState) => {
+      if (state === "APPROVED") return;
+      await BusinessModel.updateOne({ _id: businessId }, { $set: { status: state } }).exec();
+    };
+
+    /** A Business in `state` with a fully bookable fixture (so an authorized request would
+     * otherwise succeed), plus the exact manual-booking body for it. */
+    const targetIn = async (state: TargetState) => {
+      const fixture = await setupBookableBusiness();
+      await setState(fixture.business._id, state);
+      return {
+        ...fixture,
+        path: `/businesses/${fixture.business._id}/bookings`,
+        body: validBody(fixture.service._id, fixture.membership._id, fixture.client._id),
+      };
+    };
+
+    const observe = (response: request.Response) => ({
+      status: response.status,
+      message: response.body?.message,
+      errors: response.body?.errors,
+      data: response.body?.data,
+    });
+
+    const nothingCreated = async () => {
+      expect(await BookingModel.countDocuments({}).exec()).toBe(0);
+      expect(await BookingSlotReservationModel.countDocuments({}).exec()).toBe(0);
+    };
+
+    it("an unrelated Owner sees the same 404 for approved, warning, pending, suspended and nonexistent Businesses", async () => {
+      const app = buildApp();
+      const outsider = await createBusiness("Outsider Owner");
+      const auth = await bearerFor(outsider.owner._id, "BUSINESS_OWNER");
+      const seen = [];
+      for (const state of STATES) {
+        const target = await targetIn(state);
+        seen.push(
+          observe(
+            await request(app).post(target.path).set("Authorization", auth).send(target.body),
+          ),
+        );
+      }
+      const ghost = await targetIn("APPROVED");
+      seen.push(
+        observe(
+          await request(app)
+            .post(`/businesses/${new Types.ObjectId()}/bookings`)
+            .set("Authorization", auth)
+            .send(ghost.body),
+        ),
+      );
+      expect(seen[0]?.status).toBe(404);
+      expect(seen[0]?.message).toBe("Business not found");
+      for (const observed of seen) expect(observed).toEqual(seen[0]);
+      expect(JSON.stringify(seen)).not.toMatch(/PENDING|SUSPENDED|APPROVAL|WARNING/);
+      await nothingCreated();
+    });
+
+    it("an unrelated, inactive or removed Supervisor cannot distinguish the Business state", async () => {
+      const app = buildApp();
+      const elsewhere = await createBusiness("Elsewhere");
+      const foreignSupervisor = await createStaff(elsewhere.business._id, "SUPERVISOR");
+      const foreignAuth = await bearerFor(foreignSupervisor.user._id, "SUPERVISOR");
+      const seen = [];
+      for (const state of STATES) {
+        const target = await targetIn(state);
+        const inactive = await createStaff(target.business._id, "SUPERVISOR");
+        await StaffMembershipModel.updateOne(
+          { _id: inactive.membership._id },
+          { $set: { employmentActive: false } },
+        ).exec();
+        const removed = await createStaff(target.business._id, "SUPERVISOR");
+        await StaffMembershipModel.updateOne(
+          { _id: removed.membership._id },
+          { $set: { removedAt: new Date() } },
+        ).exec();
+        for (const auth of [
+          foreignAuth,
+          await bearerFor(inactive.user._id, "SUPERVISOR"),
+          await bearerFor(removed.user._id, "SUPERVISOR"),
+        ]) {
+          seen.push(
+            observe(
+              await request(app).post(target.path).set("Authorization", auth).send(target.body),
+            ),
+          );
+        }
+      }
+      seen.push(
+        observe(
+          await request(app)
+            .post(`/businesses/${new Types.ObjectId()}/bookings`)
+            .set("Authorization", foreignAuth)
+            .send((await targetIn("APPROVED")).body),
+        ),
+      );
+      expect(seen[0]?.status).toBe(404);
+      for (const observed of seen) expect(observed).toEqual(seen[0]);
+      expect(JSON.stringify(seen)).not.toMatch(/PENDING|SUSPENDED|APPROVAL|WARNING/);
+      await nothingCreated();
+    });
+
+    it("Staff and Customer stay at the role boundary, identically for every Business state", async () => {
+      const app = buildApp();
+      const customer = await userRepository.create({
+        normalizedEmail: `customer-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      const customerAuth = await bearerFor(customer._id, "CUSTOMER");
+      const staffSeen = [];
+      const customerSeen = [];
+      for (const state of STATES) {
+        const target = await targetIn(state);
+        const staffAuth = await bearerFor(target.membership.userId, "STAFF");
+        staffSeen.push(
+          observe(
+            await request(app).post(target.path).set("Authorization", staffAuth).send(target.body),
+          ),
+        );
+        customerSeen.push(
+          observe(
+            await request(app)
+              .post(target.path)
+              .set("Authorization", customerAuth)
+              .send(target.body),
+          ),
+        );
+      }
+      expect(staffSeen[0]?.status).toBe(403);
+      for (const observed of [...staffSeen, ...customerSeen])
+        expect(observed).toEqual(staffSeen[0]);
+      expect(JSON.stringify(staffSeen)).not.toMatch(/PENDING|SUSPENDED|APPROVAL|WARNING/);
+      await nothingCreated();
+    });
+
+    it("the authorized Owner and active Supervisor still create on APPROVED/WARNING and learn PENDING/SUSPENDED", async () => {
+      const app = buildApp();
+      const expected: Record<TargetState, { status: number; code?: string }> = {
+        APPROVED: { status: 201 },
+        WARNING: { status: 201 },
+        PENDING: { status: 403, code: "BUSINESS_PENDING_APPROVAL" },
+        SUSPENDED: { status: 403, code: "BUSINESS_SUSPENDED" },
+      };
+      for (const state of STATES) {
+        const target = await targetIn(state);
+        const supervisor = await createStaff(target.business._id, "SUPERVISOR");
+        const actors = [
+          await bearerFor(target.owner._id, "BUSINESS_OWNER"),
+          await bearerFor(supervisor.user._id, "SUPERVISOR"),
+        ];
+        for (const [index, auth] of actors.entries()) {
+          const body = validBody(
+            target.service._id,
+            target.membership._id,
+            target.client._id,
+            index === 0 ? "10:00" : "12:00",
+          );
+          const response = await request(app)
+            .post(target.path)
+            .set("Authorization", auth)
+            .send(body);
+          expect({ state, index, status: response.status }).toEqual({
+            state,
+            index,
+            status: expected[state].status,
+          });
+          if (expected[state].code) {
+            expect(JSON.stringify(response.body)).toContain(expected[state].code);
+          }
+        }
+        const created = await BookingModel.countDocuments({
+          businessId: target.business._id,
+        }).exec();
+        expect(created).toBe(expected[state].status === 201 ? 2 : 0);
+      }
+    });
+
+    it("an authorized Owner's malformed request is still validated before the status gate", async () => {
+      const app = buildApp();
+      const target = await targetIn("PENDING");
+      const response = await request(app)
+        .post(target.path)
+        .set("Authorization", await bearerFor(target.owner._id, "BUSINESS_OWNER"))
+        .send({ ...target.body, unexpected: true });
+      expect(response.status).toBe(400);
+      await nothingCreated();
+    });
+
+    it("existing-booking lifecycle reads stay owner-scoped and ungated on a SUSPENDED Business", async () => {
+      const app = buildApp();
+      const target = await targetIn("APPROVED");
+      const ownerAuth = await bearerFor(target.owner._id, "BUSINESS_OWNER");
+      const created = await request(app)
+        .post(target.path)
+        .set("Authorization", ownerAuth)
+        .send(target.body)
+        .expect(201);
+      await setState(target.business._id, "SUSPENDED");
+      const id = created.body.data.id;
+      await request(app).get(`${target.path}/${id}`).set("Authorization", ownerAuth).expect(200);
+      const outsider = await createBusiness("Outsider Reader");
+      const outsiderAuth = await bearerFor(outsider.owner._id, "BUSINESS_OWNER");
+      await request(app).get(`${target.path}/${id}`).set("Authorization", outsiderAuth).expect(404);
+    });
+  });
 });

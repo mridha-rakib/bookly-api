@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { type RequestHandler, Router } from "express";
 
 import { asyncHandler } from "../../common/middleware/async-handler.js";
 import { validateRequest } from "../../common/middleware/validate-request.js";
@@ -6,6 +6,7 @@ import { AddonRepository } from "../addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../addons/addon-service-assignment.repository.js";
 import { AppointmentReminderRepository } from "../appointment-reminder/appointment-reminder.repository.js";
 import { AppointmentReminderScheduler } from "../appointment-reminder/appointment-reminder-scheduler.js";
+import { AuthError } from "../auth/auth.errors.js";
 import {
   createAuthenticateAccessTokenMiddleware,
   requireActiveUser,
@@ -65,6 +66,7 @@ import { UserRepository } from "../user/user.repository.js";
 import { BookAgainController } from "./book-again.controller.js";
 import { BookAgainService } from "./book-again.service.js";
 import { BookingController } from "./booking.controller.js";
+import { BookingError } from "./booking.errors.js";
 import { BookingRepository } from "./booking.repository.js";
 import {
   bookingBusinessParamsSchema,
@@ -101,6 +103,26 @@ import { BookingRescheduleAvailabilityService } from "./booking-reschedule-avail
 import { CustomerFinancialOutcomeRead } from "./customer-financial-outcome.read.js";
 import { OrdinaryCalendarJournal } from "./ordinary-calendar-journal.js";
 import { createPenaltyCollectionService } from "./penalty-collection.factory.js";
+
+/** Fix #2 — resolves the caller's Booking-management scope for the validated `:businessId`
+ * using the existing BookingService rule (Owner of the Business, or its active Supervisor),
+ * so an unauthorized caller is answered 404 before any Business status gate runs. Grants no
+ * new access: the handler's service call re-applies the same rule. */
+const requireBookingManagementScope =
+  (access: Pick<BookingService, "requireBookingManagementAccess">): RequestHandler =>
+  async (request, _response, next): Promise<void> => {
+    try {
+      const auth = request.auth;
+      if (!auth) throw new AuthError("PORTAL_MISMATCH", 403);
+      const businessId = (request.validated?.params as { businessId?: string } | undefined)
+        ?.businessId;
+      if (!businessId) throw new BookingError("BOOKING_BUSINESS_NOT_FOUND", 404);
+      await access.requireBookingManagementAccess(auth.userId, auth.role, businessId);
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
 
 const buildController = (): BookingController => {
   const businessRepository = new BusinessRepository();
@@ -277,6 +299,16 @@ export const createBusinessBookingRoute = (): Router => {
   const authenticate = buildAuthenticate();
   const controller = buildController();
   const businessRepository = new BusinessRepository();
+  const managementAccess = new BookingService(
+    businessRepository,
+    new StaffRepository(),
+    new ServiceRepository(),
+    new AddonRepository(),
+    new AddonServiceAssignmentRepository(),
+    new ClientRepository(),
+    new BookingRepository(),
+    new PackageProgressRepository(),
+  );
 
   router.get(
     "/:businessId/bookings/:bookingId/reschedule-availability",
@@ -291,13 +323,21 @@ export const createBusinessBookingRoute = (): Router => {
   // (confirmed policy). Existing-booking lifecycle routes below (calendar/list/detail/complete/
   // no-show/waive-fee/cancel/reschedule) are deliberately NOT gated — those must always remain
   // available regardless of Business status.
+  //
+  // Fix #2 — order is authenticate → role → validate → Business management scope → approval
+  // status. A Business's PENDING/SUSPENDED status is private to its own Owner and active
+  // Supervisors: an unrelated Owner, an inactive/removed/foreign Supervisor or a nonexistent
+  // Business all receive the same 404 BOOKING_BUSINESS_NOT_FOUND from
+  // requireBookingManagementAccess (unchanged; the service re-checks it) before
+  // requireApprovedBusiness can answer with a status-specific 403.
   router.post(
     "/:businessId/bookings",
     authenticate,
     requireActiveUser(),
     requireRoles(["BUSINESS_OWNER", "SUPERVISOR"]),
-    requireApprovedBusiness(businessRepository),
     validateRequest({ params: bookingBusinessParamsSchema, body: createManualBookingBodySchema }),
+    requireBookingManagementScope(managementAccess),
+    requireApprovedBusiness(businessRepository),
     asyncHandler(controller.createManual),
   );
 
