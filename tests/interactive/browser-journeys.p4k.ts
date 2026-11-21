@@ -1403,19 +1403,16 @@ describe.skipIf(!enabled)("P4K isolated interactive First-Class Package browser 
           startAt,
           idempotencyKey: randomUUID(),
         };
-        expect(
-          (
-            await api(`/businesses/${v().id}/bookings/preview`, {
-              method: "POST",
-              token: other,
-              body,
-            })
-          ).status,
-        ).toBe(200);
-        const finalized = await api(`/businesses/${v().id}/bookings/finalize`, {
+        const quote = await api(`/businesses/${v().id}/bookings/preview`, {
           method: "POST",
           token: other,
           body,
+        });
+        expect(quote.status).toBe(200);
+        const finalized = await api(`/businesses/${v().id}/bookings/finalize`, {
+          method: "POST",
+          token: other,
+          body: { ...body, acceptedQuoteDigest: quote.data["quoteDigest"] },
         });
         // Customer B has no saved card: the shipped ordinary path must refuse or create an
         // ordinary Booking — never a Package entitlement.

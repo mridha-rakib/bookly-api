@@ -20,10 +20,12 @@ import type {
   CompleteBookingBody,
   CreateCustomerBookingPreviewBody,
   CreateManualBookingBody,
+  FinalizeCustomerBookingBody,
   ListBusinessBookingsQuery,
   ListCustomerBookingsQuery,
   MarkNoShowBody,
   PackagePurchaseBody,
+  PackagePurchaseFinalizeBody,
   PackageRedemptionPreviewBody,
   RedeemPackageSessionBody,
   RescheduleAvailabilityQuery,
@@ -396,7 +398,7 @@ export class BookingController {
   public finalizeCustomerBooking = async (request: Request, response: Response): Promise<void> => {
     const userId = this.requireCustomerId(request);
     const params = request.validated?.params as BookingBusinessParams;
-    const body = request.validated?.body as CreateCustomerBookingPreviewBody;
+    const body = request.validated?.body as FinalizeCustomerBookingBody;
 
     const result = await this.creationService.finalizeCustomerBooking(userId, params.businessId, {
       serviceLines: body.serviceLines,
@@ -406,6 +408,7 @@ export class BookingController {
       notes: body.notes,
       idempotencyKey: body.idempotencyKey,
       promoCode: body.promoCode,
+      acceptedQuoteDigest: body.acceptedQuoteDigest,
     });
 
     if (result.status === "requires_action") {
@@ -438,7 +441,7 @@ export class BookingController {
   public finalizePackagePurchase = async (request: Request, response: Response): Promise<void> => {
     const userId = this.requireCustomerId(request);
     const params = request.validated?.params as BookingBusinessParams;
-    const body = request.validated?.body as PackagePurchaseBody;
+    const body = request.validated?.body as PackagePurchaseFinalizeBody;
 
     const result = await this.creationService.finalizePackagePurchase(userId, params.businessId, {
       serviceLines: body.serviceLines,
@@ -447,6 +450,7 @@ export class BookingController {
       customerCity: body.customerCity,
       notes: body.notes,
       idempotencyKey: body.idempotencyKey,
+      acceptedQuoteDigest: body.acceptedQuoteDigest,
     });
 
     if (result.status === "requires_action") {

@@ -4,6 +4,7 @@ import { MAX_AVAILABILITY_RANGE_DAYS } from "../availability/availability.types.
 import { businessCities } from "../business/business.types.js";
 import { clientPropertyTypes } from "../client/client.types.js";
 import { bookingSources, bookingStatuses } from "./booking.types.js";
+import { BOOKING_QUOTE_DIGEST_PATTERN } from "./booking-quote-acceptance.js";
 
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid id");
 const isoDateTimeSchema = z.string().datetime({ offset: true }).or(z.string().datetime());
@@ -82,6 +83,14 @@ export const createManualBookingBodySchema = createBookingBodyBase
 
 export const createCustomerBookingPreviewBodySchema = createBookingBodyBase.strict();
 
+/** Fix #1 — the preview's `quoteDigest` the Customer explicitly confirmed. Mandatory: a finalize
+ * or purchase request without an accepted quote is rejected before any work. */
+const acceptedQuoteDigestSchema = z.string().regex(BOOKING_QUOTE_DIGEST_PATTERN, "Invalid quote");
+
+export const finalizeCustomerBookingBodySchema = createBookingBodyBase
+  .extend({ acceptedQuoteDigest: acceptedQuoteDigestSchema })
+  .strict();
+
 /**
  * Package purchase (preview + finalize) — reuses createBookingBodyBase's full shape (same
  * fields a normal Customer booking preview/finalize already sends: startAt, travelAddress,
@@ -95,6 +104,11 @@ export const createCustomerBookingPreviewBodySchema = createBookingBodyBase.stri
 export const packagePurchaseBodySchema = createBookingBodyBase
   .omit({ promoCode: true })
   .extend({ serviceLines: z.array(serviceLineBodySchema).length(1) })
+  .strict();
+
+/** Fix #1 — the purchase (finalize) body additionally requires the accepted preview digest. */
+export const packagePurchaseFinalizeBodySchema = packagePurchaseBodySchema
+  .extend({ acceptedQuoteDigest: acceptedQuoteDigestSchema })
   .strict();
 
 /**
@@ -292,6 +306,8 @@ export type CreateCustomerBookingPreviewBody = z.infer<
   typeof createCustomerBookingPreviewBodySchema
 >;
 export type PackagePurchaseBody = z.infer<typeof packagePurchaseBodySchema>;
+export type FinalizeCustomerBookingBody = z.infer<typeof finalizeCustomerBookingBodySchema>;
+export type PackagePurchaseFinalizeBody = z.infer<typeof packagePurchaseFinalizeBodySchema>;
 export type RedeemPackageSessionBody = z.infer<typeof redeemPackageSessionBodySchema>;
 export type PackageRedemptionPreviewBody = z.infer<typeof packageRedemptionPreviewBodySchema>;
 export type VoidPackageBody = z.infer<typeof voidPackageBodySchema>;

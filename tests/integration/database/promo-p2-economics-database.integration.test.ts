@@ -3,13 +3,16 @@ import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { businessLocalToUtc } from "../../../src/common/time/business-clock.js";
+import { AddonModel } from "../../../src/modules/addons/addon.model.js";
 import { AddonRepository } from "../../../src/modules/addons/addon.repository.js";
 import { AddonServiceAssignmentRepository } from "../../../src/modules/addons/addon-service-assignment.repository.js";
 import { AvailabilityService } from "../../../src/modules/availability/availability.service.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
 import {
+  finalizeCustomerBookingBodySchema,
   packagePurchaseBodySchema,
+  packagePurchaseFinalizeBodySchema,
   redeemPackageSessionBodySchema,
 } from "../../../src/modules/booking/booking.schema.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
@@ -57,6 +60,7 @@ import { PromoRedemptionModel } from "../../../src/modules/promo/promo-redemptio
 import { PromoRedemptionRepository } from "../../../src/modules/promo/promo-redemption.repository.js";
 import { PromoUserUsageModel } from "../../../src/modules/promo/promo-user-usage.model.js";
 import { PromoUserUsageRepository } from "../../../src/modules/promo/promo-user-usage.repository.js";
+import { ServiceModel } from "../../../src/modules/services/service.model.js";
 import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
@@ -1299,6 +1303,344 @@ describe("P2.1 — business-funded booking-price promos + Financial Contract V3"
         .orFail()
         .exec();
       expect(attempt.financialContractVersion).toBe(2);
+    });
+  });
+
+  // --- Fix #1: customer payment consent ---------------------------------------------------------
+
+  describe("Fix #1 — finalize is bound to the Customer's accepted preview (BOOKING_QUOTE_CHANGED)", () => {
+    const quoteChanged = expectCode("BOOKING_QUOTE_CHANGED", 409);
+
+    const accept = async <T extends ReturnType<typeof normalInput>>(
+      fixture: Fixture,
+      customerId: Types.ObjectId,
+      input: T,
+    ) => {
+      const quote = await preview(fixture, customerId, input);
+      return { quote, input: { ...input, acceptedQuoteDigest: quote.quoteDigest } };
+    };
+
+    const setFixedPrice = (fixture: Fixture, priceCents: number) =>
+      ServiceModel.updateOne(
+        { _id: fixture.fixedService._id },
+        { $set: { "fixedPricing.priceCents": priceCents } },
+      ).exec();
+
+    /** Proves a refused finalize left no financial commitment of any kind behind. */
+    const expectNothingCommitted = async (
+      fixture: Fixture,
+      customerId: Types.ObjectId,
+      key: string,
+      before: { intents: number; bookings: number; attempts: number; ledger: number },
+    ) => {
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents);
+      expect(await BookingModel.countDocuments().exec()).toBe(before.bookings);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(before.attempts);
+      expect(await BookingFinancialTransactionModel.countDocuments().exec()).toBe(before.ledger);
+      expect(await BookingCreationClaimModel.countDocuments({ idempotencyKey: key }).exec()).toBe(
+        0,
+      );
+      await expect(
+        creationService.readCustomerBookingPayment(
+          String(customerId),
+          String(fixture.business._id),
+          key,
+        ),
+      ).resolves.toMatchObject({ state: "NOT_OBSERVED" });
+    };
+
+    const snapshot = async () => ({
+      intents: paymentGateway.paymentIntentInputs.length,
+      bookings: await BookingModel.countDocuments().exec(),
+      attempts: await PaymentAttemptModel.countDocuments().exec(),
+      ledger: await BookingFinancialTransactionModel.countDocuments().exec(),
+    });
+
+    it("preview is deterministic and side-effect free, and the digest is bound to the exact terms", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "digest");
+      const input = normalInput(fixture);
+      const a = await preview(fixture, customer._id, input);
+      const b = await preview(fixture, customer._id, { ...input, idempotencyKey: "other-key" });
+      expect(a.quoteDigest).toMatch(/^bq1_[a-f0-9]{64}$/);
+      expect(b.quoteDigest).toBe(a.quoteDigest);
+      expect(await BookingCreationClaimModel.countDocuments().exec()).toBe(0);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(0);
+      await setFixedPrice(fixture, 10_100);
+      expect((await preview(fixture, customer._id, input)).quoteDigest).not.toBe(a.quoteDigest);
+    });
+
+    it("€100 previewed, price raised to €120: refused before any PaymentIntent; a fresh €120 acceptance then succeeds", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer, client } = await createLinkedCustomer(fixture, "raise");
+      const relationshipBefore = (await relationshipOf(client._id)).financialRelationship?.state;
+      const { quote, input } = await accept(fixture, customer._id, normalInput(fixture));
+      expect(quote).toMatchObject({ dueNowCents: 2_000, financials: { totalCents: 10_000 } });
+      const before = await snapshot();
+
+      await setFixedPrice(fixture, 12_000);
+      await expect(finalize(fixture, customer._id, input)).rejects.toEqual(quoteChanged);
+      await expectNothingCommitted(fixture, customer._id, input.idempotencyKey, before);
+      // The transient FIRST claim was released — the Customer is still a first-time Customer.
+      expect([undefined, "ELIGIBLE"]).toContain(relationshipBefore);
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("ELIGIBLE");
+      // Same key, same stale acceptance: refused again, never charged.
+      await expect(finalize(fixture, customer._id, input)).rejects.toEqual(quoteChanged);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents);
+
+      const fresh = await accept(fixture, customer._id, normalInput(fixture));
+      expect(fresh.quote).toMatchObject({ dueNowCents: 2_400, financials: { totalCents: 12_000 } });
+      const booking = confirmed(await finalize(fixture, customer._id, fresh.input));
+      expect(booking.financials).toMatchObject({ totalCents: 12_000, depositCents: 2_400 });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents + 1);
+      expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(2_400);
+      expect((await relationshipOf(client._id)).financialRelationship?.state).toBe("CONSUMED");
+    });
+
+    it("a price DECREASE also requires fresh acceptance", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "lower");
+      const { input } = await accept(fixture, customer._id, normalInput(fixture));
+      const before = await snapshot();
+      await setFixedPrice(fixture, 8_000);
+      await expect(finalize(fixture, customer._id, input)).rejects.toEqual(quoteChanged);
+      await expectNothingCommitted(fixture, customer._id, input.idempotencyKey, before);
+      const fresh = await accept(fixture, customer._id, normalInput(fixture));
+      confirmed(await finalize(fixture, customer._id, fresh.input));
+      expect(paymentGateway.paymentIntentInputs.at(-1)?.amountCents).toBe(1_600);
+    });
+
+    it("a promo whose discount changed is refused; an expired promo is refused; usage is never consumed", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "promo");
+      const promo = await createPromo({ code: "FIVE", type: "FIXED", value: 500 });
+      const { quote, input } = await accept(
+        fixture,
+        customer._id,
+        normalInput(fixture, "10:00", { promoCode: "FIVE" }),
+      );
+      expect(quote.promo).toMatchObject({ discountCents: 500 });
+      const before = await snapshot();
+
+      await PromoCodeModel.updateOne({ _id: promo._id }, { $set: { value: 1_000 } }).exec();
+      await expect(finalize(fixture, customer._id, input)).rejects.toEqual(quoteChanged);
+      await expectNothingCommitted(fixture, customer._id, input.idempotencyKey, before);
+
+      await PromoCodeModel.updateOne(
+        { _id: promo._id },
+        { $set: { value: 500, expiresAt: new Date(Date.now() - 60_000) } },
+      ).exec();
+      await expect(finalize(fixture, customer._id, input)).rejects.toMatchObject({
+        statusCode: 400,
+      });
+      await expectNothingCommitted(fixture, customer._id, input.idempotencyKey, before);
+      expect(await promoState(promo._id)).toEqual({ redeemedCount: 0, redemptions: 0 });
+      expect(await PromoUserUsageModel.countDocuments().exec()).toBe(0);
+    });
+
+    it("an add-on price change and a travel-fee change are each refused before payment", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000, travel: { feeCents: 1_500 } });
+      const addon = await addonRepository.create({
+        businessId: fixture.business._id,
+        status: "ACTIVE",
+        name: "Hot stones",
+        priceCents: 2_000,
+      });
+      await addonServiceAssignmentRepository.insertMany([
+        {
+          businessId: fixture.business._id,
+          addonId: addon._id,
+          serviceId: fixture.fixedService._id,
+        },
+      ]);
+      const { customer } = await createLinkedCustomer(fixture, "extras");
+      const extras = { addonIds: [String(addon._id)], travel: true };
+      const before = await snapshot();
+
+      const addonQuote = await accept(fixture, customer._id, normalInput(fixture, "10:00", extras));
+      await AddonModel.updateOne({ _id: addon._id }, { $set: { priceCents: 2_500 } }).exec();
+      await expect(finalize(fixture, customer._id, addonQuote.input)).rejects.toEqual(quoteChanged);
+      await expectNothingCommitted(fixture, customer._id, addonQuote.input.idempotencyKey, before);
+
+      const travelQuote = await accept(
+        fixture,
+        customer._id,
+        normalInput(fixture, "11:00", extras),
+      );
+      await businessTravelSettingsRepository.upsertByBusinessId(fixture.business._id, [
+        { city: "Larnaca", active: true, feeCents: 2_000 },
+      ]);
+      await expect(finalize(fixture, customer._id, travelQuote.input)).rejects.toEqual(
+        quoteChanged,
+      );
+      await expectNothingCommitted(fixture, customer._id, travelQuote.input.idempotencyKey, before);
+    });
+
+    it("FIRST preview that became RETURNING is refused (never silently re-priced); an accepted RETURNING quote finalizes at €0 online", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "classification");
+      const first = await accept(fixture, customer._id, normalInput(fixture, "10:00"));
+      expect(first.quote).toMatchObject({ isFirstBooking: true, dueNowCents: 2_000 });
+      // Another operation consumes the first-booking relationship before this Confirm.
+      await consumeFirst(fixture, customer._id, "09:00");
+      const before = await snapshot();
+
+      await expect(finalize(fixture, customer._id, first.input)).rejects.toEqual(quoteChanged);
+      await expectNothingCommitted(fixture, customer._id, first.input.idempotencyKey, before);
+
+      const returning = await accept(fixture, customer._id, normalInput(fixture, "10:00"));
+      expect(returning.quote).toMatchObject({ isFirstBooking: false, dueNowCents: 0 });
+      const booking = confirmed(await finalize(fixture, customer._id, returning.input));
+      expect(booking.financialContract).toMatchObject({
+        classification: "RETURNING",
+        onlineChargeCents: 0,
+      });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents);
+    });
+
+    it("Legacy Package purchase: a bundle-price change is refused before payment; a fresh acceptance purchases once", async () => {
+      const fixture = await setupFixture({ bundlePriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "package-quote");
+      const purchase = (input: ReturnType<typeof packageInput> & { acceptedQuoteDigest: string }) =>
+        creationService.finalizePackagePurchase(
+          String(customer._id),
+          String(fixture.business._id),
+          input,
+        );
+      const acceptPackage = async () => {
+        const input = packageInput(fixture);
+        const quote = await creationService.previewPackagePurchase(
+          String(customer._id),
+          String(fixture.business._id),
+          input,
+        );
+        return { quote, input: { ...input, acceptedQuoteDigest: quote.quoteDigest } };
+      };
+      const stale = await acceptPackage();
+      expect(stale.quote).toMatchObject({ dueNowCents: 2_000 });
+      const before = await snapshot();
+
+      await ServiceModel.updateOne(
+        { _id: fixture.packageService._id },
+        { $set: { "packagePricing.bundlePriceCents": 12_000 } },
+      ).exec();
+      await expect(purchase(stale.input)).rejects.toEqual(quoteChanged);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents);
+      expect(await BookingModel.countDocuments().exec()).toBe(before.bookings);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(before.attempts);
+      expect(
+        await BookingCreationClaimModel.countDocuments({
+          idempotencyKey: stale.input.idempotencyKey,
+        }).exec(),
+      ).toBe(0);
+
+      const fresh = await acceptPackage();
+      expect(fresh.quote).toMatchObject({ dueNowCents: 2_400 });
+      const booking = confirmed(await purchase(fresh.input));
+      expect(booking.financialContract).toMatchObject({
+        packageBundlePriceCents: 12_000,
+        onlineChargeCents: 2_400,
+      });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(before.intents + 1);
+    });
+
+    it("repeated Confirm clicks (same key + acceptance) create one booking, PaymentIntent, ledger row and promo redemption", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "clicks");
+      const promo = await createPromo({ code: "FIVE", type: "FIXED", value: 500 });
+      const { input } = await accept(
+        fixture,
+        customer._id,
+        normalInput(fixture, "10:00", { promoCode: "FIVE" }),
+      );
+      const results = await Promise.allSettled([
+        finalize(fixture, customer._id, input),
+        finalize(fixture, customer._id, input),
+        finalize(fixture, customer._id, input),
+      ]);
+      const ids = new Set(
+        results
+          .filter(
+            (r): r is PromiseFulfilledResult<FinalizeBookingResult> => r.status === "fulfilled",
+          )
+          .map((r) => String(confirmed(r.value)._id)),
+      );
+      expect(ids.size).toBe(1);
+      confirmed(await finalize(fixture, customer._id, input));
+      expect(await BookingModel.countDocuments().exec()).toBe(1);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(1);
+      expect(
+        await BookingFinancialTransactionModel.countDocuments({ type: "PLATFORM_FEE" }).exec(),
+      ).toBe(1);
+      expect(await promoState(promo._id)).toEqual({ redeemedCount: 1, redemptions: 1 });
+    });
+
+    it("3DS: the same-key continuation resumes the SAME PaymentIntent under its recorded contract and is never re-quoted", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "three-ds");
+      const { input } = await accept(fixture, customer._id, normalInput(fixture));
+      paymentGateway.queueNextChargeOutcome("requires_action");
+      const pending = requiresAction(await finalize(fixture, customer._id, input));
+      paymentGateway.succeedPaymentIntent(pending.paymentIntentId);
+      const booking = confirmed(await finalize(fixture, customer._id, input));
+      expect(booking.financials.depositCents).toBe(2_000);
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(1);
+    });
+
+    it("3DS pending then a price change: the continuation is governed by the recorded contract — no second PaymentIntent, never BOOKING_QUOTE_CHANGED", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "three-ds-change");
+      const { input } = await accept(fixture, customer._id, normalInput(fixture));
+      paymentGateway.queueNextChargeOutcome("requires_action");
+      requiresAction(await finalize(fixture, customer._id, input));
+      await setFixedPrice(fixture, 12_000);
+      const outcome = await finalize(fixture, customer._id, input).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      );
+      expect(outcome).not.toEqual({ error: quoteChanged });
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(1);
+      expect(await BookingModel.countDocuments().exec()).toBe(0);
+    });
+
+    it("lost response / ambiguous outcome: exact-key replay with the same acceptance recovers one Booking and one PaymentIntent", async () => {
+      const fixture = await setupFixture({ fixedPriceCents: 10_000 });
+      const { customer } = await createLinkedCustomer(fixture, "lost");
+      const { input } = await accept(fixture, customer._id, normalInput(fixture));
+      paymentGateway.queueNextChargeLostResponse();
+      await expect(finalize(fixture, customer._id, input)).rejects.toThrow();
+      confirmed(await finalize(fixture, customer._id, input));
+      expect(paymentGateway.paymentIntentInputs).toHaveLength(1);
+      expect(await BookingModel.countDocuments().exec()).toBe(1);
+      expect(await PaymentAttemptModel.countDocuments().exec()).toBe(1);
+    });
+
+    it("the Customer finalize and package-purchase HTTP bodies require a well-formed accepted quote", () => {
+      const fixtureLike = {
+        serviceLines: [
+          {
+            serviceId: new Types.ObjectId().toString(),
+            staffMembershipId: new Types.ObjectId().toString(),
+            addonIds: [],
+            pricingInput: {},
+          },
+        ],
+        startAt: businessLocalToUtc(TIMEZONE, DATE, "10:00").toISOString(),
+        idempotencyKey: "key-1",
+      };
+      const digest = `bq1_${"a".repeat(64)}`;
+      for (const schema of [finalizeCustomerBookingBodySchema, packagePurchaseFinalizeBodySchema]) {
+        expect(schema.safeParse(fixtureLike).success).toBe(false);
+        expect(schema.safeParse({ ...fixtureLike, acceptedQuoteDigest: "1000" }).success).toBe(
+          false,
+        );
+        expect(schema.safeParse({ ...fixtureLike, acceptedQuoteDigest: digest }).success).toBe(
+          true,
+        );
+      }
     });
   });
 });

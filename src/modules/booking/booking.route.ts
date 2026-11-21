@@ -78,11 +78,13 @@ import {
   completeBookingBodySchema,
   createCustomerBookingPreviewBodySchema,
   createManualBookingBodySchema,
+  finalizeCustomerBookingBodySchema,
   legacyPackageStatusQuerySchema,
   listBusinessBookingsQuerySchema,
   listCustomerBookingsQuerySchema,
   markNoShowBodySchema,
   packagePurchaseBodySchema,
+  packagePurchaseFinalizeBodySchema,
   packageRedemptionPreviewBodySchema,
   redeemPackageSessionBodySchema,
   rescheduleAvailabilityQuerySchema,
@@ -458,7 +460,7 @@ export const createBusinessBookingRoute = (): Router => {
     requireApprovedBusiness(businessRepository),
     validateRequest({
       params: bookingBusinessParamsSchema,
-      body: createCustomerBookingPreviewBodySchema,
+      body: finalizeCustomerBookingBodySchema,
     }),
     asyncHandler(controller.finalizeCustomerBooking),
   );
@@ -486,7 +488,10 @@ export const createBusinessBookingRoute = (): Router => {
     requireActiveUser(),
     requireRoles(["CUSTOMER"]),
     requireApprovedBusiness(businessRepository),
-    validateRequest({ params: bookingBusinessParamsSchema, body: packagePurchaseBodySchema }),
+    validateRequest({
+      params: bookingBusinessParamsSchema,
+      body: packagePurchaseFinalizeBodySchema,
+    }),
     asyncHandler(controller.finalizePackagePurchase),
   );
 

@@ -1153,6 +1153,17 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
       .spyOn(StripePaymentGateway.prototype, "createAndConfirmPaymentIntent")
       .mockRejectedValue(Error("Forbidden real provider dispatch"));
     try {
+      const customerBody = {
+        ...normal,
+        idempotencyKey: `customer-${new Types.ObjectId()}`,
+        serviceLines: lines,
+      };
+      const customerAuth = await bearerFor(customer._id, "CUSTOMER");
+      const preview = await request(app)
+        .post(`/businesses/${t.business._id}/bookings/preview`)
+        .set("Authorization", customerAuth)
+        .send(customerBody);
+      expect(preview.status).toBe(200);
       const responses = await Promise.all([
         request(app)
           .post(`/businesses/${t.business._id}/bookings`)
@@ -1160,12 +1171,8 @@ describe("HTTP-level manual booking creation (Batch 10)", () => {
           .send({ ...original, serviceLines: lines }),
         request(app)
           .post(`/businesses/${t.business._id}/bookings/finalize`)
-          .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
-          .send({
-            ...normal,
-            idempotencyKey: `customer-${new Types.ObjectId()}`,
-            serviceLines: lines,
-          }),
+          .set("Authorization", customerAuth)
+          .send({ ...customerBody, acceptedQuoteDigest: preview.body.data.quoteDigest }),
       ]);
       expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
       expect(dispatch).not.toHaveBeenCalled();

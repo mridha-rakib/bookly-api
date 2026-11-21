@@ -896,6 +896,8 @@ describe("first-class Package definition Owner API (isolated database)", () => {
           ],
           startAt: new Date(Date.now() + 14 * 86400000).toISOString(),
           idempotencyKey: `p1-no-sale-${action}`,
+          // Fix #1 — a well-formed accepted quote so the purchase reaches the service check.
+          ...(action === "purchase" ? { acceptedQuoteDigest: `bq1_${"0".repeat(64)}` } : {}),
         });
       expect(result.status).toBe(404);
       expect(result.body.errors[0].code).toBe("BOOKING_SERVICE_NOT_FOUND");

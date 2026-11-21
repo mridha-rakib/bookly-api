@@ -83,6 +83,7 @@ import type { CreateBookingInput, CreateManualBookingInput } from "./booking-cre
 import type { BookingCreationClaimRepository } from "./booking-creation-claim.repository.js";
 import { resolveCustomerBusinessClient } from "./booking-customer-client.js";
 import { type BookingPaymentState, bookingPaymentState } from "./booking-payment-status.js";
+import { type BookingQuoteTerms, computeBookingQuoteDigest } from "./booking-quote-acceptance.js";
 import {
   acquireSchedulingAdmission,
   validateSchedulingLine,
@@ -186,6 +187,9 @@ export type BookingCreationPreview = {
   balanceDueCents: number;
   requiresSavedCard: boolean;
   hasSavedCard: boolean;
+  /** Fix #1 — opaque witness of exactly these monetary terms (see booking-quote-acceptance.ts).
+   * The Customer's finalize/purchase must echo it as `acceptedQuoteDigest`. */
+  quoteDigest: string;
   /** Present only when a valid `promoCode` was supplied. P2: the promo discounts the booking
    * PRICE — `financials` (total, deposit, balance) and `preTaxChargeCents` above are already
    * post-promo; this breakdown lets the frontend show the price before the promo and the
@@ -684,6 +688,13 @@ export class BookingCreationService {
       ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
+      quoteDigest: this.quoteDigestFor({
+        productKind: "NORMAL_BOOKING",
+        classification,
+        financials,
+        lines,
+        resolvedPromo,
+      }),
       ...(resolvedPromo
         ? {
             promo: {
@@ -952,6 +963,7 @@ export class BookingCreationService {
         lines,
         travelFeeCents,
         promoCode: input.promoCode,
+        acceptedQuoteDigest: input.acceptedQuoteDigest,
       });
     } catch (error) {
       if (!existingClaim)
@@ -1256,6 +1268,16 @@ export class BookingCreationService {
       ...financialCommitment,
       requiresSavedCard: true,
       hasSavedCard: cardStatus.hasSavedCard,
+      quoteDigest: this.quoteDigestFor({
+        productKind: "PACKAGE_PURCHASE",
+        classification,
+        financials,
+        lines,
+        resolvedPromo: undefined,
+        packageBundlePriceCents: (
+          line.service.packagePricing as NonNullable<ServiceDocument["packagePricing"]>
+        ).bundlePriceCents,
+      }),
     };
   }
 
@@ -1562,6 +1584,7 @@ export class BookingCreationService {
         lines,
         travelFeeCents,
         packageBundlePriceCents: packagePricing.bundlePriceCents,
+        acceptedQuoteDigest: input.acceptedQuoteDigest,
       });
     } catch (error) {
       if (!existingClaim)
@@ -3234,6 +3257,8 @@ export class BookingCreationService {
     travelFeeCents: number;
     packageBundlePriceCents?: number | undefined;
     promoCode?: string | undefined;
+    /** Fix #1 — see CreateBookingInput.acceptedQuoteDigest. */
+    acceptedQuoteDigest?: string | undefined;
   }): Promise<EstablishedFinancialTerms> {
     const customerUserId = new Types.ObjectId(params.customerUserId);
     const classification = await this.relationships.resolveForFinalize({
@@ -3285,6 +3310,38 @@ export class BookingCreationService {
         resolvedPromo?.promoDiscountCents,
       );
 
+      // Fix #1 — customer payment consent. A NEW operation (no Financial Contract recorded yet)
+      // must match the exact preview the Customer confirmed, compared against these fresh,
+      // classification-authoritative terms BEFORE the contract is recorded and therefore before
+      // any tax compute, PaymentIntent, ledger row, relationship consumption or promo
+      // redemption. Any difference — higher, lower, promo, add-on, travel, FIRST↔RETURNING —
+      // refuses; the catch below releases a FIRST claim and the caller releases the idempotency
+      // claim, so the Customer can re-preview and explicitly confirm under a new key. A resumed
+      // operation (3DS / ambiguous outcome) is governed by its already-recorded contract, which
+      // recordFinancialContract enforces exactly as before — never re-quoted, never re-charged.
+      if (
+        params.acceptedQuoteDigest !== undefined &&
+        params.existingContract === undefined &&
+        params.acceptedQuoteDigest !==
+          this.quoteDigestFor({
+            productKind: params.productKind,
+            classification,
+            financials,
+            lines: params.lines,
+            resolvedPromo,
+            packageBundlePriceCents: params.packageBundlePriceCents,
+          })
+      ) {
+        throw new BookingError("BOOKING_QUOTE_CHANGED", 409, [
+          {
+            code: "BOOKING_QUOTE_CHANGED",
+            path: "acceptedQuoteDigest",
+            message:
+              "The booking price changed since you reviewed it. Refresh the preview and confirm the updated amount.",
+          },
+        ]);
+      }
+
       const contract: FinancialContract = {
         version,
         productKind: params.productKind,
@@ -3327,6 +3384,43 @@ export class BookingCreationService {
       }
       throw error;
     }
+  }
+
+  /** Fix #1 — the single mapping from resolved booking terms to the acceptance digest, shared by
+   * both previews and establishFinancialTerms so the two sides can never drift apart. */
+  private quoteDigestFor(params: {
+    productKind: BookingQuoteTerms["productKind"];
+    classification: RelationshipClassification;
+    financials: BookingFinancials;
+    lines: ResolvedServiceLine[];
+    resolvedPromo: ResolvedPromo | undefined;
+    packageBundlePriceCents?: number | undefined;
+  }): string {
+    return computeBookingQuoteDigest({
+      productKind: params.productKind,
+      classification: params.classification,
+      financials: params.financials,
+      lines: params.lines.map((line) => ({
+        serviceId: String(line.service._id),
+        staffMembershipId: String(line.staffMembership._id),
+        amountCents: line.amountCents,
+        discountCents: line.discountCents,
+        addons: line.addons,
+      })),
+      ...(params.resolvedPromo
+        ? {
+            promo: {
+              normalizedCode: params.resolvedPromo.promo.normalizedCode,
+              type: params.resolvedPromo.promo.type,
+              value: params.resolvedPromo.promo.value,
+              discountCents: params.resolvedPromo.promoDiscountCents,
+            },
+          }
+        : {}),
+      ...(params.packageBundlePriceCents !== undefined
+        ? { packageBundlePriceCents: params.packageBundlePriceCents }
+        : {}),
+    });
   }
 
   /** Never masks the caller's original error. An unbound claim is released immediately; a bound

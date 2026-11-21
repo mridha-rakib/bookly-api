@@ -699,14 +699,23 @@ describe.skipIf(!artifacts || !clientRoot)("BC-F06 real Next booking integration
             },
           ],
         };
+        // Fix #1 — each contender confirms exactly the preview it was shown.
+        const quote = await post(`/businesses/${b.businessId}/bookings/preview`, auth, {
+          ...input,
+          idempotencyKey: randomUUID(),
+        });
+        expect(quote.status).toBe(200);
+        const acceptedQuoteDigest = quote.body.data["quoteDigest"] as string;
         const contenders = await Promise.all([
           post(`/businesses/${b.businessId}/bookings/finalize`, auth, {
             ...input,
             idempotencyKey: randomUUID(),
+            acceptedQuoteDigest,
           }),
           post(`/businesses/${b.businessId}/bookings/finalize`, auth, {
             ...input,
             idempotencyKey: randomUUID(),
+            acceptedQuoteDigest,
           }),
         ]);
         expect(contenders.filter((r) => [200, 201].includes(r.status))).toHaveLength(1);
@@ -1140,6 +1149,9 @@ describe.skipIf(!artifacts || !clientRoot)("BC-F06 real Next booking integration
             },
           ],
           idempotencyKey: b.financialContract!.idempotencyKey,
+          // A committed same-key replay returns the existing Booking before any quote
+          // comparison; the digest only has to be well-formed (the browser resends its own).
+          acceptedQuoteDigest: `bq1_${"0".repeat(64)}`,
         };
         const replay = await post(
           `/businesses/${v.id}/bookings/finalize`,

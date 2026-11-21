@@ -42,6 +42,11 @@ export type CreateBookingInput = {
    * applied against the online booking-time charge. Raw, as typed by the customer — normalized
    * and validated server-side only, never trusted from the client. */
   promoCode?: string | undefined;
+  /** Fix #1 — the `quoteDigest` of the preview the Customer explicitly confirmed. Mandatory on
+   * the Customer finalize/purchase HTTP routes; when present, finalize refuses with
+   * BOOKING_QUOTE_CHANGED before any new financial commitment if its fresh authoritative terms
+   * differ. Never a pricing input. Never read by `createManualBooking`. */
+  acceptedQuoteDigest?: string | undefined;
 };
 
 export type CreateManualBookingInput = CreateBookingInput & {

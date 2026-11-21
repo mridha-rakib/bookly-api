@@ -28,6 +28,7 @@ import {
   bookingBusinessParamsSchema,
   bookingIdOnlyParamsSchema,
   createCustomerBookingPreviewBodySchema,
+  finalizeCustomerBookingBodySchema,
 } from "../../../src/modules/booking/booking.schema.js";
 import { BookingService } from "../../../src/modules/booking/booking.service.js";
 import { BookingCreationService } from "../../../src/modules/booking/booking-creation.service.js";
@@ -1406,17 +1407,14 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       requireActiveUser(),
       requireRoles(["CUSTOMER"]),
     );
-    for (const [suffix, handler] of [
-      ["preview", controller.previewCustomerBooking],
-      ["finalize", controller.finalizeCustomerBooking],
+    for (const [suffix, handler, body] of [
+      ["preview", controller.previewCustomerBooking, createCustomerBookingPreviewBodySchema],
+      ["finalize", controller.finalizeCustomerBooking, finalizeCustomerBookingBodySchema],
     ] as const) {
       app.post(
         `/businesses/:businessId/bookings/${suffix}`,
         requireApprovedBusiness(businessRepository),
-        validateRequest({
-          params: bookingBusinessParamsSchema,
-          body: createCustomerBookingPreviewBodySchema,
-        }),
+        validateRequest({ params: bookingBusinessParamsSchema, body }),
         asyncHandler(handler),
       );
     }
@@ -1433,15 +1431,23 @@ describe("database-backed Booking payment integration (Batch 4)", () => {
       .set("Authorization", `Bearer ${token}`)
       .send(input)
       .expect(200);
-    const first = await request(app)
+    // Fix #1 — a finalize without the accepted preview is rejected before any work.
+    await request(app)
       .post(`${base}/finalize`)
       .set("Authorization", `Bearer ${token}`)
       .send(input)
+      .expect(400);
+    expect(paymentGateway.paymentIntentInputs).toHaveLength(0);
+    const accepted = { ...input, acceptedQuoteDigest: preview.body.data.quoteDigest };
+    const first = await request(app)
+      .post(`${base}/finalize`)
+      .set("Authorization", `Bearer ${token}`)
+      .send(accepted)
       .expect(201);
     const retry = await request(app)
       .post(`${base}/finalize`)
       .set("Authorization", `Bearer ${token}`)
-      .send(input)
+      .send(accepted)
       .expect(201);
     expect(retry.body.data.id).toBe(first.body.data.id);
     expect(first.body.data.id).toBeDefined();
