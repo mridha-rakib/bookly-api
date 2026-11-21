@@ -1,4 +1,4 @@
-import type { ClientSession, Types } from "mongoose";
+import mongoose, { type ClientSession, type Types } from "mongoose";
 import { logger } from "../../config/logger.js";
 import type { BookingFinancialTransactionService } from "../booking-financial-transaction/booking-financial-transaction.service.js";
 import type { BusinessRepository } from "../business/business.repository.js";
@@ -103,9 +103,13 @@ export class NoShowResolutionService {
     }),
   ) {}
 
-  /** Best-effort, non-transactional (matching this worker's own existing write style — see
-   * transitionViaOwner's own bare casUpdate) — no-op for a Booking with no Package-linked line. */
-  private async syncPackageSessionOnResolvedNoShow(booking: BookingDocument): Promise<void> {
+  /** Fix #9 — runs INSIDE the waiver transaction (see `waiveAtomically`), so the Booking's
+   * terminal status and its Package session outcome commit or roll back together. No-op for a
+   * Booking with no Package-linked line. */
+  private async syncPackageSessionOnResolvedNoShow(
+    booking: BookingDocument,
+    session: ClientSession,
+  ): Promise<void> {
     if (!this.packageProgressRepository || !isPackageLinkedBooking(booking)) {
       return;
     }
@@ -113,7 +117,11 @@ export class NoShowResolutionService {
     if (outcome === "NONE") {
       return;
     }
-    await this.packageProgressRepository.resolveSessionOnTerminalStatus(booking._id, outcome);
+    await this.packageProgressRepository.resolveSessionOnTerminalStatus(
+      booking._id,
+      outcome,
+      session,
+    );
   }
 
   /**
@@ -172,16 +180,13 @@ export class NoShowResolutionService {
     // no linked Customer identity to charge (should not happen for BOOKLY_MANAGED, defensive).
     if (!noShowPercentage || penalty.amountCents <= 0 || !isPenaltyCollectible(booking)) {
       if (shouldStop()) return undefined;
-      const waived = await this.transitionViaOwner(booking, "NO_SHOW_WAIVED", {
+      const waived = await this.waiveAtomically(booking, {
         note: isPackageLinkedBooking(booking)
           ? "Auto-resolved: Package base-service no-show — the forfeited session is the only penalty, no additional fee applies"
           : !noShowPercentage
             ? "Auto-resolved: no cancellation/no-show policy was configured for this business at booking time"
             : "Auto-resolved: no chargeable amount or payment method available",
       });
-      if (waived) {
-        await this.syncPackageSessionOnResolvedNoShow(waived);
-      }
       // Only notify the customer of a "fee waived" outcome when there genuinely WAS a no-show
       // fee to waive: a policy existed, it is a real online customer, and it is not a MANUAL
       // booking (i.e. the ONLY reason we reached this branch is amountCents <= 0 — the deposit
@@ -275,10 +280,39 @@ export class NoShowResolutionService {
     return counts;
   }
 
+  /**
+   * Fix #9 — the no-charge resolution and its Package session outcome are ONE logical
+   * transition. Previously the Booking CAS committed first and the session forfeiture was a
+   * separate, best-effort write: a failure in between left the Booking NO_SHOW_WAIVED while its
+   * Package session stayed SCHEDULED, and the worker never revisits a non-PENDING Booking, so it
+   * never converged. Now both run in one transaction (the same shape the charged branch already
+   * uses in PenaltyCollectionService): any failure rolls both back, the Booking stays PENDING and
+   * overdue, and a later worker run resolves it once. The CAS (still PENDING, never claimed)
+   * keeps concurrent workers, waivers and reversals to exactly one winner.
+   */
+  private async waiveAtomically(
+    booking: BookingDocument,
+    extra: { note?: string | undefined },
+  ): Promise<BookingDocument | null> {
+    const session = await mongoose.startSession();
+    let waived: BookingDocument | null = null;
+    try {
+      await session.withTransaction(async () => {
+        waived = null;
+        waived = await this.transitionViaOwner(booking, "NO_SHOW_WAIVED", extra, session);
+        if (waived) await this.syncPackageSessionOnResolvedNoShow(waived, session);
+      });
+    } finally {
+      await session.endSession();
+    }
+    return waived;
+  }
+
   private async transitionViaOwner(
     booking: BookingDocument,
     nextStatus: "NO_SHOW_WAIVED",
     extra: { note?: string | undefined },
+    session: ClientSession,
   ): Promise<BookingDocument | null> {
     const business = await this.businessRepository.findById(booking.businessId);
     if (!business) {
@@ -297,10 +331,16 @@ export class NoShowResolutionService {
 
     // Never on a claimed booking: once a charge obligation exists only the penalty gate may
     // resolve it (P5).
-    return this.bookingRepository.casUpdate(booking.businessId, booking._id, ["PENDING"], {
-      set: { status: nextStatus },
-      pushEvent: event,
-      extraFilter: { noShowChargeClaimedAt: { $exists: false } },
-    });
+    return this.bookingRepository.casUpdate(
+      booking.businessId,
+      booking._id,
+      ["PENDING"],
+      {
+        set: { status: nextStatus },
+        pushEvent: event,
+        extraFilter: { noShowChargeClaimedAt: { $exists: false } },
+      },
+      session,
+    );
   }
 }

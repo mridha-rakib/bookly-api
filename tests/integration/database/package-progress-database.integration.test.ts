@@ -21,6 +21,7 @@ import { BookingCreationClaimRepository } from "../../../src/modules/booking/boo
 import { BookingLifecycleService } from "../../../src/modules/booking/booking-lifecycle.service.js";
 import { BookingRescheduleAvailabilityService } from "../../../src/modules/booking/booking-reschedule-availability.service.js";
 import { LegacyPackageBalanceService } from "../../../src/modules/booking/legacy-package-balance.service.js";
+import { NoShowResolutionService } from "../../../src/modules/booking/no-show-resolution.service.js";
 import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
@@ -1934,6 +1935,200 @@ describe("database-backed Package Deal integration", () => {
   // --- Redemption ------------------------------------------------------------------------------
 
   // --- Fix #3: Legacy Package purchase balance after session 1 leaves UPCOMING -----------------
+
+  // --- Fix #9: no-show auto-resolution and the Package session commit together ---------------
+
+  describe("Fix #9 — atomic no-show auto-resolution for Package sessions", () => {
+    const notifier = () => ({
+      notifyNoShowCharged: vi.fn(async () => undefined),
+      notifyNoShowWaived: vi.fn(async () => undefined),
+    });
+    const worker = (port = notifier()) =>
+      new NoShowResolutionService(
+        bookingRepository,
+        businessRepository,
+        paymentService,
+        financialTransactionService,
+        port,
+        packageProgressRepository,
+      );
+    /** A purchased Legacy Package whose session 1 no-show was started by the Business and whose
+     * 90-minute deadline has (deterministically) passed. */
+    const overdueNoShow = async () => {
+      const f = await setUpPurchasedPackage();
+      await lifecycleService.markNoShow(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.purchase._id),
+      );
+      const now = Date.now();
+      await BookingModel.collection.updateOne(
+        { _id: f.purchase._id },
+        {
+          $set: {
+            noShowStartedAt: new Date(now - 120 * 60_000),
+            noShowDeadlineAt: new Date(now - 60_000),
+          },
+        },
+      );
+      return f;
+    };
+    const state = async (f: Awaited<ReturnType<typeof overdueNoShow>>) => {
+      const booking = await BookingModel.findById(f.purchase._id).orFail().lean();
+      const progress = await PackageProgressModel.findById(f.progress._id).orFail().lean();
+      return {
+        status: booking.status,
+        terminalEvents: booking.eventHistory.filter((e) => e.previousStatus === "PENDING").length,
+        session: progress.sessions.find((s) => String(s.bookingId) === String(f.purchase._id))
+          ?.status,
+        remainingSessions: progress.remainingSessions,
+      };
+    };
+    const money = async () => ({
+      ledger: await BookingFinancialTransactionModel.countDocuments({}),
+      attempts: await PaymentAttemptModel.countDocuments({}),
+    });
+
+    it("an overdue Package no-show is waived and its session forfeited together, with no fee or payment", async () => {
+      const f = await overdueNoShow();
+      const before = await money();
+      const port = notifier();
+      const counts = await worker(port).runOnce(10);
+      expect(counts.waived_no_charge_possible + counts.waived_no_policy).toBe(1);
+      expect(await state(f)).toEqual({
+        status: "NO_SHOW_WAIVED",
+        terminalEvents: 1,
+        session: "FORFEITED",
+        remainingSessions: 4,
+      });
+      expect(await money()).toEqual(before); // the forfeited session is the only penalty
+      expect(port.notifyNoShowWaived).not.toHaveBeenCalled(); // no fee existed to waive
+    });
+
+    it("a Package write failure rolls back the Booking too; the next worker run converges exactly once", async () => {
+      const f = await overdueNoShow();
+      const original = await state(f);
+      const spy = vi
+        .spyOn(packageProgressRepository, "resolveSessionOnTerminalStatus")
+        .mockRejectedValueOnce(new Error("injected package write failure"));
+      const port = notifier();
+      const failed = await worker(port).runOnce(10);
+      expect(failed.error).toBe(1);
+      // Both original states are preserved: no resolved Booking with a still-SCHEDULED session.
+      expect(await state(f)).toEqual(original);
+      expect(original).toMatchObject({ status: "PENDING", session: "SCHEDULED" });
+      spy.mockRestore();
+      const retried = await worker(port).runOnce(10);
+      expect(retried.error).toBe(0);
+      expect(await state(f)).toEqual({
+        status: "NO_SHOW_WAIVED",
+        terminalEvents: 1,
+        session: "FORFEITED",
+        remainingSessions: 4,
+      });
+      expect(
+        (await worker(port).runOnce(10)).skipped_already_resolved +
+          (await worker(port).runOnce(10)).waived_no_charge_possible,
+      ).toBe(0);
+      expect(port.notifyNoShowWaived).not.toHaveBeenCalled();
+    });
+
+    it("duplicate and concurrent workers resolve the same overdue Booking once", async () => {
+      const f = await overdueNoShow();
+      const before = await money();
+      const outcomes = await Promise.all([
+        worker().autoResolve(f.purchase._id),
+        worker().autoResolve(f.purchase._id),
+        worker().autoResolve(f.purchase._id),
+      ]);
+      expect(outcomes.filter((o) => o === "skipped_already_resolved")).toHaveLength(2);
+      expect(await state(f)).toEqual({
+        status: "NO_SHOW_WAIVED",
+        terminalEvents: 1,
+        session: "FORFEITED",
+        remainingSessions: 4,
+      });
+      expect(await worker().autoResolve(f.purchase._id)).toBe("skipped_already_resolved");
+      expect(await money()).toEqual(before);
+    });
+
+    it("a concurrent manual waiver and the worker: exactly one resolution, one forfeiture", async () => {
+      const f = await overdueNoShow();
+      const results = await Promise.allSettled([
+        worker().autoResolve(f.purchase._id),
+        lifecycleService.waiveFee(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.purchase._id),
+          "Package session",
+          undefined,
+        ),
+      ]);
+      expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+      expect(await state(f)).toEqual({
+        status: "NO_SHOW_WAIVED",
+        terminalEvents: 1,
+        session: "FORFEITED",
+        remainingSessions: 4,
+      });
+    });
+
+    it("a concurrent no-show reversal and the worker end in one consistent pairing", async () => {
+      const f = await overdueNoShow();
+      await Promise.allSettled([
+        worker().autoResolve(f.purchase._id),
+        lifecycleService.cancelNoShowByBusiness(
+          String(f.owner._id),
+          "BUSINESS_OWNER",
+          String(f.business._id),
+          String(f.purchase._id),
+        ),
+      ]);
+      const after = await state(f);
+      expect(after.terminalEvents).toBe(1);
+      expect([
+        { status: "NO_SHOW_WAIVED", terminalEvents: 1, session: "FORFEITED", remainingSessions: 4 },
+        {
+          status: "NO_SHOW_CANCELLED",
+          terminalEvents: 1,
+          session: "CANCELLED",
+          remainingSessions: 5,
+        },
+      ]).toContainEqual(after);
+    });
+
+    it("one failing candidate never blocks other independent overdue no-shows", async () => {
+      const first = await overdueNoShow();
+      const second = await overdueNoShow();
+      const original =
+        packageProgressRepository.resolveSessionOnTerminalStatus.bind(packageProgressRepository);
+      vi.spyOn(packageProgressRepository, "resolveSessionOnTerminalStatus").mockImplementation(
+        async (bookingId, outcome, session) => {
+          if (String(bookingId) === String(first.purchase._id)) throw new Error("injected");
+          return original(bookingId, outcome, session);
+        },
+      );
+      const counts = await worker().runOnce(10);
+      expect(counts.error).toBe(1);
+      expect(await state(first)).toMatchObject({ status: "PENDING", session: "SCHEDULED" });
+      expect(await state(second)).toMatchObject({ status: "NO_SHOW_WAIVED", session: "FORFEITED" });
+      vi.restoreAllMocks();
+      await worker().runOnce(10);
+      expect(await state(first)).toMatchObject({ status: "NO_SHOW_WAIVED", session: "FORFEITED" });
+    });
+
+    it("historical package data stays readable after resolution", async () => {
+      const f = await overdueNoShow();
+      await worker().runOnce(10);
+      const detail = await getPackageDetail(f.customer._id, f.progress._id);
+      expect(detail.sessions.find((s) => s.bookingId === String(f.purchase._id))).toMatchObject({
+        status: "FORFEITED",
+      });
+      expect(detail.remainingSessions).toBe(4);
+    });
+  });
 
   describe("Fix #6 — Legacy Package sessions keep their professional", () => {
     const staffService = () =>

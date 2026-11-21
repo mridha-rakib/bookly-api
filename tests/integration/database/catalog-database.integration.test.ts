@@ -24,6 +24,7 @@ import { BookingSlotReservationRepository } from "../../../src/modules/booking-s
 import { BookingSlotReservationService } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.service.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
 import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
+import { createBusinessRoute } from "../../../src/modules/business/business.route.js";
 import { updateBusinessBodySchema } from "../../../src/modules/business/business.schema.js";
 import { BusinessBookingSettingsRepository } from "../../../src/modules/business-booking-settings/business-booking-settings.repository.js";
 import { BusinessCancellationPolicyRepository } from "../../../src/modules/business-cancellation-policy/business-cancellation-policy.repository.js";
@@ -516,6 +517,70 @@ describe("database-backed Customer Catalog + AT_BUSINESS_LOCATION first-booking 
     const malformed = await read();
     expect(malformed).not.toHaveProperty("instagramHandle");
     expect(malformed).not.toHaveProperty("facebookPageUrl");
+  });
+
+  it("Fix #10 — the Owner's real Business Profile save reaches the public catalog unchanged", async () => {
+    const { business, owner } = await setupBookableBusiness(8000);
+    const app = express();
+    app.use(express.json());
+    app.use("/catalog", createCatalogRoute());
+    app.use("/businesses", createBusinessRoute());
+    app.use(createErrorHandler({ isProduction: true }));
+    const ownerAuth = await bearerFor(owner._id, "BUSINESS_OWNER");
+    const save = (body: object) =>
+      request(app).patch(`/businesses/${business._id}`).set("Authorization", ownerAuth).send(body);
+    const anonymous = async () =>
+      (await request(app).get(`/catalog/businesses/${business._id}`).expect(200)).body.data
+        .business;
+    const customer = await userRepository.create({
+      normalizedEmail: `social-${new Types.ObjectId()}@example.com`,
+      passwordHash: "hash",
+      role: "CUSTOMER",
+      status: "ACTIVE",
+    });
+    const signedIn = async () =>
+      (
+        await request(app)
+          .get(`/catalog/businesses/${business._id}`)
+          .set("Authorization", await bearerFor(customer._id, "CUSTOMER"))
+          .expect(200)
+      ).body.data.business;
+
+    // Instagram only, saved through the real Owner route.
+    await save({ instagramHandle: "@aurelia.studio" }).expect(200);
+    expect((await BusinessModel.findById(business._id).lean())?.instagramHandle).toBe(
+      "@aurelia.studio",
+    );
+    expect(await anonymous()).toMatchObject({ instagramHandle: "aurelia.studio" });
+    expect(await anonymous()).not.toHaveProperty("facebookPageUrl");
+
+    // Facebook added; both appear, anonymously and signed in.
+    await save({ facebookPageUrl: "https://www.facebook.com/aurelia.studio" }).expect(200);
+    for (const view of [await anonymous(), await signedIn()]) {
+      expect(view).toMatchObject({
+        instagramHandle: "aurelia.studio",
+        facebookPageUrl: "https://www.facebook.com/aurelia.studio",
+      });
+      // Existing contact privacy is unchanged.
+      expect(view.email).toBeUndefined();
+      expect(view.phone).toBeUndefined();
+    }
+
+    // Invalid saves are refused and never replace the published values.
+    await save({ instagramHandle: "https://instagram.com/x y" }).expect(400);
+    await save({ facebookPageUrl: "http://facebook.com/aurelia" }).expect(400);
+    await save({ facebookPageUrl: "https://facebook.com.evil.example/aurelia" }).expect(400);
+    expect(await anonymous()).toMatchObject({
+      instagramHandle: "aurelia.studio",
+      facebookPageUrl: "https://www.facebook.com/aurelia.studio",
+    });
+
+    // A previously saved record (handle stored without "@") stays readable.
+    await BusinessModel.updateOne(
+      { _id: business._id },
+      { $set: { instagramHandle: "legacy.handle" } },
+    ).exec();
+    expect(await anonymous()).toMatchObject({ instagramHandle: "legacy.handle" });
   });
 
   it("still serves the public venue catalog to a logged-in Business Owner / Staff (no role gate on the read)", async () => {
