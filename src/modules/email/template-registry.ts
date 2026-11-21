@@ -27,6 +27,10 @@ import {
   renderBookingRescheduledCustomerEmail,
 } from "./templates/booking/booking-rescheduled-customer.template.js";
 import {
+  type BookingRescheduledOwnerEmailData,
+  renderBookingRescheduledOwnerEmail,
+} from "./templates/booking/booking-rescheduled-owner.template.js";
+import {
   renderBookingStaffCreatedEmail,
   type StaffCreatedBookingEmailData,
 } from "./templates/booking/booking-staff-created.template.js";
@@ -114,6 +118,8 @@ export type EmailTemplateKey =
   | "SESSION_END_REMINDER"
   // Mandatory customer transactional email — appointment schedule changed (customer or business)
   | "BOOKING_RESCHEDULED_CUSTOMER"
+  // Fix #7 — Business Owner transactional email for a CUSTOMER-initiated reschedule
+  | "BOOKING_RESCHEDULED_OWNER"
   // Stage D — cancellation + no-show + business registration
   | "BOOKING_CANCELLED_CUSTOMER"
   | "BOOKING_CANCELLED_OWNER"
@@ -170,6 +176,9 @@ const registry: Partial<Record<EmailTemplateKey, EmailTemplateRenderer<never>>> 
   SESSION_END_REMINDER: asRenderer<SessionEndReminderEmailData>(renderSessionEndReminderEmail),
   BOOKING_RESCHEDULED_CUSTOMER: asRenderer<BookingRescheduledEmailData>(
     renderBookingRescheduledCustomerEmail,
+  ),
+  BOOKING_RESCHEDULED_OWNER: asRenderer<BookingRescheduledOwnerEmailData>(
+    renderBookingRescheduledOwnerEmail,
   ),
   BOOKING_CANCELLED_CUSTOMER: asRenderer<CancellationEmailData>(
     renderBookingCancelledCustomerEmail,

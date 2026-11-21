@@ -34,6 +34,10 @@ import { BookingCancelledNotifier } from "../notification/booking-cancelled.noti
 import { BookingCompletedNotifier } from "../notification/booking-completed.notifier.js";
 import { BookingCreatedNotifier } from "../notification/booking-created.notifier.js";
 import { BookingRescheduledCustomerNotifier } from "../notification/booking-rescheduled-customer.notifier.js";
+import {
+  BookingRescheduledNotifications,
+  BookingRescheduledOwnerNotifier,
+} from "../notification/booking-rescheduled-owner.notifier.js";
 import { NoShowNotifier } from "../notification/no-show.notifier.js";
 import { StaffBookingNotifier } from "../notification/staff-booking.notifier.js";
 import { PackageProgressController } from "../package-progress/package-progress.controller.js";
@@ -255,7 +259,11 @@ const buildController = (): BookingController => {
     new NoShowNotifier(new EmailOutboxService()),
     new StaffBookingNotifier(new EmailOutboxService(), staffRepository, userRepository),
     appointmentReminderScheduler,
-    new BookingRescheduledCustomerNotifier(new EmailOutboxService()),
+    // Fix #7 — customer confirmation (unchanged) + Owner email for customer-made reschedules.
+    new BookingRescheduledNotifications(
+      new BookingRescheduledCustomerNotifier(new EmailOutboxService()),
+      new BookingRescheduledOwnerNotifier(new EmailOutboxService(), userRepository),
+    ),
     packageProgressRepository,
     undefined,
     undefined,

@@ -18,6 +18,7 @@ import { AvailabilityService } from "../../../src/modules/availability/availabil
 import { BookingController } from "../../../src/modules/booking/booking.controller.js";
 import { BookingModel } from "../../../src/modules/booking/booking.model.js";
 import { BookingRepository } from "../../../src/modules/booking/booking.repository.js";
+import { createCustomerBookingRoute } from "../../../src/modules/booking/booking.route.js";
 import {
   bookingIdOnlyParamsSchema,
   bookingIdParamsSchema,
@@ -33,6 +34,7 @@ import {
   acquireSchedulingAdmission,
   validateSchedulingLine,
 } from "../../../src/modules/booking/booking-scheduling-admission.js";
+import { BookingFinancialTransactionModel } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.model.js";
 import { BookingFinancialTransactionRepository } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.repository.js";
 import { BookingFinancialTransactionService } from "../../../src/modules/booking-financial-transaction/booking-financial-transaction.service.js";
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
@@ -48,12 +50,19 @@ import { BusinessHoursService } from "../../../src/modules/business-hours/busine
 import { BusinessTravelSettingsRepository } from "../../../src/modules/business-travel-settings/business-travel-settings.repository.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
 import { createDashboardOverviewRoute } from "../../../src/modules/dashboard-overview/dashboard-overview.route.js";
+import { renderEmailTemplate } from "../../../src/modules/email/template-registry.js";
 import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox.model.js";
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
 import { EmailOutboxService } from "../../../src/modules/email-outbox/email-outbox.service.js";
 import { BookingRescheduledCustomerNotifier } from "../../../src/modules/notification/booking-rescheduled-customer.notifier.js";
+import {
+  BookingRescheduledNotifications,
+  BookingRescheduledOwnerNotifier,
+} from "../../../src/modules/notification/booking-rescheduled-owner.notifier.js";
+import { StaffBookingNotifier } from "../../../src/modules/notification/staff-booking.notifier.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
 import { PaymentService } from "../../../src/modules/payment/payment.service.js";
+import { PaymentAttemptModel } from "../../../src/modules/payment/payment-attempt.model.js";
 import { CyprusTaxService } from "../../../src/modules/payment/tax.service.js";
 import { PromoRepository } from "../../../src/modules/promo/promo.repository.js";
 import { PromoApplicationService } from "../../../src/modules/promo/promo-application.service.js";
@@ -66,6 +75,7 @@ import { StaffRepository } from "../../../src/modules/staff/staff.repository.js"
 import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
+import { UserModel } from "../../../src/modules/user/user.model.js";
 import { UserRepository } from "../../../src/modules/user/user.repository.js";
 import { issueTestAccessToken } from "../../helpers/access-token.js";
 import { startScheduledAppointmentsBeforeLifecycleActions } from "../../helpers/appointment-start.js";
@@ -1890,6 +1900,300 @@ describe("database-backed Booking creation + lifecycle integration", () => {
           .lean(),
       ).toEqual(originalClaims);
       expect(await EmailOutboxModel.find({}).sort({ _id: 1 }).lean()).toEqual(originalOutbox);
+    });
+  });
+
+  // --- Fix #7: Business Owner email on a CUSTOMER-initiated reschedule -------------------------
+
+  describe("Fix #7 — BOOKING_RESCHEDULED_OWNER", () => {
+    const ownerRows = () =>
+      EmailOutboxModel.find({ templateKey: "BOOKING_RESCHEDULED_OWNER" })
+        .sort({ createdAt: 1 })
+        .lean();
+    const withOwnerNotifier = (enqueue?: EmailOutboxService["enqueue"]) =>
+      new BookingLifecycleService(
+        bookingService,
+        bookingRepository,
+        businessRepository,
+        reservationService,
+        availabilityService,
+        serviceRepository,
+        staffRepository,
+        paymentService,
+        financialTransactionService,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        new StaffBookingNotifier(
+          new EmailOutboxService(new EmailOutboxRepository()),
+          staffRepository,
+          userRepository,
+        ),
+        undefined,
+        new BookingRescheduledNotifications(
+          new BookingRescheduledCustomerNotifier(
+            enqueue ? { enqueue } : new EmailOutboxService(new EmailOutboxRepository()),
+          ),
+          new BookingRescheduledOwnerNotifier(
+            enqueue ? { enqueue } : new EmailOutboxService(new EmailOutboxRepository()),
+            userRepository,
+          ),
+        ),
+      );
+    const linkedBooking = async (time = "10:00") => {
+      const f = await createUpcomingBooking(time);
+      const customer = await userRepository.create({
+        normalizedEmail: `fix7-${new Types.ObjectId().toString()}@example.com`,
+        passwordHash: "hash",
+        role: "CUSTOMER",
+        status: "ACTIVE",
+      });
+      await clientRepository.setLinkState(f.client._id, {
+        linkState: "LINKED",
+        linkedUserId: customer._id,
+      });
+      await BookingModel.updateOne(
+        { _id: f.booking._id },
+        { $set: { "customer.customerUserId": customer._id } },
+      ).exec();
+      return { ...f, customer };
+    };
+    const moneyState = async () => ({
+      ledger: await BookingFinancialTransactionModel.countDocuments({}),
+      attempts: await PaymentAttemptModel.countDocuments({}),
+    });
+
+    it("the real customer route records one Owner intent beside the unchanged customer and staff intents", async () => {
+      const f = await linkedBooking("10:00");
+      const money = await moneyState();
+      const app = express();
+      app.use(express.json());
+      app.use("/me", createCustomerBookingRoute());
+      app.use(createErrorHandler({ isProduction: true }));
+      const token = await issueTestAccessToken(new TokenService(new SessionRepository()), {
+        userId: f.customer._id,
+        role: "CUSTOMER",
+      });
+      await request(app)
+        .post(`/me/bookings/${f.booking._id}/reschedule`)
+        .set("Authorization", `Bearer ${token}`)
+        .send({ startAt: startAtFor("14:30") })
+        .expect(200);
+
+      const owner = await userRepository.findById(f.owner._id);
+      const rows = await ownerRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        status: "PENDING",
+        recipient: owner?.normalizedEmail,
+        eventKey: `BOOKING_RESCHEDULED_OWNER:${f.booking._id}:1`,
+      });
+      const booking = await BookingModel.findById(f.booking._id).orFail().lean();
+      expect(rows[0]?.payload).toMatchObject({
+        businessName: f.business.name,
+        bookingReference: booking.reference,
+        customerName: [booking.customer.contact.firstName, booking.customer.contact.lastName]
+          .filter(Boolean)
+          .join(" "),
+        previousDate: "Tuesday, 20 August 2030",
+        previousTime: "10:00",
+        newDate: "Tuesday, 20 August 2030",
+        newTime: "14:30",
+        venueTimezone: "Europe/Nicosia",
+        manageBookingsUrlPath: "/business-dashboard?section=all-bookings",
+      });
+      expect(
+        (rows[0]?.payload as { services?: Array<{ name: string }> } | undefined)?.services?.[0]
+          ?.name,
+      ).toBe(booking.serviceLines[0]?.serviceSnapshot.name);
+      // Existing intents are unchanged: one customer confirmation, one staff schedule change.
+      expect(
+        await EmailOutboxModel.countDocuments({
+          templateKey: "BOOKING_RESCHEDULED_CUSTOMER",
+          eventKey: `BOOKING_RESCHEDULED:${f.booking._id}:1`,
+        }),
+      ).toBe(1);
+      expect(
+        await EmailOutboxModel.countDocuments({ templateKey: "STAFF_BOOKING_SCHEDULE_CHANGED" }),
+      ).toBe(1);
+      expect(await moneyState()).toEqual(money);
+
+      // The worker's renderer produces the dedicated email from the persisted payload.
+      const rendered = renderEmailTemplate("BOOKING_RESCHEDULED_OWNER", rows[0]?.payload);
+      expect(rendered.subject).toBe(`Booking rescheduled by customer — ${booking.reference}`);
+      expect(rendered.text).toContain("The customer requested this change.");
+      expect(rendered.text).toContain("Previous: Tuesday, 20 August 2030 at 10:00");
+      expect(rendered.text).toContain("New: Tuesday, 20 August 2030 at 14:30");
+      expect(rendered.text).toContain("Europe/Nicosia");
+      expect(rendered.html).toContain(booking.reference);
+      expect(`${rendered.html}${rendered.text}`).not.toMatch(
+        /deposit|refund|token|secret|stripe|customerUserId|@example\.com/i,
+      );
+    });
+
+    it("two genuine customer reschedules give two Owner intents; a re-dispatch of a committed one adds none", async () => {
+      const f = await linkedBooking("10:00");
+      const lifecycle = withOwnerNotifier();
+      await lifecycle.rescheduleByCustomer(
+        String(f.customer._id),
+        String(f.booking._id),
+        startAtFor("13:00"),
+      );
+      const committed = await lifecycle.rescheduleByCustomer(
+        String(f.customer._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      );
+      const notifier = new BookingRescheduledNotifications(
+        new BookingRescheduledCustomerNotifier(new EmailOutboxService(new EmailOutboxRepository())),
+        new BookingRescheduledOwnerNotifier(
+          new EmailOutboxService(new EmailOutboxRepository()),
+          userRepository,
+        ),
+      );
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(() =>
+          notifier.enqueueBookingRescheduledInTransaction(committed, f.business, session),
+        );
+      } finally {
+        await session.endSession();
+      }
+      expect((await ownerRows()).map((r) => r.eventKey)).toEqual([
+        `BOOKING_RESCHEDULED_OWNER:${f.booking._id}:1`,
+        `BOOKING_RESCHEDULED_OWNER:${f.booking._id}:2`,
+      ]);
+      expect((await ownerRows())[1]?.payload).toMatchObject({
+        previousTime: "13:00",
+        newTime: "15:00",
+      });
+    });
+
+    it("identical concurrent customer reschedules commit once and record one Owner intent", async () => {
+      const f = await linkedBooking("10:00");
+      const lifecycle = withOwnerNotifier();
+      const results = await Promise.allSettled([
+        lifecycle.rescheduleByCustomer(
+          String(f.customer._id),
+          String(f.booking._id),
+          startAtFor("13:00"),
+        ),
+        lifecycle.rescheduleByCustomer(
+          String(f.customer._id),
+          String(f.booking._id),
+          startAtFor("13:00"),
+        ),
+      ]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(await ownerRows()).toHaveLength(1);
+    });
+
+    it("Owner- and Supervisor-initiated reschedules send the customer confirmation but no Owner email", async () => {
+      const f = await linkedBooking("10:00");
+      const lifecycle = withOwnerNotifier();
+      await lifecycle.rescheduleByOwner(
+        String(f.owner._id),
+        "BUSINESS_OWNER",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("13:00"),
+      );
+      const supervisor = await createStaff(f.business._id, "SUPERVISOR");
+      await lifecycle.rescheduleByOwner(
+        String(supervisor.user._id),
+        "SUPERVISOR",
+        String(f.business._id),
+        String(f.booking._id),
+        startAtFor("15:00"),
+      );
+      expect(await ownerRows()).toHaveLength(0);
+      expect(
+        await EmailOutboxModel.countDocuments({ templateKey: "BOOKING_RESCHEDULED_CUSTOMER" }),
+      ).toBe(2);
+    });
+
+    it("failed, unauthorized and rolled-back customer reschedules record no Owner intent", async () => {
+      const f = await linkedBooking("10:00");
+      const other = await linkedBooking("16:00");
+      const lifecycle = withOwnerNotifier();
+      // Unauthorized: another customer's booking is indistinguishable from a missing one.
+      await expect(
+        lifecycle.rescheduleByCustomer(
+          String(other.customer._id),
+          String(f.booking._id),
+          startAtFor("13:00"),
+        ),
+      ).rejects.toMatchObject({ statusCode: 404 });
+      // Failed: the slot is taken by the other appointment's professional? Use a past instant.
+      await expect(
+        lifecycle.rescheduleByCustomer(
+          String(f.customer._id),
+          String(f.booking._id),
+          new Date(Date.now() - 60_000).toISOString(),
+        ),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+
+      // Rolled back: the Owner intent's own enqueue fails inside the transaction.
+      const original = await BookingModel.findById(f.booking._id).orFail().lean();
+      const outbox = new EmailOutboxService(new EmailOutboxRepository());
+      const broken = withOwnerNotifier(async (input, session) => {
+        const result = await outbox.enqueue(input, session);
+        if (input.templateKey === "BOOKING_RESCHEDULED_OWNER")
+          throw new Error("owner outbox unavailable");
+        return result;
+      });
+      await expect(
+        broken.rescheduleByCustomer(
+          String(f.customer._id),
+          String(f.booking._id),
+          startAtFor("13:00"),
+        ),
+      ).rejects.toThrow("owner outbox unavailable");
+      const after = await BookingModel.findById(f.booking._id).orFail().lean();
+      expect(after.schedule).toEqual(original.schedule);
+      expect(after.rescheduleHistory).toEqual(original.rescheduleHistory);
+      expect(after.customerRescheduleCount).toBe(original.customerRescheduleCount);
+      expect(await EmailOutboxModel.countDocuments({})).toBe(0);
+    });
+
+    it("an Owner without a usable email is skipped safely; the reschedule and customer email proceed", async () => {
+      for (const unusable of ["", "   ", "not-an-address"]) {
+        await clearIsolatedDatabase();
+        const f = await linkedBooking("10:00");
+        await UserModel.collection.updateOne(
+          { _id: f.owner._id },
+          { $set: { normalizedEmail: unusable } },
+        );
+        const moved = await withOwnerNotifier().rescheduleByCustomer(
+          String(f.customer._id),
+          String(f.booking._id),
+          startAtFor("13:00"),
+        );
+        expect(moved.customerRescheduleCount).toBe(1);
+        expect(await ownerRows()).toHaveLength(0);
+        expect(
+          await EmailOutboxModel.countDocuments({ templateKey: "BOOKING_RESCHEDULED_CUSTOMER" }),
+        ).toBe(1);
+      }
+    });
+
+    it("the Owner of THIS Business is the only recipient", async () => {
+      const f = await linkedBooking("10:00");
+      const other = await linkedBooking("16:00");
+      await withOwnerNotifier().rescheduleByCustomer(
+        String(f.customer._id),
+        String(f.booking._id),
+        startAtFor("13:00"),
+      );
+      const rows = await ownerRows();
+      expect(rows.map((r) => r.recipient)).toEqual([
+        (await userRepository.findById(f.owner._id))?.normalizedEmail,
+      ]);
+      expect(rows[0]?.recipient).not.toBe(
+        (await userRepository.findById(other.owner._id))?.normalizedEmail,
+      );
     });
   });
 
