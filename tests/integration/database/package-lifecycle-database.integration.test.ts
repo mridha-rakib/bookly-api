@@ -47,6 +47,7 @@ import { BookingFinancialTransactionService } from "../../../src/modules/booking
 import { BookingSlotReservationModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation.model.js";
 import { BookingSlotReservationClaimModel } from "../../../src/modules/booking-slot-reservation/booking-slot-reservation-claim.model.js";
 import { BusinessModel } from "../../../src/modules/business/business.model.js";
+import { BusinessRepository } from "../../../src/modules/business/business.repository.js";
 import { BusinessTravelSettingsModel } from "../../../src/modules/business-travel-settings/business-travel-settings.model.js";
 import { BusinessClientModel } from "../../../src/modules/client/client.model.js";
 import { ClientRepository } from "../../../src/modules/client/client.repository.js";
@@ -56,6 +57,7 @@ import { EmailOutboxModel } from "../../../src/modules/email-outbox/email-outbox
 import { EmailOutboxRepository } from "../../../src/modules/email-outbox/email-outbox.repository.js";
 import * as eligibility from "../../../src/modules/package-progress/package-eligibility.js";
 import { withPackageEligibility } from "../../../src/modules/package-progress/package-eligibility.js";
+import { PackageProgressRepository } from "../../../src/modules/package-progress/package-progress.repository.js";
 import { PackageProgressV2Model } from "../../../src/modules/package-progress/package-progress-v2.model.js";
 import { PackageProgressV2Repository } from "../../../src/modules/package-progress/package-progress-v2.repository.js";
 import { CustomerPaymentProfileRepository } from "../../../src/modules/payment/customer-payment-profile.repository.js";
@@ -70,8 +72,12 @@ import { PaymentAttemptRepository } from "../../../src/modules/payment/payment-a
 import { RefundOperationModel } from "../../../src/modules/payment/refund-operation.model.js";
 import { RefundOperationRepository } from "../../../src/modules/payment/refund-operation.repository.js";
 import { ServiceModel } from "../../../src/modules/services/service.model.js";
+import { ServiceRepository } from "../../../src/modules/services/service.repository.js";
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
+import { StaffService } from "../../../src/modules/staff/staff.service.js";
+import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
+import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { StripeWebhookService } from "../../../src/modules/stripe-webhook/stripe-webhook.service.js";
 import { StripeWebhookEventRepository } from "../../../src/modules/stripe-webhook/stripe-webhook-event.repository.js";
 import { UserModel } from "../../../src/modules/user/user.model.js";
@@ -409,6 +415,56 @@ describe("S5 internal first-class lifecycle", () => {
     const t = await fixture();
     const r = await t.business(t.intent("CANCEL", { bookingId: t.first._id }));
     expect(r?.booking?.status).toBe("CANCELLED_BY_BUSINESS");
+  });
+  it("Fix #6 a First-Class scheduled appointment blocks removing or deactivating its professional", async () => {
+    const t = await fixture();
+    const staffId = String(must(t.first.serviceLines[0]).responsibleStaffMembershipId);
+    const staffService = new StaffService(
+      new StaffRepository(),
+      new BusinessRepository(),
+      new UserRepository(),
+      undefined as never,
+      undefined as never,
+      new StaffScheduleRepository(),
+      new StaffTimeOffRepository(),
+      undefined as never,
+      undefined,
+      undefined,
+      new ServiceRepository(),
+      new PackageProgressRepository(),
+    );
+    const owner = String(t.f.business.ownerUserId);
+    const business = String(t.f.business._id);
+    // updateStaff edits a real staff identity; the batch fixture creates provider profiles only.
+    const staffUser = (await StaffMembershipModel.findById(staffId).orFail().lean()).userId;
+    if (!(await UserModel.exists({ _id: staffUser })))
+      await UserModel.create({
+        _id: staffUser,
+        normalizedEmail: `provider-${staffUser}@example.com`,
+        passwordHash: "hash",
+        role: "STAFF",
+        status: "ACTIVE",
+        security: { passwordUpdatedAt: new Date() },
+      });
+    const bookingBefore = await BookingModel.findById(t.first._id).lean();
+    const progressBefore = (
+      await PackageProgressV2Model.findById(t.progress._id).orFail()
+    ).toObject();
+    await expect(staffService.removeStaff(owner, business, staffId)).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("active or upcoming bookings"),
+    });
+    await expect(
+      staffService.updateStaff(owner, business, staffId, { employmentActive: false }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await StaffMembershipModel.findById(staffId).lean()).toMatchObject({
+      employmentActive: true,
+    });
+    expect((await StaffMembershipModel.findById(staffId).lean())?.removedAt).toBeUndefined();
+    expect(await BookingModel.findById(t.first._id).lean()).toEqual(bookingBefore);
+    expect((await PackageProgressV2Model.findById(t.progress._id).orFail()).toObject()).toEqual(
+      progressBefore,
+    );
   });
   it("Fix #5 early First-Class completion is refused before any operation, credit or booking change", async () => {
     const t = await fixture();

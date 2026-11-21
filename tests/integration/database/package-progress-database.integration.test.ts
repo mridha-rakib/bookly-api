@@ -64,6 +64,7 @@ import { SessionRepository } from "../../../src/modules/session/session.reposito
 import { StaffMembershipModel } from "../../../src/modules/staff/staff.model.js";
 import { StaffRepository } from "../../../src/modules/staff/staff.repository.js";
 import { createStaffScheduleRoute } from "../../../src/modules/staff/staff.route.js";
+import { StaffService } from "../../../src/modules/staff/staff.service.js";
 import { StaffScheduleRepository } from "../../../src/modules/staff/staff-schedule.repository.js";
 import { StaffTimeOffRepository } from "../../../src/modules/staff/staff-time-off.repository.js";
 import { createSuperAdminRoute } from "../../../src/modules/super-admin/super-admin.route.js";
@@ -1933,6 +1934,79 @@ describe("database-backed Package Deal integration", () => {
   // --- Redemption ------------------------------------------------------------------------------
 
   // --- Fix #3: Legacy Package purchase balance after session 1 leaves UPCOMING -----------------
+
+  describe("Fix #6 — Legacy Package sessions keep their professional", () => {
+    const staffService = () =>
+      new StaffService(
+        new StaffRepository(),
+        new BusinessRepository(),
+        new UserRepository(),
+        undefined as never,
+        undefined as never,
+        new StaffScheduleRepository(),
+        new StaffTimeOffRepository(),
+        undefined as never,
+        undefined,
+        undefined,
+        new ServiceRepository(),
+        new PackageProgressRepository(),
+      );
+
+    it("purchase session 1 and redeemed sessions block their professional until resolved; another eligible professional keeps the entitlement usable", async () => {
+      const { owner, business, staff, service } = await setupPackageBusiness(2);
+      const customer = await createCustomer("fix6");
+      await saveCard(customer._id);
+      await linkCustomerToBusiness(business._id, owner._id, customer._id);
+      const bought = await creationService.finalizePackagePurchase(
+        String(customer._id),
+        String(business._id),
+        purchaseInput(service._id, staff[0]!.membership._id),
+      );
+      if (bought.status !== "confirmed") throw Error("expected purchase");
+      const progress = await PackageProgressModel.findOne({ originBookingId: bought.booking._id })
+        .orFail()
+        .exec();
+      const remove = (index: number) =>
+        staffService().removeStaff(
+          String(owner._id),
+          String(business._id),
+          String(staff[index]!.membership._id),
+        );
+      const blocked = {
+        statusCode: 409,
+        message: expect.stringContaining("active or upcoming bookings"),
+      };
+
+      await expect(remove(0)).rejects.toMatchObject(blocked); // session 1 (purchase) is upcoming
+      await settleOriginBalance(owner, business, bought.booking._id);
+      const session2 = await redeemConfirmed(
+        String(customer._id),
+        String(business._id),
+        String(progress._id),
+        redeemInput(staff[0]!.membership._id),
+      );
+      await expect(remove(0)).rejects.toMatchObject(blocked); // redeemed session 2 is upcoming
+      await lifecycleService.cancelByBusiness(
+        String(owner._id),
+        "BUSINESS_OWNER",
+        String(business._id),
+        String(session2._id),
+        undefined,
+      );
+      await remove(0); // both sessions resolved; staff[1] stays eligible for the entitlement
+      const after = await PackageProgressModel.findById(progress._id).orFail().lean();
+      expect(after.remainingSessions).toBe(4);
+      expect(
+        (await BookingModel.findById(session2._id).orFail().lean()).serviceLines[0]
+          ?.responsibleStaffMembershipId,
+      ).toEqual(staff[0]!.membership._id);
+      // The pre-existing final-eligible-professional protection still applies to staff[1].
+      await expect(remove(1)).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining("last eligible staff member"),
+      });
+    });
+  });
 
   describe("Fix #3 — Legacy Package purchase balance recorder", () => {
     const balanceService = () =>

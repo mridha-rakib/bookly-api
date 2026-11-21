@@ -2,6 +2,8 @@ import mongoose, { type ClientSession } from "mongoose";
 import { env } from "../../config/env.js";
 import { logger } from "../../config/logger.js";
 import { normalizeEmail } from "../auth/auth.utils.js";
+import { BookingModel } from "../booking/booking.model.js";
+import type { BookingStatus } from "../booking/booking.types.js";
 import type { BusinessDocument } from "../business/business.model.js";
 import type { BusinessRepository } from "../business/business.repository.js";
 import type { StaffAccessNotificationPort } from "../notification/staff-access.notifier.js";
@@ -36,6 +38,9 @@ import { normalizeScheduleIntervals } from "./staff-schedule.utils.js";
 import type { StaffTimeOffDocument } from "./staff-time-off.model.js";
 import type { StaffTimeOffRepository } from "./staff-time-off.repository.js";
 import type { StaffTimeOffType } from "./staff-time-off.types.js";
+
+/** Fix #6 — appointment states that still need the assigned provider. */
+const UNRESOLVED_APPOINTMENT_STATUSES: BookingStatus[] = ["UPCOMING", "PENDING"];
 
 export type StaffTimeOffDto = {
   id: string;
@@ -222,6 +227,36 @@ export class StaffService {
         throw new StaffError("STAFF_REMOVAL_BLOCKED_BY_PACKAGE_ENTITLEMENTS", 409);
       }
     }
+  }
+
+  /**
+   * Fix #6 — a professional who is still the responsible provider on an unresolved appointment
+   * can be neither removed nor deactivated: the customer's Booking would be left with a provider
+   * who can no longer fulfil it. Reads the authoritative persisted Booking state (never Calendar
+   * data) across every appointment type — normal, manual, rescheduled, group, Legacy Package
+   * purchase/redemption and First-Class sessions all carry the provider on
+   * `serviceLines.responsibleStaffMembershipId`. Unresolved = UPCOMING (future, or started but
+   * not yet completed/cancelled/no-showed) or PENDING (no-show under review). Terminal history
+   * never blocks. Nothing is cancelled, reassigned or rewritten.
+   *
+   * Must run inside the transaction that holds the Business package-eligibility fence: every
+   * Booking writer that can assign this professional (creation, reschedule, package redemption,
+   * First-Class persistence) takes that same fence through `acquireSchedulingAdmission` and
+   * re-validates the professional as active and not removed, so a concurrent assignment either
+   * commits first and is seen here, or runs after and is refused as BOOKING_STAFF_NOT_ELIGIBLE.
+   */
+  private async assertNoUnresolvedAppointments(
+    businessId: BusinessDocument["_id"],
+    membershipId: string,
+    session: ClientSession,
+  ): Promise<void> {
+    if (!mongoose.isValidObjectId(membershipId)) return;
+    const blocking = await BookingModel.exists({
+      businessId,
+      "serviceLines.responsibleStaffMembershipId": new mongoose.Types.ObjectId(membershipId),
+      status: { $in: UNRESOLVED_APPOINTMENT_STATUSES },
+    }).session(session);
+    if (blocking) throw new StaffError("STAFF_REMOVAL_BLOCKED_BY_BOOKINGS", 409);
   }
 
   public async listStaff(actorUserId: string, businessId: string): Promise<StaffListDto> {
@@ -663,6 +698,9 @@ export class StaffService {
         await acquirePackageEligibilityFence(businessId, dbSession);
         if (!nextActive)
           await this.assertPackageStaffRemovalSafe({ _id: businessId }, staffId, dbSession);
+        // Fix #6 — deactivation cannot bypass the removal guard.
+        if (previousActive && !nextActive)
+          await this.assertNoUnresolvedAppointments(businessId, staffId, dbSession);
 
         const updatedMembership = await this.staffRepository.updateActiveById(
           businessId,
@@ -711,6 +749,7 @@ export class StaffService {
     const business = await this.requireOwnedStaffBusiness(actorUserId, businessId);
     const removed = await withPackageEligibility(business._id, undefined, async (session) => {
       await this.assertPackageStaffRemovalSafe(business, staffId, session);
+      await this.assertNoUnresolvedAppointments(business._id, staffId, session);
       return this.staffRepository.softRemoveById(business._id, staffId, session);
     });
 
